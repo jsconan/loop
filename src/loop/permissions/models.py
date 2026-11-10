@@ -407,13 +407,14 @@ class SandboxedCommandRule(BaseModel):
 
 
 class HostCommandRule(BaseModel):
-    """Remember an exact unrestricted host retry for the current session.
+    """Remember an exact host approval with virtual working-directory context.
 
     Args:
         id (str): Identifier used to list and revoke the approval.
         signature (str): Digest of virtual workspace coordinates and safe command shape only.
         cwd (str): Virtual workspace working directory; never a host path.
         source (str): Path-free command label for listing and revocation.
+        scope (ApprovalChoice): Lifetime of a trusted grant; retry rules remain session-only.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -422,6 +423,7 @@ class HostCommandRule(BaseModel):
     signature: str
     cwd: str
     source: str
+    scope: ApprovalChoice = ApprovalChoice.SESSION
 
     @model_validator(mode="after")
     def validate_virtual_context(self) -> HostCommandRule:
@@ -522,6 +524,10 @@ class PermissionConfigurationError(PermissionArtifactError):
         super().__init__(f"Could not load permission policy at {self.path}: {message}")
 
 
+class PermissionNamespaceError(PermissionConfigurationError):
+    """Report policy provenance or publication state requiring trusted recovery."""
+
+
 class PermissionPresetError(PermissionArtifactError):
     """Report one or more invalid built-in permission presets.
 
@@ -570,7 +576,7 @@ class PermissionPreset(BaseModel):
 
     Args:
         version (Literal[1]): Preset schema version.
-        kind (Literal["loop.permission-preset"]): Artifact type discriminator.
+        kind (Literal["app.permission-preset"]): Artifact type discriminator.
         metadata (PresetMetadata): Identity and explanation shown before replacement.
         confirmation_warning (str | None): Warning shown before the required confirmation, or
             ``None`` when the standard replacement prompt is sufficient.
@@ -581,7 +587,7 @@ class PermissionPreset(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     version: Literal[1] = 1
-    kind: Literal["loop.permission-preset"] = "loop.permission-preset"
+    kind: Literal["app.permission-preset"] = "app.permission-preset"
     metadata: PresetMetadata
     confirmation_warning: str | None = None
     defaults: dict[Action, Decision]
@@ -620,7 +626,7 @@ class PermissionPreset(BaseModel):
 
     @classmethod
     def builtin_presets(cls) -> tuple[PermissionPreset, ...]:
-        """Return all validated presets shipped with Loop.
+        """Return all validated presets shipped with the application.
 
         Returns:
             tuple[PermissionPreset, ...]: Catalog entries sorted by stable identifier.
@@ -645,7 +651,7 @@ class PermissionPreset(BaseModel):
         """
         presets = []
         failures = []
-        directory = files("loop.permissions").joinpath("presets")
+        directory = files(__package__).joinpath("presets")
         for entry in sorted(directory.iterdir(), key=lambda item: item.name):
             if not entry.name.endswith((".yaml", ".yml")):
                 continue
@@ -704,22 +710,72 @@ class PolicyLimits(BaseModel):
 
     Args:
         readable_roots (tuple[str, ...]): Allowed filesystem read roots. ``workspace`` and
-            ``loop-temp`` are special runtime roots.
+            ``app-temp`` are special runtime roots.
         writable_roots (tuple[str, ...]): Allowed mutation roots. ``workspace`` and
-            ``loop-temp`` are special runtime roots.
+            ``app-temp`` are special runtime roots.
         network_origins (tuple[str, ...]): Allowed origin globs. ``"*"`` permits every origin;
             an empty tuple denies every origin.
         deny_private_networks (bool): Whether literal private and local IP targets are forbidden.
+        deny_local_networks (bool): Whether sandbox-attempt loopback communication is forbidden.
         allow_host_processes (bool): Whether policy may approve a host process.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    readable_roots: tuple[str, ...] = ("workspace", "loop-temp")
-    writable_roots: tuple[str, ...] = ("workspace", "loop-temp")
+    readable_roots: tuple[str, ...] = ("workspace", "app-temp")
+    writable_roots: tuple[str, ...] = ("workspace", "app-temp")
     network_origins: tuple[str, ...] = ("*",)
     deny_private_networks: bool = True
+    deny_local_networks: bool = False
     allow_host_processes: bool = False
+
+
+class LimitClassification(StrEnum):
+    """Classify a user-controlled collection limit for scoped sandbox requests."""
+
+    HARD = "hard"
+    APPROVAL = "approval"
+
+
+class PolicyLimitClassifications(BaseModel):
+    """Store the provenance-sensitive behavior of collection limits.
+
+    Args:
+        readable_roots (LimitClassification): Classification of sandbox read roots.
+        writable_roots (LimitClassification): Classification of sandbox write roots.
+        network_origins (LimitClassification): Classification of network origins.
+        sources (dict[str, str]): Provenance of each persisted classification.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    readable_roots: LimitClassification = LimitClassification.APPROVAL
+    writable_roots: LimitClassification = LimitClassification.APPROVAL
+    network_origins: LimitClassification = LimitClassification.APPROVAL
+    sources: dict[str, str] = Field(
+        default_factory=lambda: {
+            "readable_roots": "builtin",
+            "writable_roots": "builtin",
+            "network_origins": "builtin",
+        }
+    )
+
+    @model_validator(mode="after")
+    def validate_sources(self) -> PolicyLimitClassifications:
+        """Require a complete, known provenance for each classified collection.
+
+        Returns:
+            PolicyLimitClassifications: Validated classifications and provenance.
+
+        Raises:
+            ValueError: If provenance is missing or unknown.
+        """
+        if self.sources.keys() != {"readable_roots", "writable_roots", "network_origins"} or any(
+            source not in {"builtin", "legacy", "user", "session"}
+            for source in self.sources.values()
+        ):
+            raise ValueError("Permission limit classification provenance is invalid.")
+        return self
 
 
 def _default_decisions() -> dict[Action, Decision]:
@@ -739,17 +795,25 @@ class PermissionConfiguration(BaseModel):
     """Represent a complete persisted local operation policy.
 
     Args:
-        version (Literal[1]): Configuration schema version.
+        version (Literal[1, 2]): Configuration schema version.
         defaults (dict[Action, Decision]): Fallback decision for every known action.
         limits (PolicyLimits): User-configurable ceilings ordinary rules cannot override.
+        limit_classifications (PolicyLimitClassifications): Provenance-sensitive sandbox grant
+            behavior, recorded separately from the effective limit values.
+        namespace_generation (str | None): Durable policy namespace marker when bound to the
+            application registry; markerless valid policies are migrated conservatively.
         rules (list[PermissionRule]): Composed explicit policy rules.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    version: Literal[1] = 1
+    version: Literal[1, 2] = 2
     defaults: dict[Action, Decision] = Field(default_factory=_default_decisions)
     limits: PolicyLimits = Field(default_factory=PolicyLimits)
+    limit_classifications: PolicyLimitClassifications = Field(
+        default_factory=PolicyLimitClassifications
+    )
+    namespace_generation: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
     rules: list[PermissionRule] = Field(default_factory=list)
 
     @model_validator(mode="after")
@@ -771,20 +835,24 @@ class PermissionConfiguration(BaseModel):
 class UserPermissionConfiguration(BaseModel):
     """Store remembered exact approvals shared by every workspace.
 
-    User policy deliberately contains rules only. Application-wide defaults and enforcement limits
+    User policy contains reviewed approvals only. Application-wide defaults and enforcement limits
     would widen authority beyond a single reviewed approval and require their own management flow.
 
     Args:
-        version (Literal[1]): Persisted schema version.
+        version (Literal[1, 2]): Persisted schema version.
         rules (list[PermissionRule]): Exact user-approved operation rules.
         sandboxed_command_rules (list[SandboxedCommandRule]): User-persisted sandbox-only approvals.
+        trusted_host_command_rules (list[HostCommandRule]): Human-approved durable host grants.
+        namespace_generation (str | None): Durable user-data-scoped policy namespace marker.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    version: Literal[1] = 1
+    version: Literal[1, 2] = 2
     rules: list[PermissionRule] = Field(default_factory=list)
     sandboxed_command_rules: list[SandboxedCommandRule] = Field(default_factory=list)
+    trusted_host_command_rules: list[HostCommandRule] = Field(default_factory=list)
+    namespace_generation: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
 
     @model_validator(mode="after")
     def validate_rule_ids(self) -> UserPermissionConfiguration:
@@ -798,10 +866,16 @@ class UserPermissionConfiguration(BaseModel):
         """
         identifiers = [rule.id for rule in self.rules]
         sandbox_identifiers = [rule.id for rule in self.sandboxed_command_rules]
+        host_identifiers = [rule.id for rule in self.trusted_host_command_rules]
         if len(identifiers) != len(set(identifiers)):
             raise ValueError("Permission rule identifiers must be unique.")
         if len(sandbox_identifiers) != len(set(sandbox_identifiers)):
             raise ValueError("Sandbox command rule identifiers must be unique.")
+        if len(host_identifiers) != len(set(host_identifiers)) or any(
+            rule.scope not in {ApprovalChoice.WORKSPACE, ApprovalChoice.USER}
+            for rule in self.trusted_host_command_rules
+        ):
+            raise ValueError("Durable host grants require distinct IDs and durable scopes.")
         return self
 
 
@@ -813,6 +887,7 @@ class PolicyLimitOverrides(BaseModel):
         writable_roots (tuple[str, ...] | None): Replacement writable roots, or inheritance.
         network_origins (tuple[str, ...] | None): Replacement network origins, or inheritance.
         deny_private_networks (bool | None): Private-network override, or inheritance.
+        deny_local_networks (bool | None): Sandbox-local override, or inheritance.
         allow_host_processes (bool | None): Host-process override, or inheritance.
     """
 
@@ -822,6 +897,7 @@ class PolicyLimitOverrides(BaseModel):
     writable_roots: tuple[str, ...] | None = None
     network_origins: tuple[str, ...] | None = None
     deny_private_networks: bool | None = None
+    deny_local_networks: bool | None = None
     allow_host_processes: bool | None = None
 
 
@@ -831,18 +907,23 @@ class SessionPolicyOverrides(BaseModel):
     Args:
         defaults (dict[Action, Decision]): Session fallback decisions by action.
         limits (PolicyLimitOverrides): Session replacements for selected workspace limits.
+        limit_classifications (dict[str, LimitClassification]): Trusted session changes to
+            collection classifications; a new session value is hard unless reclassified.
         rules (list[PermissionRule]): Session-only matching rules.
         sandboxed_command_rules (list[SandboxedCommandRule]): Session-only sandbox approvals.
         host_command_rules (list[HostCommandRule]): Session-only exact host retry approvals.
+        trusted_host_command_rules (list[HostCommandRule]): Human-installed session host grants.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     defaults: dict[Action, Decision] = Field(default_factory=dict)
     limits: PolicyLimitOverrides = Field(default_factory=PolicyLimitOverrides)
+    limit_classifications: dict[str, LimitClassification] = Field(default_factory=dict)
     rules: list[PermissionRule] = Field(default_factory=list)
     sandboxed_command_rules: list[SandboxedCommandRule] = Field(default_factory=list)
     host_command_rules: list[HostCommandRule] = Field(default_factory=list)
+    trusted_host_command_rules: list[HostCommandRule] = Field(default_factory=list)
 
 
 class PolicyDecision(BaseModel):

@@ -23,8 +23,19 @@ from typing import TYPE_CHECKING
 from .... import constants
 from ....constants import GIT_DIRECTORY
 from ....permissions.protection import PRIVATE_READ_COMPONENTS, is_protected_external_read
-from ..constants import TMPDIR_ENVIRONMENT_VARIABLE
-from .constants import NATIVE_ALIAS_PATH, NATIVE_SCRATCH_PATH
+from ..constants import (
+    CPYTHON_EXECUTABLE_NAME,
+    PYTHON_BIN_DIRECTORY_NAME,
+    PYTHON_ENVIRONMENT_CONFIG_NAME,
+    PYTHON_LIBRARY_DIRECTORY_NAME,
+    TMPDIR_ENVIRONMENT_VARIABLE,
+)
+from .constants import (
+    NATIVE_ALIAS_PATH,
+    NATIVE_CONVENTIONAL_TMP_PATH,
+    NATIVE_SCRATCH_PATH,
+    SESSION_CONVENTIONAL_TMP_NAME,
+)
 
 if TYPE_CHECKING:
     from ..contracts import SandboxRequest
@@ -59,19 +70,58 @@ def payload_path(path: Path, scratch: Path) -> Path:
     return NATIVE_SCRATCH_PATH / path.relative_to(scratch) if path.is_relative_to(scratch) else path
 
 
-def payload_aliases(request: SandboxRequest) -> tuple[tuple[Path, Path, Path], ...]:
-    """Map bound virtual aliases to stable request-local symlinks.
-
-    Args:
-        request (SandboxRequest): Original bound virtual aliases and targets.
-
-    Returns:
-        tuple[tuple[Path, Path, Path], ...]: Host alias, namespace alias and original target.
-    """
-    return tuple(
-        (alias, NATIVE_ALIAS_PATH / f"r{index}", target)
-        for index, (_, alias, target) in enumerate(request.aliases)
-    )
+def _python_environment_values(config: Path) -> dict[str, str] | None:
+    """Read bounded, identity-checked environment metadata without following its leaf."""
+    try:
+        before = config.lstat()
+    except FileNotFoundError:
+        return None
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+        or before.st_uid != os.getuid()
+        or before.st_mode & constants.OTHER_WRITE_MODE_BIT
+        or before.st_mode & constants.GROUP_WRITE_MODE_BIT
+        and before.st_gid != os.getgid()
+        or before.st_size > _MAX_VENV_CONFIG_BYTES
+    ):
+        raise ValueError("Workspace Python environment metadata is unsafe.")
+    descriptor = os.open(config, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        bound = os.fstat(descriptor)
+        if (before.st_dev, before.st_ino) != (bound.st_dev, bound.st_ino):
+            raise ValueError("Workspace Python environment metadata changed.")
+        content = os.read(descriptor, _MAX_VENV_CONFIG_BYTES + 1)
+        latest = os.fstat(descriptor)
+        if len(content) > _MAX_VENV_CONFIG_BYTES or (
+            bound.st_dev,
+            bound.st_ino,
+            bound.st_size,
+            bound.st_mtime_ns,
+        ) != (latest.st_dev, latest.st_ino, latest.st_size, latest.st_mtime_ns):
+            raise ValueError("Workspace Python environment metadata changed.")
+    finally:
+        os.close(descriptor)
+    try:
+        lines = content.decode("utf-8").splitlines()
+    except UnicodeDecodeError as error:
+        raise ValueError("Workspace Python environment metadata is invalid.") from error
+    values = {}
+    ambiguous = set()
+    for line in lines:
+        key, separator, value = line.partition("=")
+        if not separator:
+            continue
+        key = key.strip().casefold()
+        if key in {"home", "implementation", "version_info", "version", "executable"}:
+            if key in values:
+                if key in {"home", "implementation", "version_info"}:
+                    raise ValueError("Workspace Python environment metadata is ambiguous.")
+                ambiguous.add(key)
+            values[key] = value.strip()
+    for key in ambiguous:
+        values.pop(key)
+    return values
 
 
 def python_runtime_mounts(
@@ -81,7 +131,7 @@ def python_runtime_mounts(
     *,
     system_roots: tuple[Path, ...] = (),
 ) -> tuple[tuple[Path, Path], ...]:
-    """Bind a user-local CPython runtime referenced by an identity-bound uv tool.
+    """Discover the user-local CPython runtime for a selected workspace interpreter.
 
     Args:
         workspace (Path): Canonical workspace containing the active virtual environment.
@@ -91,100 +141,110 @@ def python_runtime_mounts(
         system_roots (tuple[Path, ...]): Authenticated system runtime roots already mounted.
 
     Returns:
-        tuple[tuple[Path, Path], ...]: Canonical user-local runtime roots and their configured
-            path aliases, or an empty tuple when the venv uses a system or workspace runtime.
+        tuple[tuple[Path, Path], ...]: Candidate runtime roots and their configured path aliases,
+            or an empty tuple when no selected interpreter needs an external runtime. A caller
+            must separately authorize each returned root before use. Unsafe metadata that
+            cannot identify a selected interpreter contributes no runtime authority.
 
     Raises:
-        ValueError: The user home, venv metadata, interpreter, or runtime path is unsafe.
-        OSError: Required user or runtime filesystem metadata cannot be inspected.
+        ValueError: An identified interpreter's home, metadata, or runtime path is unsafe.
+        OSError: Required identified-runtime metadata cannot be inspected, or preparation times out.
     """
-    if not any(name == "uv" for name, *_ in executable_identities):
+    if not executable_identities:
         return ()
-    try:
-        home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve(strict=True)
-    except (KeyError, OSError, RuntimeError) as error:
-        raise ValueError(
-            "Current account home is unavailable for Python runtime binding."
-        ) from error
-    home_details = home.stat()
-    if (
-        not home.is_dir()
-        or home_details.st_uid != os.getuid()
-        or home_details.st_mode & constants.OTHER_WRITE_MODE_BIT
-        or home_details.st_mode & constants.GROUP_WRITE_MODE_BIT
-        and home_details.st_gid != os.getgid()
-    ):
-        raise ValueError("Current account home is unsafe for Python runtime binding.")
-
-    for _, path_root in path_roots:
-        if not path_root.is_relative_to(workspace) or path_root.name != "bin":
+    candidates = []
+    for spelling_root, path_root in path_roots:
+        if not path_root.is_relative_to(workspace) or path_root.name != PYTHON_BIN_DIRECTORY_NAME:
             continue
-        config = path_root.parent / "pyvenv.cfg"
         try:
-            before = config.lstat()
+            anchor = (path_root / CPYTHON_EXECUTABLE_NAME).resolve(strict=True)
         except FileNotFoundError:
+            anchor = None
+        except (OSError, RuntimeError):
             continue
-        if (
-            not stat.S_ISREG(before.st_mode)
-            or before.st_nlink != 1
-            or before.st_uid != os.getuid()
-            or before.st_mode & constants.OTHER_WRITE_MODE_BIT
-            or before.st_mode & constants.GROUP_WRITE_MODE_BIT
-            and before.st_gid != os.getgid()
-            or before.st_size > _MAX_VENV_CONFIG_BYTES
-        ):
-            raise ValueError("Workspace Python environment metadata is unsafe.")
-        descriptor = os.open(config, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
-        try:
-            bound = os.fstat(descriptor)
-            if (before.st_dev, before.st_ino) != (bound.st_dev, bound.st_ino):
-                raise ValueError("Workspace Python environment metadata changed.")
-            content = os.read(descriptor, _MAX_VENV_CONFIG_BYTES + 1)
-            latest = os.fstat(descriptor)
-            if len(content) > _MAX_VENV_CONFIG_BYTES or (
-                bound.st_dev,
-                bound.st_ino,
-                bound.st_size,
-                bound.st_mtime_ns,
-            ) != (latest.st_dev, latest.st_ino, latest.st_size, latest.st_mtime_ns):
-                raise ValueError("Workspace Python environment metadata changed.")
-        finally:
-            os.close(descriptor)
-        try:
-            lines = content.decode("utf-8").splitlines()
-        except UnicodeDecodeError as error:
-            raise ValueError("Workspace Python environment metadata is invalid.") from error
-        values = {}
-        for line in lines:
-            key, separator, value = line.partition("=")
-            if not separator:
+        for _, spelling, resolved, device, inode in executable_identities:
+            if spelling.parent != spelling_root:
                 continue
-            key = key.strip().casefold()
-            if key in {"home", "implementation", "version_info"}:
-                if key in values:
-                    raise ValueError("Workspace Python environment metadata is ambiguous.")
-                values[key] = value.strip()
-        version = re.match(r"^(\d+)\.(\d+)(?:\.|$)", values.get("version_info", ""))
+            try:
+                interpreter = spelling.resolve(strict=True)
+                details = interpreter.stat()
+            except (OSError, RuntimeError):
+                continue
+            if (
+                resolved != interpreter
+                or anchor is not None
+                and anchor != interpreter
+                or (device, inode) != (details.st_dev, details.st_ino)
+            ):
+                continue
+            candidates.append((path_root, spelling, interpreter, device, inode, anchor is None))
+    home = None
+    runtimes = []
+    for path_root, spelling, selected_interpreter, device, inode, needs_anchor in candidates:
+        config = path_root.parent / PYTHON_ENVIRONMENT_CONFIG_NAME
+        try:
+            values = _python_environment_values(config)
+        except (OSError, ValueError) as error:
+            # Without an interpreter anchor, unusable metadata cannot identify this executable.
+            if needs_anchor and not isinstance(error, TimeoutError):
+                continue
+            raise
+        if values is None:
+            continue
+        standard = (
+            "implementation" not in values
+            and "version_info" not in values
+            and "version" in values
+            and "executable" in values
+        )
+        version = re.match(
+            r"^(\d+)\.(\d+)(?:\.|$)",
+            values.get("version" if standard else "version_info", ""),
+        )
         home_value = values.get("home", "")
         if (
-            values.get("implementation", "").casefold() != "cpython"
+            not standard
+            and values.get("implementation", "").casefold() != "cpython"
             or version is None
             or not home_value
             or "\x00" in home_value
         ):
             continue
         configured_home = Path(home_value)
-        if not configured_home.is_absolute() or configured_home.name != "bin":
+        if not configured_home.is_absolute() or configured_home.name != PYTHON_BIN_DIRECTORY_NAME:
+            if needs_anchor:
+                continue
             raise ValueError("Workspace Python runtime path is invalid.")
+        if is_protected_external_read(configured_home):
+            if needs_anchor:
+                continue
+            raise ValueError("Workspace Python runtime root is outside the safe user-local scope.")
         try:
             canonical_home = configured_home.resolve(strict=True)
             runtime_root = canonical_home.parent
-            interpreter = (path_root / "python").resolve(strict=True)
-            stdlib = runtime_root / "lib" / f"python{version.group(1)}.{version.group(2)}"
+            interpreter = spelling.resolve(strict=True)
+            versioned_name = f"{CPYTHON_EXECUTABLE_NAME}{version.group(1)}.{version.group(2)}"
+            stdlib = runtime_root / PYTHON_LIBRARY_DIRECTORY_NAME / versioned_name
+            if (needs_anchor or standard) and (canonical_home / versioned_name).resolve(
+                strict=True
+            ) != interpreter:
+                continue
+            if standard:
+                if "\x00" in values["executable"]:
+                    continue
+                executable_path = Path(values["executable"])
+                if (
+                    not executable_path.is_absolute()
+                    or is_protected_external_read(executable_path)
+                    or executable_path.resolve(strict=True) != interpreter
+                ):
+                    continue
         except (OSError, RuntimeError):
             continue
         if (
             not canonical_home.is_dir()
+            or interpreter != selected_interpreter
+            or (interpreter.stat().st_dev, interpreter.stat().st_ino) != (device, inode)
             or not interpreter.is_relative_to(canonical_home)
             or not stat.S_ISREG(interpreter.stat().st_mode)
             or not interpreter.stat().st_mode & constants.EXECUTE_MODE_MASK
@@ -194,7 +254,23 @@ def python_runtime_mounts(
         ):
             continue
         if any(runtime_root.is_relative_to(root) for root in system_roots):
-            return ()
+            continue
+        if home is None:
+            try:
+                home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve(strict=True)
+            except (KeyError, OSError, RuntimeError) as error:
+                raise ValueError(
+                    "Current account home is unavailable for Python runtime binding."
+                ) from error
+            home_details = home.stat()
+            if (
+                not home.is_dir()
+                or home_details.st_uid != os.getuid()
+                or home_details.st_mode & constants.OTHER_WRITE_MODE_BIT
+                or home_details.st_mode & constants.GROUP_WRITE_MODE_BIT
+                and home_details.st_gid != os.getgid()
+            ):
+                raise ValueError("Current account home is unsafe for Python runtime binding.")
         if (
             not runtime_root.is_relative_to(home)
             or runtime_root == home
@@ -226,8 +302,99 @@ def python_runtime_mounts(
         ):
             raise ValueError("Workspace Python interpreter is unsafe.")
         alias_root = configured_home.parent
-        return ((runtime_root, alias_root),)
-    return ()
+        runtimes.append((runtime_root, alias_root))
+    return tuple(dict.fromkeys(runtimes))
+
+
+def conventional_tmp_available(
+    request: SandboxRequest, scratch: Path, *, runtime_roots: tuple[Path, ...] = ()
+) -> bool:
+    """Check whether a session-private conventional temporary mount avoids other authority.
+
+    Args:
+        request (SandboxRequest): Bound request and its approved path identities.
+        scratch (Path): Bound physical session scratch directory.
+        runtime_roots (tuple[Path, ...]): Authenticated system runtime roots.
+
+    Returns:
+        bool: Whether the separate session subtree can safely occupy the conventional path.
+    """
+    if not request.session_scratch or not request.scratch_data or request.scratch_root != scratch:
+        return False
+    temporary = NATIVE_CONVENTIONAL_TMP_PATH
+    physical = temporary.resolve()
+    candidates = (
+        request.workspace,
+        request.cwd,
+        scratch,
+        *request.read_roots,
+        *request.write_roots,
+        *request.read_aliases,
+        *(path for pair in request.path_roots for path in pair),
+        *(
+            path
+            for _, spelling, resolved, _, _ in request.executable_identities
+            for path in (spelling, resolved)
+        ),
+        *runtime_roots,
+        *(
+            path
+            for root, alias in python_runtime_mounts(
+                request.workspace,
+                request.path_roots,
+                request.executable_identities,
+                system_roots=runtime_roots,
+            )
+            for path in (root, alias)
+        ),
+    )
+    return not any(
+        path.is_relative_to(root) or root.is_relative_to(path)
+        for path in candidates
+        for root in (temporary, physical)
+    )
+
+
+@contextmanager
+def _conventional_tmp_source(
+    request: SandboxRequest, scratch: Path
+) -> Generator[tuple[Path, int, tuple[int, ...]], None, None]:
+    """Create and pin the exact private session subtree without following links."""
+    path = scratch / SESSION_CONVENTIONAL_TMP_NAME
+    with ExitStack() as opened:
+        parent = os.open(scratch, _DIRECTORY_FLAGS)
+        opened.callback(os.close, parent)
+        if not request.directory_matches_descriptor(scratch, parent):
+            raise ValueError("Session scratch changed before temporary preparation.")
+        try:
+            os.mkdir(path.name, mode=constants.PRIVATE_DIRECTORY_MODE, dir_fd=parent)
+        except FileExistsError:
+            pass
+        descriptor = os.open(path.name, _DIRECTORY_FLAGS, dir_fd=parent)
+        opened.callback(os.close, descriptor)
+        details = os.fstat(descriptor)
+        current = path.lstat()
+        if (
+            not stat.S_ISDIR(details.st_mode)
+            or details.st_uid != os.getuid()
+            or stat.S_IMODE(details.st_mode) != constants.PRIVATE_DIRECTORY_MODE
+            or (details.st_dev, details.st_ino) != (current.st_dev, current.st_ino)
+            or path.resolve(strict=True) != path
+        ):
+            raise ValueError("Session temporary subtree is not a private real directory.")
+        for acl in ("system.posix_acl_access", "system.posix_acl_default"):
+            try:
+                value = os.getxattr(descriptor, acl)
+            except OSError as error:
+                if error.errno not in (errno.ENODATA, errno.ENOTSUP):
+                    raise
+            else:
+                if value:
+                    raise ValueError("Session temporary subtree has an extended access list.")
+        state = _source_state(details)
+        if any(_source_state(latest) != state for latest in (os.fstat(descriptor), path.lstat())):
+            raise ValueError("Session temporary subtree changed during inspection.")
+        yield path, descriptor, state
 
 
 def _hardlink_mount_sources(
@@ -525,7 +692,6 @@ def bind_paths(
             scratch,
             *(canonical for _, canonical in request.path_roots),
             *(alias.parent for alias in request.read_aliases),
-            *(alias.parent for _, alias, _ in request.aliases),
             *(path for inventory in inventories for path in inventory),
         )
     )
@@ -567,6 +733,7 @@ def mount_arguments(
     empty_mask: int | None = None,
     skip_path_roots: tuple[Path, ...] = (),
     skip_executable_roots: tuple[Path, ...] = (),
+    runtime_roots: tuple[Path, ...] = (),
 ) -> Generator[tuple[tuple[str, ...], tuple[int, ...]], None, None]:
     """Prepare descriptor-backed request mounts without granting native launch authority.
 
@@ -576,11 +743,12 @@ def mount_arguments(
     checks and at a stable namespace path for payload access. Apply ancestor mountpoints before
     protected read-only binds, then hide private directories with empty tmpfs mounts and private
     regular files with the supplied empty inode. Mirror every restrictive scratch overlay;
-    selected workspaces below scratch retain their read-only role. Preserve original alias
-    metadata for validation and recreate virtual aliases at stable, read-only namespace paths.
-    Refuse a whole filesystem or home bind and aliases whose target is absent from this request
-    view. The
-    filename layer still protects future names.
+    selected workspaces below scratch retain their read-only role. Refuse a whole filesystem or
+    home bind and read aliases whose target is absent from this request view. For eligible fresh
+    session scratch, create and pin a private conventional temporary subtree, with its contents
+    retained as part of the session working directory. Existing grants
+    that overlap the conventional destination keep their original view. The filename layer still
+    protects future names.
 
     The caller must authenticate the helper and immutable mask-control inode, provide reviewed
     runtime/proc/device/control mounts and namespace/network setup, enforce the filename policy,
@@ -588,7 +756,7 @@ def mount_arguments(
     filesystem fragment; they contain no shell source, capabilities or launch operation.
 
     Args:
-        request (SandboxRequest): Current approved roots, aliases and execution deadline.
+        request (SandboxRequest): Current approved roots, read aliases and execution deadline.
         scratch (Path): Live private directory bound as the request's TMPDIR.
         empty_mask (int | None): Caller-authenticated read-only empty regular-file descriptor
             for private file masks. Required only when such targets exist. The original descriptor
@@ -597,6 +765,8 @@ def mount_arguments(
             authenticated runtime mount, whose duplicate directory mounts and aliases are omitted.
         skip_executable_roots (tuple[Path, ...]): Authenticated runtime roots that already supply
             named executable files, so no duplicate exact-file mount is needed.
+        runtime_roots (tuple[Path, ...]): Authenticated runtime roots checked for overlap with
+            the optional conventional temporary mount.
 
     Yields:
         tuple[tuple[str, ...], tuple[int, ...]]: Bubblewrap filesystem argument fragment and
@@ -607,7 +777,7 @@ def mount_arguments(
         ValueError: Request/source authority is unsafe or stale, a root covers the filesystem or
             home, a reserved namespace destination overlaps another grant, a skipped PATH root is
             not bound to the request, an alias target is outside the bound view, an executable
-            source changes, or a required mask is missing/unsafe.
+            source changes, a temporary subtree is unsafe, or a required mask is missing/unsafe.
         TimeoutError: Preparation reaches the approved command deadline.
         OSError: Linux O_PATH is unavailable or source/mask descriptors cannot be inspected.
     """
@@ -620,22 +790,17 @@ def mount_arguments(
     )
     if not skipped_paths <= {spelling for spelling, _ in request.path_roots}:
         raise ValueError("Linux skipped PATH roots are not bound to this request.")
-    metadata = (
-        {canonical for _, canonical in request.path_roots}
-        | {alias.parent for alias in request.read_aliases}
-        | {alias.parent for _, alias, _ in request.aliases}
-    )
-    mounted_metadata = (
-        {canonical for _, canonical in path_roots}
-        | {alias.parent for alias in request.read_aliases}
-        | {alias.parent for _, alias, _ in request.aliases}
-    )
+    metadata = {canonical for _, canonical in request.path_roots} | {
+        alias.parent for alias in request.read_aliases
+    }
+    mounted_metadata = {canonical for _, canonical in path_roots} | {
+        alias.parent for alias in request.read_aliases
+    }
     home = Path.home().resolve(strict=True)
     if any(root == Path("/") or home.is_relative_to(root) for root in roots | metadata):
         raise ValueError("Linux request mounts cannot expose the whole filesystem or home.")
     aliases = {
         **{alias: alias.resolve(strict=True) for alias in request.read_aliases},
-        **{alias: target for _, alias, target in request.aliases},
     }
     if any(
         path == reserved or path.is_relative_to(reserved) or reserved.is_relative_to(path)
@@ -645,7 +810,16 @@ def mount_arguments(
         raise ValueError("Reserved native namespace destination overlaps another mount.")
     if any(not any(target.is_relative_to(root) for root in roots) for target in aliases.values()):
         raise ValueError("Linux request alias target is outside the mounted view.")
-    with bind_paths(request, scratch) as (inventories, descriptors), ExitStack() as owned:
+    with ExitStack() as owned:
+        if not request.paths_are_current():
+            raise ValueError("Linux approved path authority changed.")
+        conventional = (
+            owned.enter_context(_conventional_tmp_source(request, scratch))
+            if conventional_tmp_available(request, scratch, runtime_roots=runtime_roots)
+            else None
+        )
+        temporary_state = conventional[2] if conventional else None
+        inventories, descriptors = owned.enter_context(bind_paths(request, scratch))
         protected, private, anchors, hardlinked = inventories
         arguments, scratch_mounts, inherited = [], [], set()
 
@@ -676,6 +850,10 @@ def mount_arguments(
             )
             mount(option, descriptors[path], path)
             inherited.add(descriptors[path])
+        if conventional is not None:
+            temporary_path, temporary_descriptor, _ = conventional
+            mount("--bind-fd", temporary_descriptor, temporary_path)
+            inherited.add(temporary_descriptor)
         for path in hardlinked:
             _check_deadline(request.deadline)
             mount("--ro-bind-fd", descriptors[path], path)
@@ -717,10 +895,22 @@ def mount_arguments(
         arguments.extend(("--dir", str(NATIVE_SCRATCH_PATH)))
         arguments.extend(scratch_mounts)
         inherited.add(descriptors[scratch])
-        if request.aliases:
-            arguments.extend(("--dir", str(NATIVE_ALIAS_PATH)))
-            for _, alias, target in payload_aliases(request):
-                arguments.extend(("--symlink", str(payload_path(target, scratch)), str(alias)))
+        if conventional is not None:
+            temporary_path, temporary_descriptor, _ = conventional
+            if any(
+                _source_state(details) != temporary_state
+                for details in (os.fstat(temporary_descriptor), temporary_path.lstat())
+            ):
+                raise ValueError("Session temporary subtree changed during binding.")
+            arguments.extend(
+                (
+                    "--dir",
+                    str(NATIVE_CONVENTIONAL_TMP_PATH),
+                    "--bind-fd",
+                    str(temporary_descriptor),
+                    str(NATIVE_CONVENTIONAL_TMP_PATH),
+                )
+            )
         executable_mounts = set()
         for _, spelling, resolved, device, inode in request.executable_identities:
             if resolved in executable_mounts:

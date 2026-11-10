@@ -22,6 +22,7 @@ _MAX_SETUP_ERROR_CHARS = 160
 _INITIAL_USER_NAMESPACE_UID_MAP = ("0", "0", "4294967295")
 _PROC_UID_MAP_PATH = Path("/proc/self/uid_map")
 _SYSTEM_RUNTIME_DIRECTORY = "/run"
+_AUTHENTICATED_IMPORT_PREFIX = "loop-native-authenticated-"
 _PRIVATE_TEMP_DIRECTORY_MODE = 0o700
 _OWNER_READ_ONLY_FILE_MODE = 0o400
 
@@ -99,7 +100,7 @@ def _invoke_reviewed_setup(
 ) -> None:
     """Materialize the authenticated imports privately and invoke the fixed setup owner."""
     with tempfile.TemporaryDirectory(
-        prefix="loop-native-authenticated-", dir=_SYSTEM_RUNTIME_DIRECTORY
+        prefix=_AUTHENTICATED_IMPORT_PREFIX, dir=_SYSTEM_RUNTIME_DIRECTORY
     ) as temporary:
         root = Path(temporary)
         for name, value in contents.items():

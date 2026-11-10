@@ -8,7 +8,14 @@ from pathlib import Path
 
 from .. import constants
 
-PRIVATE_READ_COMPONENTS = (".ssh", ".aws", ".gnupg", ".config", ".loop", "Library")
+PRIVATE_READ_COMPONENTS = (
+    ".ssh",
+    ".aws",
+    ".gnupg",
+    ".config",
+    constants.APP_DIRECTORY.as_posix(),
+    "Library",
+)
 _PRIVATE_READ_FOLDED = frozenset(name.casefold() for name in PRIVATE_READ_COMPONENTS)
 
 

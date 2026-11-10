@@ -1,9 +1,12 @@
 """Exercise mailbox execution with native prompt input and captured response output."""
 
 import asyncio
+import json
+import os
 from io import StringIO
 from threading import Event, get_ident
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from prompt_toolkit import PromptSession
@@ -21,14 +24,78 @@ from loop import (
     Loop,
     Message,
     ModelInfo,
+    PermissionManager,
+    Response,
     ResponseCompleted,
+    Session,
     SessionController,
     SessionManager,
+    ToolCall,
+    ToolRegistry,
+    ToolResult,
+    delete_path,
 )
 from loop.configuration import ConfigurationCommands, ConfigurationManager
+from loop.conversation import ConversationCommands
+from loop.conversation.interaction import ApprovalInteraction
 from loop.session import LocalSessionNameGenerator
 
 pytestmark = pytest.mark.integration
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="Requires POSIX FIFO support")
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_recovery_error_safely_renders_untrusted_fifo_name(tmp_path, async_mode):
+    """A failed retry displays a literal filename without executing terminal controls."""
+    target = tmp_path / "owned_\x1b[2J_marker"
+    os.mkfifo(target)
+    output = StringIO()
+    source = ConsoleInteraction(
+        console=Console(file=output, force_terminal=True, color_system=None, width=120),
+        session=Mock(),
+        choices_session=Mock(),
+    )
+    source.confirm = Mock(return_value=True)
+    source.confirm_async = AsyncMock(return_value=True)
+    backend = Mock()
+    backend.default_model = "fixture"
+    backend.prepare_context.side_effect = list
+    sessions = SessionManager()
+    sessions.add_user_message("Synthetic delete request")
+    sessions.begin_run()
+    call = ToolCall(
+        call_id="owned", name="delete_path", arguments=json.dumps({"path": str(target)})
+    )
+    sessions.add_response(Response(answer="", reasoning="", tool_calls=(call,), items=(call,)))
+    sessions.record_tool_execution_started(call.call_id)
+    restored = SessionManager(session=Session.deserialize(sessions.session.serialize()))
+    permissions = PermissionManager(tmp_path, interaction=source)
+    registry = ToolRegistry([delete_path])
+    loop = Loop.create_default(
+        backend,
+        interaction=source,
+        permission_manager=permissions,
+        tool_registry=registry,
+        session_manager=restored,
+        working_directory=tmp_path,
+        session_name_generator=LocalSessionNameGenerator(),
+    )
+    try:
+        if async_mode:
+            result = asyncio.run(loop.agent_runner.recover_session_async(confirmed=True))
+        else:
+            result = loop.agent_runner.recover_session(confirmed=True)
+        rendered = output.getvalue()
+        assert result.pending and result.result.stop_reason == "recovery_required"
+        assert restored.recovery_pending and not any(
+            isinstance(item, ToolResult) for item in restored.messages
+        )
+        assert "\x1b[2J" not in rendered and "␛[2J" in rendered
+        assert target.exists()
+        backend.get_response.assert_not_called()
+    finally:
+        registry.close()
+        permissions.close()
 
 
 def test_async_loop_commands_can_reserve_the_native_terminal(tmp_path):
@@ -38,9 +105,12 @@ def test_async_loop_commands_can_reserve_the_native_terminal(tmp_path):
         prompt = PromptSession(input=pipe, output=DummyOutput())
         source = ConsoleInteraction(session=prompt, console=Console(file=output), markdown=False)
         controller = SessionController(source)
+        permissions = PermissionManager(tmp_path)
+        interaction = ApprovalInteraction(controller.interaction, permissions)
         loop = Loop.create_default(
             SimpleNamespace(default_model="fixture", get_context_window=lambda _model: None),
-            interaction=controller.interaction,
+            interaction=interaction,
+            permission_manager=permissions,
             run_control=controller.control,
             working_directory=tmp_path,
             session_name_generator=LocalSessionNameGenerator(),
@@ -377,6 +447,106 @@ def test_native_input_queues_and_controls_active_model_execution(tmp_path, mode)
     assert controller.running is False
 
 
+def test_native_recalled_message_can_be_replaced_by_export_command(tmp_path):
+    """Replacing a recalled draft with /export runs the command after the active run."""
+    output = StringIO()
+    release = Event()
+    requests = []
+    destination = tmp_path / "recalled-export.md"
+    with create_pipe_input() as pipe:
+        prompt = PromptSession(input=pipe, output=DummyOutput())
+        source = ConsoleInteraction(session=prompt, console=Console(file=output), markdown=False)
+        controller = SessionController(source)
+        permissions = PermissionManager(tmp_path)
+        interaction = ApprovalInteraction(controller.interaction, permissions)
+
+        async def scenario():
+            """Recall queued text, replace it in the real editor, and export the session."""
+            working, queued, recalled, completed, exported = (asyncio.Event() for _ in range(5))
+            original_info, original_metrics = source.info, source.run_metrics
+
+            def info(text=""):
+                """Observe the real controller and export messages."""
+                original_info(text)
+                if text == "model waiting":
+                    working.set()
+                elif text.startswith("Queued input"):
+                    queued.set()
+                elif text == "Pending message moved to the editor.":
+                    recalled.set()
+                elif text.startswith("Exported session"):
+                    exported.set()
+
+            def metrics(value):
+                """Expose completion of the original model run."""
+                original_metrics(value)
+                completed.set()
+
+            def get_response(**kwargs):
+                """Hold one synthetic model response while the draft is recalled."""
+                requests.append(kwargs["input"])
+                controller.interaction.info("model waiting")
+                release.wait()
+                return [
+                    AnswerCompleted(text="done"),
+                    ResponseCompleted(
+                        answer="done", items=(Message(role="assistant", content="done"),)
+                    ),
+                ]
+
+            source.info, source.run_metrics = info, metrics
+            backend = SimpleNamespace(
+                default_model="local",
+                get_context_window=lambda _model: None,
+                prepare_context=list,
+                get_response=get_response,
+            )
+            sessions = SessionManager(interaction=interaction)
+            loop = Loop.create_default(
+                backend,
+                interaction=interaction,
+                permission_manager=permissions,
+                run_control=controller.control,
+                session_manager=sessions,
+                working_directory=tmp_path,
+                session_name_generator=LocalSessionNameGenerator(),
+            )
+            controller.bind_session_manager(sessions)
+            loop.register_command_provider(ConversationCommands(controller))
+            controller.bind_command_manager(loop.command_manager)
+            task = asyncio.create_task(
+                controller._run_sync_callback_async(lambda receive: loop.run(input_source=receive))
+            )
+            try:
+                pipe.send_text("first\n")
+                await asyncio.wait_for(working.wait(), timeout=5)
+                pipe.send_text("wrong message\n")
+                await asyncio.wait_for(queued.wait(), timeout=5)
+                pipe.send_text("/recall\n")
+                await asyncio.wait_for(recalled.wait(), timeout=5)
+                release.set()
+                await asyncio.wait_for(completed.wait(), timeout=5)
+                pipe.send_text(f"\x01\x0b/export destination={destination}\n")
+                try:
+                    await asyncio.wait_for(exported.wait(), timeout=5)
+                except TimeoutError:
+                    pytest.fail(f"Export did not finish. Output: {output.getvalue()}")
+                pipe.send_text("/exit\n")
+                await asyncio.wait_for(task, timeout=5)
+                return loop
+            finally:
+                release.set()
+                controller.stop()
+                await asyncio.gather(task, return_exceptions=True)
+
+        loop = asyncio.run(scenario())
+
+    assert len(requests) == 1
+    assert destination.is_file()
+    assert "first" in destination.read_text(encoding="utf-8")
+    assert [message.content for message in loop.messages] == ["first", "done"]
+
+
 def test_idle_config_command_opens_its_choice_prompt_immediately(tmp_path):
     """The config scope picker opens immediately and applies its selected scope."""
     output = StringIO()
@@ -391,6 +561,7 @@ def test_idle_config_command_opens_its_choice_prompt_immediately(tmp_path):
             console=Console(file=output),
         )
         controller = SessionController(source)
+        interaction = ApprovalInteraction(controller.interaction, PermissionManager(tmp_path))
         choice_open = asyncio.Event()
         selection_reported = asyncio.Event()
         original_prompt_async = choices_session.prompt_async
@@ -404,14 +575,14 @@ def test_idle_config_command_opens_its_choice_prompt_immediately(tmp_path):
         choices_session.prompt_async = observed_prompt_async
 
         provider = ConfigurationCommands(configuration, lambda _path, _settings: "applied now")
-        manager = CommandManager(providers=(provider,), interaction=controller.interaction)
+        manager = CommandManager(providers=(provider,), interaction=interaction)
         controller.bind_command_manager(manager)
         original_info = source.info
 
         def info(message=""):
             """Render output and observe completion of the command selection."""
             original_info(message)
-            if message.startswith("Updated loop.max_agent_turns"):
+            if message.startswith("Updated app.max_agent_turns"):
                 selection_reported.set()
 
         source.info = info
@@ -427,7 +598,7 @@ def test_idle_config_command_opens_its_choice_prompt_immediately(tmp_path):
                 controller._run_sync_callback_async(conversation, route_idle_commands=True)
             )
             try:
-                pipe.send_text("/config set loop.max_agent_turns 100\n")
+                pipe.send_text("/config set app.max_agent_turns 100\n")
                 await choice_open.wait()
                 pipe.send_text("s\n")
                 await selection_reported.wait()
@@ -439,8 +610,8 @@ def test_idle_config_command_opens_its_choice_prompt_immediately(tmp_path):
 
         asyncio.run(scenario())
 
-    assert configuration.effective.loop.max_agent_turns == 100
-    assert configuration.source_for("loop.max_agent_turns") == "session"
+    assert configuration.effective.app.max_agent_turns == 100
+    assert configuration.source_for("app.max_agent_turns") == "session"
     assert "Input requested:" not in output.getvalue()
     assert "Save for current user" in output.getvalue()
     assert "This session only" in output.getvalue()
@@ -461,6 +632,7 @@ def test_active_config_command_opens_its_choice_prompt_immediately(tmp_path):
             console=Console(file=output),
         )
         controller = SessionController(source)
+        interaction = ApprovalInteraction(controller.interaction, PermissionManager(tmp_path))
         choice_open = asyncio.Event()
         selection_reported = asyncio.Event()
         working = asyncio.Event()
@@ -475,7 +647,7 @@ def test_active_config_command_opens_its_choice_prompt_immediately(tmp_path):
         choices_session.prompt_async = observed_prompt_async
 
         provider = ConfigurationCommands(configuration, lambda _path, _settings: "applied now")
-        manager = CommandManager(providers=(provider,), interaction=controller.interaction)
+        manager = CommandManager(providers=(provider,), interaction=interaction)
         controller.bind_command_manager(manager)
         original_info = source.info
 
@@ -484,7 +656,7 @@ def test_active_config_command_opens_its_choice_prompt_immediately(tmp_path):
             original_info(message)
             if message == "agent working":
                 working.set()
-            elif message.startswith("Updated loop.max_agent_turns"):
+            elif message.startswith("Updated app.max_agent_turns"):
                 selection_reported.set()
 
         source.info = info
@@ -503,7 +675,7 @@ def test_active_config_command_opens_its_choice_prompt_immediately(tmp_path):
             try:
                 pipe.send_text("start\n")
                 await working.wait()
-                pipe.send_text("/config set loop.max_agent_turns 100\n")
+                pipe.send_text("/config set app.max_agent_turns 100\n")
                 await choice_open.wait()
                 pipe.send_text("s\n")
                 await selection_reported.wait()
@@ -517,8 +689,8 @@ def test_active_config_command_opens_its_choice_prompt_immediately(tmp_path):
 
         asyncio.run(scenario())
 
-    assert configuration.effective.loop.max_agent_turns == 100
-    assert configuration.source_for("loop.max_agent_turns") == "session"
+    assert configuration.effective.app.max_agent_turns == 100
+    assert configuration.source_for("app.max_agent_turns") == "session"
     assert "Input requested:" not in output.getvalue()
     assert "Save for current user" in output.getvalue()
     assert "This session only" in output.getvalue()

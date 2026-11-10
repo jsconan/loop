@@ -174,6 +174,11 @@ def attest_units(
                     " ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }",
                     actual["ExecStart"],
                 )
+            if (
+                expected.get("MemoryPressureWatch") == "off"
+                and actual.get("MemoryPressureWatch") == "no"
+            ):
+                actual["MemoryPressureWatch"] = "off"
             if actual != wanted:
                 differences = sorted(key for key in wanted if actual.get(key) != wanted[key])
                 if actual.keys() - wanted.keys():

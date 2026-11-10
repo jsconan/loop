@@ -52,7 +52,7 @@ def test_migration_coordinates_owned_importers_and_copies_policy(tmp_path) -> No
         json.dumps({"record_id": "audit", "event_name": "decision"}) + "\n",
         encoding="utf-8",
     )
-    (legacy / "loop.log").write_text('{"event.name":"legacy"}\n', encoding="utf-8")
+    (legacy / "app.log").write_text('{"event.name":"legacy"}\n', encoding="utf-8")
     workspace = initialized_workspace(project)
     paths = application_paths(tmp_path)
     workspace_paths = paths.for_workspace(workspace.id, workspace.root)
@@ -88,7 +88,7 @@ def test_migration_preserves_policy_and_appends_to_existing_central_log(tmp_path
     legacy = project / ".loop"
     legacy.mkdir(parents=True)
     (legacy / "permissions.yaml").write_text("legacy\n", encoding="utf-8")
-    (legacy / "loop.log").write_text("legacy\n", encoding="utf-8")
+    (legacy / "app.log").write_text("legacy\n", encoding="utf-8")
     workspace = initialized_workspace(project)
     paths = application_paths(tmp_path)
     workspace_paths = paths.for_workspace(workspace.id, workspace.root)

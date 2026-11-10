@@ -6,8 +6,23 @@ import os
 import pytest
 
 from loop.execution.sandbox.linux.host import apparmor_library, bind_host_file, discover_tool
+from loop.execution.sandbox.linux.mountinfo import read_descriptor_mount_ids, read_mountinfo
 
 pytestmark = [pytest.mark.integration, pytest.mark.linux]
+
+
+def test_live_mount_inventory_matches_the_open_root_descriptor():
+    """The live kernel inventory identifies the mount holding the current filesystem root."""
+    descriptor = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        identifiers = read_descriptor_mount_ids(descriptor)
+        rows = read_mountinfo()
+    finally:
+        os.close(descriptor)
+
+    assert len(identifiers) == 1 and len(identifiers[0]) == 1
+    matched = [row for row in rows if row and [row[0]] == identifiers[0]]
+    assert len(matched) == 1 and matched[0][4] == "/"
 
 
 def test_protected_apparmor_library_loads_from_verified_inode():

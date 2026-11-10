@@ -1,0 +1,391 @@
+"""Verify sandbox-owned command intent, fresh consent and sanitized management failures."""
+
+from contextlib import contextmanager, nullcontext
+from unittest.mock import MagicMock, Mock
+
+import pytest
+from prompt_toolkit.document import Document
+
+from loop import CommandCompletionAdapter, CompletionManager, ProblemException
+from loop.commands import CommandArgumentError, CommandContext, CommandManager
+from loop.execution.sandbox.linux import commands as module
+from loop.execution.sandbox.linux.commands import LinuxSandboxCommands as SandboxCommands
+
+
+def management_interaction():
+    """Provide interaction with a default exclusive-terminal presentation scope."""
+    interaction = MagicMock()
+    interaction.terminal_context.side_effect = nullcontext
+    return interaction
+
+
+@pytest.fixture
+def commands(monkeypatch):
+    """Provide sandbox commands with default non-elevating library authority."""
+    monkeypatch.setattr(module, "installation_status", Mock(return_value="Inventory"))
+    return SandboxCommands()
+
+
+@pytest.fixture(autouse=True)
+def reviewed_replacement(monkeypatch):
+    """Keep slash-command unit checks independent of live archive downloads."""
+    selected = Mock(return_value=b"reviewed replacement")
+    monkeypatch.setattr(module, "selected_bubblewrap_bytes", selected)
+    return selected
+
+
+def test_sandbox_status_delegates_to_management_owner(commands, monkeypatch):
+    """App status displays the owner's safe result without reconstructing Linux authority."""
+
+    status = Mock(return_value="authenticated; unavailable")
+    monkeypatch.setattr(module, "installation_status", status)
+    context = CommandContext("sandbox", management_interaction())
+    commands.sandbox(context)
+    status.assert_called_once_with(details=False)
+    context.interaction.info.assert_called_once_with("authenticated; unavailable")
+    assert commands.get_commands()[0].name == "sandbox"
+
+
+def test_sandbox_status_can_request_diagnostics(commands, monkeypatch):
+    """The name=value slash-command syntax exposes diagnostics as an explicit opt-in."""
+    status = Mock(return_value="Files and settings")
+    monkeypatch.setattr(module, "installation_status", status)
+    interaction = management_interaction()
+    manager = CommandManager(
+        commands=commands.get_commands(), interaction=interaction, exit_command_names=()
+    )
+
+    manager.call("sandbox", "status details=true")
+
+    status.assert_called_once_with(details=True)
+    interaction.info.assert_called_once_with("Files and settings")
+
+
+def test_sandbox_status_completion_offers_opt_in_diagnostics(commands, monkeypatch):
+    """Status argument completion offers the opt-in inventory switch."""
+    manager = CommandManager(commands=commands.get_commands(), exit_command_names=())
+    completion = CompletionManager((CommandCompletionAdapter(lambda: manager.commands),))
+
+    values = completion.get_completions(Document("/sandbox status details=t"), Mock())
+
+    assert [value.text for value in values] == ["details=true"]
+
+
+def test_sandbox_details_option_is_restricted_to_status(commands, monkeypatch):
+    """Diagnostic inventory is not accepted as an unrelated management argument."""
+
+    with pytest.raises(CommandArgumentError, match="only with /sandbox status"):
+        commands.sandbox(
+            CommandContext("sandbox", management_interaction()), "install", details=True
+        )
+
+
+@pytest.mark.parametrize("decision", [False, None, True])
+def test_sandbox_uninstall_delegates_intent_and_fresh_human_review(commands, monkeypatch, decision):
+    """The app owns human consent and audits while management owns construction and execution."""
+
+    interaction = management_interaction()
+    interaction.confirm.return_value = decision
+    audit = Mock()
+    monkeypatch.setattr(module, "telemetry_audit", audit)
+
+    def manage(action, review, *, main_app, helper_bytes):
+        """Exercise the app callback through the public management intent boundary."""
+        assert main_app is False
+        assert helper_bytes is None
+        assert action == "uninstall"
+        return review("exact reviewed action")
+
+    monkeypatch.setattr(module, "manage_setup", manage)
+    commands.sandbox(CommandContext("sandbox", interaction), "uninstall")
+    assert interaction.info.call_args_list[0].args[0] == "exact reviewed action"
+    interaction.confirm.assert_called_once_with("Uninstall the Linux sandbox?", default=False)
+    audit.assert_any_call(
+        "sandbox.management.decided", action="uninstall", approved=decision is True
+    )
+    if decision is True:
+        audit.assert_any_call("sandbox.management.finished", action="uninstall", success=True)
+
+
+@pytest.mark.parametrize("message", ["Changed authority", "", "\ninternal detail"])
+def test_sandbox_uninstall_owner_refusal_reports_unavailable(commands, monkeypatch, message):
+    """Owner refusals show one bounded reason and current inventory without another action."""
+
+    manage = Mock(side_effect=ValueError(message))
+    monkeypatch.setattr(module, "manage_setup", manage)
+    monkeypatch.setattr(module, "installation_status", Mock(return_value="Inventory"))
+    interaction = management_interaction()
+    with pytest.raises(ProblemException) as caught:
+        commands.sandbox(CommandContext("sandbox", interaction), "uninstall")
+    interaction.confirm.assert_not_called()
+    assert caught.value.problem.title == "Native uninstall incomplete"
+    assert caught.value.problem.detail == (
+        f"Uninstall: {message if message == 'Changed authority' else 'Native management failed.'}"
+        "\nInventory"
+    )
+    manage.assert_called_once()
+
+
+def test_sandbox_install_reports_distinct_grouped_failures(commands, monkeypatch):
+    """A failed activation and admission closure show both causes and one inventory."""
+    monkeypatch.setattr(
+        module,
+        "manage_setup",
+        Mock(
+            side_effect=ExceptionGroup(
+                "activation",
+                [
+                    ValueError("activation changed"),
+                    OSError("closure failed"),
+                    ValueError("activation changed"),
+                ],
+            )
+        ),
+    )
+    monkeypatch.setattr(module, "installation_status", Mock(return_value="Inventory"))
+    interaction = management_interaction()
+
+    with pytest.raises(ProblemException) as caught:
+        commands.sandbox(CommandContext("sandbox", interaction), "install")
+
+    assert caught.value.problem.title == "Native install incomplete"
+    assert caught.value.problem.detail == (
+        "Install: activation changed\nInstall: closure failed\nInventory"
+    )
+    interaction.info.assert_not_called()
+
+
+def test_sandbox_preserves_argument_errors_from_setup_owner(commands, monkeypatch):
+    """The command keeps argument and operational failures on their distinct paths."""
+    monkeypatch.setattr(
+        module,
+        "manage_setup",
+        Mock(side_effect=CommandArgumentError("Invalid setup action.")),
+    )
+    interaction = management_interaction()
+
+    with pytest.raises(CommandArgumentError, match="Invalid setup action"):
+        commands.sandbox(CommandContext("sandbox", interaction), "install")
+
+    interaction.confirm.assert_not_called()
+
+
+def test_refresh_dispatch_reports_native_failure_as_an_operational_problem(monkeypatch):
+    """The public slash-command path reports setup failure without the invalid-arguments label."""
+    monkeypatch.setattr(module, "installation_status", Mock(return_value="Inventory"))
+    interaction = management_interaction()
+    interaction.confirm.return_value = True
+
+    def manage(action, review, *, main_app, helper_bytes):
+        """Complete the reviewed removal and fail the install step."""
+        assert main_app is True
+        assert helper_bytes == (b"reviewed replacement" if action == "install" else None)
+        if action == "install":
+            review("review install")
+            raise OSError("systemd activation refused")
+        return review("review uninstall")
+
+    monkeypatch.setattr(module, "manage_setup", manage)
+    manager = CommandManager(
+        commands=SandboxCommands(main_app=True).get_commands(),
+        interaction=interaction,
+        exit_command_names=(),
+    )
+
+    assert manager.handle_user_command("/sandbox refresh") is True
+
+    problem = interaction.report.call_args.args[0]
+    assert problem.code == "sandbox.management.incomplete"
+    assert problem.title == "Native reinstall incomplete"
+    assert "Install: incomplete (systemd activation refused)" in problem.detail
+    assert "Inventory" in problem.detail
+    assert interaction.confirm.call_count == 2
+
+
+def test_refresh_download_failure_preserves_installed_generation(monkeypatch, reviewed_replacement):
+    """A missing or unauthenticated replacement fails before removal or human prompts."""
+    monkeypatch.setattr(module, "installation_status", Mock(return_value="Installed."))
+    managed = Mock()
+    monkeypatch.setattr(module, "manage_setup", managed)
+    reviewed_replacement.side_effect = OSError("Ubuntu archive unavailable")
+    interaction = management_interaction()
+
+    with pytest.raises(ProblemException) as caught:
+        SandboxCommands(main_app=True).sandbox(CommandContext("sandbox", interaction), "refresh")
+
+    assert "Ubuntu archive unavailable" in caught.value.problem.detail
+    assert "Installed." in caught.value.problem.detail
+    managed.assert_not_called()
+    interaction.confirm.assert_not_called()
+
+
+@pytest.mark.parametrize("action", ["install"])
+def test_sandbox_setup_delegates_one_intent_and_consent(monkeypatch, action):
+    """The existing provider forwards setup intent and literal human consent to its domain owner."""
+
+    monkeypatch.setattr(module, "installation_status", Mock(return_value="Inventory"))
+    interaction = management_interaction()
+    interaction.confirm.return_value = True
+
+    def manage(operation, review, *, main_app, helper_bytes):
+        """Exercise the public setup boundary without constructing installation models."""
+        assert operation == action
+        assert main_app is True
+        assert helper_bytes is None
+        return review("exact setup bytes")
+
+    monkeypatch.setattr(module, "manage_setup", manage)
+    refresh_backend = Mock()
+    commands = SandboxCommands(main_app=True, refresh_backend=refresh_backend)
+    commands.sandbox(CommandContext("sandbox", interaction), action)
+    refresh_backend.assert_called_once_with()
+    assert interaction.info.call_args_list[0].args[0] == "exact setup bytes"
+    interaction.confirm.assert_called_once_with("Install the Linux sandbox?", default=False)
+    assert [value.value for value in commands.get_commands()[0].completion.values] == [
+        "status",
+        "install",
+        "reinstall",
+        "refresh",
+        "uninstall",
+    ]
+
+
+@pytest.mark.parametrize("uninstall", ["completed", "declined"])
+@pytest.mark.parametrize("action", ["reinstall", "refresh"])
+def test_reinstall_runs_reviewed_steps_in_order(monkeypatch, uninstall, action):
+    """Reinstall uses its prepared helper and stops after declined removal consent."""
+    monkeypatch.setattr(module, "installation_status", Mock(return_value="Inventory"))
+    interaction = management_interaction()
+    interaction.confirm.return_value = uninstall != "declined"
+    refresh_backend = Mock()
+    audit = Mock()
+    monkeypatch.setattr(module, "telemetry_audit", audit)
+    calls = []
+
+    def manage(action, review, *, main_app, helper_bytes):
+        """Observe ordered management intents at the package boundary."""
+        assert main_app is True
+        assert helper_bytes == (b"reviewed replacement" if action == "install" else None)
+        calls.append(action)
+        return review(f"review {action}")
+
+    monkeypatch.setattr(module, "manage_setup", manage)
+    commands = SandboxCommands(main_app=True, refresh_backend=refresh_backend)
+    commands.sandbox(CommandContext("sandbox", interaction), action)
+
+    assert calls == (["uninstall"] if uninstall == "declined" else ["uninstall", "install"])
+    assert "Inventory" in interaction.info.call_args.args[0]
+    assert interaction.info.call_args.args[0].count("Inventory") == 1
+    if uninstall == "completed":
+        assert [call.args[0] for call in interaction.confirm.call_args_list] == [
+            "Uninstall the Linux sandbox?",
+            "Install the Linux sandbox?",
+        ]
+        audit.assert_any_call("sandbox.management.finished", action=action, success=True)
+        assert refresh_backend.call_count == 2
+    else:
+        interaction.confirm.assert_called_once_with("Uninstall the Linux sandbox?", default=False)
+        refresh_backend.assert_not_called()
+
+
+@pytest.mark.parametrize("uninstall_fails", [False, True])
+def test_reinstall_stops_after_failed_removal_or_install(monkeypatch, uninstall_fails):
+    """Failed retirement preserves the generation; failed installation reports both steps."""
+    monkeypatch.setattr(module, "installation_status", Mock(return_value="Inventory"))
+    interaction = management_interaction()
+    interaction.confirm.return_value = True
+    audit = Mock()
+    monkeypatch.setattr(module, "telemetry_audit", audit)
+    calls = []
+
+    def manage(action, review, *, main_app, helper_bytes):
+        """Fail the second step after the first reviewed action completes."""
+        assert main_app is True
+        assert helper_bytes == (b"reviewed replacement" if action == "install" else None)
+        calls.append(action)
+        if action == "install" or uninstall_fails:
+            raise OSError(f"{action} incomplete")
+        return review("review uninstall")
+
+    monkeypatch.setattr(module, "manage_setup", manage)
+    with pytest.raises(ProblemException) as caught:
+        SandboxCommands(main_app=True).sandbox(CommandContext("sandbox", interaction), "reinstall")
+
+    assert calls == (["uninstall"] if uninstall_fails else ["uninstall", "install"])
+    assert caught.value.problem.title == "Native reinstall incomplete"
+    assert caught.value.problem.detail == (
+        "Uninstall: incomplete (uninstall incomplete)\nInventory"
+        if uninstall_fails
+        else "Uninstall: completed\nInstall: incomplete (install incomplete)\nInventory"
+    )
+    assert [call.args[0] for call in interaction.info.call_args_list] == (
+        [] if uninstall_fails else ["review uninstall"]
+    )
+    audit.assert_any_call("sandbox.management.finished", action="reinstall", success=False)
+
+
+def test_reinstall_reports_grouped_install_failure(monkeypatch):
+    """Reinstall preserves each owner failure while rendering one final inventory."""
+    monkeypatch.setattr(module, "installation_status", Mock(return_value="Inventory"))
+
+    def manage(action, review, *, main_app, helper_bytes):
+        """Complete uninstall and raise a grouped install failure at the owner boundary."""
+        assert main_app is True
+        assert helper_bytes == (b"reviewed replacement" if action == "install" else None)
+        if action == "install":
+            raise ExceptionGroup(
+                "install", [ValueError("policy changed"), OSError("closure failed")]
+            )
+        return review("review uninstall")
+
+    monkeypatch.setattr(module, "manage_setup", manage)
+    interaction = management_interaction()
+    interaction.confirm.return_value = True
+
+    with pytest.raises(ProblemException) as caught:
+        SandboxCommands(main_app=True).sandbox(CommandContext("sandbox", interaction), "reinstall")
+
+    assert caught.value.problem.detail == (
+        "Uninstall: completed\nInstall: incomplete (policy changed)"
+        "\nInstall: incomplete (closure failed)\nInventory"
+    )
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_management_reserves_the_terminal_until_consent_and_execution_settle(
+    commands, monkeypatch, failure
+):
+    """Direct management authentication cannot overlap the ordinary asynchronous editor."""
+    interaction = management_interaction()
+    interaction.confirm.return_value = False
+    events = []
+
+    @contextmanager
+    def terminal():
+        """Retain exclusive input ownership through success or failure."""
+        events.append("enter")
+        try:
+            yield
+        finally:
+            events.append("exit")
+
+    def manage(_action, review, *, main_app, helper_bytes):
+        """Verify that native management and fresh consent occur inside the terminal scope."""
+        assert main_app is False
+        assert helper_bytes is None
+        events.append("manage")
+        assert review("exact operation") is False
+        if failure:
+            raise ValueError("management failed")
+        return False
+
+    interaction.terminal_context.side_effect = terminal
+    monkeypatch.setattr(module, "manage_setup", manage)
+    if failure:
+        with pytest.raises(ProblemException, match="management failed"):
+            commands.sandbox(CommandContext("sandbox", interaction), "uninstall")
+    else:
+        commands.sandbox(CommandContext("sandbox", interaction), "uninstall")
+
+    assert events == ["enter", "manage", "exit"]
+    interaction.confirm.assert_called_once_with("Uninstall the Linux sandbox?", default=False)

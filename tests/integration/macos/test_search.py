@@ -3,14 +3,16 @@
 import json
 import os
 import shlex
-import time
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
-from loop.execution.sandbox.macos import MacOSSeatbeltBackend
+from loop.execution.sandbox.macos.backend import MacOSSeatbeltBackend
+from loop.utils.process import read_bounded_stream, supervise_process
 
 _RIPGREP_CANDIDATES = tuple(
     Path(root) / "rg" for root in os.environ.get("PATH", "").split(os.pathsep)
@@ -164,7 +166,7 @@ def test_public_native_search_preserves_dialect_unicode_and_bounds(
 
 
 def test_public_native_search_keeps_selected_files_isolated(
-    public_command, native_workspace, native_search_helper
+    public_command, native_workspace, native_search_helper, monkeypatch
 ):
     """Concurrent native searches disclose only selected inputs and deny outside aliases."""
     first = native_workspace / "first"
@@ -189,20 +191,24 @@ def test_public_native_search_keeps_selected_files_isolated(
     assert "unselected-private-canary" not in json.dumps(values)
     descriptor = os.open(first, os.O_RDONLY)
     try:
-        capture = public_command.backend.run_read_only_argv(
-            public_command.helper,
-            (
-                "--no-config",
-                "--json",
-                "--regexp",
-                "unselected-private-canary",
-                "--",
-                str(native_workspace / "unselected"),
-                f"/dev/fd/{descriptor:05d}",
-            ),
-            (descriptor,),
-            time.monotonic() + 5,
-        )
+        with monkeypatch.context() as controlled:
+            clock = SimpleNamespace(monotonic=lambda: 100.0, sleep=lambda _delay: os.sched_yield())
+            controlled.setattr("loop.execution.sandbox.macos.backend.time", clock)
+            controlled.setattr("loop.utils.process.time", clock)
+            capture = public_command.backend.run_read_only_argv(
+                public_command.helper,
+                (
+                    "--no-config",
+                    "--json",
+                    "--regexp",
+                    "unselected-private-canary",
+                    "--",
+                    str(native_workspace / "unselected"),
+                    f"/dev/fd/{descriptor:05d}",
+                ),
+                (descriptor,),
+                110.0,
+            )
     finally:
         os.close(descriptor)
     assert capture.exit_code == 2
@@ -222,13 +228,40 @@ def test_public_native_search_keeps_selected_files_isolated(
 
 
 def test_native_selected_helper_bounds_a_running_child(
-    public_command, native_workspace, native_search_helper
+    public_command, native_workspace, native_search_helper, monkeypatch
 ):
-    """A qualified helper and its system preprocessor stop within the original deadline."""
+    """A fake deadline stops a qualified helper after its real preprocessor produces output."""
     selected = native_workspace / "selected"
     selected.write_text("selected input\n")
     descriptor = os.open(selected, os.O_RDONLY)
-    started = time.monotonic()
+    entered = threading.Event()
+    first_output = []
+
+    def read_after_entry(process, deadline, **kwargs):
+        """Observe the real helper's first byte before the synthetic deadline expires."""
+
+        def reader(stream, chunks, *, maximum):
+            """Signal only after the helper's stdout pipe delivers a byte or EOF."""
+            if stream is process.stdout:
+                first = stream.read(1)
+                first_output.append(first)
+                chunks.append(first)
+                entered.set()
+                return read_bounded_stream(stream, chunks, maximum=maximum - len(first))
+            return read_bounded_stream(stream, chunks, maximum=maximum)
+
+        return supervise_process(process, deadline, reader=reader, **kwargs)
+
+    def expired_after_output():
+        """Release the fake deadline once native output or EOF establishes entry."""
+        entered.wait()
+        return 200.0
+
+    monkeypatch.setattr(
+        "loop.execution.sandbox.macos.backend.time", SimpleNamespace(monotonic=lambda: 100.0)
+    )
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.supervise_process", read_after_entry)
+    monkeypatch.setattr("loop.utils.process.time", SimpleNamespace(monotonic=expired_after_output))
     try:
         capture = public_command.backend.run_read_only_argv(
             public_command.helper,
@@ -237,16 +270,16 @@ def test_native_selected_helper_bounds_a_running_child(
                 "--json",
                 "--pre=/usr/bin/yes",
                 "--regexp",
-                "no-match",
+                "/",
                 "--",
                 f"/dev/fd/{descriptor:05d}",
             ),
             (descriptor,),
-            started + 0.5,
+            102.0,
         )
     finally:
         os.close(descriptor)
     assert capture.status.value == "timed_out", capture
-    assert time.monotonic() - started < 3
+    assert first_output and first_output[0]
     assert len(capture.stdout) <= 65536
     public_command.host.run_host_command.assert_not_called()

@@ -50,6 +50,7 @@ def reviewed(tmp_path, monkeypatch):
     def scratch(*, prefix, dir):
         """Redirect authenticated import output to the test's disposable root."""
         assert dir == "/run"
+        assert prefix == "loop-native-authenticated-"
         with temporary(prefix=prefix, dir=tmp_path) as root:
             yield root
 

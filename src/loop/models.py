@@ -555,6 +555,19 @@ class ToolCall(ConversationItemModel):
     arguments_redacted: bool = Field(default=False, exclude=True)
     id: str | None = None
 
+    def for_storage(self, *, redact_arguments: bool = False) -> ToolCall:
+        """Remove transient terminal controls before session storage or routine display.
+
+        Args:
+            redact_arguments (bool): Registered tool policy requiring argument removal.
+
+        Returns:
+            ToolCall: This call, or a copy without terminal input and control arguments.
+        """
+        if redact_arguments or self.name == "control_command_terminal":
+            return self.model_copy(update={"arguments": "{}", "arguments_redacted": True})
+        return self
+
 
 class ContentArtifact(BaseModel):
     """Describe session-persisted metadata for one out-of-context artifact.

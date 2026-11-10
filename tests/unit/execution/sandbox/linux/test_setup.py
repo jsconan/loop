@@ -54,6 +54,9 @@ def terminal(monkeypatch, tmp_path):
         bound(Path("/original/loop_uninstall.py")),
     )
     monkeypatch.setattr(module, "uninstall_authority", Mock(return_value=original))
+    monkeypatch.setattr(module, "selected_bubblewrap_bytes", Mock(return_value=b"helper"))
+    monkeypatch.setattr(module, "partial_bubblewrap_bytes", Mock(return_value=b"helper"))
+    monkeypatch.setattr(module, "require_reviewed_bubblewrap_bytes", Mock())
     process = Mock(return_value=SimpleNamespace(returncode=0))
     monkeypatch.setattr(module.subprocess, "run", process)
     return process
@@ -81,6 +84,11 @@ def test_manage_setup_exact_review_terminal_and_cleanup(terminal, action, decisi
         return decision
 
     assert module.manage_setup(action, review, main_app=True) is (decision is True)
+    assert module.selected_bubblewrap_bytes.call_count == (1 if action == "install" else 0)
+    assert module.runtime_catalog.call_args.kwargs == {
+        "helper_bytes": b"helper" if action == "install" else None,
+        "management_only": action == "uninstall",
+    }
     if decision is True:
         argv = terminal.call_args.args[0]
         assert argv[:7] == ["/usr/bin/sudo", "--", "/usr/bin/python3", "-I", "-S", "-B", "-c"]
@@ -94,6 +102,52 @@ def test_manage_setup_exact_review_terminal_and_cleanup(terminal, action, decisi
     assert module.bind_host_file.call_args_list[0].kwargs == {"system_elevation": True}
     assert module.bind_host_file.call_args_list[1].kwargs == {}
     assert len(reviewed) == 1
+
+
+def test_manage_setup_import_namespace_does_not_follow_app_name(terminal, monkeypatch):
+    """An app rename cannot redirect the authenticated setup package snapshot."""
+    monkeypatch.setattr(module.constants, "APP_NAME", "renamed-app")
+    package_files = Mock(wraps=module.files)
+    monkeypatch.setattr(module, "files", package_files)
+
+    assert module.manage_setup("uninstall", Mock(return_value=False), main_app=True) is False
+
+    package_files.assert_called_once_with(module.PACKAGE_NAMESPACE)
+    terminal.assert_not_called()
+
+
+def test_manage_setup_rejects_unavailable_bubblewrap_before_consent(terminal):
+    """An unsupported host cannot approve setup without a fixed selected helper."""
+    module.selected_bubblewrap_bytes.side_effect = OSError("No qualified Bubblewrap")
+    review = Mock()
+    with pytest.raises(OSError, match="No qualified Bubblewrap"):
+        module.manage_setup("install", review, main_app=True)
+    review.assert_not_called()
+    module.runtime_catalog.assert_not_called()
+    terminal.assert_not_called()
+
+
+def test_manage_setup_reuses_prefetched_helper_for_refresh(terminal):
+    """A prepared replacement is checked but never downloaded after old removal."""
+    assert module.manage_setup(
+        "install", Mock(return_value=True), main_app=True, helper_bytes=b"helper"
+    )
+    module.selected_bubblewrap_bytes.assert_not_called()
+    module.require_reviewed_bubblewrap_bytes.assert_called_once_with(b"helper")
+
+
+def test_partial_uninstall_uses_staged_helper_without_archive(terminal, monkeypatch):
+    """A retained partial generation can be reviewed for removal while offline."""
+    (module._DIRECTORY / "management.json").unlink()
+    reservations = module._DIRECTORY / "reservations"
+    reservations.mkdir()
+    (reservations / "native_saved").write_bytes(b"capacity")
+    monkeypatch.setattr(module, "protected_path", lambda path, **kwargs: path)
+    monkeypatch.setattr(module, "generation_limits", Mock(return_value=(1, 1)))
+    module.selected_bubblewrap_bytes.side_effect = OSError("archive unavailable")
+    assert module.manage_setup("uninstall", Mock(return_value=True), main_app=True)
+    module.selected_bubblewrap_bytes.assert_not_called()
+    module.partial_bubblewrap_bytes.assert_called_once_with(module._DIRECTORY)
 
 
 @pytest.mark.parametrize(
@@ -191,12 +245,20 @@ def test_manage_setup_changed_or_failed_handoff(terminal, monkeypatch, case):
 
 
 @pytest.fixture
-def administrator(tmp_path, monkeypatch):
+def administrator(tmp_path, monkeypatch, logical_admission_sources):
     """Provide an isolated fixed-root lifecycle with public collaborators and real file effects."""
     root = tmp_path / "libexec/loop/native"
     (tmp_path / "libexec").mkdir()
     (tmp_path / "libexec").chmod(0o755)
     monkeypatch.setattr(module, "_DIRECTORY", root)
+    render_policy = module.runtime_policy_sources
+    monkeypatch.setattr(
+        module,
+        "runtime_policy_sources",
+        lambda directory, generation: render_policy(
+            logical_admission_sources(directory), generation
+        ),
+    )
     monkeypatch.setattr(module.os, "getuid", lambda: 0)
     read_text = Path.read_text
     monkeypatch.setattr(
@@ -207,8 +269,16 @@ def administrator(tmp_path, monkeypatch):
         ),
     )
     monkeypatch.setattr(module, "protected_path", lambda path, **k: path)
+    monkeypatch.setattr(module, "_remove_boot_unit", Mock())
     monkeypatch.setattr(module, "validate_generation_catalog", Mock())
-    monkeypatch.setattr(module, "discover_tool", lambda name: bound(Path("/bwrap"), b"helper"))
+    monkeypatch.setattr(module, "partial_bubblewrap_bytes", Mock(return_value=b"helper"))
+
+    def reviewed(data):
+        """Model an exact selected helper digest at the privileged boundary."""
+        if data != b"helper":
+            raise ValueError("Reviewed system helper changed.")
+
+    monkeypatch.setattr(module, "require_reviewed_bubblewrap_bytes", Mock(side_effect=reviewed))
 
     def bind(path):
         """Read real isolated bytes through a pinned descriptor for scaffold validation."""
@@ -259,6 +329,15 @@ def administrator(tmp_path, monkeypatch):
         Mock(return_value=(bound(root / "management.json"), bound(root / "loop_uninstall.py"))),
     )
     return root
+
+
+def test_install_reviewed_rechecks_fixed_helper_before_mutation(administrator):
+    """Privileged setup refuses a helper changed since the ordinary user's review."""
+    module.require_reviewed_bubblewrap_bytes.side_effect = ValueError("Bubblewrap is unfixed")
+    with pytest.raises(ValueError, match="unfixed"):
+        module.install_reviewed("install", "generation", 1000, 1000, "", {"helper": b"helper"})
+    assert not administrator.exists()
+    module.install_generation.assert_not_called()
 
 
 def test_install_reviewed_fixed_scaffolding_and_repeat(administrator):
@@ -396,7 +475,7 @@ def test_uninstall_refuses_changed_unrecorded_reservation(administrator, monkeyp
     elif case == "multiple":
         (reservations / "another").write_bytes(b"capacity")
     elif case == "helper":
-        monkeypatch.setattr(module, "discover_tool", Mock(return_value=bound(Path("/changed"))))
+        module.partial_bubblewrap_bytes.return_value = b"changed"
     with pytest.raises(ValueError, match="aliases|Ambiguous|generation changed|helper changed"):
         module.install_reviewed(
             "uninstall",

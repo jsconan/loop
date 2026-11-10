@@ -1,18 +1,88 @@
 """Exercise native prompt-toolkit async input with owned pipes and captured output."""
 
 import asyncio
+import os
 from contextlib import aclosing
 from io import StringIO
 
 import pytest
 from prompt_toolkit import PromptSession
-from prompt_toolkit.input import create_pipe_input
+from prompt_toolkit.input import create_input, create_pipe_input
 from prompt_toolkit.output import DummyOutput
 from rich.console import Console
 
-from loop import AnswerDelta, ConsoleInteraction, Response, ResponseCompleted, SessionManager
+from loop import (
+    AnswerDelta,
+    ConsoleInteraction,
+    PermissionManager,
+    Response,
+    ResponseCompleted,
+    SessionManager,
+)
+from loop.execution.sandbox import SandboxRequest
 
 pytestmark = pytest.mark.integration
+
+
+def test_sandbox_prompt_displays_details_only_when_requested(tmp_path):
+    """Actual choice input can show and hide full scope before denying the command."""
+    output = StringIO()
+    with create_pipe_input() as pipe:
+        prompt = PromptSession(input=pipe, output=DummyOutput())
+        interaction = ConsoleInteraction(
+            session=prompt,
+            choices_session=prompt,
+            console=Console(file=output, width=200),
+            markdown=False,
+        )
+        manager = PermissionManager(tmp_path, interaction=interaction)
+        request = SandboxRequest.create(
+            source="printf x > output",
+            cwd=tmp_path,
+            workspace=tmp_path,
+            read_roots=(),
+            write_roots=(tmp_path,),
+            network=False,
+            environment={"PATH": "/usr/bin:/bin"},
+            policy_version="test",
+            deadline=130.0,
+            workspace_id="test",
+        )
+
+        async def scenario():
+            """Toggle details twice, then deny through the same prompt session."""
+            pipe.send_text("D\nD\nN\n")
+            return await asyncio.wait_for(
+                manager.authorize_sandboxed_command_async(request, tool_id="run_command"), 5
+            )
+
+        assert not asyncio.run(scenario())
+
+    rendered = output.getvalue()
+    assert "Show full scope" in rendered
+    assert "Show reduced scope" in rendered
+    assert "Full scope:" in rendered
+    assert "working_directory" in rendered
+    assert rendered.count("Command:") == 3
+    assert rendered.count("Reason:") == 3
+
+
+def test_host_approval_capability_uses_the_actual_input_descriptor():
+    """An owned pseudo-terminal qualifies, while a prompt-toolkit pipe does not."""
+    master, slave = os.openpty()
+    try:
+        with os.fdopen(slave, "r", closefd=False) as stream:
+            terminal_input = create_input(stdin=stream)
+            prompt = PromptSession(input=terminal_input, output=DummyOutput())
+            interaction = ConsoleInteraction(session=prompt, choices_session=prompt)
+            assert interaction.supports_fresh_host_approval
+        with create_pipe_input() as pipe:
+            prompt = PromptSession(input=pipe, output=DummyOutput())
+            interaction = ConsoleInteraction(session=prompt, choices_session=prompt)
+            assert not interaction.supports_fresh_host_approval
+    finally:
+        os.close(slave)
+        os.close(master)
 
 
 def test_async_response_presentation_keeps_native_input_available():

@@ -2199,6 +2199,10 @@ class SessionManager:
     async def record_authorization_async(self, result: AuthorizationResult) -> None:
         """Persist one authorization decision without blocking the async owner.
 
+        Cancellation before persistence admission can prevent the event from being recorded.
+        Caller cancellation alone waits for an admitted write, but independent worker-task
+        cancellation during event-loop shutdown can leave the underlying write unsettled.
+
         Args:
             result (AuthorizationResult): Policy, approval, and effective outcome.
 
@@ -2206,7 +2210,7 @@ class SessionManager:
             None: The authorization decision is durably committed to the timeline.
 
         Raises:
-            asyncio.CancelledError: If the owning task is cancelled after persistence settles.
+            asyncio.CancelledError: If cancellation interrupts recording.
         """
         event = PermissionEvent(
             id=str(new_uuid()),

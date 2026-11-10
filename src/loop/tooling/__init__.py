@@ -3,10 +3,17 @@
 __all__ = [
     "TOOL_READY",
     "FileObservations",
+    "OwnedToolTask",
+    "OwnedToolTaskCancelled",
+    "PlatformArgumentCapability",
     "Tool",
     "ToolCommands",
     "ToolContext",
+    "ToolExecutionAdmissionRejected",
     "ToolExecutionCancelled",
+    "ToolExecutionInterrupted",
+    "ToolExecutionNotStarted",
+    "ToolExecutionOutcomeUnknown",
     "ToolPreflight",
     "ToolPreflightResult",
     "ToolRegistration",
@@ -30,14 +37,19 @@ from .context import ToolContext
 from .file_observations import FileObservations
 from .models import (
     TOOL_READY,
+    OwnedToolTaskCancelled,
+    ToolExecutionAdmissionRejected,
     ToolExecutionCancelled,
+    ToolExecutionInterrupted,
+    ToolExecutionNotStarted,
+    ToolExecutionOutcomeUnknown,
     ToolPreflight,
     ToolPreflightResult,
     ToolRegistrationError,
     ToolRuntimeSettings,
     ToolStatus,
 )
-from .tool import Tool, ToolRegistration, tool
+from .tool import OwnedToolTask, PlatformArgumentCapability, Tool, ToolRegistration, tool
 from .tool_registry import ToolRegistry, ToolRegistryView
 from .utils import (
     get_tool_arguments_model,

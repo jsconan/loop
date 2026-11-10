@@ -2,8 +2,10 @@
 
 import asyncio
 import json
+import os
 import sys
 import termios
+from io import StringIO
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, call
 
@@ -29,6 +31,30 @@ from loop.models import Usage
 def test_console_interaction_does_not_claim_worker_calls_are_routed():
     """A directly used console interaction remains owner-affine by default."""
     assert ConsoleInteraction().worker_calls_routed is False
+
+
+@pytest.mark.parametrize("is_terminal", [False, True])
+def test_console_fresh_host_approval_requires_terminal_input(monkeypatch, is_terminal):
+    """Console host approval requires the choice session's input to be a terminal."""
+    choices = Mock()
+    choices.input.fileno.return_value = 123
+    check = Mock(return_value=is_terminal)
+    monkeypatch.setattr(os, "isatty", check)
+    assert (
+        ConsoleInteraction(session=Mock(), choices_session=choices).supports_fresh_host_approval
+        is is_terminal
+    )
+    check.assert_called_once_with(123)
+
+
+@pytest.mark.parametrize("error", [AttributeError, OSError, TypeError, ValueError])
+def test_console_fresh_host_approval_rejects_unavailable_input(error):
+    """An unavailable or non-file input cannot qualify as an interactive terminal."""
+    choices = Mock()
+    choices.input.fileno.side_effect = error("unavailable")
+    assert not ConsoleInteraction(
+        session=Mock(), choices_session=choices
+    ).supports_fresh_host_approval
 
 
 def test_primary_editor_text_can_be_read_and_replaced():
@@ -791,6 +817,34 @@ def test_report_renders_a_problem_with_its_reference_and_retry_guidance(capsys):
     assert "can be retried" in output
 
 
+@pytest.mark.parametrize("via_tool_result", [False, True])
+def test_problem_display_escapes_terminal_controls_without_changing_problem(via_tool_result):
+    """Problem fields remain readable while terminal control sequences cannot execute."""
+    output = StringIO()
+    interaction = ConsoleInteraction(
+        console=Console(file=output, force_terminal=True, color_system=None, width=120),
+        session=Mock(),
+        choices_session=Mock(),
+    )
+    problem = Problem(
+        code="fixture.failed",
+        title="Untrusted [bold]title\x1b[31m",
+        detail="First line\nUntrusted path\x1b[2J\x9bend",
+        instance="ref\x1b[H",
+    )
+    if via_tool_result:
+        interaction.tool_result(json.dumps({"ok": False, "problem": problem.model_dump()}))
+    else:
+        interaction.report(problem)
+
+    rendered = output.getvalue()
+    assert "\x1b" not in rendered and "\x9b" not in rendered
+    assert "␛[31m" in rendered and "␛[2J" in rendered and "␛[H" in rendered
+    assert "First line" in rendered and "Untrusted path" in rendered
+    assert "[bold]title" in rendered
+    assert problem.detail == "First line\nUntrusted path\x1b[2J\x9bend"
+
+
 def test_info_supports_a_blank_separator(capsys):
     """Neutral information can emit a blank line between streamed sections."""
     ConsoleInteraction().info()
@@ -882,6 +936,21 @@ def test_tool_call_displays_its_name_and_arguments(capsys):
     ConsoleInteraction().tool_call("search", '{"query":"term"}')
 
     assert capsys.readouterr().out == '\n[TOOL CALL]: search(query="term")\n'
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    ['{"\\u001b[2J": 1}', "invalid\x1b[2J\nforged", '{"name":"\u009b"}'],
+)
+def test_tool_call_neutralizes_terminal_controls(arguments, capsys):
+    """Untrusted tool names and argument representations cannot control the terminal."""
+    ConsoleInteraction().tool_call("tool\x1b[2J\nforged", arguments)
+
+    output = capsys.readouterr().out
+    assert "\x1b" not in output
+    assert "\u009b" not in output
+    assert output.count("\n") == 2
+    assert "tool␛[2J␊forged" in output
 
 
 def test_tool_call_truncates_each_long_argument_value_in_the_middle(capsys):

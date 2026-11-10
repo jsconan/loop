@@ -5,20 +5,21 @@ receiver admits authenticated bounded frames and composes trusted setup with enf
 entry. Catalog assembly grants no administrator consent or native qualification.
 """
 
-import hashlib
-import os
 import re
 from importlib.resources import files
 from pathlib import Path
 
 from .constants import (
+    BOOT_FILENAME,
     CACHE_LOCK_FILENAME,
+    PACKAGE_ARTIFACT_PREFIX,
+    PACKAGE_NAMESPACE,
     PAYLOAD_FILENAME,
     RECEIVER_FILENAME,
     UNINSTALLER_FILENAME,
 )
-from .host import discover_tool
 from .installation import validate_generation_catalog
+from .managed_bubblewrap import selected_bubblewrap_bytes
 from .policy import runtime_policy_sources
 
 _MODULES = (
@@ -36,6 +37,7 @@ _MODULES = (
     "execution/sandbox/linux/mountinfo.py",
     "execution/sandbox/linux/admission.py",
     "execution/sandbox/linux/transport.py",
+    "execution/sandbox/linux/egress.py",
     "execution/sandbox/linux/management.py",
     "execution/sandbox/linux/records.py",
     "execution/sandbox/linux/runtime.py",
@@ -57,6 +59,7 @@ _BARRELS = (
     "execution/sandbox/linux/",
 )
 _RESOURCES = {
+    BOOT_FILENAME: "boot.py",
     RECEIVER_FILENAME: "receiver.py",
     UNINSTALLER_FILENAME: "uninstall.py",
     PAYLOAD_FILENAME: "payload.py",
@@ -70,8 +73,8 @@ def runtime_member_names() -> tuple[str, ...]:
         tuple[str, ...]: Relative file names installed by the current package catalog.
     """
     return (
-        *("loop/" + name for name in _MODULES),
-        *("loop/" + prefix + "__init__.py" for prefix in _BARRELS),
+        *(PACKAGE_ARTIFACT_PREFIX + name for name in _MODULES),
+        *(PACKAGE_ARTIFACT_PREFIX + prefix + "__init__.py" for prefix in _BARRELS),
         *_RESOURCES,
         "helper",
         "mask.empty",
@@ -82,13 +85,16 @@ def runtime_member_names() -> tuple[str, ...]:
 def runtime_catalog(
     directory: Path,
     generation: str,
+    *,
+    helper_bytes: bytes | None = None,
+    management_only: bool = False,
 ) -> tuple[dict[str, bytes], set[str], dict[str, dict[str, bytes]], bytes]:
     """Build a trusted runtime catalog from installed resources.
 
     Read packaged Python resources, never plans or developer paths. Use passive native package
     barrels so the retained uninstaller remains independent of application dependencies. Copy the
-    authenticated host Bubblewrap bytes into a private helper; do not modify a shared
-    binary/profile.
+    authenticated fixed system or reviewed downloaded Bubblewrap bytes into a private helper.
+    Do not modify a shared binary/profile.
     Include a fresh read-only cache-lock seed and fixed installed receiver/uninstaller resources.
     The administrator installer must authenticate the exact reviewed catalog before executing it.
     Trusted bootstrap grants precede separately compiled restrictive payload entry. Successful setup
@@ -98,6 +104,8 @@ def runtime_catalog(
     Args:
         directory (Path): Intended literal absolute private runtime root, without aliases or '..'.
         generation (str): New simple ASCII generation identity, at most 120 characters.
+        helper_bytes (bytes | None): Already selected helper bytes, or None to select once here.
+        management_only (bool): Omit the helper for recorded or absent uninstall authority.
 
     Returns:
         tuple[dict[str, bytes], set[str], dict[str, dict[str, bytes]], bytes]: Reviewed file
@@ -115,26 +123,25 @@ def runtime_catalog(
     ):
         raise ValueError("Invalid fixed runtime catalog location or generation.")
 
-    package = files("loop")
-    catalog = {"loop/" + name: package.joinpath(name).read_bytes() for name in _MODULES}
-    catalog.update({"loop/" + prefix + "__init__.py": b"" for prefix in _BARRELS})
+    package = files(PACKAGE_NAMESPACE)
+    catalog = {
+        PACKAGE_ARTIFACT_PREFIX + name: package.joinpath(name).read_bytes() for name in _MODULES
+    }
+    catalog.update({PACKAGE_ARTIFACT_PREFIX + prefix + "__init__.py": b"" for prefix in _BARRELS})
     resources = package.joinpath("execution/sandbox/linux/resources")
     catalog.update(
         {name: resources.joinpath(resource).read_bytes() for name, resource in _RESOURCES.items()}
     )
-    helper = discover_tool("bwrap")
-
-    with helper.open_verified() as descriptor:
-        catalog["helper"] = os.pread(descriptor, helper.identity[4] + 1, 0)
-    if (
-        len(catalog["helper"]) != helper.identity[4]
-        or hashlib.sha256(catalog["helper"]).hexdigest() != helper.digest
-    ):
-        raise ValueError("Authenticated helper changed during catalog read.")
+    if not management_only:
+        catalog["helper"] = (
+            helper_bytes if helper_bytes is not None else selected_bubblewrap_bytes()
+        )
 
     catalog["mask.empty"] = b""
     catalog[CACHE_LOCK_FILENAME] = (generation + "\n").encode("ascii")
-    executable = {RECEIVER_FILENAME, UNINSTALLER_FILENAME, "helper"}
+    executable = {RECEIVER_FILENAME, UNINSTALLER_FILENAME}
+    if not management_only:
+        executable.add("helper")
     validate_generation_catalog(directory, catalog, executable)
     sources, source = runtime_policy_sources(directory, generation)
     return catalog, executable, sources, source

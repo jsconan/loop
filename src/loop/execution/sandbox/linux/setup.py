@@ -26,23 +26,34 @@ from .catalog import runtime_catalog
 from .constants import (
     COMPILER_LOCK_FILENAME,
     INITIAL_USER_NAMESPACE_UID_MAP,
+    LINUX_ARTIFACT_DIRECTORY,
     MANAGEMENT_LOCK_FILENAME,
     MANAGEMENT_RECORD_NAME,
     NATIVE_RESERVATIONS_DIRECTORY_NAME,
+    PACKAGE_NAMESPACE,
     PROC_UID_MAP_PATH,
     RECEIVER_FILENAME,
     SYSTEM_PYTHON_PATH,
     SYSTEMD_SLICE_UNIT_SUFFIX,
     UNINSTALLER_FILENAME,
 )
-from .host import NATIVE_LOCK_SEEDS, HostFile, bind_host_file, discover_tool, protected_path
+from .host import (
+    NATIVE_LOCK_SEEDS,
+    HostFile,
+    bind_host_file,
+    partial_bubblewrap_bytes,
+    protected_path,
+    require_reviewed_bubblewrap_bytes,
+)
 from .installation import (
     generation_limits,
     reserve_generation,
     stage_generation_files,
     validate_generation_catalog,
 )
+from .managed_bubblewrap import selected_bubblewrap_bytes
 from .management import (
+    _remove_boot_unit,
     clean_unrecorded_installation,
     install_generation,
     uninstall_authority,
@@ -139,9 +150,8 @@ def install_reviewed(
                     validate_generation_catalog(
                         _DIRECTORY, contents, {RECEIVER_FILENAME, UNINSTALLER_FILENAME, "helper"}
                     )
-                    helper = discover_tool("bwrap")
-                    if hashlib.sha256(contents["helper"]).hexdigest() != helper.digest:
-                        raise ValueError("Reviewed system helper changed.")
+                    if contents["helper"] != partial_bubblewrap_bytes(_DIRECTORY):
+                        raise ValueError("Reviewed partial Bubblewrap helper changed.")
                     sources, source = runtime_policy_sources(_DIRECTORY, generation)
                     lock = bind_host_file(_DIRECTORY / MANAGEMENT_LOCK_FILENAME)
                     compiler = bind_host_file(_DIRECTORY / COMPILER_LOCK_FILENAME)
@@ -167,6 +177,13 @@ def install_reviewed(
                         source,
                         time.monotonic() + _SETUP_ACTION_TIMEOUT_SECONDS,
                     )
+            lock_path = _DIRECTORY / MANAGEMENT_LOCK_FILENAME
+            if lock_path.exists() or lock_path.is_symlink():
+                _remove_boot_unit(
+                    _DIRECTORY,
+                    bind_host_file(lock_path),
+                    time.monotonic() + NATIVE_MANAGEMENT_TIMEOUT_SECONDS,
+                )
             verify_uninstalled(
                 _DIRECTORY,
                 time.monotonic() + NATIVE_MANAGEMENT_TIMEOUT_SECONDS,
@@ -191,9 +208,7 @@ def install_reviewed(
     validate_generation_catalog(
         _DIRECTORY, contents, {RECEIVER_FILENAME, UNINSTALLER_FILENAME, "helper"}
     )
-    helper = discover_tool("bwrap")
-    if hashlib.sha256(contents["helper"]).hexdigest() != helper.digest:
-        raise ValueError("Reviewed system helper changed.")
+    require_reviewed_bubblewrap_bytes(contents["helper"])
     sources, source = runtime_policy_sources(_DIRECTORY, generation)
     executables = {RECEIVER_FILENAME, UNINSTALLER_FILENAME, "helper"}
     deadline = time.monotonic() + _SETUP_ACTION_TIMEOUT_SECONDS
@@ -239,13 +254,14 @@ def install_reviewed(
             raise ValueError("Partial installation reservation differs from reviewed generation.")
         original_reservation = bind_host_file(retained[0])
         generation_limits(original_reservation, generation)
+        cleanup_contents = {**contents, "helper": partial_bubblewrap_bytes(_DIRECTORY)}
         clean_unrecorded_installation(
             GenerationAdmission(
                 generation, uid, gid, config.receiver, placeholder, original_reservation
             ),
             lock,
             compiler,
-            contents,
+            cleanup_contents,
             executables,
             sources,
             source,
@@ -274,7 +290,13 @@ def install_reviewed(
     install_generation(config, lock, compiler, catalog, executables, sources, source, deadline)
 
 
-def manage_setup(action: str, review: Callable[[str], bool], *, main_app: bool = False) -> bool:
+def manage_setup(
+    action: str,
+    review: Callable[[str], bool],
+    *,
+    main_app: bool = False,
+    helper_bytes: bytes | None = None,
+) -> bool:
     """Review and authenticate a fixed native sandbox setup action.
 
     Refuse library/headless calls before catalog reads or elevation. The main app presents a concise
@@ -289,6 +311,8 @@ def manage_setup(action: str, review: Callable[[str], bool], *, main_app: bool =
         review (Callable[[str], bool]): Direct human review of the operation/effect summary; only
             literal True authorizes execution.
         main_app (bool): True only for direct main-app dispatch; False refuses elevation by default.
+        helper_bytes (bytes | None): Previously verified bytes reserved for a safe refresh;
+            None selects the helper for a fresh install.
 
     Returns:
         bool: True after successful checked setup; False when the human declines.
@@ -304,11 +328,19 @@ def manage_setup(action: str, review: Callable[[str], bool], *, main_app: bool =
         raise OSError("Linux installation management is unavailable on this platform.")
     if action not in {"install", "uninstall"} or min(os.getuid(), os.getgid()) <= 0:
         raise ValueError("Setup requires an ordinary user and a fixed action.")
+    selected_helper = (
+        (helper_bytes if helper_bytes is not None else selected_bubblewrap_bytes())
+        if action == "install"
+        else None
+    )
+    if selected_helper is not None:
+        require_reviewed_bubblewrap_bytes(selected_helper)
     record = _DIRECTORY / MANAGEMENT_RECORD_NAME
     has_record = record.exists() or record.is_symlink()
     original = uninstall_authority(record) if has_record else None
     generation = "native_" + uuid.uuid4().hex
     reservations = _DIRECTORY / NATIVE_RESERVATIONS_DIRECTORY_NAME
+    has_partial = False
     if action in {"install", "uninstall"} and not has_record and reservations.exists():
         if protected_path(reservations, directory=True) != reservations:
             raise ValueError("Installation capacity directory aliases other authority.")
@@ -316,16 +348,24 @@ def manage_setup(action: str, review: Callable[[str], bool], *, main_app: bool =
         if len(retained) > 1:
             raise ValueError("Ambiguous partial installation capacity.")
         if retained:
+            has_partial = True
             reserved = bind_host_file(retained[0])
             generation_limits(reserved, retained[0].name)
             generation = retained[0].name
-    contents, _, _, _ = runtime_catalog(_DIRECTORY, generation)
+    if action == "uninstall" and has_partial:
+        selected_helper = partial_bubblewrap_bytes(_DIRECTORY)
+    contents, _, _, _ = runtime_catalog(
+        _DIRECTORY,
+        generation,
+        helper_bytes=selected_helper,
+        management_only=action == "uninstall" and not has_partial,
+    )
     # The temporary privileged import snapshot includes these orchestration owners; the retained
     # runtime remains the smaller catalog needed by its receiver and app-absent uninstaller.
-    package = files("loop")
+    package = files(PACKAGE_NAMESPACE)
     snapshot = {**contents}
-    for name in ("catalog.py", "setup.py"):
-        snapshot["loop/execution/sandbox/linux/" + name] = package.joinpath(
+    for name in ("catalog.py", "managed_bubblewrap.py", "setup.py"):
+        snapshot[LINUX_ARTIFACT_DIRECTORY + name] = package.joinpath(
             "execution/sandbox/linux/" + name
         ).read_bytes()
     data = json.dumps(
@@ -343,7 +383,7 @@ def manage_setup(action: str, review: Callable[[str], bool], *, main_app: bool =
     )
     sudo = bind_host_file(Path("/usr/bin/sudo"), system_elevation=True)
     python = bind_host_file(SYSTEM_PYTHON_PATH)
-    with tempfile.TemporaryDirectory(prefix="loop-native-reviewed-") as temporary:
+    with tempfile.TemporaryDirectory(prefix=f"{constants.APP_NAME}-native-reviewed-") as temporary:
         path = Path(temporary) / "input.json"
         with path.open("xb") as stream:
             stream.write(data)

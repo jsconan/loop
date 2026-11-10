@@ -19,6 +19,15 @@ from .models import ListMarker
 class InteractionInput(ABC):
     """Read user messages and explicit confirmations independently of presentation."""
 
+    @property
+    def supports_fresh_host_approval(self) -> bool:
+        """Report whether the input is configured for fresh human host decisions.
+
+        Returns:
+            bool: False unless an interactive implementation explicitly supports this decision.
+        """
+        return False
+
     @abstractmethod
     def prompt(
         self,

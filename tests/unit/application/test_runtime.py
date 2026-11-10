@@ -16,6 +16,7 @@ from loop.application.commands import ApplicationCommands
 from loop.application.runtime import ApplicationRuntime
 from loop.configuration import ApplicationSettings, ConfigurationCommands
 from loop.conversation import ConversationCommands, ConversationRecoveryCommands
+from loop.permissions import PermissionNamespaceError
 from loop.telemetry import SQLiteTelemetryAdapter, Telemetry
 from loop.workspace import Workspace, WorkspaceCommands
 from tests.scheduling import deliver_callbacks
@@ -71,7 +72,7 @@ def test_create_composes_runtime_from_bound_references(dependencies, assembled):
     workspace, paths, workspace_paths, settings = assembled
     settings = settings.model_copy(
         update={
-            "loop": settings.loop.model_copy(
+            "app": settings.app.model_copy(
                 update={"temperature": 0.2, "reasoning_effort": "medium"}
             ),
         }
@@ -102,6 +103,7 @@ def test_create_composes_runtime_from_bound_references(dependencies, assembled):
     assert dependencies["PermissionManager"].call_args.kwargs["user_configuration_path"] == (
         paths.user_permissions
     )
+    assert dependencies["PermissionManager"].call_args.kwargs["bootstrap_pristine_policy"]
     loop_kwargs = dependencies["Loop"].create_default.call_args.kwargs
     tool_kwargs = dependencies["create_default_tool_registry"].call_args.kwargs
     assert tool_kwargs["settings"].user_agent == settings.web.user_agent
@@ -112,12 +114,12 @@ def test_create_composes_runtime_from_bound_references(dependencies, assembled):
         dependencies["CommandExecutionService"].for_host.return_value.refresh_backend
     )
     assert loop_kwargs["working_directory"] is workspace.working_directory
-    assert loop_kwargs["stream"] is settings.loop.stream
+    assert loop_kwargs["stream"] is settings.app.stream
     assert loop_kwargs["temperature"] == 0.2
     assert loop_kwargs["reasoning_effort"] == "medium"
-    assert loop_kwargs["compaction_threshold"] == settings.loop.compaction_threshold
+    assert loop_kwargs["compaction_threshold"] == settings.app.compaction_threshold
     loop_kwargs["on_model_select"]("selected")
-    configuration.set.assert_called_once_with("loop.model", "selected")
+    configuration.set.assert_called_once_with("app.model", "selected")
     dependencies["set_telemetry"].assert_called_once_with(dependencies["Telemetry"].return_value)
 
     runtime.run()
@@ -132,6 +134,51 @@ def test_create_composes_runtime_from_bound_references(dependencies, assembled):
         ]
     )
     dependencies["set_telemetry"].assert_called_with(None)
+
+
+def test_trusted_persistent_yolo_is_announced_before_runtime_use(dependencies, assembled):
+    """Startup activates trusted no-prompt policy and visibly names its configuration source."""
+    workspace, paths, workspace_paths, settings = assembled
+    settings = settings.model_copy(update={"app": settings.app.model_copy(update={"yolo": True})})
+    configuration = Mock()
+    configuration.source_for.return_value = "user"
+    interaction = Mock()
+
+    runtime = ApplicationRuntime.create(
+        workspace, paths, workspace_paths, settings, configuration, Mock(), interaction
+    )
+
+    assert dependencies["PermissionManager"].call_args.kwargs["yolo"] is True
+    assert "YOLO mode is active (source: user)" in interaction.warning.call_args.args[0]
+    runtime.close()
+
+
+def test_managed_yolo_suppression_is_announced_at_startup(dependencies, assembled):
+    """A saved activation is reported inactive when administrator policy forbids it."""
+    workspace, paths, workspace_paths, settings = assembled
+    settings = settings.model_copy(update={"app": settings.app.model_copy(update={"yolo": True})})
+    dependencies["PermissionManager"].return_value.yolo = False
+    interaction = Mock()
+    runtime = ApplicationRuntime.create(
+        workspace, paths, workspace_paths, settings, Mock(), Mock(), interaction
+    )
+    assert "saved YOLO setting is inactive" in interaction.warning.call_args.args[0]
+    runtime.close()
+
+
+def test_policy_recovery_stops_runtime_before_model_composition(dependencies, assembled):
+    """A durable policy error closes owned services before any model can run."""
+    workspace, paths, workspace_paths, settings = assembled
+    failure = PermissionNamespaceError(workspace_paths.permissions, "Restore the policy.")
+    dependencies["PermissionManager"].return_value.require_policy_ready.side_effect = failure
+
+    with pytest.raises(PermissionNamespaceError, match="Restore the policy"):
+        ApplicationRuntime.create(
+            workspace, paths, workspace_paths, settings, Mock(), Mock(), Mock()
+        )
+
+    dependencies["Loop"].create_default.assert_not_called()
+    dependencies["PermissionManager"].return_value.close.assert_called_once_with()
 
 
 def test_async_runtime_registers_and_binds_the_session_command_provider(
@@ -246,16 +293,16 @@ def test_create_accepts_execution_service_without_close_hook(dependencies, assem
 def test_apply_configuration_routes_aggregate_domain_and_scalar_changes(dependencies):
     """Backend and model operations remain explicit while scalar references update directly."""
     active_loop = Mock()
-    settings = ApplicationSettings.model_validate({"loop": {"debug": True, "model": "model"}})
+    settings = ApplicationSettings.model_validate({"app": {"debug": True, "model": "model"}})
     active_loop.apply_runtime_settings.side_effect = lambda path, _settings: (
         "saved; restart required" if path.startswith("telemetry.") else "applied now"
     )
     runtime = ApplicationRuntime(active_loop, Mock(), 2.0)
 
     assert runtime.apply_configuration("backend.default_model", settings) == "applied now"
-    assert runtime.apply_configuration("loop.temperature", settings) == "applied now"
-    assert runtime.apply_configuration("loop.model", settings) == "applied now"
-    assert runtime.apply_configuration("loop.debug", settings) == "applied now"
+    assert runtime.apply_configuration("app.temperature", settings) == "applied now"
+    assert runtime.apply_configuration("app.model", settings) == "applied now"
+    assert runtime.apply_configuration("app.debug", settings) == "applied now"
     assert (
         runtime.apply_configuration("telemetry.batch_size", settings) == "saved; restart required"
     )
@@ -269,19 +316,19 @@ def test_apply_configuration_async_uses_async_loop_and_backend_paths(dependencie
     active_loop = Mock()
     active_loop.apply_runtime_settings_async = AsyncMock(return_value="applied now")
     active_loop.replace_backend_async = AsyncMock()
-    settings = ApplicationSettings.model_validate({"loop": {"model": "selected"}})
+    settings = ApplicationSettings.model_validate({"app": {"model": "selected"}})
     runtime = ApplicationRuntime(active_loop, Mock(), 2.0)
 
     async def dispatch():
         """Apply one model change and one backend change through async callbacks."""
-        assert await runtime.apply_configuration_async("loop.model", settings) == "applied now"
+        assert await runtime.apply_configuration_async("app.model", settings) == "applied now"
         assert (
             await runtime.apply_configuration_async("backend.base_url", settings) == "applied now"
         )
 
     asyncio.run(dispatch())
 
-    active_loop.apply_runtime_settings_async.assert_awaited_once_with("loop.model", settings)
+    active_loop.apply_runtime_settings_async.assert_awaited_once_with("app.model", settings)
     active_loop.replace_backend_async.assert_awaited_once_with(
         dependencies["OpenAIBackend"].return_value
     )
@@ -294,14 +341,14 @@ def test_apply_configuration_changes_async_batches_backend_and_model_updates(dep
     active_loop.apply_runtime_settings_async = AsyncMock(return_value="applied now")
     active_loop.replace_backend_async = AsyncMock()
     runtime = ApplicationRuntime(active_loop, Mock(), 2.0)
-    settings = ApplicationSettings.model_validate({"loop": {"model": "selected"}})
+    settings = ApplicationSettings.model_validate({"app": {"model": "selected"}})
 
     async def dispatch():
         """Apply mixed, scalar-only, and empty reload change sets."""
         mixed = await runtime.apply_configuration_changes_async(
-            ("backend.default_model", "loop.model", "telemetry.batch_size"), settings
+            ("backend.default_model", "app.model", "telemetry.batch_size"), settings
         )
-        scalar = await runtime.apply_configuration_changes_async(("loop.debug",), settings)
+        scalar = await runtime.apply_configuration_changes_async(("app.debug",), settings)
         empty = await runtime.apply_configuration_changes_async((), settings)
         return mixed, scalar, empty
 
@@ -309,16 +356,16 @@ def test_apply_configuration_changes_async_batches_backend_and_model_updates(dep
 
     assert mixed == {
         "backend.default_model": "applied now",
-        "loop.model": "applied now",
+        "app.model": "applied now",
         "telemetry.batch_size": "applied now",
     }
-    assert scalar == {"loop.debug": "applied now"}
+    assert scalar == {"app.debug": "applied now"}
     assert empty == {}
     assert active_loop.replace_backend_async.await_count == 1
     assert active_loop.apply_runtime_settings_async.await_args_list == [
-        call("loop.model", settings),
+        call("app.model", settings),
         call("telemetry.batch_size", settings),
-        call("loop.debug", settings),
+        call("app.debug", settings),
     ]
 
 
@@ -329,16 +376,16 @@ def test_apply_configuration_changes_replaces_the_backend_once(dependencies):
     runtime = ApplicationRuntime(active_loop, Mock(), 2.0)
 
     statuses = runtime.apply_configuration_changes(
-        ("backend.base_url", "backend.default_model", "loop.debug"), ApplicationSettings()
+        ("backend.base_url", "backend.default_model", "app.debug"), ApplicationSettings()
     )
 
     assert statuses == {
         "backend.base_url": "applied now",
         "backend.default_model": "applied now",
-        "loop.debug": "applied now",
+        "app.debug": "applied now",
     }
     active_loop.replace_backend.assert_called_once_with(dependencies["OpenAIBackend"].return_value)
-    active_loop.apply_runtime_settings.assert_called_once_with("loop.debug", ApplicationSettings())
+    active_loop.apply_runtime_settings.assert_called_once_with("app.debug", ApplicationSettings())
 
 
 def test_apply_configuration_changes_skips_backend_replacement_without_backend_changes(
@@ -349,9 +396,9 @@ def test_apply_configuration_changes_skips_backend_replacement_without_backend_c
     active_loop.apply_runtime_settings.return_value = "applied now"
     runtime = ApplicationRuntime(active_loop, Mock(), 2.0)
 
-    statuses = runtime.apply_configuration_changes(("loop.debug",), ApplicationSettings())
+    statuses = runtime.apply_configuration_changes(("app.debug",), ApplicationSettings())
 
-    assert statuses == {"loop.debug": "applied now"}
+    assert statuses == {"app.debug": "applied now"}
     active_loop.replace_backend.assert_not_called()
 
 
@@ -978,12 +1025,13 @@ def test_async_runtime_binds_all_services_to_its_controller(dependencies, assemb
         runtime.close()
 
     create.assert_called_once_with(source, input_mode=settings.conversation.input_mode)
-    for dependency in ("PermissionManager", "SessionManager", "create_default_tool_registry"):
-        assert dependencies[dependency].call_args.kwargs["interaction"] is controller.interaction
     assert (
-        dependencies["Loop"].create_default.call_args.kwargs["interaction"]
-        is controller.interaction
+        dependencies["PermissionManager"].call_args.kwargs["interaction"] is controller.interaction
     )
+    active_interaction = dependencies["Loop"].create_default.call_args.kwargs["interaction"]
+    for dependency in ("SessionManager", "create_default_tool_registry"):
+        assert dependencies[dependency].call_args.kwargs["interaction"] is active_interaction
+    assert active_interaction.supports_fresh_host_approval is False
     assert dependencies["Loop"].create_default.call_args.kwargs["run_control"] is controller.control
     active.run_async.assert_awaited_once_with(input_source=receive)
     controller.stop.assert_called_once_with()

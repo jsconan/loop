@@ -577,7 +577,7 @@ def list_folder(
     context: ToolContext,
     path: Annotated[
         str,
-        "loop:virtual-path",
+        VirtualPath.METADATA_KEY,
         Field(description=f"Folder to list; use {VirtualPath.TEMPORARY}/ for session files."),
     ],
     entry_type: Annotated[
@@ -635,7 +635,7 @@ def read_text_file(
     context: ToolContext,
     path: Annotated[
         str,
-        "loop:virtual-path",
+        VirtualPath.METADATA_KEY,
         Field(
             description="Path to the text file to read. "
             f"Use {VirtualPath.TEMPORARY}/ for session files."
@@ -733,7 +733,7 @@ def search_text(
     context: ToolContext,
     path: Annotated[
         str,
-        "loop:virtual-path",
+        VirtualPath.METADATA_KEY,
         Field(
             description="Path to a text file or folder to search. "
             f"Use {VirtualPath.TEMPORARY}/ for session files."
@@ -856,7 +856,7 @@ def write_text_file(
     context: ToolContext,
     path: Annotated[
         str,
-        "loop:virtual-path",
+        VirtualPath.METADATA_KEY,
         Field(
             description="Path to the text file to write. "
             f"Use {VirtualPath.TEMPORARY}/ for session files."
@@ -904,7 +904,7 @@ def edit_text_file(
     context: ToolContext,
     path: Annotated[
         str,
-        "loop:virtual-path",
+        VirtualPath.METADATA_KEY,
         Field(description=f"UTF-8 file to edit; use {VirtualPath.TEMPORARY}/ for session files."),
     ],
     old_content: Annotated[
@@ -973,7 +973,7 @@ def delete_path(
     context: ToolContext,
     path: Annotated[
         str,
-        "loop:virtual-path",
+        VirtualPath.METADATA_KEY,
         Field(
             description="File, link, or folder to delete; use "
             f"{VirtualPath.TEMPORARY}/ for session files."

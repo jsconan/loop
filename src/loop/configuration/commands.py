@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
+from contextlib import AbstractContextManager, asynccontextmanager, nullcontext
+from threading import Lock
 from typing import Annotated, Literal, TypeVar
 
 from pydantic import BaseModel, Field, ValidationError
@@ -21,6 +23,14 @@ from .manager import ApplicationSettings, ConfigurationManager
 
 Result = TypeVar("Result")
 Effect = TypeVar("Effect")
+_CONFIG_LOCK_POLL_SECONDS = 0.01
+_YOLO_ACTIVATION_WARNING = (
+    "Enabling YOLO: eligible requests will proceed without confirmation. "
+    "The agent can request private data, change or delete files, "
+    "use networks, and run commands directly on the host. "
+    "Host execution can alter or bypass the sandbox. "
+    "Hard policy denies and unavailable enforcement still apply."
+)
 
 
 class ConfigurationGetArguments(BaseModel):
@@ -115,12 +125,20 @@ class ConfigurationCommands:
         apply_many_async (Callable[[tuple[str, ...], ApplicationSettings], Awaitable[
             Mapping[str, str]]] | None): Applies multiple changed settings through native async
             services when provided. Defaults to applying settings individually.
+        validate_yolo (Callable[[], None] | None): Validate managed authority before activation.
+        yolo_active (Callable[[], bool] | None): Return the active managed-adjusted mode.
+        yolo_gate (Callable[[], AbstractContextManager[Callable[[], None]]] | None): Withhold
+            newly granted automatic decisions and provide a policy-aware rollback operation.
     """
 
     _configuration: ConfigurationManager
+    _mutation_lock: Lock
     _apply: Callable[[str, ApplicationSettings], str]
     _apply_many: Callable[[tuple[str, ...], ApplicationSettings], Mapping[str, str]] | None
     _apply_async: Callable[[str, ApplicationSettings], Awaitable[str]] | None
+    _validate_yolo: Callable[[], None] | None
+    _yolo_active: Callable[[], bool] | None
+    _yolo_gate: Callable[[], AbstractContextManager[Callable[[], None]]] | None
     _apply_many_async: (
         Callable[[tuple[str, ...], ApplicationSettings], Awaitable[Mapping[str, str]]] | None
     )
@@ -136,12 +154,19 @@ class ConfigurationCommands:
         apply_many_async: (
             Callable[[tuple[str, ...], ApplicationSettings], Awaitable[Mapping[str, str]]] | None
         ) = None,
+        validate_yolo: Callable[[], None] | None = None,
+        yolo_active: Callable[[], bool] | None = None,
+        yolo_gate: Callable[[], AbstractContextManager[Callable[[], None]]] | None = None,
     ) -> None:
         self._configuration = configuration
+        self._mutation_lock = Lock()
         self._apply = apply
         self._apply_many = apply_many
         self._apply_async = apply_async
         self._apply_many_async = apply_many_async
+        self._validate_yolo = validate_yolo
+        self._yolo_active = yolo_active
+        self._yolo_gate = yolo_gate
 
     def get_commands(self) -> tuple[CommandRegistration, ...]:
         """Return the configuration command registration.
@@ -284,7 +309,7 @@ class ConfigurationCommands:
         ] = None,
         path: Annotated[
             str | None,
-            Field(description="Setting path such as loop.temperature."),
+            Field(description="Setting path such as app.temperature."),
         ] = None,
         value: Annotated[
             str | None,
@@ -292,19 +317,21 @@ class ConfigurationCommands:
         ] = None,
         scope: Annotated[
             Literal["session", "user", "workspace"] | None,
-            Field(description="Override scope, or omit it to choose interactively."),
+            Field(description="Override scope; app.yolo defaults to session."),
         ] = None,
     ) -> None:
-        """Show, update, reset, or reload the application configuration.
+        """Show, update, reset, or reload configuration. Enabling app.yolo skips eligible
+        confirmation prompts: the agent can access private data, change or delete files,
+        use networks, and run host commands that can alter or bypass the sandbox.
 
         Args:
             context (CommandContext): Interaction and capability snapshot for this invocation.
             action (Literal["get", "set", "secret", "reset", "reload"] | None): Configuration
                 operation, or ``None`` to show every setting.
-            path (str | None): Setting path such as ``loop.temperature``.
+            path (str | None): Setting path such as ``app.temperature``.
             value (str | None): New setting value for the set operation.
             scope (Literal["session", "user", "workspace"] | None): Override scope, or ``None``
-                to choose it interactively.
+                to choose it interactively for ordinary settings. YOLO defaults to session.
 
         Returns:
             None: After displaying or applying the requested configuration operation.
@@ -340,7 +367,8 @@ class ConfigurationCommands:
         if action == "reload":
             if path is not None or value is not None or scope is not None:
                 raise CommandArgumentError("The reload operation does not accept arguments.")
-            await self._reload_async(context)
+            async with self._mutation_async():
+                await self._reload_async(context)
             return
         if action == "secret":
             await self._set_secret_async(context, path, value, scope)
@@ -353,25 +381,42 @@ class ConfigurationCommands:
                 scope=selected_scope,
                 explicit_scope=scope is not None,
             ):
-                await self._reset_all_async(context, selected_scope)
+                async with self._mutation_async():
+                    await self._reset_all_async(context, selected_scope)
             return
         if action == "reset":
-            selected_scope = await self._select_scope_async(context, scope)
+            selected_scope = await self._select_scope_async(
+                context, "session" if path == "app.yolo" and scope is None else scope
+            )
             if selected_scope is not None and await self._confirm_reset_async(
                 context,
                 path=path,
                 scope=selected_scope,
                 explicit_scope=scope is not None,
             ):
-                await self._reset_async(context, path, selected_scope)
+                async with self._mutation_async():
+                    await self._reset_async(context, path, selected_scope)
             return
         if path is None:
             raise CommandArgumentError("The set operation requires a setting path.")
         if value is None:
             raise CommandArgumentError("The set operation requires a value.")
-        selected_scope = await self._select_scope_async(context, scope)
+        selected_scope = await self._select_scope_async(
+            context, "session" if path == "app.yolo" and scope is None else scope
+        )
         if selected_scope is not None:
-            await self._set_async(context, path, value, selected_scope)
+            async with self._mutation_async():
+                await self._set_async(context, path, value, selected_scope)
+
+    @asynccontextmanager
+    async def _mutation_async(self) -> AsyncGenerator[None, None]:
+        """Serialize configuration publication and runtime application across dispatch modes."""
+        while not self._mutation_lock.acquire(blocking=False):
+            await asyncio.sleep(_CONFIG_LOCK_POLL_SECONDS)
+        try:
+            yield
+        finally:
+            self._mutation_lock.release()
 
     @staticmethod
     async def _select_scope_async(
@@ -425,9 +470,12 @@ class ConfigurationCommands:
         if not explicit_scope:
             return True
         target = path if path is not None else "all configuration entries"
-        return await require_async_interaction(
-            context.interaction, "configuration reset confirmation"
-        ).confirm_async(f"Reset {target} for {scope}?", default=False)
+        return (
+            await require_async_interaction(
+                context.interaction, "configuration reset confirmation"
+            ).confirm_async(f"Reset {target} for {scope}?", default=False)
+            is True
+        )
 
     async def _reset_all_async(
         self,
@@ -482,6 +530,8 @@ class ConfigurationCommands:
     ) -> Mapping[str, str]:
         """Apply only runtime settings whose effective values changed."""
         paths = self._changed_paths(previous, current)
+        if not previous.app.yolo and current.app.yolo:
+            context.interaction.warning(_YOLO_ACTIVATION_WARNING)
         return await self._apply_paths_async(context, paths, current)
 
     async def _apply_paths_async(
@@ -605,6 +655,25 @@ class ConfigurationCommands:
             title="Application configuration:",
             columns=("path", "value", "source", "description"),
         )
+        if path is None or path == "app.yolo":
+            requested = self._configuration.effective.app.yolo
+            active = self._yolo_active() if self._yolo_active is not None else requested
+            source = self._configuration.source_for("app.yolo")
+            if requested and not active:
+                source = "inactive"
+            saved = self._configuration.saved_yolo
+            detail = f"YOLO active: {active}; source: {source}; saved user value: {saved}."
+            if requested and not active:
+                detail += " A trusted action is required to activate it."
+            elif not active and saved:
+                detail += (
+                    " It will become active on restart; disable with scope=user to persist off."
+                )
+            if active and source == "session" and not saved:
+                detail += " Disable with scope=session to stop it now."
+            if active and source == "session" and saved:
+                detail += " Disable both session and user scopes to keep it off after restart."
+            context.interaction.info(detail)
 
     async def _set_async(
         self,
@@ -620,8 +689,32 @@ class ConfigurationCommands:
             raise CommandArgumentError(
                 "Use the secret operation to update secret configuration fields."
             )
+        if path == "app.yolo":
+            if scope == "workspace":
+                raise CommandArgumentError("app.yolo supports session and user scopes only.")
+            if value.strip().lower() == "true":
+                if self._validate_yolo is not None:
+                    try:
+                        await context.run_blocking_async(self._validate_yolo)
+                    except ValueError as error:
+                        raise CommandArgumentError(str(error)) from error
+                context.interaction.warning(_YOLO_ACTIVATION_WARNING)
         try:
-            if scope == "session":
+            if path == "app.yolo" and value.strip().lower() == "true":
+                was_active = (
+                    self._yolo_active()
+                    if self._yolo_active is not None
+                    else self._configuration.effective.app.yolo
+                )
+                with (
+                    self._yolo_gate()
+                    if self._yolo_gate is not None
+                    else nullcontext(None) as rollback
+                ):
+                    status = await self._apply_effect_settled_async(
+                        lambda: self._activate_yolo_async(context, scope, was_active, rollback)
+                    )
+            elif scope == "session":
                 settings = self._configuration.set_session(path, value)
                 status = await self._apply_effect_settled_async(
                     lambda: self._apply_setting_async(context, path, settings)
@@ -638,6 +731,56 @@ class ConfigurationCommands:
         except (ValueError, ValidationError) as error:
             raise CommandArgumentError(str(error)) from error
         context.interaction.info(f"Updated {path} for {scope}: {status}")
+        if path == "app.yolo":
+            self._show(context, path)
+            if not self._configuration.effective.app.yolo and CommandCapability.RUN_ACTIVE in (
+                context.capabilities or frozenset()
+            ):
+                context.interaction.warning(
+                    "An active run may retain authority already admitted to running jobs; "
+                    "stop the run to withdraw that authority immediately."
+                )
+
+    async def _activate_yolo_async(
+        self,
+        context: CommandContext,
+        scope: str,
+        was_active: bool,
+        rollback: Callable[[], None] | None,
+    ) -> str:
+        """Apply before publication and validate again under the durable destination lock."""
+        previous = self._configuration.effective
+        previous_runtime = previous.model_copy(
+            update={"app": previous.app.model_copy(update={"yolo": was_active})}
+        )
+        enabled = scope == "session" or self._configuration.source_for("app.yolo") != "session"
+        candidate = previous.model_copy(
+            update={"app": previous.app.model_copy(update={"yolo": enabled or previous.app.yolo})}
+        )
+        try:
+            status = await self._apply_setting_async(context, "app.yolo", candidate)
+            if scope == "session":
+                if self._validate_yolo is not None:
+                    await context.run_blocking_async(self._validate_yolo)
+                self._configuration.set_session("app.yolo", True)
+            else:
+                await context.run_blocking_async(
+                    self._configuration.set,
+                    "app.yolo",
+                    True,
+                    scope="user",
+                    before_save=self._validate_yolo,
+                )
+            return status
+        except BaseException as error:
+            try:
+                if rollback is not None:
+                    rollback()
+                else:
+                    await self._apply_setting_async(context, "app.yolo", previous_runtime)
+            except BaseException as rollback_error:  # noqa: BLE001 - retain the original failure.
+                error.add_note(f"Runtime rollback failed: {rollback_error}")
+            raise
 
     async def _set_secret_async(
         self,
@@ -661,9 +804,10 @@ class ConfigurationCommands:
             return
         selected_scope = await self._select_scope_async(context, scope)
         if selected_scope is not None:
-            await self._set_async(
-                context, path, str(secret_value), selected_scope, allow_secret=True
-            )
+            async with self._mutation_async():
+                await self._set_async(
+                    context, path, str(secret_value), selected_scope, allow_secret=True
+                )
 
     def _is_secret(self, path: str) -> bool:
         """Return whether a known configuration path is secret."""

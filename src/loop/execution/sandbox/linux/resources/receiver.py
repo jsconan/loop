@@ -31,7 +31,7 @@ def _validate_installed_entry() -> Path:
     return entry
 
 
-def _receive_request(entry: Path) -> bytes:
+def _receive_request(entry: Path):
     """Admit one bounded request after validating retained code and native membership."""
     from loop.execution.sandbox.linux.admission import ADMISSION_SECONDS
     from loop.execution.sandbox.linux.runtime import receive_installed_request
@@ -42,7 +42,9 @@ def _receive_request(entry: Path) -> bytes:
     )
 
 
-def _execute_request(entry: Path, payload: bytes) -> tuple[object, object]:
+def _execute_request(
+    entry: Path, payload: bytes, connection: socket.socket
+) -> tuple[object, object]:
     """Restore an admitted request and retain its authenticated timeout result."""
     from loop.execution.sandbox.contracts import (
         CommandProcessResult,
@@ -59,7 +61,9 @@ def _execute_request(entry: Path, payload: bytes) -> tuple[object, object]:
         result = CommandProcessResult(SandboxOutcome.TIMED_OUT)
     else:
         try:
-            result = execute_installed_request(entry.parent / "management.json", payload)
+            result = execute_installed_request(
+                entry.parent / "management.json", payload, connection
+            )
         except TimeoutError:
             # Preparation did not produce trustworthy capture or a descendant-cleanup result.
             result = CommandProcessResult(
@@ -73,7 +77,7 @@ def _execute_request(entry: Path, payload: bytes) -> tuple[object, object]:
 
 def _deliver_result(request: Any, result: Any, delivery_seconds: float) -> None:
     """Send one bounded attempt-authenticated result within the fixed delivery allowance."""
-    data = result.to_wire(request.attempt_id)
+    data = result.to_wire(request.attempt_id, include_cleanup_proof=request.cleanup_proof)
     remaining = request.deadline + delivery_seconds - time.monotonic()
     if remaining <= 0:
         raise TimeoutError("Native result delivery deadline expired.")
@@ -101,11 +105,11 @@ def main() -> None:
     entry = _validate_installed_entry()
     # Load retained modules only after proving immutable code ancestry.
     sys.path.insert(0, str(entry.parent))
-    payload = _receive_request(entry)
-    from loop.constants import NATIVE_RESULT_DELIVERY_SECONDS
+    with _receive_request(entry) as (payload, connection):
+        from loop.constants import NATIVE_RESULT_DELIVERY_SECONDS
 
-    request, result = _execute_request(entry, payload)
-    _deliver_result(request, result, NATIVE_RESULT_DELIVERY_SECONDS)
+        request, result = _execute_request(entry, payload, connection)
+        _deliver_result(request, result, NATIVE_RESULT_DELIVERY_SECONDS)
 
 
 if __name__ == "__main__":

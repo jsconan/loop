@@ -12,7 +12,6 @@ import pytest
 
 from loop.execution.sandbox.contracts import SandboxRequest
 from loop.execution.sandbox.linux import paths as linux_paths
-from loop.execution.sandbox.linux.constants import NATIVE_SCRATCH_PATH
 from loop.execution.sandbox.linux.paths import (
     bind_paths,
     mount_arguments,
@@ -20,10 +19,14 @@ from loop.execution.sandbox.linux.paths import (
     python_runtime_mounts,
 )
 
+from ..helpers import logical_private_name
+
+_TEST_NATIVE_SCRATCH = Path("/test-native-scratch")
+
 
 @pytest.fixture
 def bound(monkeypatch, tmp_path):
-    """Create a real private scratch and workspace with controlled time and temp authority."""
+    """Bind real test paths and a separate simulated inner namespace destination."""
     workspace, scratch = tmp_path / "workspace", tmp_path / "scratch"
     workspace.mkdir()
     scratch.mkdir(mode=0o700)
@@ -31,6 +34,12 @@ def bound(monkeypatch, tmp_path):
         "loop.execution.sandbox.contracts.tempfile.gettempdir", lambda: str(tmp_path)
     )
     monkeypatch.setattr("loop.execution.sandbox.linux.paths.time.monotonic", lambda: 0)
+    monkeypatch.setattr(linux_paths, "NATIVE_SCRATCH_PATH", _TEST_NATIVE_SCRATCH)
+    monkeypatch.setattr(
+        linux_paths,
+        "is_protected_external_read",
+        lambda path: logical_private_name(path, tmp_path.parent),
+    )
 
     def create(**changes):
         """Bind a fresh request without launching source or inspecting shell effects."""
@@ -52,8 +61,13 @@ def bound(monkeypatch, tmp_path):
     return create, workspace, scratch
 
 
-def _python_environment(tmp_path):
+def _python_environment(tmp_path, monkeypatch):
     """Create a workspace venv that references a versioned user-local CPython install."""
+    monkeypatch.setattr(
+        linux_paths,
+        "is_protected_external_read",
+        lambda path: logical_private_name(path, tmp_path.parent),
+    )
     home = tmp_path / "home"
     home.mkdir()
     workspace = tmp_path / "workspace"
@@ -78,11 +92,16 @@ def _python_environment(tmp_path):
     return home, workspace, venv_bin, runtime_root, runtime_alias
 
 
-def _uv_identity(path):
-    """Create an exact file identity row for the named uv runtime dependency."""
-    path.write_text("uv", encoding="utf-8")
-    details = path.stat()
-    return (("uv", path, path, details.st_dev, details.st_ino),)
+def _python_identity(venv_bin):
+    """Create a selected interpreter identity for the workspace environment."""
+    spelling = venv_bin / "python"
+    try:
+        resolved = spelling.resolve(strict=True)
+        details = resolved.stat()
+        device, inode = details.st_dev, details.st_ino
+    except (OSError, RuntimeError):
+        resolved, device, inode = spelling, 0, 0
+    return (("python", spelling, resolved, device, inode),)
 
 
 def _external_executable_request(create, scratch, tools):
@@ -99,18 +118,16 @@ def _external_executable_request(create, scratch, tools):
     return request, executable
 
 
-def test_python_runtime_mounts_bind_only_a_user_local_runtime_referenced_by_uv(
-    tmp_path, monkeypatch
-):
-    """Discover the safe runtime named by a workspace venv only for a bound uv executable."""
-    home, workspace, venv_bin, runtime_root, runtime_alias = _python_environment(tmp_path)
+def test_python_runtime_mounts_bind_only_a_selected_workspace_interpreter(tmp_path, monkeypatch):
+    """Discover a safe runtime only for the selected workspace interpreter identity."""
+    home, workspace, venv_bin, runtime_root, runtime_alias = _python_environment(
+        tmp_path, monkeypatch
+    )
     monkeypatch.setattr(
         "loop.execution.sandbox.linux.paths.pwd.getpwuid",
         lambda _uid: SimpleNamespace(pw_dir=str(home)),
     )
-    tools = tmp_path / "tools"
-    tools.mkdir()
-    identity = _uv_identity(tools / "uv")
+    identity = _python_identity(venv_bin)
     config = venv_bin.parent / "pyvenv.cfg"
     config.write_text(config.read_text() + "unrecognized line\nother = value\n", encoding="utf-8")
 
@@ -124,9 +141,366 @@ def test_python_runtime_mounts_bind_only_a_user_local_runtime_referenced_by_uv(
     )
 
 
+@pytest.mark.parametrize("matching", [True, False])
+def test_python_runtime_mounts_validate_standard_environment_metadata(
+    tmp_path, monkeypatch, matching
+):
+    """Standard environment metadata requires the selected base executable identity."""
+    home, workspace, venv_bin, runtime_root, runtime_alias = _python_environment(
+        tmp_path, monkeypatch
+    )
+    monkeypatch.setattr(linux_paths.pwd, "getpwuid", lambda _uid: SimpleNamespace(pw_dir=str(home)))
+    interpreter = runtime_root / "bin/python3.14"
+    reference = interpreter if matching else runtime_root / "bin/other"
+    if not matching:
+        reference.write_text("other", encoding="utf-8")
+    (venv_bin.parent / "pyvenv.cfg").write_text(
+        f"home = {runtime_alias / 'bin'}\nversion = 3.14.1\nexecutable = {reference}\n",
+        encoding="utf-8",
+    )
+
+    result = python_runtime_mounts(workspace, ((venv_bin, venv_bin),), _python_identity(venv_bin))
+
+    assert result == (((runtime_root, runtime_alias),) if matching else ())
+
+
+@pytest.mark.parametrize(
+    "case", ["relative", "protected", "nul", "duplicate-version", "duplicate-executable"]
+)
+def test_standard_environment_metadata_rejects_unsafe_references(tmp_path, monkeypatch, case):
+    """Unsafe or ambiguous standard-environment evidence creates no runtime scope."""
+    home, workspace, venv_bin, runtime_root, runtime_alias = _python_environment(
+        tmp_path, monkeypatch
+    )
+    monkeypatch.setattr(linux_paths.pwd, "getpwuid", lambda _uid: SimpleNamespace(pw_dir=str(home)))
+    interpreter = runtime_root / "bin/python3.14"
+    reference = str(interpreter)
+    if case == "relative":
+        reference = "relative"
+    elif case == "protected":
+        private = home / ".ssh"
+        private.mkdir()
+        link = private / "fixture"
+        link.symlink_to(interpreter)
+        reference = str(link)
+    elif case == "nul":
+        reference = "bad\x00path"
+    config = f"home = {runtime_alias / 'bin'}\nversion = 3.14.1\nexecutable = {reference}\n"
+    if case == "duplicate-version":
+        config += "version = 3.14.1\n"
+    elif case == "duplicate-executable":
+        config += f"executable = {reference}\n"
+    (venv_bin.parent / "pyvenv.cfg").write_text(config, encoding="utf-8")
+
+    assert not python_runtime_mounts(workspace, ((venv_bin, venv_bin),), _python_identity(venv_bin))
+
+
+def test_managed_environment_ignores_duplicate_unused_standard_fields(tmp_path, monkeypatch):
+    """Unused standard fields do not invalidate already-supported managed metadata."""
+    home, workspace, venv_bin, runtime_root, runtime_alias = _python_environment(
+        tmp_path, monkeypatch
+    )
+    monkeypatch.setattr(linux_paths.pwd, "getpwuid", lambda _uid: SimpleNamespace(pw_dir=str(home)))
+    config = venv_bin.parent / "pyvenv.cfg"
+    config.write_text(config.read_text(encoding="utf-8") + "version = one\nversion = two\n")
+
+    assert python_runtime_mounts(
+        workspace, ((venv_bin, venv_bin),), _python_identity(venv_bin)
+    ) == ((runtime_root, runtime_alias),)
+
+
+@pytest.mark.parametrize("name", ["python", "python3", "project-interpreter"])
+def test_python_runtime_mounts_accept_selected_interpreter_aliases(tmp_path, monkeypatch, name):
+    """Interpreter identity, rather than the tool name, determines the candidate runtime."""
+    home, workspace, venv_bin, runtime_root, runtime_alias = _python_environment(
+        tmp_path, monkeypatch
+    )
+    monkeypatch.setattr(linux_paths.pwd, "getpwuid", lambda _uid: SimpleNamespace(pw_dir=str(home)))
+    spelling = venv_bin / name
+    if name != "python":
+        spelling.symlink_to(venv_bin / "python")
+    target = spelling.resolve(strict=True)
+    details = target.stat()
+    identity = ((name, spelling, target, details.st_dev, details.st_ino),)
+
+    assert python_runtime_mounts(workspace, ((venv_bin, venv_bin),), identity) == (
+        (runtime_root, runtime_alias),
+    )
+
+
+def test_python_runtime_mounts_accept_selected_interpreter_without_conventional_alias(
+    tmp_path, monkeypatch
+):
+    """A selected interpreter is bound even when its environment has no standard alias."""
+    home, workspace, venv_bin, runtime_root, runtime_alias = _python_environment(
+        tmp_path, monkeypatch
+    )
+    monkeypatch.setattr(linux_paths.pwd, "getpwuid", lambda _uid: SimpleNamespace(pw_dir=str(home)))
+    original = venv_bin / "python"
+    interpreter = original.resolve(strict=True)
+    original.unlink()
+    selected = venv_bin / "project-interpreter"
+    selected.symlink_to(interpreter)
+    details = interpreter.stat()
+    identity = ((selected.name, selected, interpreter, details.st_dev, details.st_ino),)
+
+    assert python_runtime_mounts(workspace, ((venv_bin, venv_bin),), identity) == (
+        (runtime_root, runtime_alias),
+    )
+
+
+@pytest.mark.parametrize("versioned_present", [True, False])
+def test_python_runtime_mounts_refuse_other_binary_without_conventional_alias(
+    tmp_path, monkeypatch, versioned_present
+):
+    """Missing or different CPython anchors cannot turn another executable into a grant."""
+    home, workspace, venv_bin, runtime_root, _ = _python_environment(tmp_path, monkeypatch)
+    monkeypatch.setattr(linux_paths.pwd, "getpwuid", lambda _uid: SimpleNamespace(pw_dir=str(home)))
+    (venv_bin / "python").unlink()
+    versioned = runtime_root / "bin/python3.14"
+    if not versioned_present:
+        versioned.unlink()
+    other = runtime_root / "bin/other"
+    other.write_text("not an interpreter", encoding="utf-8")
+    other.chmod(0o755)
+    selected = venv_bin / "project-tool"
+    selected.symlink_to(other)
+    details = other.stat()
+    identity = ((selected.name, selected, other, details.st_dev, details.st_ino),)
+
+    assert python_runtime_mounts(workspace, ((venv_bin, venv_bin),), identity) == ()
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        "missing",
+        "symlink",
+        "hardlink",
+        "mode",
+        "invalid",
+        "duplicate",
+        "invalid-home",
+        "protected-home",
+        "mismatch",
+    ],
+)
+def test_unidentified_workspace_executable_does_not_depend_on_runtime_metadata(
+    tmp_path, monkeypatch, metadata
+):
+    """Unrelated tools cannot gain authority or fail because of optional environment metadata."""
+    _home, workspace, bin_dir, _runtime_root, _runtime_alias = _python_environment(
+        tmp_path, monkeypatch
+    )
+    (bin_dir / "python").unlink()
+    executable = bin_dir / "fixture-processor"
+    executable.write_text("unrelated executable", encoding="utf-8")
+    executable.chmod(0o755)
+    details = executable.stat()
+    identity = ((executable.name, executable, executable, details.st_dev, details.st_ino),)
+    config = bin_dir.parent / "pyvenv.cfg"
+    if metadata == "missing":
+        config.unlink()
+    elif metadata == "symlink":
+        config.unlink()
+        config.symlink_to(workspace / "unrelated")
+    elif metadata == "hardlink":
+        os.link(config, workspace / "unrelated")
+    elif metadata == "mode":
+        config.chmod(0o666)
+    elif metadata == "invalid":
+        config.write_bytes(b"\xff")
+    elif metadata == "duplicate":
+        config.write_text(config.read_text(encoding="utf-8") + "home = /other/bin\n")
+    elif metadata in {"invalid-home", "protected-home"}:
+        value = "relative/bin" if metadata == "invalid-home" else str(workspace / ".ssh/bin")
+        config.write_text(f"home = {value}\nimplementation = CPython\nversion_info = 3.14\n")
+    lookup = Mock(side_effect=KeyError("unavailable account"))
+    monkeypatch.setattr(linux_paths.pwd, "getpwuid", lookup)
+
+    assert python_runtime_mounts(workspace, ((bin_dir, bin_dir),), identity) == ()
+    lookup.assert_not_called()
+
+
+def test_identified_interpreter_without_standard_alias_still_rejects_unsafe_runtime(
+    tmp_path, monkeypatch
+):
+    """Matching versioned interpreter identity never bypasses runtime-root validation."""
+    home, workspace, bin_dir, runtime_root, _ = _python_environment(tmp_path, monkeypatch)
+    monkeypatch.setattr(linux_paths.pwd, "getpwuid", lambda _uid: SimpleNamespace(pw_dir=str(home)))
+    interpreter = (bin_dir / "python").resolve(strict=True)
+    (bin_dir / "python").unlink()
+    selected = bin_dir / "fixture-interpreter"
+    selected.symlink_to(interpreter)
+    details = interpreter.stat()
+    identity = ((selected.name, selected, interpreter, details.st_dev, details.st_ino),)
+    runtime_root.chmod(0o777)
+
+    with pytest.raises(ValueError, match="runtime directory is unsafe"):
+        python_runtime_mounts(workspace, ((bin_dir, bin_dir),), identity)
+
+
+def test_unidentified_runtime_metadata_timeout_is_not_suppressed(tmp_path, monkeypatch):
+    """Timeouts stop preparation even before an optional interpreter can be identified."""
+    _home, workspace, bin_dir, _runtime_root, _ = _python_environment(tmp_path, monkeypatch)
+    (bin_dir / "python").unlink()
+    executable = bin_dir / "fixture-processor"
+    executable.write_text("unrelated executable", encoding="utf-8")
+    details = executable.stat()
+    identity = ((executable.name, executable, executable, details.st_dev, details.st_ino),)
+    monkeypatch.setattr(linux_paths.os, "open", Mock(side_effect=TimeoutError("metadata timeout")))
+
+    with pytest.raises(TimeoutError, match="metadata timeout"):
+        python_runtime_mounts(workspace, ((bin_dir, bin_dir),), identity)
+
+
+def test_python_runtime_mounts_check_all_selected_interpreters_without_conventional_alias(
+    tmp_path, monkeypatch
+):
+    """An unrelated earlier executable cannot hide the selected interpreter."""
+    home, workspace, venv_bin, runtime_root, runtime_alias = _python_environment(
+        tmp_path, monkeypatch
+    )
+    monkeypatch.setattr(linux_paths.pwd, "getpwuid", lambda _uid: SimpleNamespace(pw_dir=str(home)))
+    interpreter = (venv_bin / "python").resolve(strict=True)
+    (venv_bin / "python").unlink()
+    other = runtime_root / "bin/other"
+    other.write_text("not an interpreter", encoding="utf-8")
+    other.chmod(0o755)
+    selected = venv_bin / "selected-interpreter"
+    unrelated = venv_bin / "selected-other"
+    selected.symlink_to(interpreter)
+    unrelated.symlink_to(other)
+    identities = []
+    for spelling in (unrelated, selected):
+        resolved = spelling.resolve(strict=True)
+        details = resolved.stat()
+        identities.append((spelling.name, spelling, resolved, details.st_dev, details.st_ino))
+
+    assert python_runtime_mounts(workspace, ((venv_bin, venv_bin),), tuple(identities)) == (
+        (runtime_root, runtime_alias),
+    )
+
+
+def test_python_runtime_mounts_refuse_unreadable_conventional_anchor(tmp_path, monkeypatch):
+    """An inaccessible conventional interpreter is not treated as an absent anchor."""
+    home, workspace, venv_bin, _, _ = _python_environment(tmp_path, monkeypatch)
+    monkeypatch.setattr(linux_paths.pwd, "getpwuid", lambda _uid: SimpleNamespace(pw_dir=str(home)))
+    identity = _python_identity(venv_bin)
+    original = Path.resolve
+
+    def resolve(path, *args, **kwargs):
+        """Model an anchor that cannot be inspected without changing other path resolution."""
+        if path == venv_bin / "python":
+            raise PermissionError("anchor inaccessible")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+    assert python_runtime_mounts(workspace, ((venv_bin, venv_bin),), identity) == ()
+
+
+def test_python_runtime_mounts_preserve_each_selected_environment(tmp_path, monkeypatch):
+    """Independent interpreter identities bind only their own user-local runtimes."""
+    home, workspace, first_bin, first_root, first_alias = _python_environment(tmp_path, monkeypatch)
+    monkeypatch.setattr(linux_paths.pwd, "getpwuid", lambda _uid: SimpleNamespace(pw_dir=str(home)))
+    second_bin = workspace / "second/bin"
+    second_bin.mkdir(parents=True)
+    second_root = home / "runtime-store/cpython-3.13"
+    (second_root / "bin").mkdir(parents=True)
+    (second_root / "lib/python3.13").mkdir(parents=True)
+    interpreter = second_root / "bin/python3.13"
+    interpreter.write_text("interpreter", encoding="utf-8")
+    interpreter.chmod(0o755)
+    (second_bin / "python").symlink_to(interpreter)
+    (second_bin / "python-second").symlink_to(interpreter)
+    (second_bin.parent / "pyvenv.cfg").write_text(
+        f"home = {second_root / 'bin'}\nimplementation = CPython\nversion_info = 3.13\n",
+        encoding="utf-8",
+    )
+    roots = ((first_bin, first_bin), (second_bin, second_bin))
+    details = interpreter.stat()
+    identities = (
+        *_python_identity(first_bin),
+        (
+            "python-second",
+            second_bin / "python-second",
+            interpreter,
+            details.st_dev,
+            details.st_ino,
+        ),
+    )
+
+    assert python_runtime_mounts(workspace, roots, identities) == (
+        (first_root, first_alias),
+        (second_root, second_root),
+    )
+    assert python_runtime_mounts(workspace, roots, identities, system_roots=(first_root,)) == (
+        (second_root, second_root),
+    )
+    assert python_runtime_mounts(workspace, roots, _python_identity(first_bin)) == (
+        (first_root, first_alias),
+    )
+
+
+@pytest.mark.parametrize("change", ["unrelated", "outside", "stale", "spoofed", "missing"])
+def test_python_runtime_mounts_do_not_infer_from_unrelated_or_stale_tools(
+    tmp_path, monkeypatch, change
+):
+    """An unselected, changed or unrelated executable cannot imply runtime read authority."""
+    home, workspace, venv_bin, _, _ = _python_environment(tmp_path, monkeypatch)
+    monkeypatch.setattr(linux_paths.pwd, "getpwuid", lambda _uid: SimpleNamespace(pw_dir=str(home)))
+    name, spelling, target, device, inode = _python_identity(venv_bin)[0]
+    if change == "unrelated":
+        other = venv_bin / "other"
+        other.write_text("other", encoding="utf-8")
+        details = other.stat()
+        spelling, target, device, inode = other, other, details.st_dev, details.st_ino
+    elif change == "outside":
+        spelling = tmp_path / "python"
+    elif change == "stale":
+        inode += 1
+    elif change == "spoofed":
+        spelling = venv_bin / "other"
+        spelling.write_text("not the selected interpreter", encoding="utf-8")
+    else:
+        spelling.unlink()
+
+    assert (
+        python_runtime_mounts(
+            workspace, ((venv_bin, venv_bin),), ((name, spelling, target, device, inode),)
+        )
+        == ()
+    )
+
+
+def test_python_runtime_mounts_reject_interpreter_disappearing_during_binding(
+    tmp_path, monkeypatch
+):
+    """An interpreter that disappears between lookup and verification grants no runtime."""
+    home, workspace, venv_bin, _, _ = _python_environment(tmp_path, monkeypatch)
+    monkeypatch.setattr(linux_paths.pwd, "getpwuid", lambda _uid: SimpleNamespace(pw_dir=str(home)))
+    identity = _python_identity(venv_bin)
+    original = Path.resolve
+    calls = 0
+
+    def resolve(path, *args, **kwargs):
+        """Refuse the selected spelling after its initial successful lookup."""
+        nonlocal calls
+        if path == venv_bin / "python":
+            calls += 1
+            if calls == 2:
+                raise OSError("interpreter disappeared")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+    assert python_runtime_mounts(workspace, ((venv_bin, venv_bin),), identity) == ()
+
+
 def test_python_runtime_mounts_accept_a_canonical_python_home(tmp_path, monkeypatch):
     """A venv already pointing at the runtime's canonical path needs no alias."""
-    home, workspace, venv_bin, runtime_root, _runtime_alias = _python_environment(tmp_path)
+    home, workspace, venv_bin, runtime_root, _runtime_alias = _python_environment(
+        tmp_path, monkeypatch
+    )
     monkeypatch.setattr(
         "loop.execution.sandbox.linux.paths.pwd.getpwuid",
         lambda _uid: SimpleNamespace(pw_dir=str(home)),
@@ -137,11 +511,8 @@ def test_python_runtime_mounts_accept_a_canonical_python_home(tmp_path, monkeypa
         f"home = {runtime_root / 'bin'}\nimplementation = CPython\nversion_info = 3.14\n",
         encoding="utf-8",
     )
-    tools = tmp_path / "tools"
-    tools.mkdir()
-
     assert python_runtime_mounts(
-        workspace, ((venv_bin, venv_bin),), _uv_identity(tools / "uv")
+        workspace, ((venv_bin, venv_bin),), _python_identity(venv_bin)
     ) == ((runtime_root, runtime_root),)
 
 
@@ -157,30 +528,27 @@ def test_python_runtime_mounts_skip_non_cpython_or_incomplete_venv_metadata(
     tmp_path, monkeypatch, metadata
 ):
     """Do not infer runtime authority from unsupported or incomplete venv metadata."""
-    home, workspace, venv_bin, _, _ = _python_environment(tmp_path)
+    home, workspace, venv_bin, _, _ = _python_environment(tmp_path, monkeypatch)
     monkeypatch.setattr(
         "loop.execution.sandbox.linux.paths.pwd.getpwuid",
         lambda _uid: SimpleNamespace(pw_dir=str(home)),
     )
     (venv_bin.parent / "pyvenv.cfg").write_text(metadata, encoding="utf-8")
-    tools = tmp_path / "tools"
-    tools.mkdir()
-
     assert (
-        python_runtime_mounts(workspace, ((venv_bin, venv_bin),), _uv_identity(tools / "uv")) == ()
+        python_runtime_mounts(workspace, ((venv_bin, venv_bin),), _python_identity(venv_bin)) == ()
     )
 
 
 def test_python_runtime_mounts_skip_missing_and_unrelated_path_environments(tmp_path, monkeypatch):
     """Search only workspace PATH venvs and ignore absent or unrelated configurations."""
-    home, workspace, venv_bin, _, _ = _python_environment(tmp_path)
+    home, workspace, venv_bin, _, _ = _python_environment(tmp_path, monkeypatch)
     monkeypatch.setattr(
         "loop.execution.sandbox.linux.paths.pwd.getpwuid",
         lambda _uid: SimpleNamespace(pw_dir=str(home)),
     )
     tools = tmp_path / "tools"
     tools.mkdir()
-    identity = _uv_identity(tools / "uv")
+    identity = _python_identity(venv_bin)
     config = venv_bin.parent / "pyvenv.cfg"
     config.unlink()
 
@@ -214,7 +582,9 @@ def test_python_runtime_mounts_validate_the_selected_interpreter_and_tree(
     tmp_path, monkeypatch, failure, raises
 ):
     """Only a safe CPython tree referenced by the workspace venv becomes read authority."""
-    home, workspace, venv_bin, runtime_root, runtime_alias = _python_environment(tmp_path)
+    home, workspace, venv_bin, runtime_root, runtime_alias = _python_environment(
+        tmp_path, monkeypatch
+    )
     configured_home = runtime_alias / "bin"
     interpreter = runtime_root / "bin/python3.14"
     config = venv_bin.parent / "pyvenv.cfg"
@@ -297,9 +667,7 @@ def test_python_runtime_mounts_validate_the_selected_interpreter_and_tree(
         "loop.execution.sandbox.linux.paths.pwd.getpwuid",
         lambda _uid: SimpleNamespace(pw_dir=str(home)),
     )
-    tools = tmp_path / "tools"
-    tools.mkdir()
-    identity = _uv_identity(tools / "uv")
+    identity = _python_identity(venv_bin)
 
     if raises:
         with pytest.raises(ValueError):
@@ -311,7 +679,8 @@ def test_python_runtime_mounts_validate_the_selected_interpreter_and_tree(
 @pytest.mark.parametrize("failure", ["lookup", "file", "world-write", "group-write"])
 def test_python_runtime_mounts_reject_an_untrusted_account_home(tmp_path, monkeypatch, failure):
     """Refuse runtime discovery when the account home cannot be safely bound."""
-    home, workspace, venv_bin, _, _ = _python_environment(tmp_path)
+    home, workspace, venv_bin, _, _ = _python_environment(tmp_path, monkeypatch)
+    (venv_bin.parent / "pyvenv.cfg").chmod(0o600)
     if failure == "lookup":
         monkeypatch.setattr(
             "loop.execution.sandbox.linux.paths.pwd.getpwuid",
@@ -332,14 +701,11 @@ def test_python_runtime_mounts_reject_an_untrusted_account_home(tmp_path, monkey
         )
         if failure == "group-write":
             monkeypatch.setattr("loop.execution.sandbox.linux.paths.os.getgid", lambda: -1)
-    tools = tmp_path / "tools"
-    tools.mkdir()
-
     with pytest.raises(ValueError, match="home is unavailable|home is unsafe"):
         python_runtime_mounts(
             workspace,
             ((venv_bin, venv_bin),),
-            _uv_identity(tools / "uv"),
+            _python_identity(venv_bin),
         )
 
 
@@ -348,12 +714,10 @@ def test_python_runtime_mounts_reject_changed_or_invalid_venv_metadata(
     tmp_path, monkeypatch, failure
 ):
     """Bind bounded venv metadata without accepting a replacement or malformed encoding."""
-    home, workspace, venv_bin, _, _ = _python_environment(tmp_path)
+    home, workspace, venv_bin, _, _ = _python_environment(tmp_path, monkeypatch)
     monkeypatch.setattr(linux_paths.pwd, "getpwuid", lambda _uid: SimpleNamespace(pw_dir=str(home)))
     config = venv_bin.parent / "pyvenv.cfg"
     selected = config.stat()
-    tools = tmp_path / "tools"
-    tools.mkdir()
     if failure == "link":
         copy = tmp_path / "pyvenv-copy"
         os.link(config, copy)
@@ -399,7 +763,7 @@ def test_python_runtime_mounts_reject_changed_or_invalid_venv_metadata(
         python_runtime_mounts(
             workspace,
             ((venv_bin, venv_bin),),
-            _uv_identity(tools / "uv"),
+            _python_identity(venv_bin),
         )
 
 
@@ -408,7 +772,9 @@ def test_python_runtime_mounts_reject_unsafe_automatic_read_authority(
     tmp_path, monkeypatch, unsafe
 ):
     """Reject private or ambiguous venv metadata before granting a runtime directory read."""
-    home, workspace, venv_bin, _runtime_root, runtime_alias = _python_environment(tmp_path)
+    home, workspace, venv_bin, _runtime_root, runtime_alias = _python_environment(
+        tmp_path, monkeypatch
+    )
     monkeypatch.setattr(
         "loop.execution.sandbox.linux.paths.pwd.getpwuid",
         lambda _uid: SimpleNamespace(pw_dir=str(home)),
@@ -435,15 +801,11 @@ def test_python_runtime_mounts_reject_unsafe_automatic_read_authority(
         config.chmod(0o666)
     else:
         config.write_text(config.read_text() + "home = /duplicate\n", encoding="utf-8")
-    uv = tmp_path / "uv"
-    uv.write_text("uv", encoding="utf-8")
-    details = uv.stat()
-
     with pytest.raises(ValueError, match="unsafe|ambiguous|outside the safe"):
         python_runtime_mounts(
             workspace,
             ((venv_bin, venv_bin),),
-            (("uv", uv, uv, details.st_dev, details.st_ino),),
+            _python_identity(venv_bin),
         )
 
 
@@ -537,6 +899,11 @@ def test_prepare_paths_skips_ordinary_symlinks_and_preserves_bound_read_aliases(
     alias.symlink_to(outside, target_is_directory=True)
     with pytest.raises(ValueError, match="approved path authority changed"):
         prepare_paths(request, scratch)
+    with (
+        pytest.raises(ValueError, match="alias target is outside the mounted view"),
+        mount_arguments(request, scratch),
+    ):
+        pytest.fail("A retargeted alias must not reach mount construction.")
 
 
 @pytest.mark.parametrize("git_create", [False, True])
@@ -984,9 +1351,9 @@ def test_mount_arguments_preserves_grant_roles_protection_and_private_masks(bind
         protected_index = arguments.index(str(instruction))
         assert protected_index > nested_index
         assert arguments[protected_index - 2] == "--ro-bind-fd"
-        assert arguments[-5:-3] == ("--dir", str(NATIVE_SCRATCH_PATH))
+        assert arguments[-5:-3] == ("--dir", str(_TEST_NATIVE_SCRATCH))
         assert arguments[-3] == "--bind-fd"
-        assert arguments[-1] == str(NATIVE_SCRATCH_PATH)
+        assert arguments[-1] == str(_TEST_NATIVE_SCRATCH)
         assert int(arguments[-2]) in inherited
         assert str(private / "AGENTS.md") not in arguments
         assert set(inherited) < set(opened)
@@ -997,6 +1364,228 @@ def test_mount_arguments_preserves_grant_roles_protection_and_private_masks(bind
             os.fstat(descriptor)
         assert error.value.errno == errno.EBADF
     assert (private / "AGENTS.md").read_text() == "private instructions"
+
+
+def test_mount_arguments_binds_only_a_private_session_temporary_subdirectory(binding, monkeypatch):
+    """The conventional temporary path receives a pinned session-owned subtree."""
+    create, _, scratch, _ = binding
+    destination = Path("/unit-conventional-temp")
+    monkeypatch.setattr(linux_paths, "NATIVE_CONVENTIONAL_TMP_PATH", destination, raising=False)
+    request = create(scratch_root=scratch, scratch_data=True)
+
+    with mount_arguments(request, scratch) as (arguments, inherited):
+        index = len(arguments) - 1 - arguments[::-1].index(str(destination))
+        assert arguments[index - 2] == "--bind-fd"
+        descriptor = int(arguments[index - 1])
+        assert descriptor in inherited
+        backing = scratch / linux_paths.SESSION_CONVENTIONAL_TMP_NAME
+        assert backing.stat().st_ino == os.fstat(descriptor).st_ino
+        assert backing.stat().st_mode & 0o777 == 0o700
+
+
+def test_conventional_temporary_mount_rejects_existing_hardlinks(binding, monkeypatch, tmp_path):
+    """The conventional alias cannot bypass the session's shared-inode restriction."""
+    create, _, scratch, _ = binding
+    destination = Path("/unit-conventional-temp")
+    monkeypatch.setattr(linux_paths, "NATIVE_CONVENTIONAL_TMP_PATH", destination)
+    subtree = scratch / linux_paths.SESSION_CONVENTIONAL_TMP_NAME
+    subtree.mkdir(mode=0o700)
+    outside = tmp_path / "outside"
+    outside.write_text("outside-data")
+    os.link(outside, subtree / "link")
+    request = create(scratch_root=scratch, scratch_data=True)
+
+    with (
+        pytest.raises(ValueError, match="Session scratch contains a shared inode"),
+        mount_arguments(request, scratch),
+    ):
+        pytest.fail("A shared inode became accessible through the conventional alias")
+
+
+def test_conventional_temporary_refuses_substituted_scratch_before_creation(binding, monkeypatch):
+    """A scratch descriptor that no longer matches the grant is never mutated."""
+    create, _, scratch, _ = binding
+    monkeypatch.setattr(
+        linux_paths, "NATIVE_CONVENTIONAL_TMP_PATH", Path("/unit-conventional-temp")
+    )
+    monkeypatch.setattr(SandboxRequest, "directory_matches_descriptor", lambda *_: False)
+    request = create(scratch_root=scratch, scratch_data=True)
+    with (
+        pytest.raises(ValueError, match="changed before temporary preparation"),
+        mount_arguments(request, scratch),
+    ):
+        pytest.fail("An unbound scratch descriptor was used")
+    assert not (scratch / linux_paths.SESSION_CONVENTIONAL_TMP_NAME).exists()
+
+
+@pytest.mark.parametrize("error", [False, True])
+def test_conventional_temporary_checks_acl_read_outcomes(binding, monkeypatch, error):
+    """An empty ACL is accepted while unexpected inspection errors fail closed."""
+    create, _, scratch, _ = binding
+    monkeypatch.setattr(
+        linux_paths, "NATIVE_CONVENTIONAL_TMP_PATH", Path("/unit-conventional-temp")
+    )
+    request = create(scratch_root=scratch, scratch_data=True)
+    original = os.getxattr
+
+    def getxattr(path, name, *args, **kwargs):
+        """Return the selected outcome only for the temporary subtree."""
+        subtree = scratch / linux_paths.SESSION_CONVENTIONAL_TMP_NAME
+        if (
+            isinstance(path, int)
+            and subtree.exists()
+            and os.fstat(path).st_ino == subtree.stat().st_ino
+        ):
+            if error:
+                raise OSError(errno.EIO, "ACL inspection failed")
+            return b""
+        return original(path, name, *args, **kwargs)
+
+    monkeypatch.setattr(os, "getxattr", getxattr)
+    expected = pytest.raises(OSError, match="ACL inspection failed") if error else nullcontext()
+    with expected, mount_arguments(request, scratch):
+        assert not error
+
+
+def test_conventional_temporary_rechecks_source_after_scanning(binding, monkeypatch):
+    """A changed temporary subtree is refused before any namespace arguments are yielded."""
+    from contextlib import contextmanager
+
+    create, _, scratch, _ = binding
+    monkeypatch.setattr(
+        linux_paths, "NATIVE_CONVENTIONAL_TMP_PATH", Path("/unit-conventional-temp")
+    )
+    original = linux_paths.bind_paths
+
+    @contextmanager
+    def changed(*args, **kwargs):
+        """Substitute the selected inode after the real binding scan."""
+        with original(*args, **kwargs) as result:
+            subtree = scratch / linux_paths.SESSION_CONVENTIONAL_TMP_NAME
+            subtree.rename(scratch / "replaced")
+            subtree.mkdir(mode=0o700)
+            yield result
+
+    monkeypatch.setattr(linux_paths, "bind_paths", changed)
+    with (
+        pytest.raises(ValueError, match="temporary subtree changed during binding"),
+        mount_arguments(create(scratch_root=scratch, scratch_data=True), scratch),
+    ):
+        pytest.fail("A changed temporary subtree was mounted")
+
+
+def test_conventional_temporary_rechecks_source_after_acl_inspection(binding, monkeypatch):
+    """Metadata changed during ACL inspection cannot become a private mount source."""
+    create, _, scratch, _ = binding
+    monkeypatch.setattr(
+        linux_paths, "NATIVE_CONVENTIONAL_TMP_PATH", Path("/unit-conventional-temp")
+    )
+    subtree = scratch / linux_paths.SESSION_CONVENTIONAL_TMP_NAME
+
+    def change_acl_target(_path, _name):
+        """Change the inode authority while ACLs are being read."""
+        subtree.chmod(0o750)
+        return b""
+
+    monkeypatch.setattr(os, "getxattr", change_acl_target)
+    with (
+        pytest.raises(ValueError, match="temporary subtree changed during inspection"),
+        mount_arguments(create(scratch_root=scratch, scratch_data=True), scratch),
+    ):
+        pytest.fail("A changed temporary subtree was accepted")
+
+
+def test_mount_arguments_rejects_stale_authority_before_temporary_creation(binding, monkeypatch):
+    """Refuse stale grants before creating any temporary subtree."""
+    create, _, scratch, _ = binding
+    monkeypatch.setattr(SandboxRequest, "paths_are_current", lambda self: False)
+    request = create(scratch_root=scratch, scratch_data=True)
+    with (
+        pytest.raises(ValueError, match="approved path authority changed"),
+        mount_arguments(request, scratch),
+    ):
+        pytest.fail("Stale authority produced mount arguments")
+    assert not (scratch / linux_paths.SESSION_CONVENTIONAL_TMP_NAME).exists()
+
+
+@pytest.mark.parametrize("restricted", [False, True])
+def test_conventional_temporary_mount_is_omitted_when_authority_overlaps(
+    binding, monkeypatch, restricted
+):
+    """Restricted scratch or an existing grant at the destination keeps the mount unavailable."""
+    create, workspace, scratch, _ = binding
+    destination = Path("/unit-conventional-temp") if restricted else workspace
+    monkeypatch.setattr(linux_paths, "NATIVE_CONVENTIONAL_TMP_PATH", destination)
+    request = create(scratch_root=scratch, scratch_data=not restricted)
+
+    assert not linux_paths.conventional_tmp_available(request, scratch)
+    with mount_arguments(request, scratch):
+        assert not (scratch / linux_paths.SESSION_CONVENTIONAL_TMP_NAME).exists()
+
+
+@pytest.mark.parametrize("overlap", ["runtime", "interpreter-alias"])
+def test_conventional_temporary_respects_discovered_runtime_paths(binding, monkeypatch, overlap):
+    """A discovered runtime or interpreter alias keeps its existing namespace view."""
+    create, _, scratch, _ = binding
+    destination = Path("/unit-conventional-temp")
+    monkeypatch.setattr(linux_paths, "NATIVE_CONVENTIONAL_TMP_PATH", destination)
+    runtime = destination / "selected-runtime"
+    roots = (runtime,) if overlap == "runtime" else ()
+    monkeypatch.setattr(
+        linux_paths,
+        "python_runtime_mounts",
+        lambda *_args, **_kwargs: (
+            ((Path("/selected-runtime"), runtime),) if overlap == "interpreter-alias" else ()
+        ),
+    )
+    request = create(scratch_root=scratch, scratch_data=True)
+    assert not linux_paths.conventional_tmp_available(request, scratch, runtime_roots=roots)
+    with mount_arguments(request, scratch, runtime_roots=roots):
+        assert not (scratch / linux_paths.SESSION_CONVENTIONAL_TMP_NAME).exists()
+
+
+@pytest.mark.parametrize("kind", ["symlink", "file", "shared", "access-acl", "default-acl"])
+def test_conventional_temporary_subtree_refuses_unsafe_existing_authority(
+    binding, monkeypatch, tmp_path, kind
+):
+    """A substituted, nonprivate or ACL-bearing subtree cannot become a mount source."""
+    create, _, scratch, _ = binding
+    monkeypatch.setattr(
+        linux_paths, "NATIVE_CONVENTIONAL_TMP_PATH", Path("/unit-conventional-temp")
+    )
+    subtree = scratch / linux_paths.SESSION_CONVENTIONAL_TMP_NAME
+    if kind == "symlink":
+        subtree.symlink_to(tmp_path, target_is_directory=True)
+    elif kind == "file":
+        subtree.write_text("preserve", encoding="utf-8")
+    else:
+        subtree.mkdir(mode=0o700)
+        if kind == "shared":
+            subtree.chmod(0o755)
+        if kind.endswith("-acl"):
+            acl_name = "system.posix_acl_" + ("access" if kind == "access-acl" else "default")
+            original = os.getxattr
+
+            def getxattr(path, name, *args, **kwargs):
+                """Expose only the selected synthetic ACL on the owned subtree."""
+                if (
+                    isinstance(path, int)
+                    and os.fstat(path).st_ino == subtree.stat().st_ino
+                    and name == acl_name
+                ):
+                    return b"extended-acl"
+                return original(path, name, *args, **kwargs)
+
+            monkeypatch.setattr(os, "getxattr", getxattr)
+    request = create(scratch_root=scratch, scratch_data=True)
+    if kind in {"symlink", "file"}:
+        with pytest.raises(OSError) as error, mount_arguments(request, scratch):
+            pytest.fail("An unsafe temporary subtree was mounted")
+        assert error.value.errno in (errno.ELOOP, errno.ENOTDIR)
+    else:
+        expected = "extended access list" if kind.endswith("-acl") else "private real directory"
+        with pytest.raises(ValueError, match=expected), mount_arguments(request, scratch):
+            pytest.fail("An unsafe temporary subtree was mounted")
 
 
 def test_mount_arguments_binds_hardlinks_read_only_after_writable_roots(binding, tmp_path):
@@ -1258,11 +1847,11 @@ def test_mount_arguments_keeps_selected_workspace_read_only_in_scratch_mirror(bi
     (selected / "ordinary").write_text("selected")
     request = create(cwd=selected, workspace=selected, write_roots=())
     with mount_arguments(request, scratch) as (arguments, inherited):
-        for path in (selected, NATIVE_SCRATCH_PATH / "selected"):
+        for path in (selected, _TEST_NATIVE_SCRATCH / "selected"):
             index = arguments.index(str(path))
             assert arguments[index - 2] == "--ro-bind-fd"
             assert int(arguments[index - 1]) in inherited
-        index = arguments.index(str(NATIVE_SCRATCH_PATH))
+        index = arguments.index(str(_TEST_NATIVE_SCRATCH))
         assert arguments[index + 1] == "--bind-fd"
 
 
@@ -1281,24 +1870,12 @@ def test_mount_arguments_mirrors_scratch_hardlinks_and_private_masks(binding, tm
         mount_arguments(create(), scratch, empty_mask=empty.fileno()) as (arguments, inherited),
     ):
         for name in ("linked", ".aws"):
-            path = NATIVE_SCRATCH_PATH / name
+            path = _TEST_NATIVE_SCRATCH / name
             index = arguments.index(str(path))
             assert arguments[index - 2] == "--ro-bind-fd"
             assert int(arguments[index - 1]) in inherited
-        index = arguments.index(str(NATIVE_SCRATCH_PATH / ".ssh"))
+        index = arguments.index(str(_TEST_NATIVE_SCRATCH / ".ssh"))
         assert arguments[index - 1] == "--tmpfs"
-
-
-def test_mount_arguments_maps_virtual_alias_targets_inside_scratch(binding, tmp_path):
-    """A namespace alias to private scratch cannot expose the original host spelling."""
-    create, _, scratch, _ = binding
-    parent = tmp_path / "mappings"
-    parent.mkdir(mode=0o700)
-    alias = parent / "r0"
-    alias.symlink_to(scratch)
-    request = create(aliases=(("$TMPDIR", alias, scratch),))
-    with mount_arguments(request, scratch) as (arguments, _):
-        assert arguments[-3:] == ("--symlink", str(NATIVE_SCRATCH_PATH), "/.loop-private-paths/r0")
 
 
 @pytest.mark.parametrize("skip", [False, True])
@@ -1442,41 +2019,6 @@ def test_mount_arguments_rejects_an_external_executable_changed_after_open(bindi
         pytest.fail("A multiply linked executable passed identity validation")
 
 
-@pytest.mark.parametrize("mounted", [False, True])
-def test_mount_arguments_validates_alias_targets_and_preserves_original_links(
-    binding, tmp_path, mounted
-):
-    """Pin external alias parents read-only and preserve original link inodes."""
-    create, workspace, scratch, _ = binding
-    external = tmp_path / "external"
-    external.mkdir()
-    parent = tmp_path / "aliases"
-    parent.mkdir(mode=0o700)
-    alias = parent / "workspace"
-    alias.symlink_to(external, target_is_directory=True)
-    interior = workspace / "approved-read"
-    interior.symlink_to(external, target_is_directory=True)
-    request = create(
-        aliases=(("$WORKSPACE_ROOT", alias, external),),
-        read_roots=(external,) if mounted else (),
-        read_aliases=(interior,) if mounted else (),
-    )
-    if not mounted:
-        with (
-            pytest.raises(ValueError, match="alias target is outside"),
-            mount_arguments(request, scratch),
-        ):
-            pytest.fail("unmounted alias target produced mount arguments")
-    else:
-        with mount_arguments(request, scratch) as (arguments, _):
-            assert str(parent) in arguments
-            index = arguments.index(str(parent))
-            assert arguments[index - 2] == "--ro-bind-fd"
-            assert ("--symlink", str(external), "/.loop-private-paths/r0") == arguments[-3:]
-            assert str(interior) not in arguments
-        assert interior.resolve() == external
-
-
 def test_mount_arguments_rechecks_mask_before_yield(binding, monkeypatch, tmp_path):
     """An empty mask changed during construction fails before arguments leave the context."""
     create, workspace, scratch, _ = binding
@@ -1513,7 +2055,7 @@ def test_mount_arguments_rejects_final_shared_authority_drift(binding, monkeypat
     """Reject identity drift after descriptor preparation and before yielding the mount."""
     create, _, scratch, _ = binding
     request = create()
-    responses = iter((True, True, True, False))
+    responses = iter((True, True, True, True, False))
     monkeypatch.setattr(SandboxRequest, "paths_are_current", lambda self: next(responses))
     with (
         pytest.raises(ValueError, match="approved path authority changed"),
@@ -1534,9 +2076,9 @@ def test_mount_arguments_preserves_external_path_symlink_metadata(bound, monkeyp
     with mount_arguments(request, scratch) as (arguments, _):
         index = arguments.index("--symlink")
         assert arguments[index : index + 3] == ("--symlink", str(runtime), str(alias))
-        assert arguments[-5:-3] == ("--dir", str(NATIVE_SCRATCH_PATH))
+        assert arguments[-5:-3] == ("--dir", str(_TEST_NATIVE_SCRATCH))
         assert arguments[-3] == "--bind-fd"
-        assert arguments[-1] == str(NATIVE_SCRATCH_PATH)
+        assert arguments[-1] == str(_TEST_NATIVE_SCRATCH)
 
 
 def test_mount_arguments_skips_path_roots_supplied_by_runtime_mount(bound, monkeypatch, tmp_path):
@@ -1572,14 +2114,12 @@ def test_session_scratch_under_private_ancestry_keeps_masks_and_hardlink_guards(
     create, _, _ = bound
     scratch = tmp_path / "Library" / "storage" / "session"
     scratch.mkdir(parents=True, mode=0o700)
-    alias = tmp_path / "scratch-alias"
-    alias.symlink_to(scratch, target_is_directory=True)
     private = scratch / ".ssh"
     private.mkdir()
     (private / "key").write_text("secret")
     value = create(
         environment={"PATH": "/usr/bin:/bin", "TMPDIR": str(scratch)},
-        aliases=(("$TMPDIR", alias, scratch),),
+        scratch_root=scratch,
     )
     _, masked, _, _ = prepare_paths(value, scratch)
     assert private in masked

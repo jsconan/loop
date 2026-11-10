@@ -88,6 +88,30 @@ def test_attest_units_revalidates_actual_configuration(preflight):
     assert preflight.supervise.call_args.args[1] == 15
 
 
+@pytest.mark.parametrize("reported", ["off", "no", "yes", "auto", "skip"])
+def test_attest_units_accepts_only_disabled_memory_pressure_watch(preflight, reported):
+    """Both systemd spellings of disabled are accepted; active or automatic monitoring is not."""
+    preflight.expectations["loop@1000.service"]["MemoryPressureWatch"] = "off"
+    original = preflight.supervise.side_effect
+
+    def report(*args, **kwargs):
+        """Return the manager's observed spelling for the fixed unit property."""
+        result = original(*args, **kwargs)
+        return ProcessCapture(
+            result.status,
+            result.exit_code,
+            result.stdout.replace("MemoryPressureWatch=off", "MemoryPressureWatch=" + reported),
+            result.stderr,
+        )
+
+    preflight.supervise.side_effect = report
+    if reported in {"off", "no"}:
+        attest(preflight)
+    else:
+        with pytest.raises(ValueError, match="MemoryPressureWatch"):
+            attest(preflight)
+
+
 @pytest.mark.parametrize(
     "change",
     ["count", "roles", "fragment", "name", "missing", "key", "type", "newline", "nul", "weaken"],

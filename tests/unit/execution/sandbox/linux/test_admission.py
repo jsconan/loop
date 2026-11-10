@@ -97,6 +97,7 @@ def admission(monkeypatch):
     monkeypatch.setattr(linux_admission, "attest_units", state.attest)
     monkeypatch.setattr(linux_admission, "generation_limits", state.capacity)
     original_read = Path.read_text
+    original_bytes = Path.read_bytes
     original_stat = Path.lstat
     original_open = linux_admission.os.open
     original_close = linux_admission.os.close
@@ -124,6 +125,15 @@ def admission(monkeypatch):
     )
     monkeypatch.setattr(
         Path,
+        "read_bytes",
+        lambda path: (
+            text[str(path)].encode()
+            if str(path) == "/proc/self/mountinfo"
+            else original_bytes(path)
+        ),
+    )
+    monkeypatch.setattr(
+        Path,
         "lstat",
         lambda path: (
             state.details if path.is_relative_to("/sys/fs/cgroup") else original_stat(path)
@@ -134,7 +144,8 @@ def admission(monkeypatch):
 
 def receive(state, deadline=100):
     """Call the public receiver with fixed preparation authority."""
-    return linux_admission.receive_request(state.config, state.files, deadline)
+    with linux_admission.receive_request(state.config, state.files, deadline) as (payload, _):
+        return payload
 
 
 def test_unit_sources_have_fixed_root_drop_and_no_listener_kill_dependency(admission):
@@ -143,8 +154,10 @@ def test_unit_sources_have_fixed_root_drop_and_no_listener_kill_dependency(admis
     service = sources["loopgen_owned@.service"]
     assert "--reuid=1000 --regid=1000 --clear-groups --bounding-set=-all" in service
     assert "--no-new-privs /usr/bin/python3 -I -B /installed/receiver" in service
-    assert "ExitType=cgroup" in service and "Slice=loopgen_owned.slice" in service
+    assert "ExitType=main" in service and "Slice=loopgen_owned.slice" in service
     assert "ProtectControlGroups=yes" in service and "Delegate=no" in service
+    assert "KillMode=control-group\n" in service
+    assert "KillSignal=SIGKILL\n" in service and "SendSIGKILL=yes\n" in service
     assert "MemoryPressureWatch=off\n" in service
     assert "NoNewPrivileges=yes\n" in service
     assert "CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_SETPCAP\n" in service
@@ -196,10 +209,27 @@ def test_receive_request_attests_before_reading_and_revalidates(admission):
     assert expected["ControlGroup"] == "/loopgen_owned.slice/loopgen_owned@1.service"
     assert expected["User"] == "0" and "--clear-groups" in expected["ExecStart"]
     assert expected["MemoryPressureWatch"] == "off"
+    assert expected["Type"] == "exec"
+    assert expected["ExitType"] == "main"
+    assert expected["KillMode"] == "control-group"
+    assert expected["KillSignal"] == "9" and expected["SendSIGKILL"] == "yes"
     assert admission.attest.call_args.args[2] == 15
     assert admission.config.slice_unit.open_verified.call_count == 2
     assert admission.connection.settimeout.call_args.args == (5,)
     admission.connection.__exit__.assert_called_once()
+
+
+def test_receive_request_refuses_changed_service_before_reading(admission):
+    """A service missing fixed cleanup authority cannot admit a request."""
+    path = "/installed/loopgen_owned@.service"
+    original = admission.records[path]
+    admission.records[path] = original.replace(b"ExitType=main\n", b"ExitType=cgroup\n").replace(
+        b"KillSignal=SIGKILL\nSendSIGKILL=yes\n", b""
+    )
+    with pytest.raises(ValueError, match="Installed admission unit differs"):
+        receive(admission)
+    admission.attest.assert_not_called()
+    admission.connection.recv.assert_not_called()
 
 
 @pytest.mark.parametrize("field", ["uid", "gid", "groups", "mapping", "nnpriv", "capability"])
@@ -439,6 +469,24 @@ def test_receive_request_preserves_early_cancellation_for_process_supervisor(adm
     assert receive(admission) == b"abc"
 
 
+def test_receive_request_retains_authenticated_socket_until_scope_exit(admission):
+    """The admitted socket remains owned throughout execution and closes on scope exit."""
+    with linux_admission.receive_request(admission.config, admission.files, 100) as result:
+        assert result == (b"abc", admission.connection)
+        admission.connection.__exit__.assert_not_called()
+    admission.connection.__exit__.assert_called_once()
+
+
+def test_receive_request_closes_socket_if_execution_fails(admission):
+    """A caller failure propagates while releasing the retained admitted socket."""
+    with (
+        pytest.raises(RuntimeError, match="execution failed"),
+        linux_admission.receive_request(admission.config, admission.files, 100),
+    ):
+        raise RuntimeError("execution failed")
+    admission.connection.__exit__.assert_called_once()
+
+
 @pytest.mark.parametrize("boundary", ["start", "read", "end"])
 def test_receive_request_refuses_expired_budget(admission, monkeypatch, boundary):
     """The admission deadline covers attestation, all stream reads and final revalidation."""
@@ -447,7 +495,7 @@ def test_receive_request_refuses_expired_budget(admission, monkeypatch, boundary
             linux_admission.time, "monotonic", lambda: 100
         )
     elif boundary == "end":
-        admission.connection.__exit__.side_effect = lambda *args: monkeypatch.setattr(
+        admission.connection.setblocking.side_effect = lambda *args: monkeypatch.setattr(
             linux_admission.time, "monotonic", lambda: 100
         )
     with pytest.raises(TimeoutError, match="deadline"):
@@ -463,7 +511,7 @@ def test_receive_request_propagates_socket_timeout(admission):
 
 def test_receive_request_refuses_membership_change_after_frame(admission):
     """Late migration cannot return request bytes as valid generation admission."""
-    admission.connection.__exit__.side_effect = lambda *args: admission.text.update(
+    admission.connection.setblocking.side_effect = lambda *args: admission.text.update(
         {
             "/proc/self/cgroup": "0::/loopgen_owned.slice/loopgen_owned@2.service",
             "/sys/fs/cgroup/loopgen_owned.slice/loopgen_owned@2.service/cgroup.type": "domain",
@@ -475,7 +523,7 @@ def test_receive_request_refuses_membership_change_after_frame(admission):
 
 def test_receive_request_refuses_late_installed_drift(admission):
     """Authority changes after EOF prevent the receiver from returning client bytes."""
-    admission.connection.__exit__.side_effect = lambda *args: setattr(
+    admission.connection.setblocking.side_effect = lambda *args: setattr(
         admission.files["receiver"].open_verified, "side_effect", ValueError("receiver drift")
     )
     with pytest.raises(ValueError, match="receiver drift"):

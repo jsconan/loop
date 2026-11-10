@@ -7,14 +7,15 @@ import select
 import shlex
 import sqlite3
 import subprocess
-import time
 from contextlib import closing
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
 from loop import Interaction, SessionManager
 from loop.execution.sandbox import SandboxOutcome, SandboxRequest
+from loop.utils import process as process_utils
 from loop.utils.path import ensure_private_directory
 
 pytestmark = [pytest.mark.integration, pytest.mark.macos]
@@ -22,7 +23,7 @@ pytestmark = [pytest.mark.integration, pytest.mark.macos]
 
 @pytest.fixture
 def writer_executable(native_workspace):
-    """Compile a self-bounded writer with native spawn, shared mappings and SQLite WAL."""
+    """Compile a pipe-controlled writer with native spawn, shared mappings and SQLite WAL."""
     source = native_workspace / "writer.c"
     executable = native_workspace / "writer"
     source.write_text(r"""
@@ -50,7 +51,6 @@ static void sql(sqlite3 *db, const char *statement) {
 }
 
 static void child(const char *resource, const char *gate, int ready, const char *sibling) {
-    alarm(10);
     const char *root = getenv("TMPDIR");
     char path[4096], escape[4096];
     snprintf(path, sizeof(path), "%s/state", root);
@@ -73,11 +73,15 @@ static void child(const char *resource, const char *gate, int ready, const char 
     snprintf(completion_path, sizeof(completion_path), "%s/completed", root);
     int completed = open(completion_path, O_CREAT | O_WRONLY, 0600);
     require(completed >= 0);
+    int release = open(gate, O_RDONLY | O_NONBLOCK);
+    require(release >= 0 && fcntl(release, F_SETFL, 0) == 0);
     pid_t pid = getpid();
     require(write(ready, &pid, sizeof(pid)) == sizeof(pid));
     close(ready);
     close(STDIN_FILENO); close(STDOUT_FILENO); close(STDERR_FILENO);
-    while (access(gate, F_OK) != 0) { usleep(10000); }
+    char signal;
+    if (read(release, &signal, 1) != 1) _exit(3);
+    close(release);
     int outside = open(escape, O_CREAT | O_WRONLY, 0600);
     int neighbor = open(sibling, O_RDONLY);
     int confined = outside < 0 && neighbor < 0;
@@ -106,7 +110,6 @@ int main(int argc, char **argv) {
     if (strcmp(argv[1], "child") == 0) {
         child(argv[2], argv[3], atoi(argv[4]), argv[5]);
     }
-    alarm(10);
     int ready[2]; require(pipe(ready) == 0);
     pid_t pid;
     if (strcmp(argv[1], "double-fork") == 0) {
@@ -151,7 +154,6 @@ int main(int argc, char **argv) {
         ],
         capture_output=True,
         text=True,
-        timeout=30,
         check=False,
         env={**os.environ, "CLANG_MODULE_CACHE_PATH": str(native_workspace / "module-cache")},
     )
@@ -160,20 +162,45 @@ int main(int argc, char **argv) {
     return executable
 
 
+@pytest.fixture
+def writer_gate(native_workspace):
+    """Release the owned detached writer by pipe, or close the pipe if its test fails."""
+    path = native_workspace / "release"
+    os.mkfifo(path)
+    descriptor = os.open(path, os.O_RDWR | os.O_NONBLOCK)
+    try:
+        yield path, descriptor
+    finally:
+        os.close(descriptor)
+
+
 @pytest.mark.parametrize("mechanism", ["double-fork", "spawn-session", "spawn-group"])
 @pytest.mark.parametrize("resource", ["mmap", "wal"])
 def test_detached_native_resources_remain_confined(
-    backend, native_workspace, writer_executable, mechanism, resource
+    backend,
+    native_workspace,
+    writer_executable,
+    writer_gate,
+    mechanism,
+    resource,
+    native_directory,
+    monkeypatch,
 ):
     """Retained mappings and WAL writers survive command exit without gaining new authority."""
+    clock = SimpleNamespace(
+        monotonic=lambda: 100.0,
+        sleep=lambda _delay: os.sched_yield(),
+        strftime=lambda _format, _value: "2000-01-01 00:00:00+0000",
+        localtime=lambda: None,
+    )
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.time", clock)
+    monkeypatch.setattr(process_utils, "time", clock)
     manager = SessionManager(interaction=Mock(spec=Interaction))
     original = manager.temporary_directory.get()
     sibling = SessionManager(interaction=Mock(spec=Interaction), session_store=manager.store)
     secret = sibling.temporary_directory.get() / "secret"
     secret.write_text("sibling-private-canary")
-    alias = native_workspace / "session-alias"
-    alias.symlink_to(original, target_is_directory=True)
-    gate = native_workspace / "release"
+    gate, gate_descriptor = writer_gate
     request = SandboxRequest.create(
         source=shlex.join(
             [str(writer_executable), mechanism, resource, str(gate), "unused", str(secret)]
@@ -185,9 +212,9 @@ def test_detached_native_resources_remain_confined(
         network=False,
         environment={"PATH": "/usr/bin:/bin", "LANG": "C", "TMPDIR": str(original)},
         policy_version=backend.policy_version,
-        deadline=time.monotonic() + 5,
+        deadline=110.0,
         workspace_id="detached-native-resources",
-        aliases=(("$TMPDIR", alias, original),),
+        scratch_root=original,
     )
     with manager.execution():
         result = backend.run(request)
@@ -211,6 +238,7 @@ def test_detached_native_resources_remain_confined(
             0,
         )
         exited = False
+        released = False
         try:
             if resource == "mmap":
                 with (
@@ -220,8 +248,9 @@ def test_detached_native_resources_remain_confined(
                     manager.discard_working_directory()
                     replacement = manager.temporary_directory.get()
                     (replacement / "state").write_text("replacement-canary")
-                    gate.write_text("release")
-                    exited = bool(queue.control(None, 1, 5))
+                    os.write(gate_descriptor, b"r")
+                    released = True
+                    exited = bool(queue.control(None, 1, None))
                     assert exited, "Detached writer did not exit."
                     assert retained[:9] == b"confined\0"
                     assert (replacement / "state").read_text() == "replacement-canary"
@@ -236,8 +265,9 @@ def test_detached_native_resources_remain_confined(
                 with contender.execution():
                     with closing(sqlite3.connect(original / "state")) as reader:
                         assert reader.execute("SELECT value FROM state").fetchone() == ("before",)
-                    gate.write_text("release")
-                    exited = bool(queue.control(None, 1, 5))
+                    os.write(gate_descriptor, b"r")
+                    released = True
+                    exited = bool(queue.control(None, 1, None))
                     assert exited, "Detached writer did not exit."
                     with closing(sqlite3.connect(original / "state")) as reader:
                         assert reader.execute("SELECT value FROM state").fetchone() == ("confined",)
@@ -245,9 +275,10 @@ def test_detached_native_resources_remain_confined(
             assert secret.read_text() == "sibling-private-canary"
             assert not (original.parent / "escape").exists()
         finally:
-            gate.write_text("release")
+            if not released:
+                os.write(gate_descriptor, b"r")
             if not exited:
-                assert queue.control(None, 1, 12), "Self-bounded writer did not terminate."
+                assert queue.control(None, 1, None), "Detached writer did not terminate."
 
 
 @pytest.fixture
@@ -274,7 +305,6 @@ def test_native_acl_cannot_be_hidden_by_private_mode_bits(acl_directory):
         ["/bin/chmod", "+a", "user:nobody allow read,search", str(private)],
         capture_output=True,
         text=True,
-        timeout=5,
         check=False,
     )
     assert added.returncode == 0, added.stderr
@@ -283,7 +313,7 @@ def test_native_acl_cannot_be_hidden_by_private_mode_bits(acl_directory):
         with pytest.raises(ValueError, match="private real directory"):
             ensure_private_directory(private, create=False)
     finally:
-        subprocess.run(["/bin/chmod", "-N", str(private)], check=True, timeout=5)
+        subprocess.run(["/bin/chmod", "-N", str(private)], check=True)
     ensure_private_directory(private, create=False)
 
 
@@ -296,7 +326,6 @@ def test_distinct_account_access_matches_native_acl_admission(acl_directory):
         ["/usr/bin/sudo", "-n", "-u", "nobody", "/usr/bin/id", "-u"],
         capture_output=True,
         text=True,
-        timeout=5,
         check=False,
     )
     if identity.returncode != 0:
@@ -314,7 +343,6 @@ def test_distinct_account_access_matches_native_acl_admission(acl_directory):
             ["/usr/bin/sudo", "-n", "-u", "nobody", "/bin/cat", str(path)],
             capture_output=True,
             text=True,
-            timeout=5,
             check=False,
         )
 
@@ -326,7 +354,6 @@ def test_distinct_account_access_matches_native_acl_admission(acl_directory):
     subprocess.run(
         ["/bin/chmod", "+a", "user:nobody allow read,search", str(private)],
         check=True,
-        timeout=5,
     )
     try:
         allowed = read_as_other(secret)
@@ -334,6 +361,6 @@ def test_distinct_account_access_matches_native_acl_admission(acl_directory):
         with pytest.raises(ValueError, match="private real directory"):
             ensure_private_directory(private, create=False)
     finally:
-        subprocess.run(["/bin/chmod", "-N", str(private)], check=True, timeout=5)
+        subprocess.run(["/bin/chmod", "-N", str(private)], check=True)
     denied = read_as_other(secret)
     assert denied.returncode != 0 and denied.stdout == ""

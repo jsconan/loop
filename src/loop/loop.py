@@ -20,6 +20,7 @@ from .completion import (
 )
 from .configuration import ApplicationSettings
 from .control import RunControl
+from .conversation.interaction import ApprovalInteraction
 from .conversation.models import AdmittedConversationInput
 from .errors import Problem, log_problem
 from .execution.sandbox import SandboxCommands
@@ -67,6 +68,8 @@ class Loop:
             one default-configured request. Defaults to ``False`` for explicitly assembled loops.
         run_control (RunControl | None): Optional stop signal for the active conversation run.
             Defaults to no external stop signal.
+        interaction (Interaction | None): Optional original user interface for conversation input.
+            Defaults to the runner's interaction.
 
     """
 
@@ -101,13 +104,14 @@ class Loop:
         owns_session_name_generator: bool = False,
         skill_hints_enabled: bool = False,
         run_control: RunControl | None = None,
+        interaction: Interaction | None = None,
     ) -> None:
         self._agent_runner = agent_runner
         self._agent = agent_runner.agent
         self._session_manager = agent_runner.session_manager
         self._model_selection = agent_runner.model_selection
         self._compaction = agent_runner.compaction
-        self._interaction = agent_runner.interaction
+        self._interaction = interaction if interaction is not None else agent_runner.interaction
         self._command_manager = command_manager
         self._completion_manager = completion_manager
         self._session_name_generator = session_name_generator
@@ -129,7 +133,7 @@ class Loop:
         cls,
         backend: Backend,
         *,
-        agent_name: str = "Loop",
+        agent_name: str = constants.DEFAULT_AGENT_NAME,
         model: str | None = None,
         temperature: float | None = None,
         reasoning_effort: ReasoningEffort | None = None,
@@ -157,7 +161,7 @@ class Loop:
 
         Args:
             backend (Backend): Backend used to request model responses.
-            agent_name (str): Human-readable identity. Defaults to ``"Loop"``.
+            agent_name (str): Human-readable identity. Defaults to the application agent name.
             model (str | None): Explicit model, or ``None`` for the backend default.
             temperature (float | None): Sampling temperature for this agent's model requests.
             reasoning_effort (ReasoningEffort | None): Reasoning effort for this agent's model
@@ -166,7 +170,8 @@ class Loop:
                 before an explicit model selection takes effect. Defaults to no durable writer.
             instructions_manager (InstructionsManager | None): Injected contextual instruction
                 service, or ``None`` to discover one for the workspace.
-            interaction (Interaction | None): User interaction service.
+            interaction (Interaction | None): User interaction service. Confirmation decisions
+                follow the configured permission manager, including YOLO mode.
             permission_manager (PermissionManager | None): Tool authorization service.
             tool_registry (ToolRegistry | None): Tools exposed by the default agent.
             mention_manager (MentionManager | None): Mention resolution service.
@@ -201,6 +206,7 @@ class Loop:
                 session=session,
             )
         configured_interaction = interaction or configured_sessions.interaction
+        user_interaction = configured_interaction
         owns_name_generator = session_name_generator is None
         configured_name_generator = session_name_generator or BackendSessionNameGenerator(backend)
 
@@ -216,6 +222,9 @@ class Loop:
         configured_permissions = permission_manager or PermissionManager(
             find_project_root(configured_directory) or configured_directory,
             interaction=configured_interaction,
+        )
+        configured_interaction = ApprovalInteraction.for_permissions(
+            configured_interaction, configured_permissions
         )
         configured_instructions = instructions_manager or InstructionsManager.discover(
             configured_directory,
@@ -238,6 +247,7 @@ class Loop:
             interaction=configured_interaction,
             permission_manager=configured_permissions,
         )
+        configured_tools.bind_session_manager(configured_sessions)
         configured_agent = Agent(
             agent_name,
             tools=configured_tools,
@@ -328,6 +338,7 @@ class Loop:
         )
         return cls(
             agent_runner=configured_runner,
+            interaction=user_interaction,
             command_manager=configured_commands,
             completion_manager=configured_completion,
             session_name_generator=configured_name_generator,
@@ -402,30 +413,32 @@ class Loop:
         Returns:
             str: Whether the setting was applied now or requires restart.
         """
-        if path == "loop.debug":
-            self._agent_runner.debug = settings.loop.debug
-        elif path == "loop.stream":
-            self._agent_runner.stream = settings.loop.stream
-        elif path == "loop.max_agent_turns":
-            self._agent_runner.max_turns = settings.loop.max_agent_turns
-        elif path == "loop.prompt_on_recoverable_error":
+        if path == "app.debug":
+            self._agent_runner.debug = settings.app.debug
+        elif path == "app.yolo":
+            self.permission_manager.set_yolo(settings.app.yolo)
+        elif path == "app.stream":
+            self._agent_runner.stream = settings.app.stream
+        elif path == "app.max_agent_turns":
+            self._agent_runner.max_turns = settings.app.max_agent_turns
+        elif path == "app.prompt_on_recoverable_error":
             self._agent_runner.prompt_on_recoverable_error = (
-                settings.loop.prompt_on_recoverable_error
+                settings.app.prompt_on_recoverable_error
             )
-        elif path == "loop.compaction_threshold":
-            self._compaction.threshold = settings.loop.compaction_threshold
+        elif path == "app.compaction_threshold":
+            self._compaction.threshold = settings.app.compaction_threshold
         elif path == "web.user_agent":
             self.tool_registry.settings.user_agent = settings.web.user_agent
         elif path == "tools.command_timeout":
             self.tool_registry.settings.command_timeout = settings.tools.command_timeout
-        elif path == "loop.model":
-            self._model_selection.restore(settings.loop.model)
-        elif path == "loop.temperature":
-            self._agent_runner.agent.hyperparameters.temperature = settings.loop.temperature
+        elif path == "app.model":
+            self._model_selection.restore(settings.app.model)
+        elif path == "app.temperature":
+            self._agent_runner.agent.hyperparameters.temperature = settings.app.temperature
 
-        elif path == "loop.reasoning_effort":
+        elif path == "app.reasoning_effort":
             self._agent_runner.agent.hyperparameters.reasoning_effort = (
-                settings.loop.reasoning_effort
+                settings.app.reasoning_effort
             )
         else:
             return "saved; restart required"
@@ -444,8 +457,8 @@ class Loop:
         Raises:
             asyncio.CancelledError: If asynchronous model metadata lookup is cancelled.
         """
-        if path == "loop.model":
-            await self._model_selection.restore_async(settings.loop.model)
+        if path == "app.model":
+            await self._model_selection.restore_async(settings.app.model)
             return "applied now"
         return self.apply_runtime_settings(path, settings)
 
@@ -1020,7 +1033,7 @@ class Loop:
                     self._session_name_task_group = task_group
                     try:
                         yield
-                    # Let the group settle children without wrapping Loop's original exception.
+                    # Let the group settle children without wrapping the original exception.
                     # pylint: disable=broad-exception-caught
                     except BaseException as error:  # noqa: BLE001
                         scope_error = error

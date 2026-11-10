@@ -4,6 +4,8 @@ import ctypes
 import errno
 import io
 import os
+import shutil
+import socket
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -165,6 +167,8 @@ def cache(tmp_path, native, monkeypatch):
         "lock": lock,
         "loads": [],
         "after_load": None,
+        "after_remove": None,
+        "remove_written": None,
         "load_error": None,
         "written": None,
         "flock": Mock(),
@@ -198,11 +202,26 @@ def cache(tmp_path, native, monkeypatch):
                 state["after_load"](data)
             return len(data) if state["written"] is None else state["written"]
 
+    class RemoveStream(io.BytesIO):
+        """Model removal of one exported kernel policy."""
+
+        def write(self, data):
+            """Remove only the named entry from the disposable inventory."""
+            if state["remove_written"] is not None:
+                return state["remove_written"]
+            shutil.rmtree(directory / data.decode("ascii"))
+            if state["after_remove"] is not None:
+                state["after_remove"]()
+            return len(data)
+
     def open_path(path, *args, **kwargs):
         """Redirect only the kernel write interface to the deterministic model."""
         if path == security / ".load":
             assert args == ("wb",) and kwargs == {"buffering": 0}
             return LoadStream()
+        if path == security / ".remove":
+            assert args == ("wb",) and kwargs == {"buffering": 0}
+            return RemoveStream()
         return real_open(path, *args, **kwargs)
 
     def iterdir(path):
@@ -231,6 +250,187 @@ def test_load_cached_payload_adds_once_and_reuses_only_exact_bytes(cache):
     assert cache["loads"] == [b"compiled"]
     assert len(cache["closed"]) == 2
     assert all(call.args[1] == 6 for call in cache["flock"].call_args_list)
+
+
+def test_load_cached_payload_reclaims_only_absent_service_profiles(cache, tmp_path, monkeypatch):
+    """An active service keeps its profile while an exited service releases capacity."""
+    root = tmp_path / "tracking"
+    root.mkdir()
+    own = "loopgen_loop_sandbox@own.service"
+    live = "loopgen_loop_sandbox@live.service"
+    dead = "loopgen_loop_sandbox@dead.service"
+    for group in (own, live):
+        (root / group).mkdir()
+    monkeypatch.setattr(linux_bootstrap, "NATIVE_TRACKING_PATH", root)
+    identity = (root.stat().st_dev, root.stat().st_ino)
+
+    def profile(group):
+        """Derive a request policy name bound to one service instance."""
+        return "payload_" + "a" * 64 + "_" + linux_bootstrap.sha256_digest(group)[:48]
+
+    current, still_live, stale = map(profile, (own, live, dead))
+    cache["add"](still_live)
+    cache["add"](stale)
+    cache["after_load"] = lambda data: cache["add"](current, data)
+    assert linux_bootstrap.load_cached_payload(
+        current,
+        b"compiled",
+        "loop_sandbox",
+        1000,
+        cache["lock"],
+        3,
+        tracking=(root, identity, own),
+    )
+    assert {entry.name for entry in cache["directory"].iterdir()} == {
+        "bootstrap",
+        still_live,
+        current,
+    }
+
+
+@pytest.mark.parametrize("failure", ["short", "drift"])
+def test_load_cached_payload_refuses_incomplete_reclamation(cache, tmp_path, monkeypatch, failure):
+    """Short removals and unexpected cache changes refuse before admitting a new policy."""
+    root = tmp_path / "tracking"
+    root.mkdir()
+    own = "loopgen_loop_sandbox@own.service"
+    (root / own).mkdir()
+    monkeypatch.setattr(linux_bootstrap, "NATIVE_TRACKING_PATH", root)
+    identity = (root.stat().st_dev, root.stat().st_ino)
+    profile = "payload_" + "a" * 64 + "_" + linux_bootstrap.sha256_digest(own)[:48]
+    stale = "payload_" + "a" * 64 + "_" + "b" * 48
+    cache["add"](stale)
+    if failure == "short":
+        cache["remove_written"] = 0
+    else:
+        cache["after_remove"] = lambda: cache["add"]("unexpected")
+    with pytest.raises(OSError if failure == "short" else ValueError, match="removal|reclamation"):
+        linux_bootstrap.load_cached_payload(
+            profile,
+            b"compiled",
+            "loop_sandbox",
+            1000,
+            cache["lock"],
+            3,
+            tracking=(root, identity, own),
+        )
+    assert not cache["loads"]
+
+
+def test_load_cached_payload_refuses_overbudget_existing_profile(cache):
+    """Exact reuse cannot bypass the generation's aggregate byte reservation."""
+    cache["add"]("payload")
+    with pytest.raises(OSError, match="policy bytes exceed capacity"):
+        linux_bootstrap.load_cached_payload(
+            "payload", b"compiled", "loop_sandbox", 1000, cache["lock"], 1, aggregate_limit=8
+        )
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "path",
+        "identity",
+        "nondirectory",
+        "alias",
+        "file",
+        "foreign",
+        "missing",
+        "suffix",
+        "profile",
+    ],
+)
+def test_load_cached_payload_refuses_untrusted_tracking(cache, tmp_path, monkeypatch, change):
+    """Only the pinned cgroup view and recognizable service-owned policies permit removal."""
+    root = tmp_path / "tracking"
+    root.mkdir()
+    group = "loopgen_loop_sandbox@own.service"
+    (root / group).mkdir()
+    monkeypatch.setattr(linux_bootstrap, "NATIVE_TRACKING_PATH", root)
+    identity = (root.stat().st_dev, root.stat().st_ino)
+    profile = "payload_" + "a" * 64 + "_" + linux_bootstrap.sha256_digest(group)[:48]
+    if change == "path":
+        monkeypatch.setattr(linux_bootstrap, "NATIVE_TRACKING_PATH", tmp_path / "other")
+    elif change == "identity":
+        identity = (0, 0)
+    elif change == "nondirectory":
+        (root / group).rmdir()
+        root.rmdir()
+        root.write_text("not a cgroup")
+        identity = (root.stat().st_dev, root.stat().st_ino)
+    elif change == "alias":
+        (root / "alias").symlink_to(root / group, target_is_directory=True)
+    elif change == "file":
+        (root / "cgroup.events").write_text("populated 1\n")
+        cache["after_load"] = lambda data: cache["add"](profile, data)
+    elif change == "foreign":
+        (root / "not-a-service").mkdir()
+    elif change == "missing":
+        (root / group).rmdir()
+    elif change == "suffix":
+        profile = "payload_" + "a" * 64 + "_" + "b" * 48
+    else:
+        cache["add"]("unexpected")
+
+    def operation():
+        """Attempt admission using the selected tracking state."""
+        return linux_bootstrap.load_cached_payload(
+            profile,
+            b"compiled",
+            "loop_sandbox",
+            1000,
+            cache["lock"],
+            3,
+            tracking=(root, identity, group),
+        )
+
+    if change == "file":
+        assert operation()
+    else:
+        with pytest.raises(ValueError, match="tracking|profile"):
+            operation()
+
+
+@pytest.mark.parametrize("timeout", [False, True])
+def test_load_cached_payload_waits_for_live_profile_capacity(cache, tmp_path, monkeypatch, timeout):
+    """Full capacity waits for an owned service to exit without retaining the cache lock."""
+    root = tmp_path / "tracking"
+    root.mkdir()
+    own, live = "loopgen_loop_sandbox@own.service", "loopgen_loop_sandbox@live.service"
+    for group in (own, live):
+        (root / group).mkdir()
+    monkeypatch.setattr(linux_bootstrap, "NATIVE_TRACKING_PATH", root)
+    identity = (root.stat().st_dev, root.stat().st_ino)
+    current = "payload_" + "a" * 64 + "_" + linux_bootstrap.sha256_digest(own)[:48]
+    previous = "payload_" + "a" * 64 + "_" + linux_bootstrap.sha256_digest(live)[:48]
+    cache["add"](previous)
+    cache["after_load"] = lambda data: cache["add"](current, data)
+    clock = iter((10, 20)) if timeout else None
+    monkeypatch.setattr(linux_bootstrap.time, "monotonic", lambda: next(clock) if clock else 10)
+    monkeypatch.setattr(linux_bootstrap.time, "sleep", lambda _: (root / live).rmdir())
+
+    def operation():
+        """Attempt admission with one live profile consuming all available slots."""
+        return linux_bootstrap.load_cached_payload(
+            current,
+            b"compiled",
+            "loop_sandbox",
+            1000,
+            cache["lock"],
+            1,
+            deadline=20,
+            tracking=(root, identity, own),
+        )
+
+    if timeout:
+        with pytest.raises(TimeoutError, match="admission deadline"):
+            operation()
+    else:
+        assert operation()
+        assert not (cache["directory"] / previous).exists()
+    assert any(
+        call.args[1] == linux_bootstrap.fcntl.LOCK_UN for call in cache["flock"].call_args_list
+    )
 
 
 @pytest.mark.parametrize("actual, expected", [(1, 2), (2, 1)])
@@ -329,11 +529,37 @@ def test_load_cached_payload_rejects_nonregular_lock(cache, monkeypatch):
 
 
 def test_load_cached_payload_refuses_busy_lock(cache):
-    """Concurrent admission fails immediately instead of loading outside the lock."""
+    """Admission without a wait deadline refuses a busy lock."""
     cache["flock"].side_effect = BlockingIOError(errno.EWOULDBLOCK, "busy")
     with pytest.raises(BlockingIOError, match="busy"):
         linux_bootstrap.load_cached_payload(
             "payload", b"compiled", "loop_sandbox", 1000, cache["lock"], 1
+        )
+    assert not cache["loads"] and len(cache["closed"]) == 1
+
+
+def test_load_cached_payload_waits_for_busy_lock(cache, monkeypatch):
+    """Concurrent payload admission waits for its lock within the request budget."""
+    cache["flock"].side_effect = [BlockingIOError(errno.EWOULDBLOCK, "busy"), None]
+    monkeypatch.setattr(linux_bootstrap.time, "monotonic", Mock(side_effect=[10, 10]))
+    sleep = Mock()
+    monkeypatch.setattr(linux_bootstrap.time, "sleep", sleep)
+    assert linux_bootstrap.load_cached_payload(
+        "payload", b"compiled", "loop_sandbox", 1000, cache["lock"], 1, deadline=20
+    )
+    sleep.assert_called_once_with(0.01)
+    assert cache["loads"] == [b"compiled"]
+
+
+@pytest.mark.parametrize("when", ["busy", "acquired"])
+def test_load_cached_payload_stops_at_lock_deadline(cache, monkeypatch, when):
+    """No policy is admitted when waiting or acquiring consumes the request budget."""
+    if when == "busy":
+        cache["flock"].side_effect = BlockingIOError(errno.EWOULDBLOCK, "busy")
+    monkeypatch.setattr(linux_bootstrap.time, "monotonic", lambda: 20)
+    with pytest.raises(TimeoutError, match="Policy admission deadline expired"):
+        linux_bootstrap.load_cached_payload(
+            "payload", b"compiled", "loop_sandbox", 1000, cache["lock"], 1, deadline=20
         )
     assert not cache["loads"] and len(cache["closed"]) == 1
 
@@ -704,7 +930,13 @@ def activation(cache, native, monkeypatch, tmp_path):
         cache=cache,
         native=native,
     )
-    monkeypatch.setattr(os, "listdir", lambda path: state.descriptors)
+    real_listdir = os.listdir
+
+    def listdir(path):
+        """Simulate only the owned descriptor inventory and retain real profile listings."""
+        return state.descriptors if str(path) == "/proc/self/fd" else real_listdir(path)
+
+    monkeypatch.setattr(os, "listdir", listdir)
     return state
 
 
@@ -822,6 +1054,91 @@ def test_activate_payload_refuses_missing_installation_reservation(activation):
     assert not activation.cache["loads"] and not activation.native["events"]
 
 
+@pytest.mark.parametrize(
+    "case", ["invalid-fd", "wrong-family", "wrong-type", "not-paired", "valid"]
+)
+def test_activate_payload_preserves_only_a_valid_private_egress_bridge(
+    activation, monkeypatch, case
+):
+    """The protected bootstrap admits one verified socket pair and closes other setup FDs."""
+    channel = Mock()
+    channel.family = socket.AF_INET if case == "wrong-family" else socket.AF_UNIX
+    channel.type = socket.SOCK_STREAM if case == "wrong-type" else socket.SOCK_SEQPACKET
+    channel.getpeername.return_value = "foreign" if case == "not-paired" else ""
+    factory = Mock(return_value=channel)
+    monkeypatch.setattr(linux_bootstrap.socket, "socket", factory)
+    descriptor = 1 if case == "invalid-fd" else 9
+    activation.descriptors.append("9")
+    if case == "valid":
+        entered = Mock()
+        monkeypatch.setattr(linux_bootstrap, "enter_payload", entered)
+        activate(activation, egress_descriptor=descriptor)
+        channel.detach.assert_called_once()
+        entered.assert_called_once()
+    else:
+        with pytest.raises(ValueError, match="Mediated egress|Invalid mediated"):
+            activate(activation, egress_descriptor=descriptor)
+        assert not activation.native["events"]
+    if case == "invalid-fd":
+        factory.assert_not_called()
+    else:
+        factory.assert_called_once_with(fileno=9)
+
+
+@pytest.mark.parametrize("case", ["valid", "missing", "unexpected"])
+def test_execute_payload_configures_only_requested_private_proxy(monkeypatch, case):
+    """The shell receives an attempt-private proxy only after mediated activation."""
+    request = Mock(
+        deadline=20,
+        cwd=Path("/work"),
+        execution_source="printf safe",
+        file_creation_mask=0o027,
+        attempt_id="1248c892-42dc-4b68-a3fb-30d2a70a93a7",
+        generated_environment=(),
+        local_network=True,
+    )
+    request.egress_origins = ("http://example.com",) if case != "unexpected" else ()
+    request.paths_are_current.return_value = True
+    request.shell_environment.return_value = {"PATH": "/usr/bin:/bin"}
+    monkeypatch.setattr(Path, "cwd", lambda: Path("/work"))
+    monkeypatch.setattr(linux_bootstrap.time, "monotonic", lambda: 10)
+    monkeypatch.setattr(linux_bootstrap, "activate_payload", Mock())
+    proxy = Mock(return_value=4567)
+    monkeypatch.setattr(linux_bootstrap, "start_namespace_proxy", proxy)
+    replacement = Mock()
+    monkeypatch.setattr(linux_bootstrap.os, "execve", replacement)
+    monkeypatch.setattr(linux_bootstrap.os, "umask", Mock())
+    descriptor = None if case == "missing" else 9
+    if case == "valid":
+        expected = RuntimeError
+        message = "replacement unexpectedly returned"
+    else:
+        expected = ValueError
+        message = "Mediated egress|Unexpected mediated"
+    with pytest.raises(expected, match=message):
+        linux_bootstrap.execute_payload(
+            request,
+            "library",
+            "bootstrap",
+            "lock",
+            b"compiled",
+            "payload_profile",
+            "generation",
+            1000,
+            reservation="budget",
+            egress_descriptor=descriptor,
+        )
+    if case == "valid":
+        proxy.assert_called_once_with(9)
+        environment = replacement.call_args.args[2]
+        assert environment["http_proxy"] == "http://127.0.0.1:4567"
+        assert environment["https_proxy"] == environment["http_proxy"]
+        assert environment["NO_PROXY"] == ""
+    else:
+        proxy.assert_not_called()
+        replacement.assert_not_called()
+
+
 @pytest.mark.parametrize("limit", [0, -1, 16777217, True])
 def test_load_cached_payload_refuses_invalid_reserved_byte_limit(cache, limit):
     """A trusted reservation cannot widen the namespace beyond finite installation bounds."""
@@ -851,10 +1168,10 @@ def test_execute_payload_requires_activation_and_original_deadline(monkeypatch, 
         cwd=Path("/work"),
         execution_source="printf safe",
         environment=(),
-        aliases=(),
         file_creation_mask=0o027,
         attempt_id="1248c892-42dc-4b68-a3fb-30d2a70a93a7",
         generated_environment=(),
+        local_network=True,
     )
     request.paths_are_current.return_value = failure != "stale"
     request.host_command_runtime_signature.return_value = "signature"
@@ -904,6 +1221,7 @@ def test_execute_payload_requires_activation_and_original_deadline(monkeypatch, 
             1000,
             reservation="budget",
             namespace_level=1,
+            deadline=request.deadline,
         )
     if failure in ("exec", "returned"):
         file_mask.assert_called_once_with(request.file_creation_mask)
@@ -924,16 +1242,16 @@ def test_execute_payload_requires_activation_and_original_deadline(monkeypatch, 
         replacement.assert_not_called()
 
 
-def test_execute_payload_translates_only_bound_virtual_aliases(monkeypatch):
-    """Preserve opaque quoting while selecting the request-local alias after host validation."""
+def test_execute_payload_preserves_opaque_shell_source(monkeypatch):
+    """Pass quoted strings and embedded source unchanged to the activated shell."""
     request = Mock(
         deadline=20,
         cwd=Path("/work"),
         execution_source="cat '/tmp/bound/r0/file'; printf '%s' /tmp/bound/r0-other",
-        aliases=(("$WORKSPACE_ROOT", Path("/tmp/bound/r0"), Path("/work")),),
         generated_environment=(),
         file_creation_mask=0o022,
         attempt_id="1248c892-42dc-4b68-a3fb-30d2a70a93a7",
+        local_network=True,
     )
     request.shell_environment.return_value = {"PATH": "/usr/bin:/bin"}
     monkeypatch.setattr(Path, "cwd", lambda: request.cwd)
@@ -954,20 +1272,68 @@ def test_execute_payload_translates_only_bound_virtual_aliases(monkeypatch):
             1000,
             reservation="budget",
         )
-    assert (
-        replacement.call_args.args[1][-1]
-        == "cat '/.loop-private-paths/r0/file'; printf '%s' /tmp/bound/r0-other"
+    assert replacement.call_args.args[1][-1] == request.execution_source
+
+
+def test_execute_payload_requires_and_installs_local_filter(monkeypatch):
+    """A local deny cannot enter the shell until the precompiled filter is installed."""
+    request = Mock(
+        deadline=20,
+        cwd=Path("/work"),
+        execution_source="printf safe",
+        file_creation_mask=0o027,
+        attempt_id="1248c892-42dc-4b68-a3fb-30d2a70a93a7",
+        generated_environment=(),
+        local_network=False,
+        egress_origins=(),
     )
+    request.paths_are_current.return_value = True
+    request.shell_environment.return_value = {"PATH": "/usr/bin:/bin"}
+    monkeypatch.setattr(Path, "cwd", lambda: Path("/work"))
+    monkeypatch.setattr(linux_bootstrap.time, "monotonic", lambda: 10)
+    monkeypatch.setattr(linux_bootstrap, "activate_payload", Mock())
+    installer = Mock()
+    monkeypatch.setattr(linux_bootstrap, "install_local_network_filter", installer)
+    monkeypatch.setattr(linux_bootstrap.os, "umask", Mock())
+    monkeypatch.setattr(linux_bootstrap.os, "execve", Mock())
+    with pytest.raises(ValueError, match="filter and request authority"):
+        linux_bootstrap.execute_payload(
+            request,
+            "library",
+            "bootstrap",
+            "lock",
+            b"compiled",
+            "payload",
+            "generation",
+            1000,
+            reservation="budget",
+        )
+    installer.assert_not_called()
+    with pytest.raises(RuntimeError, match="replacement unexpectedly returned"):
+        linux_bootstrap.execute_payload(
+            request,
+            "library",
+            "bootstrap",
+            "lock",
+            b"compiled",
+            "payload",
+            "generation",
+            1000,
+            reservation="budget",
+            local_network_filter=b"filter",
+        )
+    installer.assert_called_once_with(b"filter")
 
 
 def test_payload_environment_maps_generated_paths_to_namespace_scratch():
     """All generated paths stay inside the request's unique namespace scratch mount."""
     request = Mock(
-        generated_environment=("TMPDIR", "XDG_CACHE_HOME", "COVERAGE_FILE"),
+        generated_environment=("TMPDIR", "HOME", "XDG_CACHE_HOME", "COVERAGE_FILE"),
         shell_environment=Mock(
             return_value={
                 "PATH": "/usr/bin:/bin",
                 "TMPDIR": "/tmp/loop-scratch-one",
+                "HOME": "/tmp/loop-scratch-one",
                 "XDG_CACHE_HOME": "/tmp/loop-scratch-one/cache",
                 "COVERAGE_FILE": "/tmp/loop-scratch-one/.coverage",
             }
@@ -979,6 +1345,7 @@ def test_payload_environment_maps_generated_paths_to_namespace_scratch():
     assert result == {
         "PATH": "/usr/bin:/bin",
         "TMPDIR": str(NATIVE_SCRATCH_PATH),
+        "HOME": str(NATIVE_SCRATCH_PATH),
         "XDG_CACHE_HOME": str(NATIVE_SCRATCH_PATH / "cache"),
         "COVERAGE_FILE": str(NATIVE_SCRATCH_PATH / ".coverage"),
     }

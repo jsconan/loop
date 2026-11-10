@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import termios
 from collections.abc import Generator, Iterable, Mapping
@@ -35,7 +36,7 @@ from ..models import (
     ToolResultPresentation,
     ToolResultPresentationSpec,
 )
-from ..utils import ChoiceItem, choice_items, format_tool_call_arguments
+from ..utils import ChoiceItem, choice_items, format_tool_call_arguments, render_terminal_text
 from .interaction import AsyncInteractionInput, Interaction
 from .models import ListMarker
 
@@ -133,6 +134,18 @@ class ConsoleInteraction(Interaction, AsyncInteractionInput):
         self._stream_kind = None
         self._stream = None
         self._plain_stream_has_output = False
+
+    @property
+    def supports_fresh_host_approval(self) -> bool:
+        """Report whether the choice session reads from a terminal input.
+
+        Returns:
+            bool: True when the choice session's input descriptor is a terminal.
+        """
+        try:
+            return os.isatty(self._choices_session.input.fileno())
+        except (AttributeError, OSError, TypeError, ValueError):
+            return False
 
     def current_input(self) -> str:
         """Return the current text in the normal message editor.
@@ -475,11 +488,13 @@ class ConsoleInteraction(Interaction, AsyncInteractionInput):
             problem (Problem): Safe problem to render with a stable reference.
         """
         color = "yellow" if problem.severity == "warning" else "red"
-        content = Text(problem.detail)
-        content.append(f"\n\nReference: {problem.instance}", style="dim")
+        content = Text(render_terminal_text(problem.detail))
+        content.append(f"\n\nReference: {render_terminal_text(problem.instance)}", style="dim")
         if problem.retryable:
             content.append("\nThis operation can be retried.", style="dim")
-        self._console.print(Panel(content, title=problem.title, border_style=color))
+        self._console.print(
+            Panel(content, title=Text(render_terminal_text(problem.title)), border_style=color)
+        )
 
     def error(self, message: str) -> None:
         """Write an error to the terminal.
@@ -656,8 +671,12 @@ class ConsoleInteraction(Interaction, AsyncInteractionInput):
             name (str): Name of the requested tool.
             arguments (str): JSON arguments supplied to the tool.
         """
+        display_name = render_terminal_text(name).replace("\n", "␊")
+        display_arguments = render_terminal_text(format_tool_call_arguments(arguments)).replace(
+            "\n", "␊"
+        )
         self._console.print(
-            f"\n[TOOL CALL]: {name}({format_tool_call_arguments(arguments)})",
+            f"\n[TOOL CALL]: {display_name}({display_arguments})",
             style="dim magenta",
             markup=False,
         )

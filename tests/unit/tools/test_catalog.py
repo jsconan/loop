@@ -2,12 +2,12 @@
 
 import importlib
 import json
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 
 import pytest
 
 from loop import BUILTIN_TOOLS, Interaction, PermissionManager, ToolRegistry
-from loop.execution.sandbox import UnavailableSandboxBackend
+from loop.execution.sandbox import SandboxCapability, UnavailableSandboxBackend
 from loop.tools import create_default_tool_registry
 
 
@@ -43,9 +43,30 @@ def test_builtin_manifest_has_every_tool_in_deterministic_order():
         "manage_skills",
         "resolve_executable",
         "run_command",
+        "inspect_command_jobs",
+        "read_command_job",
+        "cancel_command_job",
+        "control_command_terminal",
+        "request_host_command",
         "fetch_content",
         "read_cached_content",
     ]
+
+
+def test_builtin_nullable_arguments_explain_strict_schema_values():
+    """Every nullable model field describes JSON null after its purpose, without omission advice."""
+    service = MagicMock(backend_capabilities=frozenset(SandboxCapability))
+    registry = ToolRegistry(BUILTIN_TOOLS, execution_service=service)
+
+    for definition in registry.definitions():
+        for name, field in definition.parameters["properties"].items():
+            if {"type": "null"} not in field.get("anyOf", []):
+                continue
+            description = field["description"]
+            assert name in definition.parameters["required"]
+            assert "JSON null (unquoted)" in description, f"{definition.name}.{name}"
+            assert not description.startswith("Use JSON null"), f"{definition.name}.{name}"
+            assert "omit" not in description.lower(), f"{definition.name}.{name}"
 
 
 def test_default_registry_factory_returns_isolated_configured_registries(monkeypatch):

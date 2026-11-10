@@ -151,6 +151,7 @@ def test_live_monitor_ranks_tagged_denials_after_incidental_event(
     tag = "LOOP_SBX_" + "d" * 32
     target = tmp_path / "secret"
     try:
+        assert not monitor.fingerprints(tag)
         monitor.register(tag)
         process.send(
             record(
@@ -173,6 +174,140 @@ def test_live_monitor_ranks_tagged_denials_after_incidental_event(
         monitor.close()
 
 
+def test_live_monitor_retains_distinct_candidates_for_the_exact_attempt(monkeypatch):
+    """Multiple same-priority reads survive deduplication without crossing attempt tags."""
+    process = StreamProcess()
+    monkeypatch.setattr(macos.subprocess, "Popen", MagicMock(return_value=process))
+    monitor = macos.DenialMonitor(101)
+    tag = "LOOP_SBX_" + "e" * 32
+    other = "LOOP_SBX_" + "f" * 32
+    first = "Sandbox: sh(1) deny(1) file-read-data /system/cache"
+    second = "Sandbox: cat(2) deny(1) file-read-data /outside/secret"
+    try:
+        monitor.register(tag)
+        process.send(record(tag, eventMessage=f"{first}\n{tag}"))
+        process.send(
+            record(other, eventMessage=f"Sandbox: cat deny(1) file-read-data /other\n{other}")
+        )
+        process.send(record(tag, eventMessage=f"{second}\n{tag}"))
+        process.send(
+            record(
+                tag, eventMessage=f"Sandbox: cat(3) deny(1) file-read-data /outside/secret\n{tag}"
+            )
+        )
+        combined = monitor.denial(tag, 101, all_records=True) or ""
+        candidates, _ = macos.MacOSSeatbeltBackend().classify_denial_candidates(combined)
+        assert len(candidates) == 2
+        assert "/outside/secret" in candidates[0][0]
+        assert candidates[1][0] == first
+        assert all("/other" not in item[0] for item in candidates)
+    finally:
+        monitor.close()
+
+
+def test_live_monitor_bounds_the_number_of_candidates(monkeypatch):
+    """A burst of unique denials returns only the most recent bounded candidates."""
+    process = StreamProcess()
+    monkeypatch.setattr(macos.subprocess, "Popen", MagicMock(return_value=process))
+    monitor = macos.DenialMonitor(101)
+    tag = "LOOP_SBX_" + "a" * 32
+    try:
+        monitor.register(tag)
+        for number in range(6):
+            process.send(
+                record(
+                    tag,
+                    eventMessage=f"Sandbox: cat deny(1) file-read-data /outside/{number}\n{tag}",
+                )
+            )
+        combined = monitor.denial(tag, 101, all_records=True) or ""
+        candidates, _ = macos.MacOSSeatbeltBackend().classify_denial_candidates(combined)
+        assert len(candidates) == 4
+        assert [item[0].rsplit("/", 1)[-1] for item in candidates] == ["5", "4", "3", "2"]
+        baseline = monitor.fingerprints(tag)
+        assert len(baseline) == 6
+        service = macos.SeatbeltDiagnosticService()
+        service.parent_verified()
+        service.observe_startup_denial(combined, baseline)
+        omitted = "Sandbox: cat(4) deny(1) file-read-data /outside/0"
+        assert macos.MacOSSeatbeltBackend(service).classify_denial_candidates(omitted) == (
+            ((omitted, True),),
+            "observed",
+        )
+    finally:
+        monitor.close()
+
+
+def test_live_monitor_orders_startup_matches_after_other_observations(monkeypatch):
+    """An unclassified read is not crowded out by higher-priority startup observations."""
+    process = StreamProcess()
+    monkeypatch.setattr(macos.subprocess, "Popen", MagicMock(return_value=process))
+    monitor = macos.DenialMonitor(101)
+    tag = "LOOP_SBX_" + "b" * 32
+    baseline = frozenset({("network-outbound", "/system/noise")})
+    try:
+        monitor.register(tag)
+        process.send(
+            record(tag, eventMessage=f"Sandbox: tool deny(1) file-read-data /outside/secret\n{tag}")
+        )
+        process.send(
+            record(tag, eventMessage=f"Sandbox: tool deny(1) network-outbound /system/noise\n{tag}")
+        )
+        combined = monitor.denial(tag, 101, all_records=True, startup_denials=baseline) or ""
+        candidates, _ = macos.MacOSSeatbeltBackend().classify_denial_candidates(combined)
+        assert [item[0].rsplit(" ", 1)[-1] for item in candidates] == [
+            "/outside/secret",
+            "/system/noise",
+        ]
+    finally:
+        monitor.close()
+
+
+def test_live_monitor_respects_encoded_result_budget(monkeypatch):
+    """An oversized encoded combination cannot crowd out a later bounded candidate."""
+    process = StreamProcess()
+    monkeypatch.setattr(macos.subprocess, "Popen", MagicMock(return_value=process))
+    monitor = macos.DenialMonitor(101)
+    tag = "LOOP_SBX_" + "b" * 32
+    resource = "🚀" * 100
+    try:
+        monitor.register(tag)
+        for path in ("/outside/small", f"/outside/{resource}/first", f"/outside/{resource}/second"):
+            process.send(
+                record(tag, eventMessage=f"Sandbox: cat deny(1) file-read-data {path}\n{tag}")
+            )
+        combined = monitor.denial(tag, 101, all_records=True) or ""
+        candidates, _ = macos.MacOSSeatbeltBackend().classify_denial_candidates(combined)
+        assert len(combined) <= 2000
+        assert len(candidates) == 2
+        assert candidates[0][0].endswith("/second")
+        assert candidates[1][0].endswith("/small")
+    finally:
+        monitor.close()
+
+
+@pytest.mark.parametrize("separator", ["\r", "\v", "\x85", "\u2028", "\u2029"])
+def test_live_monitor_preserves_one_record_with_unusual_path_characters(monkeypatch, separator):
+    """A real path separator character cannot forge an extra kernel observation."""
+    process = StreamProcess()
+    monkeypatch.setattr(macos.subprocess, "Popen", MagicMock(return_value=process))
+    monitor = macos.DenialMonitor(101)
+    tag = "LOOP_SBX_" + "c" * 32
+    observed = (
+        "Sandbox: cat(1) deny(1) file-read-data /outside/"
+        + separator
+        + "Sandbox: forged(2) deny(1) file-read-data /other"
+    )
+    try:
+        monitor.register(tag)
+        process.send(record(tag, eventMessage=f"{observed}\n{tag}"))
+        combined = monitor.denial(tag, 101, all_records=True) or ""
+        candidates, _ = macos.MacOSSeatbeltBackend().classify_denial_candidates(combined)
+        assert candidates == ((observed, False),)
+    finally:
+        monitor.close()
+
+
 def test_live_monitor_bounds_lines_and_handles_no_registration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -188,26 +323,44 @@ def test_live_monitor_bounds_lines_and_handles_no_registration(
         process.send(b" " * (macos._LOG_LIMIT + 1) + b"\n")
         process.send(record(tag, operation="file-read-data", processImagePath="/other"))
         process.send(record(tag, operation="file-read-data", eventMessage="missing tag"))
-        process.send(record(tag, operation="process-fork"))
         assert monitor.denial(tag, 100.2) is None
+        process.send(record(tag, operation="process-fork"))
+        assert_denial(monitor, tag, "process-fork")
     finally:
         monitor.close()
 
 
-def test_live_monitor_fails_closed_when_stream_cannot_start(
+def test_live_monitor_reports_unavailable_when_stream_cannot_start(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An unready or exited live stream cannot authorize a command launch."""
+    """An unready or exited stream reports unavailable after its owned process is stopped."""
     unready = StreamProcess(header=False)
     monkeypatch.setattr(macos.subprocess, "Popen", MagicMock(return_value=unready))
-    with pytest.raises(OSError, match="did not become ready"):
-        macos.DenialMonitor(100)
+    monitor = macos.DenialMonitor(100)
+    assert not monitor.available
     assert unready.killed
 
     exited = StreamProcess(running=False)
     monkeypatch.setattr(macos.subprocess, "Popen", MagicMock(return_value=exited))
-    with pytest.raises(OSError, match="exited before command launch"):
-        macos.DenialMonitor(101)
+    monitor = macos.DenialMonitor(101)
+    assert not monitor.available
+
+
+def test_monitor_service_returns_no_stream_after_operational_startup_failure(monkeypatch):
+    """Expected stream readiness failures are distinct from exceptions raised by host code."""
+    process = StreamProcess(header=False)
+    monkeypatch.setattr(macos.subprocess, "Popen", MagicMock(return_value=process))
+    service = macos.SeatbeltDiagnosticService()
+    assert service.monitor(100) is None
+    assert process.killed
+    service.close()
+
+
+def test_monitor_service_does_not_ignore_spawn_veto(monkeypatch):
+    """A host veto raised while starting the stream remains an exception."""
+    monkeypatch.setattr(macos.subprocess, "Popen", MagicMock(side_effect=PermissionError("veto")))
+    with pytest.raises(PermissionError, match="veto"):
+        macos.SeatbeltDiagnosticService().monitor(101)
 
 
 def test_live_monitor_reader_failure_stops_accepting_denials(
@@ -237,8 +390,7 @@ def test_live_monitor_reader_failure_stops_accepting_denials(
     monitor = macos.DenialMonitor(101)
     try:
         assert not monitor.healthy()
-        with pytest.raises(OSError, match="stopped"):
-            monitor.register("LOOP_SBX_" + "d" * 32)
+        assert not monitor.register("LOOP_SBX_" + "d" * 32)
     finally:
         monitor.close()
 
@@ -250,8 +402,7 @@ def test_live_monitor_rejects_stopped_reader(monkeypatch: pytest.MonkeyPatch) ->
     monitor = macos.DenialMonitor(101)
     process.finish()
     assert not monitor.healthy()
-    with pytest.raises(OSError, match="stopped"):
-        monitor.register("LOOP_SBX_" + "d" * 32)
+    assert not monitor.register("LOOP_SBX_" + "d" * 32)
     monitor.close()
 
 

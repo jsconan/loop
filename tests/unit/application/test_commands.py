@@ -156,11 +156,11 @@ def test_log_export_streams_archives_with_filters_and_force(application, tmp_pat
     """Rotated JSON logs export oldest-first across boundaries with exact filters."""
     commands, paths = application
     paths.operational_log.parent.mkdir(parents=True, exist_ok=True)
-    (paths.operational_log.parent / "loop.log.2").write_text(
+    (paths.operational_log.parent / "app.log.2").write_text(
         '{"timestamp_ns":1,"level":"INFO","workspace_id":"workspace-id","event.name":"keep"}\n',
         encoding="utf-8",
     )
-    (paths.operational_log.parent / "loop.log.1").write_text(
+    (paths.operational_log.parent / "app.log.1").write_text(
         "malformed\n"
         '{"timestamp_ns":2,"level":"ERROR","workspace_id":"workspace-id","event.name":"skip"}\n',
         encoding="utf-8",

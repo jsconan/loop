@@ -6,24 +6,31 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import inspect
 import ipaddress
 import json
 import logging
+import os
 import re
 import shlex
 import sqlite3
 import stat
 import tempfile
+from _thread import LockType
 from atexit import register
-from collections.abc import Awaitable, Callable, Iterable, Iterator
-from contextlib import contextmanager
+from collections.abc import Awaitable, Callable, Generator, Iterable, Iterator
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing, contextmanager
 from fnmatch import fnmatchcase
 from functools import partial
+from importlib import import_module
 from pathlib import Path
-from threading import RLock
-from typing import TYPE_CHECKING, Any
-from urllib.parse import urlsplit
+from threading import Lock, RLock
+from time import monotonic
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
+from urllib.parse import quote, urlsplit
+from uuid import uuid4
 from weakref import WeakSet
 
 import yaml
@@ -37,12 +44,14 @@ from ..utils import (
     ShutdownRequested,
     VirtualPath,
     canonical_path,
+    ensure_private_directory,
     local_now,
     run_in_worker_async,
     sha256_digest,
 )
 from .audit import SQLitePermissionAudit
 from .inspection import CommandAnalysis, CommandInspection
+from .managed import ManagedPolicyError, ManagedPolicySnapshot, ManagedPolicyStore
 from .models import (
     Action,
     ApprovalChoice,
@@ -52,6 +61,7 @@ from .models import (
     Decision,
     FileTarget,
     HostCommandRule,
+    LimitClassification,
     NetworkTarget,
     Operation,
     Operations,
@@ -60,11 +70,13 @@ from .models import (
     PermissionConfigurationError,
     PermissionLoadPolicy,
     PermissionLoadResult,
+    PermissionNamespaceError,
     PermissionPreset,
     PermissionPresetError,
     PermissionRecorder,
     PermissionRule,
     PolicyDecision,
+    PolicyLimitClassifications,
     PolicyLimitOverrides,
     PolicyLimits,
     PolicyScope,
@@ -77,10 +89,57 @@ from .models import (
     SessionTarget,
     UserPermissionConfiguration,
 )
-from .protection import ProtectedWorkspacePaths, protected_workspace_paths
+from .protection import (
+    ProtectedWorkspacePaths,
+    is_protected_external_read,
+    protected_workspace_paths,
+)
+
+
+def _settle_egress_leases(
+    leases: tuple[EgressRevocationLease, ...], action: Callable[[EgressRevocationLease], bool]
+) -> list[bool]:
+    """Settle independent attempt channels together within their control deadlines."""
+    if len(leases) < 2:
+        return [action(lease) for lease in leases]
+    with ThreadPoolExecutor(max_workers=min(32, len(leases))) as executor:
+        return list(executor.map(action, leases))
+
 
 if TYPE_CHECKING:
     from ..execution.sandbox import SandboxRequest
+
+
+class EgressRevocationLease(Protocol):
+    """Settle mediated admission and closure when active policy changes."""
+
+    def pause(self) -> bool:
+        """Block new connections and confirm the admission barrier.
+
+        Returns:
+            bool: Whether new admission is blocked.
+        """
+
+    def resume(self) -> bool:
+        """Resume only the unchanged policy revision.
+
+        Returns:
+            bool: Whether the live unchanged attempt resumed admission.
+        """
+
+    def revoke_revision(self, revision: int) -> bool:
+        """Close covered transports and confirm the exact new revision.
+
+        Args:
+            revision (int): Published monotonic policy revision.
+
+        Returns:
+            bool: Whether covered transport closure was confirmed on time.
+        """
+
+
+_EGRESS_ACK_SECONDS = 2.0
+
 
 _READ_ACTIONS = {Action.FILESYSTEM_LIST, Action.FILESYSTEM_READ}
 _WRITE_ACTIONS = {
@@ -93,11 +152,44 @@ _LIMIT_NAMES = (
     "writable_roots",
     "network_origins",
     "deny_private_networks",
+    "deny_local_networks",
     "allow_host_processes",
 )
 _LOGGER = logging.getLogger(__name__)
+_ASYNC_POLICY_ATTEMPTS = 3
+_POLICY_LOCK_POLL_SECONDS = 0.01
+_MAX_CANCELLATION_NOTES = 8
+_RESET_PENDING_SUFFIX = ".reset-pending"
+_BROAD_NETWORK_POLICY_ORIGIN = "https://loop.invalid"
 _SIMPLE_COMMAND = re.compile(r"[A-Za-z0-9_./:@+=,-]+(?: [A-Za-z0-9_./:@+=,-]+)+")
 _LIVE_MANAGERS: WeakSet[PermissionManager] = WeakSet()
+
+
+def _retain_cancellation(
+    current: asyncio.CancelledError | None,
+    later: asyncio.CancelledError,
+    *,
+    owned_failure: bool,
+    interruption: str,
+) -> asyncio.CancelledError:
+    """Keep the first signal and report bounded diagnostics from its later interruption."""
+    if current is None:
+        return later
+    if not owned_failure:
+        current.add_note(
+            f"An additional cancellation was observed during permission {interruption}."
+        )
+        return current
+    notes = getattr(later, "__notes__", ())
+    if current is not later and isinstance(notes, (list, tuple)):
+        for note in notes[:_MAX_CANCELLATION_NOTES]:
+            if isinstance(note, str) and re.fullmatch(
+                r"(?:Permission audit|The blocking permission operation) also stopped with "
+                r"[A-Za-z_][A-Za-z0-9_]{0,127}\.",
+                note,
+            ):
+                current.add_note(note)
+    return current
 
 
 def _close_live_managers() -> None:
@@ -109,20 +201,44 @@ def _close_live_managers() -> None:
 register(_close_live_managers)
 
 
+class RememberedApproval(NamedTuple):
+    """Retain installed rule IDs, cancellation and policy application state.
+
+    Args:
+        rule_ids (tuple[str, ...]): IDs added by the approved policy update.
+        cancellation (asyncio.CancelledError | None): Preserved cancellation after settlement.
+        applied (bool): Whether the policy update was applied.
+    """
+
+    rule_ids: tuple[str, ...]
+    cancellation: asyncio.CancelledError | None
+    applied: bool
+
+
 class PermissionManager:
     """Authorize complete operation plans using limits, policy rules, and approval.
 
     Args:
         workspace_root (Path | str | None): Workspace used to resolve policy root tokens.
-        configuration_path (Path | str | None): YAML policy path. Defaults to
-            <workspace_root>/.loop/permissions.yaml when a workspace is supplied.
+        configuration_path (Path | str | None): YAML policy path. Defaults to the workspace's
+            application policy file when a workspace is supplied.
         user_configuration_path (Path | str | None): User-wide remembered-approval YAML path.
             User scope is unavailable when omitted.
         audit_path (Path | str | None): Central SQLite audit database path.
+        protected_host_roots (tuple[Path | str, ...]): Application storage roots that no
+            manually granted sandbox read or write scope may intersect.
         workspace_id (str | None): Stable identity attached to centralized audit records.
+        namespace_catalog_path (Path | str | None): Independent workspace registry used to
+            validate durable permission-policy namespace identity and migration.
+        bootstrap_pristine_policy (bool): Establish the built-in defaults automatically when a
+            validated namespace has no policy, reservation, backup, or reset evidence.
+        user_namespace_identity (str | None): Canonical user-data identity for the user-wide
+            namespace when a catalog is supplied.
         interaction (Interaction | None): User interaction used for approval prompts.
+        yolo (bool): Trusted no-prompt mode active at construction, including policy loading.
         recorder (PermissionRecorder | None): Default sink for authorization observations.
-        configuration (PermissionConfiguration | None): Explicit policy instead of the local file.
+        configuration (PermissionConfiguration | None): Explicit policy instead of the local file;
+            unavailable when durable policy namespaces are configured.
         presets (Iterable[PermissionPreset] | None): Additional selectable presets alongside
             the built-in catalog. Duplicate identifiers are rejected.
         load_policy (PermissionLoadPolicy | None): Artifact failure behavior. Defaults to
@@ -132,9 +248,12 @@ class PermissionManager:
         async_blocking_runner (Callable[..., Awaitable[Any]] | None): Application-owned bounded
             worker for synchronous policy persistence, audit writes, and compatibility recorders.
             Defaults to a shared bounded process worker.
+        managed_policy_store (ManagedPolicyStore | None): Trusted protected installation source.
+            Defaults to the platform's fixed system location.
 
     Raises:
-        PermissionConfigurationError: If a policy is invalid in strict mode.
+        PermissionConfigurationError: If a policy is invalid in strict mode or a pending reset
+            requires recovery.
         PermissionPresetError: If built-in presets are invalid in strict mode.
         ShutdownRequested: If the user exits interactive configuration recovery.
         ValueError: If interactive recovery is selected without an interaction or preset
@@ -155,11 +274,33 @@ class PermissionManager:
     _temporary_ordinary_names: Callable[[], bool] | None
     _presets: dict[str, PermissionPreset]
     _audit_store: SQLitePermissionAudit | None
+    _protected_read_roots: tuple[Path, ...]
+    _protected_host_roots: tuple[Path, ...]
     _workspace_id: str | None
+    _namespace_catalog_path: Path | None
+    _bootstrap_pristine_policy: bool
+    _user_namespace_identity: str | None
+    _namespace_errors: dict[str, str]
     _command_inspection: CommandInspection
     _host_runtime_bindings: dict[str, str]
+    _host_rules_lock: LockType
+    _host_rules_revision: int
     _policy_lock: RLock
+    _async_policy_write_lock: LockType
     _policy_revision: int
+    _egress_revokers: set[EgressRevocationLease]
+    _egress_updating: bool
+    _policy_update_depth: int
+    _yolo: bool
+    _yolo_generation: int
+    _yolo_suspensions: list[int | None]
+    _managed_policy_store: ManagedPolicyStore
+    _managed_policy: ManagedPolicySnapshot | None
+    _managed_error: str | None
+    _workspace_storage_revision: bytes | None
+    _user_storage_revision: bytes | None
+    _failed_workspace_revision: bytes | None
+    _failed_user_revision: bytes | None
     _async_blocking_runner: Callable[..., Awaitable[Any]] | None
 
     def __init__(
@@ -169,17 +310,48 @@ class PermissionManager:
         configuration_path: Path | str | None = None,
         user_configuration_path: Path | str | None = None,
         audit_path: Path | str | None = None,
+        protected_host_roots: tuple[Path | str, ...] = (),
         workspace_id: str | None = None,
+        namespace_catalog_path: Path | str | None = None,
+        bootstrap_pristine_policy: bool = False,
+        user_namespace_identity: str | None = None,
         interaction: Interaction | None = None,
+        yolo: bool = False,
         recorder: PermissionRecorder | None = None,
         configuration: PermissionConfiguration | None = None,
         presets: Iterable[PermissionPreset] | None = None,
         load_policy: PermissionLoadPolicy | None = None,
         command_inspection: CommandInspection | None = None,
         async_blocking_runner: Callable[..., Awaitable[Any]] | None = None,
+        managed_policy_store: ManagedPolicyStore | None = None,
     ) -> None:
         self._policy_lock = RLock()
+        self._async_policy_write_lock = Lock()
+        self._host_rules_lock = Lock()
+        self._host_rules_revision = 0
+        self._egress_revokers = set()
+        self._egress_updating = False
+        self._policy_update_depth = 0
         self._policy_revision = 0
+        self._yolo = yolo
+        self._yolo_generation = 0
+        self._yolo_suspensions = []
+        self._managed_policy_store = managed_policy_store or ManagedPolicyStore()
+        self._managed_policy = None
+        self._managed_error = None
+        self._load_managed_policy()
+        self._workspace_storage_revision = None
+        self._user_storage_revision = None
+        self._failed_workspace_revision = None
+        self._failed_user_revision = None
+        self._namespace_catalog_path = (
+            Path(namespace_catalog_path).expanduser().absolute()
+            if namespace_catalog_path is not None
+            else None
+        )
+        self._bootstrap_pristine_policy = bootstrap_pristine_policy
+        self._user_namespace_identity = user_namespace_identity
+        self._namespace_errors = {}
         self._async_blocking_runner = async_blocking_runner
         self._command_inspection = (
             command_inspection if command_inspection is not None else CommandInspection()
@@ -204,28 +376,85 @@ class PermissionManager:
                 else None
             )
             self._user_configuration_path = (
-                Path(user_configuration_path).expanduser().resolve()
+                (
+                    Path(user_configuration_path).expanduser().absolute()
+                    if self._namespace_catalog_path is not None
+                    else Path(user_configuration_path).expanduser().resolve()
+                )
                 if user_configuration_path is not None
                 else None
             )
             self._workspace_id = workspace_id
+            if self._namespace_catalog_path is not None and (
+                workspace_id is None
+                or user_namespace_identity is None
+                or self._workspace_root is None
+                or self._user_configuration_path is None
+                or configuration is not None
+            ):
+                raise ValueError(
+                    "Durable policy namespaces require workspace and user paths and identities, "
+                    "without an injected configuration."
+                )
             self._audit_store = (
                 SQLitePermissionAudit(audit_path) if audit_path is not None else None
             )
+            managed_directory = self._managed_policy_store.directory
+            managed_expectation = self._managed_policy_store.expectation_path
+            protected_read = [Path(root).resolve() for root in protected_host_roots]
+            protected = [Path(root) for root in protected_host_roots]
+            if managed_directory is not None:
+                protected_read.append(managed_directory)
+                protected.append(managed_directory)
+            if managed_expectation is not None:
+                protected_read.append(managed_expectation)
+                protected.append(managed_expectation)
+            self._protected_read_roots = tuple(dict.fromkeys(protected_read))
+            if self._configuration_path is not None and (
+                self._workspace_root is None
+                or not self._configuration_path.parent.is_relative_to(self._workspace_root)
+            ):
+                protected.append(self._configuration_path.parent)
+            if self._user_configuration_path is not None:
+                protected.append(self._user_configuration_path.parent)
+            if audit_path is not None:
+                protected.append(Path(audit_path).parent)
+            self._protected_host_roots = tuple(dict.fromkeys(path.resolve() for path in protected))
             self._interaction = interaction
             self._recorder = recorder
             self._load_policy = load_policy or (
                 PermissionLoadPolicy.INTERACTIVE
-                if interaction is not None
+                if interaction is not None and not self._yolo
                 else PermissionLoadPolicy.ERROR
             )
             if self._load_policy is PermissionLoadPolicy.INTERACTIVE and interaction is None:
                 raise ValueError("Interactive permission loading requires an Interaction.")
-            self._configuration = configuration or PermissionConfiguration()
+            self._configuration = (
+                configuration.model_copy(deep=True)
+                if configuration is not None
+                else PermissionConfiguration()
+            )
             if configuration is None:
                 self._load_configuration()
+            elif self._configuration_path is not None:
+                self._workspace_storage_revision = self._read_storage_revision(
+                    self._configuration_path
+                )
             self._user_configuration = UserPermissionConfiguration()
             self._load_user_configuration()
+            if (
+                self._namespace_catalog_path is not None
+                and self._workspace_root is not None
+                and any(
+                    root.is_relative_to(self._workspace_root)
+                    or self._workspace_root.is_relative_to(root)
+                    for root in self._protected_read_roots
+                )
+            ):
+                self._namespace_errors["workspace"] = (
+                    "The workspace intersects protected application storage; select a disjoint "
+                    "workspace before policy admission."
+                )
             self._session_overrides = SessionPolicyOverrides()
             builtin_presets = self._load_presets()
             catalog = (*builtin_presets, *(presets or ()))
@@ -239,7 +468,280 @@ class PermissionManager:
 
     def close(self) -> None:
         """Release the manager-owned temporary directory."""
+        with self._policy_lock:
+            confirmations = self._revoke_egress_leases(self._policy_revision + 1)
+            self._egress_revokers.clear()
         self._temporary_directory.cleanup()
+        if not all(confirmations):
+            raise OSError("Mediated egress closure could not be confirmed.")
+
+    def bind_egress(self, revision: int, lease: EgressRevocationLease) -> None:
+        """Bind one live mediated attempt to the exact approving active revision.
+
+        Args:
+            revision (int): Revision captured atomically with the command approval.
+            lease (EgressRevocationLease): Attempt-owned pause, resume, and revocation channel.
+
+        Raises:
+            OSError: Policy changed or managed authority became unavailable before activation.
+        """
+        with self._policy_lock:
+            if (
+                self._egress_updating
+                or revision != self._policy_revision
+                or self._managed_current_error() is not None
+            ):
+                raise OSError("Mediated egress policy changed before activation.")
+            self._egress_revokers.add(lease)
+
+    def unbind_egress(self, lease: EgressRevocationLease) -> None:
+        """Remove a settled mediated attempt from policy-change notifications.
+
+        Args:
+            lease (EgressRevocationLease): The exact attempt previously bound to this manager.
+        """
+        with self._policy_lock:
+            self._egress_revokers.discard(lease)
+
+    def _revoke_egress_leases(self, revision: int) -> list[bool]:
+        """Revoke channels concurrently and retire confirmed leases under the policy lock."""
+        leases = tuple(self._egress_revokers)
+        deadline = monotonic() + _EGRESS_ACK_SECONDS
+        confirmations = _settle_egress_leases(leases, lambda lease: lease.revoke_revision(revision))
+        if monotonic() > deadline:
+            confirmations = [False] * len(leases)
+        for lease, confirmed in zip(leases, confirmations):
+            if confirmed:
+                self._egress_revokers.discard(lease)
+        return confirmations
+
+    def egress_policy_revision(self) -> int:
+        """Check managed-source freshness and report this manager's active revision.
+
+        Returns:
+            int: In-process revision; another manager's persisted write awaits trusted reload.
+
+        Raises:
+            OSError: Required managed authority is invalid, changed, or stale.
+        """
+        with self._policy_lock:
+            previous = self._policy_revision
+            error = self._managed_current_error()
+            confirmations = (
+                self._revoke_egress_leases(self._policy_revision)
+                if self._policy_revision != previous
+                else []
+            )
+            if not all(confirmations):
+                raise OSError("Mediated egress revocation closure is uncertain.")
+            if error is not None:
+                raise OSError("Mediated egress managed policy is unavailable.")
+            return self._policy_revision
+
+    def try_egress_policy_revision(self) -> int | None:
+        """Check live authority without blocking the independent heartbeat sender.
+
+        Returns:
+            int | None: Active revision, or None while an exclusive policy update runs.
+
+        Raises:
+            OSError: Required managed authority is invalid, changed, or stale.
+        """
+        if not self._policy_lock.acquire(blocking=False):
+            return None
+        try:
+            return self.egress_policy_revision()
+        finally:
+            self._policy_lock.release()
+
+    @property
+    def yolo(self) -> bool:
+        """Return no-prompt state after current managed-policy restrictions.
+
+        Returns:
+            bool: Active YOLO state; invalid or prohibiting managed policy disables it.
+        """
+        with self._policy_lock:
+            if self._yolo:
+                self._managed_current_error()
+            return self._yolo and all(
+                generation == self._yolo_generation for generation in self._yolo_suspensions
+            )
+
+    def recovery_retry_generation(self) -> int | None:
+        """Capture the no-prompt generation for an explicit uncertain-outcome retry.
+
+        Returns:
+            int | None: The current generation when a human decision is possible, otherwise None.
+        """
+        with self._policy_lock:
+            return None if self.yolo else self._yolo_generation
+
+    def recovery_retry_current(self, generation: int) -> bool:
+        """Check whether a retry retains its automatic-decision generation.
+
+        A successful check at the tool callable's dispatch boundary admits that invocation;
+        later policy changes do not revoke it.
+
+        Args:
+            generation (int): Generation captured before the human retry decision.
+
+        Returns:
+            bool: Whether the captured generation still permits retry admission.
+        """
+        with self._policy_lock:
+            return not self.yolo and self._yolo_generation == generation
+
+    @contextmanager
+    def suspend_yolo_decisions(self) -> Generator[Callable[[], None], None, None]:
+        """Block newly granted automatic decisions while an activation is being published.
+
+        Yields:
+            Callable[[], None]: Roll back automatic authority without restoring a revoked
+                generation. If the transition cannot settle, disable automatic decisions without
+                claiming that existing egress leases have closed.
+        """
+
+        def fail_closed() -> None:
+            """Remove automatic authority even when normal policy transition cannot settle."""
+            with self._policy_lock:
+                if self._yolo:
+                    self._yolo = False
+                    self._yolo_generation += 1
+                    self._policy_revision += 1
+                    telemetry_audit(
+                        "permission.yolo_changed", enabled=False, source="rollback_uncertain"
+                    )
+
+        with self._policy_lock:
+            generation = self._yolo_generation if self.yolo else None
+            self._yolo_suspensions.append(generation)
+
+        def rollback() -> None:
+            """Preserve only authority that was active and has not since been revoked."""
+            try:
+                with self.policy_update():
+                    if self._yolo:
+                        self._managed_current_error()
+                    if generation is None or generation != self._yolo_generation:
+                        self.set_yolo(False)
+            except BaseException:
+                fail_closed()
+                raise
+
+        try:
+            yield rollback
+        finally:
+            with self._policy_lock:
+                self._yolo_suspensions.remove(generation)
+
+    def validate_yolo_activation(self) -> None:
+        """Require current administrator authority to permit no-prompt activation.
+
+        Raises:
+            ValueError: Managed policy is invalid, changed, or prohibits YOLO.
+        """
+        with self._policy_lock:
+            if error := self._managed_current_error():
+                raise ValueError(f"Administrator policy recovery required: {error}")
+            if self._managed_policy is not None and self._managed_policy.policy.forbid_yolo:
+                raise ValueError("Administrator policy prohibits YOLO activation.")
+
+    def set_yolo(self, enabled: bool) -> None:
+        """Apply a trusted configuration change to subsequent authorization decisions.
+
+        Args:
+            enabled (bool): Whether the trusted human configuration enables YOLO.
+
+        Raises:
+            ValueError: Managed policy is invalid or prohibits activation.
+        """
+        with self.policy_update():
+            if enabled:
+                self.validate_yolo_activation()
+            if self._yolo == enabled:
+                return
+            self._yolo = enabled
+            self._yolo_generation += 1
+            self._policy_revision += 1
+        telemetry_audit("permission.yolo_changed", enabled=enabled)
+
+    def _load_managed_policy(self) -> None:
+        """Bind a protected administrator policy, retaining an invalid-state denial."""
+        try:
+            current = self._managed_policy_store.load()
+            previous = self._managed_policy
+            if previous is not None and current is None:
+                raise ManagedPolicyError(
+                    "Administrator policy installation disappeared during this process."
+                )
+            if (
+                previous is not None
+                and current is not None
+                and (
+                    current.policy.identity == previous.policy.identity
+                    and current.identity != previous.identity
+                    and current.policy.revision <= previous.policy.revision
+                )
+            ):
+                raise ManagedPolicyError(
+                    "Administrator policy replacement needs a higher revision."
+                )
+            self._managed_policy = current
+            self._managed_error = None
+            if current is not None and current.policy.forbid_yolo:
+                self._disable_yolo_for_managed_policy()
+        except ManagedPolicyError as error:
+            self._managed_error = str(error)
+            self._disable_yolo_for_managed_policy()
+
+    def _disable_yolo_for_managed_policy(self) -> None:
+        """Revoke automatic decisions without reactivating after a later policy reload."""
+        if self._yolo:
+            self._yolo = False
+            self._yolo_generation += 1
+            self._policy_revision += 1
+            telemetry_audit("permission.yolo_changed", enabled=False, source="managed")
+
+    def _managed_current_error(self) -> str | None:
+        """Keep a changed or invalid installation denied until trusted reload."""
+        if self._managed_error is not None:
+            return self._managed_error
+        if self._managed_policy is None and not self._managed_policy_store.may_be_installed():
+            return None
+        try:
+            current = self._managed_policy_store.load()
+        except ManagedPolicyError as error:
+            self._managed_error = str(error)
+        else:
+            previous = self._managed_policy
+            if (current.identity if current is not None else None) != (
+                previous.identity if previous is not None else None
+            ):
+                self._managed_error = "Administrator policy changed; reload its trusted revision."
+        if self._managed_error is not None:
+            self._policy_revision += 1
+            self._disable_yolo_for_managed_policy()
+            telemetry_audit("permission.managed_unavailable", reason="changed_or_invalid")
+        return self._managed_error
+
+    def confirmation_decision(self, *, certain: bool = True) -> bool | None:
+        """Resolve an otherwise confirmable action without a prompt in YOLO mode.
+
+        Args:
+            certain (bool): Whether inputs and the prior outcome permit an automatic decision.
+
+        Returns:
+            bool | None: Approval or recovery refusal in YOLO, or None for normal interaction.
+        """
+        if not self.yolo:
+            return None
+        telemetry_audit(
+            "permission.confirmation_decided",
+            decision="allow" if certain else "recovery_required",
+            source="yolo",
+        )
+        return certain
 
     @contextmanager
     def policy_update(self) -> Iterator[None]:
@@ -249,10 +751,46 @@ class PermissionManager:
             None: Exclusive access to policy state until the command completes.
         """
         with self._policy_lock:
-            yield
+            outer = self._policy_update_depth == 0
+            if outer:
+                self._egress_updating = True
+                pauses = _settle_egress_leases(
+                    tuple(self._egress_revokers), lambda lease: lease.pause()
+                )
+                if not all(pauses):
+                    self._revoke_egress_leases(self._policy_revision + 1)
+                    self._egress_updating = False
+                    raise OSError("Mediated egress admission pause is uncertain.")
+            self._policy_update_depth += 1
+            revision = self._policy_revision
+            try:
+                yield
+            except BaseException:
+                if outer:
+                    confirmations = self._revoke_egress_leases(self._policy_revision + 1)
+                    if not all(confirmations):
+                        raise OSError("Mediated egress revocation closure is uncertain.")
+                raise
+            else:
+                if outer:
+                    if self._policy_revision != revision:
+                        confirmations = self._revoke_egress_leases(self._policy_revision)
+                    else:
+                        confirmations = _settle_egress_leases(
+                            tuple(self._egress_revokers), lambda lease: lease.resume()
+                        )
+                    if not all(confirmations):
+                        raise OSError("Mediated egress policy transition is uncertain.")
+            finally:
+                self._policy_update_depth -= 1
+                if outer:
+                    self._egress_updating = False
 
     def __del__(self) -> None:
-        self.close()
+        try:
+            self.close()
+        except OSError:
+            pass
 
     @property
     def configuration(self) -> PermissionConfiguration:
@@ -278,10 +816,33 @@ class PermissionManager:
             if (value := getattr(self._session_overrides.limits, name)) is not None
         }
         limits = self._configuration.limits.model_copy(update=limit_updates)
+        classifications = self._configuration.limit_classifications.model_copy(
+            update={
+                name: self._session_overrides.limit_classifications.get(
+                    name,
+                    LimitClassification.HARD
+                    if name in limit_updates
+                    else getattr(self._configuration.limit_classifications, name),
+                )
+                for name in ("readable_roots", "writable_roots", "network_origins")
+            }
+            | {
+                "sources": {
+                    **self._configuration.limit_classifications.sources,
+                    **{
+                        name: "session"
+                        for name in ("readable_roots", "writable_roots", "network_origins")
+                        if name in limit_updates
+                        or name in self._session_overrides.limit_classifications
+                    },
+                }
+            }
+        )
         return self._configuration.model_copy(
             update={
                 "defaults": defaults,
                 "limits": limits,
+                "limit_classifications": classifications,
                 "rules": [*self._configuration.rules, *self._session_overrides.rules],
             },
             deep=True,
@@ -305,6 +866,29 @@ class PermissionManager:
         """
         return self._configuration_path
 
+    def policy_namespace_identity(self, scope: str) -> str:
+        """Return the expected identity for a trusted policy initialization command.
+
+        Args:
+            scope (str): `workspace` or `user` namespace.
+
+        Returns:
+            str: Durable expected identity.
+
+        Raises:
+            ValueError: If the namespace is unavailable or unknown.
+        """
+        identity = (
+            self._workspace_id
+            if scope == "workspace"
+            else self._user_namespace_identity
+            if scope == "user"
+            else None
+        )
+        if identity is None or self._namespace_catalog_path is None:
+            raise ValueError(f"Durable policy namespace '{scope}' is unavailable.")
+        return identity
+
     @property
     def user_configuration_path(self) -> Path | None:
         """Return the user-wide remembered-approval policy path.
@@ -316,7 +900,7 @@ class PermissionManager:
 
     @property
     def temporary_directory(self) -> Path:
-        """Return the active scratch directory allowed by ``loop-temp``.
+        """Return the active scratch directory allowed by the application temporary-root token.
 
         Returns:
             Path: Bound session directory, or manager-owned storage before session binding.
@@ -336,8 +920,10 @@ class PermissionManager:
             ordinary_names (Callable[[], bool] | None): Trusted session-owner query for fresh
                 agent-data authority. None retains private-name restrictions.
         """
-        self._temporary_path = directory
-        self._temporary_ordinary_names = ordinary_names
+        with self.policy_update():
+            self._temporary_path = directory
+            self._temporary_ordinary_names = ordinary_names
+            self._policy_revision += 1
 
     @property
     def temporary_directory_allows_private_names(self) -> bool:
@@ -468,8 +1054,8 @@ class PermissionManager:
         active_interaction = interaction if interaction is not None else self._interaction
         prompt = None
         selected = None
-        headless = policy.decision is Decision.ASK and active_interaction is None
-        if policy.decision is Decision.ASK and active_interaction is not None:
+        headless = policy.decision is Decision.ASK and active_interaction is None and not self.yolo
+        if policy.decision is Decision.ASK and active_interaction is not None and not self.yolo:
             prompt_body = self._prompt(operations)
             prompt = self._authorization_prompt(prompt_body, fresh_file_review)
             selected = self.request_permission(
@@ -516,8 +1102,8 @@ class PermissionManager:
         active_interaction = interaction if interaction is not None else self._interaction
         prompt = None
         selected = None
-        headless = policy.decision is Decision.ASK and active_interaction is None
-        if policy.decision is Decision.ASK and active_interaction is not None:
+        headless = policy.decision is Decision.ASK and active_interaction is None and not self.yolo
+        if policy.decision is Decision.ASK and active_interaction is not None and not self.yolo:
             prompt_body = self._prompt(operations)
             prompt = self._authorization_prompt(prompt_body, fresh_file_review)
             selected = await self.request_permission_async(
@@ -533,25 +1119,64 @@ class PermissionManager:
             selected,
             headless=headless,
         )
+        audit_failures: list[tuple[asyncio.CancelledError, BaseException]] = []
         try:
-            await self._audit_async(result)
+            await self._audit_async(result, _owned_failures=audit_failures)
         except asyncio.CancelledError as error:
-            cancellation = cancellation or error
+            cancellation = _retain_cancellation(
+                cancellation,
+                error,
+                owned_failure=bool(audit_failures and audit_failures[0][0] is error),
+                interruption="audit",
+            )
         active_recorder = recorder if recorder is not None else self._recorder
+        recorder_error = None
         if active_recorder is not None:
+            recorded = self._recordable_result(result)
             async_recorder = getattr(active_recorder, "record_authorization_async", None)
-            if callable(async_recorder) and inspect.iscoroutinefunction(async_recorder):
-                try:
-                    await async_recorder(result)
-                except asyncio.CancelledError as error:
-                    cancellation = cancellation or error
-            else:
-                _, recorder_cancellation = await self._run_blocking_settled_async(
-                    active_recorder.record_authorization,
-                    result,
+            native_async = callable(async_recorder) and inspect.iscoroutinefunction(async_recorder)
+            recorder_failures: list[tuple[asyncio.CancelledError, BaseException]] = []
+            try:
+                if native_async:
+                    await async_recorder(recorded)
+                else:
+                    _, recorder_cancellation = await self._run_blocking_settled_async(
+                        active_recorder.record_authorization,
+                        recorded,
+                        _owned_failures=recorder_failures,
+                    )
+                    if recorder_cancellation is not None:
+                        cancellation = _retain_cancellation(
+                            cancellation,
+                            recorder_cancellation,
+                            owned_failure=False,
+                            interruption="recorder",
+                        )
+            except asyncio.CancelledError as error:
+                owned_failure = (
+                    recorder_failures[0][1]
+                    if recorder_failures
+                    and recorder_failures[0][0] is error
+                    and not isinstance(recorder_failures[0][1], asyncio.CancelledError)
+                    else None
                 )
-                cancellation = cancellation or recorder_cancellation
+                cancellation = _retain_cancellation(
+                    cancellation,
+                    error,
+                    owned_failure=owned_failure is not None,
+                    interruption="recorder",
+                )
+                recorder_error = owned_failure
+            except Exception as error:
+                if cancellation is None:
+                    raise
+                cancellation.add_note(
+                    f"Permission recorder also stopped with {type(error).__name__}."
+                )
+                recorder_error = error
         if cancellation is not None:
+            if recorder_error is not None:
+                raise cancellation from recorder_error
             raise cancellation
         return result
 
@@ -562,17 +1187,18 @@ class PermissionManager:
     ) -> tuple[PolicyDecision, bool]:
         """Evaluate policy and impose a fresh prompt for protected file changes."""
         policy = self.evaluate(operations)
-        fresh_file_review = self._requires_fresh_file_review(
+        file_review = self._requires_fresh_file_review(
             operations, self.protected_instruction_names(protected_instruction_names)
         )
-        if fresh_file_review and policy.decision is not Decision.DENY:
+        managed_fresh = any(source.startswith("managed:human:") for source in policy.sources)
+        if file_review and policy.decision is not Decision.DENY:
             policy = PolicyDecision(
                 decision=Decision.ASK,
                 reason="A user-managed replacement, deletion, "
                 "or instruction change needs fresh approval.",
                 sources=("boundary:fresh_file_review",),
             )
-        return policy, fresh_file_review
+        return policy, file_review or managed_fresh
 
     async def _authorization_policy_async(
         self,
@@ -593,6 +1219,7 @@ class PermissionManager:
             )
             if cancellation is not None:
                 raise cancellation
+        managed_fresh = any(source.startswith("managed:human:") for source in policy.sources)
         if fresh_file_review and policy.decision is not Decision.DENY:
             policy = PolicyDecision(
                 decision=Decision.ASK,
@@ -602,13 +1229,13 @@ class PermissionManager:
                 ),
                 sources=("boundary:fresh_file_review",),
             )
-        return policy, fresh_file_review
+        return policy, fresh_file_review or managed_fresh
 
     @staticmethod
     def _authorization_prompt(prompt_body: str, fresh_file_review: bool) -> str:
         """Add the appropriate confirmation wording to an operation description."""
         return (
-            f"{prompt_body}\nProceed with this one file change?"
+            f"{prompt_body}\nProceed with this one request?"
             if fresh_file_review
             else f"{prompt_body}\nProceed?"
         )
@@ -665,7 +1292,7 @@ class PermissionManager:
         self._audit(result)
         active_recorder = recorder if recorder is not None else self._recorder
         if active_recorder is not None:
-            active_recorder.record_authorization(result)
+            active_recorder.record_authorization(self._recordable_result(result))
         return result
 
     async def _complete_authorization_async(
@@ -680,10 +1307,11 @@ class PermissionManager:
     ) -> tuple[AuthorizationResult, asyncio.CancelledError | None]:
         """Apply an async approval without doing policy-file I/O on the event loop."""
         current_policy = None
-        if (
-            policy.decision is Decision.ASK
-            and not headless
-            and self._selected_approval_choice(selected) is not ApprovalChoice.DENY
+        if policy.decision is Decision.ASK and (
+            self.yolo
+            or (
+                not headless and self._selected_approval_choice(selected) is not ApprovalChoice.DENY
+            )
         ):
             current_policy = await self.evaluate_async(operations)
         (
@@ -705,23 +1333,35 @@ class PermissionManager:
         cancellation = None
         if approval_scope is not None:
             try:
-                installed_rule_ids, cancellation = await self._remember_approval_async(
-                    operations, scope=approval_scope
-                )
+                remembered = await self._remember_approval_async(operations, scope=approval_scope)
             except OSError as exc:
                 decision = Decision.DENY
                 reason = f"Could not persist the approved permission policy: {exc}"
                 source = "persistence"
             else:
-                current_policy = await self.evaluate_async(operations)
-                if current_policy.decision is Decision.DENY:
-                    policy = current_policy
+                installed_rule_ids = remembered.rule_ids
+                cancellation = remembered.cancellation
+                if not remembered.applied:
                     decision = Decision.DENY
-                    reason = (
-                        "The active permission policy changed to deny this operation while "
-                        "approval was pending."
-                    )
-                    source = "policy"
+                    reason = "Permission approval was cancelled before its rule was saved."
+                    source = "cancelled"
+                else:
+                    try:
+                        current_policy = await self.evaluate_async(operations)
+                    except asyncio.CancelledError as error:
+                        cancellation = cancellation or error
+                        decision = Decision.DENY
+                        reason = "Permission authorization was cancelled after its rule was saved."
+                        source = "cancelled"
+                    else:
+                        if current_policy.decision is Decision.DENY:
+                            policy = current_policy
+                            decision = Decision.DENY
+                            reason = (
+                                "The active permission policy changed to deny this operation while "
+                                "approval was pending."
+                            )
+                            source = "policy"
 
         result = self._authorization_result(
             operations,
@@ -760,7 +1400,19 @@ class PermissionManager:
         approval_scope = None
         approval_policy_denied = False
         if policy.decision is Decision.ASK:
-            if headless:
+            if self.yolo:
+                current_policy = current_policy or self.evaluate(operations)
+                if current_policy.decision is Decision.DENY:
+                    policy = current_policy
+                    decision = Decision.DENY
+                    reason = "The active policy denied this operation before YOLO admission."
+                    source = "policy"
+                else:
+                    decision = Decision.ALLOW
+                    reason = "Approved for this request by YOLO mode."
+                    source = "yolo"
+                    approval_choice = ApprovalChoice.ONCE
+            elif headless:
                 decision = Decision.DENY
                 reason = "Approval is required but no interactive user is available."
                 source = "headless"
@@ -812,8 +1464,8 @@ class PermissionManager:
             return selected
         return ApprovalChoice.ONCE if selected is True else ApprovalChoice.DENY
 
-    @staticmethod
     def _authorization_result(
+        self,
         operations: Operations,
         policy: PolicyDecision,
         decision: Decision,
@@ -845,11 +1497,28 @@ class PermissionManager:
             ),
             operation_count=len(result.operations),
         )
-        telemetry_trace_event(
-            "permission.decision",
-            payload=result,
-        )
+        telemetry_trace_event("permission.decision", payload=self._recordable_result(result))
         return result
+
+    @staticmethod
+    def _recordable_result(result: AuthorizationResult) -> AuthorizationResult:
+        """Remove host command material from routine decision and session records."""
+        if not any(
+            isinstance(operation.target, ProcessTarget)
+            and operation.target.boundary is ProcessBoundary.HOST
+            for operation in result.operations
+        ):
+            return result
+        return result.model_copy(
+            update={
+                "operations": (),
+                "prompt": None,
+                "reason": "Host process authorization decision.",
+                "policy": result.policy.model_copy(
+                    update={"reason": "Host process policy decision."}
+                ),
+            }
+        )
 
     def _requires_fresh_file_review(
         self,
@@ -1072,12 +1741,16 @@ class PermissionManager:
             f"{repeat}"
         )
 
-    @staticmethod
-    def host_retry_choices(reusable: bool) -> tuple[dict[str, str], dict[str, str]]:
+    def host_retry_choices(
+        self,
+        reusable: bool,
+        trusted: bool = False,
+    ) -> tuple[dict[str, str], dict[str, str]]:
         """Return permission-owned choices for a fresh or reusable host offer.
 
         Args:
             reusable (bool): Whether a prelaunch failure permits a stable exact session rule.
+            trusted (bool): Whether this is an explicit exact host command eligible for grants.
 
         Returns:
             tuple[dict[str, str], dict[str, str]]: Choice labels and keyboard index.
@@ -1085,8 +1758,19 @@ class PermissionManager:
         choices = {"deny": "Deny", "approve": "Approve this one host run"}
         index = {"deny": "N", "approve": "Y"}
         if reusable:
-            choices["session"] = "Allow this exact host command for this session"
+            choices["session"] = "Allow this exact no-effects retry for this session"
             index["session"] = "S"
+        if trusted:
+            choices["trust_session"] = "Trust this exact host command for this session"
+            index["trust_session"] = "T"
+            if (
+                self._namespace_catalog_path is not None
+                and self._user_configuration_path is not None
+            ):
+                choices["trust_workspace"] = "Trust this exact host command in this workspace"
+                choices["trust_user"] = "Trust this exact host command for this user"
+                index["trust_workspace"] = "W"
+                index["trust_user"] = "U"
         return choices, index
 
     def command_needs_git_write(self, source: str) -> bool:
@@ -1107,28 +1791,51 @@ class PermissionManager:
         *,
         tool_id: str,
         interaction: Interaction | None = None,
+        reason: str | None = None,
+        approved_revision: list[int] | None = None,
     ) -> bool:
         """Authorize a bound sandbox request using sandbox-only scoped approval rules.
 
         Legacy process allow rules never approve this request. Explicit deny policy still takes
-        precedence. Commands within the default workspace sandbox run without a prompt;
-        additional authority requires a sandbox-only approval.
+        precedence, and an explicit ask always requires a fresh decision. Commands within the
+        default workspace sandbox run without a prompt; additional authority requires a
+        sandbox-only approval or a one-request YOLO decision. A policy change observed before
+        the final policy check invalidates the decision.
 
         Args:
             request (SandboxRequest): Exact command, authority, and path identities to approve.
             tool_id (str): Registered execution tool identity for policy and audit.
             interaction (Interaction | None): Interactive approval surface.
+            reason (str | None): Model-provided explanation shown only in the user prompt.
+            approved_revision (list[int] | None): Optional output for the exact policy revision
+                that approved the sandbox attempt, populated only on approval.
 
         Returns:
             bool: Whether policy or the user approved this sandbox attempt.
         """
-        policy = self.evaluate((self._sandbox_operation(request, tool_id),))
+        with self._policy_lock:
+            egress_limited = bool(
+                request.egress_origins
+                and self.sandbox_egress_limit(tool_id, request.egress_origins)
+            )
+            network_limited = bool(request.network and self.sandbox_network_limit(tool_id))
+            operations = self._sandbox_operations(request, tool_id)
+            policy, revision = self._sandbox_policy_snapshot(operations)
+        if egress_limited:
+            self._audit_sandbox_denial(request, source="egress_rule_limit")
+            return False
+        if self.sandbox_scope_limit(request) is not None:
+            self._audit_sandbox_denial(request, source="scope_limit")
+            return False
+        if network_limited:
+            self._audit_sandbox_denial(request, source="network_limit")
+            return False
         if policy.decision is Decision.DENY:
             self._audit_sandbox_denial(request, source="policy")
             return False
         scratch_roots = self._sandbox_scratch_roots(request)
         explicit_ask = policy.decision is Decision.ASK and any(
-            source.startswith("rule:") for source in policy.sources
+            source.startswith(("rule:", "managed:human:")) for source in policy.sources
         )
         temporary_roots = tuple(scratch_roots)
         scratch = request.shell_environment().get("TMPDIR")
@@ -1146,15 +1853,31 @@ class PermissionManager:
             explicit_ask=explicit_ask,
             findings=findings,
         ):
+            if not self.sandbox_policy_revision_current(revision, approved_revision):
+                self._audit_sandbox_denial(request, source="policy")
+                return False
             self._audit_sandbox_decision(request, decision="allow", source="workspace_sandbox")
             return True
-        matched_scope = None if fresh_review else self._matching_sandbox_rule_scope(request)
+        reusable = not fresh_review and not explicit_ask
+        matched_scope = self._matching_sandbox_rule_scope(request) if reusable else None
         if matched_scope is not None:
+            if not self.sandbox_policy_revision_current(revision, approved_revision):
+                self._audit_sandbox_denial(request, source="policy")
+                return False
             self._audit_sandbox_decision(
                 request,
                 decision="allow",
                 source=f"rule:{matched_scope.value}",
             )
+            return True
+        if not self.sandbox_policy_revision_current(revision):
+            self._audit_sandbox_denial(request, source="policy")
+            return False
+        if self.yolo:
+            if not self.sandbox_policy_revision_current(revision, approved_revision):
+                self._audit_sandbox_denial(request, source="policy")
+                return False
+            self._audit_sandbox_decision(request, decision="allow", source="yolo")
             return True
         active_interaction = interaction if interaction is not None else self._interaction
         if active_interaction is None:
@@ -1163,11 +1886,14 @@ class PermissionManager:
 
         approved = self._request_sandbox_approval(
             request,
+            revision=revision,
             interaction=active_interaction,
             scratch_roots=scratch_roots,
             findings=findings,
             explicit_ask=explicit_ask,
             fresh_review=fresh_review,
+            reason=reason,
+            approved_revision=approved_revision,
         )
         self._audit_sandbox_decision(
             request,
@@ -1182,13 +1908,21 @@ class PermissionManager:
         *,
         tool_id: str,
         interaction: Interaction | None = None,
+        reason: str | None = None,
+        approved_revision: list[int] | None = None,
     ) -> bool:
         """Authorize a bound sandbox request without blocking asynchronous approval input.
+
+        Explicit asks require a fresh decision outside YOLO. A policy change observed before the
+        final policy check invalidates the decision.
 
         Args:
             request (SandboxRequest): Exact command, authority, and path identities to approve.
             tool_id (str): Registered execution tool identity for policy and audit.
             interaction (Interaction | None): Interactive approval surface.
+            reason (str | None): Model-provided explanation shown only in the user prompt.
+            approved_revision (list[int] | None): Optional output for the exact policy revision
+                that approved the sandbox attempt, populated only on approval.
 
         Returns:
             bool: Whether policy or the user approved this sandbox attempt.
@@ -1197,13 +1931,36 @@ class PermissionManager:
             asyncio.CancelledError: If approval or owned audit and persistence work is cancelled.
             ProblemException: If interactive approval lacks native asynchronous input.
         """
-        policy = await self.evaluate_async((self._sandbox_operation(request, tool_id),))
+        operations = self._sandbox_operations(request, tool_id)
+        policy, revision = await self._sandbox_policy_snapshot_async(operations)
+        await self._acquire_policy_lock_async()
+        try:
+            current_revision = revision == self._policy_revision
+            egress_limited = bool(
+                request.egress_origins
+                and self.sandbox_egress_limit(tool_id, request.egress_origins)
+            )
+            network_limited = bool(request.network and self.sandbox_network_limit(tool_id))
+        finally:
+            self._policy_lock.release()
+        if not current_revision:
+            self._audit_sandbox_denial(request, source="policy")
+            return False
+        if egress_limited:
+            self._audit_sandbox_denial(request, source="egress_rule_limit")
+            return False
+        if self.sandbox_scope_limit(request) is not None:
+            self._audit_sandbox_denial(request, source="scope_limit")
+            return False
+        if network_limited:
+            self._audit_sandbox_denial(request, source="network_limit")
+            return False
         if policy.decision is Decision.DENY:
             self._audit_sandbox_denial(request, source="policy")
             return False
         scratch_roots = self._sandbox_scratch_roots(request)
         explicit_ask = policy.decision is Decision.ASK and any(
-            source.startswith("rule:") for source in policy.sources
+            source.startswith(("rule:", "managed:human:")) for source in policy.sources
         )
         temporary_roots = tuple(scratch_roots)
         scratch = request.shell_environment().get("TMPDIR")
@@ -1225,15 +1982,31 @@ class PermissionManager:
             explicit_ask=explicit_ask,
             findings=findings,
         ):
+            if not await self._sandbox_policy_revision_current_async(revision, approved_revision):
+                self._audit_sandbox_denial(request, source="policy")
+                return False
             self._audit_sandbox_decision(request, decision="allow", source="workspace_sandbox")
             return True
-        matched_scope = None if fresh_review else self._matching_sandbox_rule_scope(request)
+        reusable = not fresh_review and not explicit_ask
+        matched_scope = self._matching_sandbox_rule_scope(request) if reusable else None
         if matched_scope is not None:
+            if not await self._sandbox_policy_revision_current_async(revision, approved_revision):
+                self._audit_sandbox_denial(request, source="policy")
+                return False
             self._audit_sandbox_decision(
                 request,
                 decision="allow",
                 source=f"rule:{matched_scope.value}",
             )
+            return True
+        if not await self._sandbox_policy_revision_current_async(revision):
+            self._audit_sandbox_denial(request, source="policy")
+            return False
+        if self.yolo:
+            if not await self._sandbox_policy_revision_current_async(revision, approved_revision):
+                self._audit_sandbox_denial(request, source="policy")
+                return False
+            self._audit_sandbox_decision(request, decision="allow", source="yolo")
             return True
         active_interaction = interaction if interaction is not None else self._interaction
         if active_interaction is None:
@@ -1242,11 +2015,14 @@ class PermissionManager:
 
         approved = await self._request_sandbox_approval_async(
             request,
+            revision=revision,
             interaction=active_interaction,
             scratch_roots=scratch_roots,
             findings=findings,
             explicit_ask=explicit_ask,
             fresh_review=fresh_review,
+            reason=reason,
+            approved_revision=approved_revision,
         )
         self._audit_sandbox_decision(
             request,
@@ -1255,25 +2031,438 @@ class PermissionManager:
         )
         return approved
 
+    def sandbox_scope_limit(self, request: SandboxRequest) -> str | None:
+        """Explain hard file and local-network ceilings for a sandbox request.
+
+        Args:
+            request (SandboxRequest): Bound command request and native file scopes.
+
+        Returns:
+            str | None: Required trusted action, or None when file scopes are eligible.
+        """
+        with self._policy_lock:
+            if request.local_network and not self.sandbox_local_network_enabled():
+                return "The effective user or managed policy denies sandbox-local networking."
+            for root in request.read_roots:
+                if root.is_relative_to(request.workspace):
+                    continue
+                if any(
+                    root.is_relative_to(protected) or protected.is_relative_to(root)
+                    for protected in self._protected_read_roots
+                ):
+                    return "A requested read root intersects protected application policy or state."
+            effective = self.effective_configuration
+            for name, roots in (
+                (
+                    "readable_roots",
+                    tuple(
+                        root
+                        for root in request.read_roots
+                        if root not in request.automatic_tool_reads
+                    ),
+                ),
+                ("writable_roots", request.write_roots),
+            ):
+                if getattr(effective.limit_classifications, name) is not LimitClassification.HARD:
+                    continue
+                if any(
+                    not self._in_roots(str(root), getattr(effective.limits, name)) for root in roots
+                ):
+                    label = "read-root" if name == "readable_roots" else "write-root"
+                    return (
+                        f"The effective {name} limit is hard and excludes a requested sandbox "
+                        f"scope. A trusted user may inspect '/permissions limit list' and "
+                        f"deliberately change that limit or classify the {label} limit as "
+                        "approval-controlled before requesting this scope again."
+                    )
+        return None
+
+    def review_legacy_sandbox_read_limit(
+        self, request: SandboxRequest, interaction: Interaction
+    ) -> bool:
+        """Offer a trusted workspace-policy migration before reviewing an external read.
+
+        Args:
+            request (SandboxRequest): Bound command and external read scope.
+            interaction (Interaction): Trusted human prompt for the policy change.
+
+        Returns:
+            bool: Whether the legacy hard read limit became approval-controlled.
+        """
+        revision = self._legacy_sandbox_read_review_revision(request)
+        if self.yolo:
+            return False
+        if revision is None:
+            return False
+        roots = tuple(
+            root for root in request.read_roots if root not in request.automatic_tool_reads
+        )
+        selected = interaction.prompt(
+            "The saved legacy policy blocks this sandboxed command's external read scope. "
+            "Allow scoped external-read approvals for this workspace? This changes the "
+            "workspace limit classification, but does not approve this command or add any roots. "
+            f"Requested roots: {json.dumps([str(root) for root in roots])}",
+            exit_commands=None,
+            choices={"deny": "Keep the hard limit", "review": "Allow scoped read approvals"},
+            index={"deny": "N", "review": "Y"},
+        )
+        return selected == "review" and self._complete_legacy_sandbox_read_review(revision)
+
+    async def review_legacy_sandbox_read_limit_async(
+        self, request: SandboxRequest, interaction: Interaction
+    ) -> bool:
+        """Offer the trusted legacy read migration through asynchronous human input.
+
+        Args:
+            request (SandboxRequest): Bound command and external read scope.
+            interaction (Interaction): Trusted human prompt for the policy change.
+
+        Returns:
+            bool: Whether the legacy hard read limit became approval-controlled.
+
+        Raises:
+            asyncio.CancelledError: If review or policy persistence is cancelled.
+            ProblemException: If native asynchronous input is unavailable.
+        """
+        revision, cancellation = await self._run_blocking_settled_async(
+            self._legacy_sandbox_read_review_revision, request
+        )
+        if cancellation is not None:
+            raise cancellation
+        if self.yolo:
+            return False
+        if revision is None:
+            return False
+        roots = tuple(
+            root for root in request.read_roots if root not in request.automatic_tool_reads
+        )
+        async_interaction = require_async_interaction(interaction, "legacy sandbox read review")
+        selected = await async_interaction.prompt_async(
+            "The saved legacy policy blocks this sandboxed command's external read scope. "
+            "Allow scoped external-read approvals for this workspace? This changes the "
+            "workspace limit classification, but does not approve this command or add any roots. "
+            f"Requested roots: {json.dumps([str(root) for root in roots])}",
+            exit_commands=None,
+            choices={"deny": "Keep the hard limit", "review": "Allow scoped read approvals"},
+            index={"deny": "N", "review": "Y"},
+        )
+        if selected != "review":
+            return False
+        approved, cancellation = await self._run_blocking_settled_async(
+            self._complete_legacy_sandbox_read_review, revision
+        )
+        if cancellation is not None:
+            raise cancellation
+        return approved
+
+    def _legacy_sandbox_read_review_revision(self, request: SandboxRequest) -> int | None:
+        """Return the current revision only for an eligible legacy read ceiling."""
+        with self.policy_update():
+            classifications = self._configuration.limit_classifications
+            if (
+                classifications.sources["readable_roots"] != "legacy"
+                or self._session_overrides.limits.readable_roots is not None
+                or "readable_roots" in self._session_overrides.limit_classifications
+                or self._namespace_recovery_decision() is not None
+                or not (self.sandbox_scope_limit(request) or "").startswith(
+                    "The effective readable_roots limit is hard"
+                )
+            ):
+                return None
+            return self._policy_revision
+
+    def _complete_legacy_sandbox_read_review(self, revision: int) -> bool:
+        """Apply the reviewed classification only when its policy snapshot still matches."""
+        with self.policy_update():
+            if revision != self._policy_revision:
+                return False
+            self.classify_limit("readable_roots", LimitClassification.APPROVAL)
+        return True
+
+    def sandbox_write_root_limit(self, workspace: Path, roots: tuple[Path, ...]) -> str | None:
+        """Reject external write scopes intersecting control or private data.
+
+        Args:
+            workspace (Path): Bound workspace root.
+            roots (tuple[Path, ...]): Manually requested write roots.
+
+        Returns:
+            str | None: Fixed boundary denial, or None when scopes are eligible.
+        """
+        for root in roots:
+            if root.is_relative_to(workspace):
+                if self._is_protected_path(str(root), mutation=True, recursive=True):
+                    return "A requested write root intersects protected workspace control data."
+                continue
+            common = Path(os.path.commonpath((workspace, root)))
+            if workspace.is_relative_to(root) or is_protected_external_read(
+                root.relative_to(common)
+            ):
+                return "An external write root intersects the workspace or private host data."
+            if any(
+                root.is_relative_to(protected) or protected.is_relative_to(root)
+                for protected in self._protected_host_roots
+            ):
+                return "An external write root intersects protected application policy or state."
+        return None
+
+    def sandbox_network_limit(self, tool_id: str) -> str | None:
+        """Explain why a broad command network grant cannot satisfy effective limits.
+
+        Args:
+            tool_id (str): Exact command tool identity used for policy matching.
+
+        Returns:
+            str | None: Required trusted policy change, or None when broad egress is eligible.
+        """
+        with self._policy_lock:
+            limits = self.effective_configuration.limits
+            if limits.deny_private_networks:
+                return (
+                    "The effective private-network limit is hard, while this sandbox backend "
+                    "offers only a general network grant. A trusted user may deliberately run "
+                    "'/permissions limit set workspace private-network allow' (or select session "
+                    "scope), then request the general grant again. That grant can reach private "
+                    "host and network services."
+                )
+            if limits.deny_local_networks or (
+                self._managed_policy is not None and self._managed_policy.policy.deny_local_networks
+            ):
+                return (
+                    "The sandbox-local network limit denies a general network grant, which "
+                    "would also expose host loopback. Use mediated egress on a qualified backend "
+                    "or remove the local deny through trusted policy."
+                )
+            if "*" not in limits.network_origins:
+                return (
+                    "The effective network-origin limit restricts destinations, while this "
+                    "sandbox backend offers only a general network grant. A trusted user may "
+                    "deliberately allow the '*' network origin in the applicable policy scope, "
+                    "then request the general grant again. That grant is not origin-scoped."
+                )
+            if self._has_scoped_network_rule(tool_id):
+                return (
+                    "A network URL or exact-request rule cannot be enforced by a general "
+                    "network grant. Use a qualified mediator for exact destinations or change "
+                    "the rule through trusted policy."
+                )
+        return None
+
+    def sandbox_local_network_enabled(self) -> bool:
+        """Report whether current user and managed limits permit attempt-local networking.
+
+        Returns:
+            bool: Whether the command may use its isolated loopback interface.
+        """
+        with self._policy_lock:
+            return not (
+                self.effective_configuration.limits.deny_local_networks
+                or self._managed_policy is not None
+                and self._managed_policy.policy.deny_local_networks
+            )
+
+    def sandbox_egress_limit(self, tool_id: str, origins: tuple[str, ...]) -> str | None:
+        """Explain rules that a destination-only mediator cannot enforce.
+
+        Args:
+            tool_id (str): Exact command tool identity used for policy matching.
+            origins (tuple[str, ...]): Canonical HTTP(S) destinations requested by the agent.
+
+        Returns:
+            str | None: Unavailable reason for stronger rules, or None for destination scope.
+        """
+        with self._policy_lock:
+            limits = self.effective_configuration.limits
+            if any(origin.startswith("https://") for origin in origins) and (
+                "*" not in limits.network_origins
+            ):
+                return (
+                    "An HTTPS tunnel cannot enforce the configured network-origin limit "
+                    "inside encrypted traffic."
+                )
+            if self._has_scoped_network_rule(tool_id):
+                return (
+                    "A network URL or exact-request rule cannot be enforced for every request "
+                    "by this destination-only mediator."
+                )
+        return None
+
     @staticmethod
-    def _sandbox_operation(request: SandboxRequest, tool_id: str) -> Operation:
-        """Build the policy operation representing one sandboxed command."""
-        return Operation(
-            tool_id=tool_id,
-            action=Action.PROCESS_EXECUTE,
-            target=ProcessTarget(
-                argv=("/bin/sh", "-c", request.source),
-                cwd=str(request.cwd),
-                boundary=ProcessBoundary.SANDBOXED,
-            ),
+    def _resource_glob_can_match_network_url(resource: str) -> bool:
+        """Check whether a glob can match an HTTP(S) URL scheme prefix.
+
+        A star before the full scheme retains the rule; excluding impossible suffixes would
+        require a complete glob-and-URL intersection check.
+        """
+        for scheme in ("http://", "https://"):
+            index = 0
+            for character in scheme:
+                if index == len(resource):
+                    break
+                token = resource[index]
+                if token == "*":
+                    return True
+                if token == "[":
+                    end = index + 1
+                    if end < len(resource) and resource[end] == "!":
+                        end += 1
+                    if end < len(resource) and resource[end] == "]":
+                        end += 1
+                    end = resource.find("]", end)
+                    if end < 0 or not fnmatchcase(character, resource[index : end + 1]):
+                        break
+                    index = end + 1
+                elif token == "?" or token == character:
+                    index += 1
+                else:
+                    break
+            else:
+                return True
+        return False
+
+    def _has_scoped_network_rule(self, tool_id: str) -> bool:
+        """Identify scoped network rules and generic rules that may match HTTP URLs."""
+        rules = (
+            *self._configuration.rules,
+            *self._user_configuration.rules,
+            *self._session_overrides.rules,
+            *(self._managed_policy.policy.rules if self._managed_policy is not None else ()),
+        )
+        return any(
+            (rule.tool == tool_id if rule.tool_exact else fnmatchcase(tool_id, rule.tool))
+            and rule.action in (None, Action.NETWORK_REQUEST)
+            and (
+                isinstance(rule.target, NetworkTarget)
+                or rule.resource is not None
+                and rule.resource != "*"
+                and (
+                    rule.action is Action.NETWORK_REQUEST
+                    or self._resource_glob_can_match_network_url(rule.resource)
+                )
+            )
+            for rule in rules
         )
 
     @staticmethod
+    def _sandbox_operations(request: SandboxRequest, tool_id: str) -> tuple[Operation, ...]:
+        """Check both shell sources and the targetless policy of a broad network grant."""
+        commands = tuple(
+            Operation(
+                tool_id=tool_id,
+                action=Action.PROCESS_EXECUTE,
+                target=ProcessTarget(
+                    argv=(constants.SHELL_COMMAND_PATH, constants.SHELL_COMMAND_OPTION, source),
+                    cwd=str(request.cwd),
+                    boundary=ProcessBoundary.SANDBOXED,
+                ),
+            )
+            for source in dict.fromkeys((request.source, request.execution_source))
+        )
+        return (
+            *commands,
+            *(
+                (
+                    Operation(
+                        tool_id=tool_id,
+                        action=Action.NETWORK_REQUEST,
+                        target=NetworkTarget(
+                            url=_BROAD_NETWORK_POLICY_ORIGIN + "/",
+                            origin=_BROAD_NETWORK_POLICY_ORIGIN,
+                        ),
+                    ),
+                )
+                if request.network
+                else ()
+            ),
+            *(
+                Operation(
+                    tool_id=tool_id,
+                    action=Action.NETWORK_REQUEST,
+                    target=NetworkTarget(url=origin + "/", origin=origin),
+                )
+                for origin in request.egress_origins
+            ),
+        )
+
+    def _sandbox_policy_snapshot(
+        self,
+        operations: tuple[Operation, ...],
+    ) -> tuple[PolicyDecision, int]:
+        """Capture the command policy and its revision under one lock."""
+        return self.evaluate_with_revision(operations)
+
+    async def _sandbox_policy_snapshot_async(
+        self,
+        operations: tuple[Operation, ...],
+    ) -> tuple[PolicyDecision, int]:
+        """Capture command policy and revision without blocking the owner event loop."""
+        decision, revision = await self.evaluate_with_revision_async(operations)
+        return decision, revision if revision is not None else -1
+
+    def sandbox_policy_revision_current(
+        self, revision: int, approved_revision: list[int] | None = None
+    ) -> bool:
+        """Check a sandbox approval without pausing unchanged mediated grants.
+
+        Args:
+            revision (int): Policy revision captured with the exact sandbox approval.
+            approved_revision (list[int] | None): Optional output for the current revision,
+                populated only when the approval remains valid.
+
+        Returns:
+            bool: Whether policy and namespace authority are still current.
+
+        Raises:
+            OSError: Active egress closure could not be confirmed after authority changed.
+        """
+        with self._policy_lock:
+            previous = self._policy_revision
+            try:
+                current = revision == previous and self._namespace_recovery_decision() is None
+            except BaseException:
+                if not all(self._revoke_egress_leases(self._policy_revision + 1)):
+                    raise OSError("Mediated egress revocation closure is uncertain.") from None
+                raise
+            if self._policy_revision != previous and not all(
+                self._revoke_egress_leases(self._policy_revision)
+            ):
+                raise OSError("Mediated egress policy transition is uncertain.")
+            if current and approved_revision is not None:
+                approved_revision.append(revision)
+            return current
+
+    async def _sandbox_policy_revision_current_async(
+        self,
+        revision: int,
+        approved_revision: list[int] | None = None,
+    ) -> bool:
+        """Recheck and settle any changed egress authority outside the owner event loop."""
+        while True:
+            current, cancellation = await self._run_blocking_settled_async(
+                self._sandbox_policy_revision_unless_busy, revision
+            )
+            if cancellation is not None:
+                raise cancellation
+            if current is not None:
+                break
+            await asyncio.sleep(_POLICY_LOCK_POLL_SECONDS)
+        if current and approved_revision is not None:
+            approved_revision.append(revision)
+        return current
+
+    def _sandbox_policy_revision_unless_busy(self, revision: int) -> bool | None:
+        """Check authority only when the worker can own the policy lock immediately."""
+        if not self._policy_lock.acquire(blocking=False):
+            return None
+        try:
+            return self.sandbox_policy_revision_current(revision)
+        finally:
+            self._policy_lock.release()
+
+    @staticmethod
     def _sandbox_scratch_roots(request: SandboxRequest) -> set[Path]:
-        """Return explicitly bound session roots and authenticated temporary alias targets."""
-        return ({request.scratch_root} if request.scratch_root is not None else set()) | {
-            target for virtual, _, target in request.aliases if virtual == VirtualPath.TEMPORARY
-        }
+        """Return the explicitly bound session root."""
+        return {request.scratch_root} if request.scratch_root is not None else set()
 
     def _audit_sandbox_scope(
         self,
@@ -1294,6 +2483,7 @@ class PermissionManager:
                     for name, spelling, resolved, _, _ in request.executable_identities
                 ],
                 "write_roots": [str(root) for root in request.write_roots],
+                "egress_origins": list(request.egress_origins),
                 "policy_version": request.policy_version,
                 "review_policies": [finding.policy_id for finding in findings],
             },
@@ -1308,19 +2498,14 @@ class PermissionManager:
         findings: tuple[CommandFinding, ...],
     ) -> bool:
         """Report whether a request stays inside the unprompted workspace sandbox."""
-        allowed_aliases = all(
-            (virtual == VirtualPath.WORKSPACE and target == request.workspace)
-            or (virtual == VirtualPath.TEMPORARY and target in scratch_roots)
-            for virtual, _, target in request.aliases
-        )
         return (
             not explicit_ask
             and not findings
             and set(request.read_roots) <= set(request.automatic_tool_reads)
             and not request.network
+            and not request.egress_origins
             and not request.git_create
             and set(request.write_roots) <= {request.workspace, *scratch_roots}
-            and allowed_aliases
         )
 
     def _matching_sandbox_rule_scope(self, request: SandboxRequest) -> ApprovalChoice | None:
@@ -1344,67 +2529,125 @@ class PermissionManager:
         self,
         request: SandboxRequest,
         *,
+        revision: int,
         interaction: Interaction,
         scratch_roots: set[Path],
         findings: tuple[CommandFinding, ...],
         explicit_ask: bool,
         fresh_review: bool,
+        reason: str | None,
+        approved_revision: list[int] | None = None,
     ) -> bool:
         """Prompt for a sandbox command and remember a selected approval when allowed."""
-        interaction.info(
-            self._sandbox_permission_message(
-                request,
-                scratch_roots=scratch_roots,
-                findings=findings,
-                explicit_ask=explicit_ask,
+        message = self._sandbox_permission_message(
+            request,
+            scratch_roots=scratch_roots,
+            findings=findings,
+            explicit_ask=explicit_ask,
+            reason=reason,
+        )
+        interaction.info(message)
+        choices, index, prefix = self._sandbox_approval_choices(
+            request, fresh_only=fresh_review or explicit_ask
+        )
+        full_scope = False
+        while True:
+            selected = interaction.prompt(
+                "Allow this command?", exit_commands=None, choices=choices, index=index
             )
-        )
-        choices, index, prefix = self._sandbox_approval_choices(request, fresh_review=fresh_review)
-        selected = interaction.prompt(
-            "Allow this command?", exit_commands=None, choices=choices, index=index
-        )
+            if selected != "details":
+                break
+            full_scope = not full_scope
+            choices = {
+                **choices,
+                "details": "Show reduced scope" if full_scope else "Show full scope",
+            }
+            interaction.info(
+                self._sandbox_permission_message(
+                    request,
+                    scratch_roots=scratch_roots,
+                    findings=findings,
+                    explicit_ask=explicit_ask,
+                    reason=reason,
+                    full_scope=True,
+                )
+                if full_scope
+                else message
+            )
         if selected not in choices or selected == "deny":
             return False
-        return selected == "approve" or self._remember_sandbox_approval(
+        if selected == "approve":
+            return self.sandbox_policy_revision_current(revision, approved_revision)
+        return self._remember_sandbox_approval(
             request,
+            revision=revision,
             selected=selected,
             prefix=prefix,
+            approved_revision=approved_revision,
         )
 
     async def _request_sandbox_approval_async(
         self,
         request: SandboxRequest,
         *,
+        revision: int,
         interaction: Interaction,
         scratch_roots: set[Path],
         findings: tuple[CommandFinding, ...],
         explicit_ask: bool,
         fresh_review: bool,
+        reason: str | None,
+        approved_revision: list[int] | None = None,
     ) -> bool:
         """Prompt asynchronously and settle any remembered approval before returning."""
         async_interaction = require_async_interaction(interaction, "sandbox command approval")
-        interaction.info(
-            self._sandbox_permission_message(
-                request,
-                scratch_roots=scratch_roots,
-                findings=findings,
-                explicit_ask=explicit_ask,
+        message = self._sandbox_permission_message(
+            request,
+            scratch_roots=scratch_roots,
+            findings=findings,
+            explicit_ask=explicit_ask,
+            reason=reason,
+        )
+        interaction.info(message)
+        choices, index, prefix = self._sandbox_approval_choices(
+            request, fresh_only=fresh_review or explicit_ask
+        )
+        full_scope = False
+        while True:
+            selected = await async_interaction.prompt_async(
+                "Allow this command?", exit_commands=None, choices=choices, index=index
             )
-        )
-        choices, index, prefix = self._sandbox_approval_choices(request, fresh_review=fresh_review)
-        selected = await async_interaction.prompt_async(
-            "Allow this command?", exit_commands=None, choices=choices, index=index
-        )
+            if selected != "details":
+                break
+            full_scope = not full_scope
+            choices = {
+                **choices,
+                "details": "Show reduced scope" if full_scope else "Show full scope",
+            }
+            interaction.info(
+                self._sandbox_permission_message(
+                    request,
+                    scratch_roots=scratch_roots,
+                    findings=findings,
+                    explicit_ask=explicit_ask,
+                    reason=reason,
+                    full_scope=True,
+                )
+                if full_scope
+                else message
+            )
         if selected not in choices or selected == "deny":
             return False
         if selected == "approve":
-            return True
+            return await self._sandbox_policy_revision_current_async(revision, approved_revision)
         approved, cancellation = await self._run_blocking_settled_async(
             partial(
                 self._remember_sandbox_approval,
                 request,
+                revision=revision,
                 selected=selected,
                 prefix=prefix,
+                approved_revision=approved_revision,
             )
         )
         if cancellation is not None:
@@ -1418,17 +2661,11 @@ class PermissionManager:
         scratch_roots: set[Path],
         findings: tuple[CommandFinding, ...],
         explicit_ask: bool,
+        reason: str | None,
+        full_scope: bool = False,
     ) -> str:
-        """Describe the additional authority requested without exposing local paths."""
-        reads_outside_workspace = set(request.read_roots) - set(
-            request.automatic_tool_reads
-        ) or any(
-            not (
-                (virtual == VirtualPath.WORKSPACE and target == request.workspace)
-                or (virtual == VirtualPath.TEMPORARY and target in scratch_roots)
-            )
-            for virtual, _, target in request.aliases
-        )
+        """Summarize the command and its additional authority for user review."""
+        reads_outside_workspace = bool(set(request.read_roots) - set(request.automatic_tool_reads))
         read_context = self._sandbox_read_context(request) if reads_outside_workspace else None
         reasons = self._sandbox_permission_reasons(
             request,
@@ -1441,11 +2678,75 @@ class PermissionManager:
         contexts.extend(finding.context for finding in findings)
         if not contexts:
             contexts.append("Run this command with additional sandbox access")
+        scope: dict[str, Any] = {
+            "workspace": str(request.workspace),
+            "workspace_write": any(
+                request.workspace.is_relative_to(root) for root in request.write_roots
+            ),
+        }
+        if request.cwd != request.workspace:
+            scope["working_directory"] = str(request.cwd)
+        extra_reads = [
+            root for root in request.read_roots if root not in request.automatic_tool_reads
+        ]
+        if extra_reads:
+            scope["read_roots"] = [str(root) for root in extra_reads]
+            if request.read_aliases:
+                scope["read_aliases"] = len(request.read_aliases)
+        extra_writes = [
+            root
+            for root in request.write_roots
+            if root != request.workspace and root not in scratch_roots
+        ]
+        if extra_writes:
+            scope["write_roots"] = [str(root) for root in extra_writes]
+        if request.automatic_tool_reads:
+            scope["automatic_tool_read_roots"] = len(request.automatic_tool_reads)
+        if request.network:
+            scope["network"] = True
+        if request.egress_origins:
+            scope["egress_origins"] = list(request.egress_origins)
+        if request.git_create:
+            scope["git_create"] = True
+        model_reason = f"\nAgent explanation: {json.dumps(reason)}" if reason is not None else ""
+        executed = (
+            f"Executed command: {json.dumps(request.execution_source)}\n"
+            if request.execution_source != request.source
+            else ""
+        )
+        scope_label = "Full scope" if full_scope else "Scope"
+        visible_scope = self._sandbox_scope(request) if full_scope else scope
         return (
             f"Command: {json.dumps(request.source)}\n"
+            f"{executed}"
+            f"{scope_label}: {json.dumps(visible_scope)}\n"
             f"Context: {'; '.join(contexts)}.\n"
-            f"Reason: Needs permission to {', '.join(reasons)}."
+            f"Reason: Needs permission to {', '.join(reasons)}.{model_reason}"
         )
+
+    @staticmethod
+    def _sandbox_scope(request: SandboxRequest) -> dict[str, Any]:
+        """Describe the complete bound sandbox scope for optional review."""
+        return {
+            "workspace": str(request.workspace),
+            "working_directory": str(request.cwd),
+            "read_roots": [str(root) for root in request.read_roots],
+            "automatic_tool_reads": [str(root) for root in request.automatic_tool_reads],
+            "read_aliases": [str(alias) for alias in request.read_aliases],
+            "write_roots": [str(root) for root in request.write_roots],
+            "executables": [
+                {"name": name, "spelling": str(spelling), "target": str(target)}
+                for name, spelling, target, _, _ in request.executable_identities
+            ],
+            "network": request.network,
+            "egress_origins": list(request.egress_origins),
+            "git_create": request.git_create,
+            "scratch_root": str(request.scratch_root) if request.scratch_root is not None else None,
+            "temporary_directory": request.shell_environment().get(
+                VirtualPath.TEMPORARY.removeprefix("$")
+            ),
+            "scratch_data": request.scratch_data,
+        }
 
     @staticmethod
     def _sandbox_read_context(request: SandboxRequest) -> str:
@@ -1490,6 +2791,8 @@ class PermissionManager:
             reasons.append("create Git metadata")
         if request.network:
             reasons.append("use the network")
+        if request.egress_origins:
+            reasons.append("use the listed HTTP(S) destinations")
         reasons.extend(finding.reason for finding in findings)
         if explicit_ask and not reasons:
             reasons.append("run under your command approval rule")
@@ -1499,12 +2802,14 @@ class PermissionManager:
         self,
         request: SandboxRequest,
         *,
-        fresh_review: bool,
+        fresh_only: bool,
     ) -> tuple[dict[str, str], dict[str, str], str | None]:
         """Build permitted interactive choices and their optional similar-command prefix."""
         choices = {"deny": "Deny", "approve": "Allow once", "session": "Allow for this session"}
         index = {"deny": "N", "approve": "Y", "session": "S"}
-        if fresh_review:
+        choices["details"] = "Show full scope"
+        index["details"] = "D"
+        if fresh_only:
             choices.pop("session")
             index.pop("session")
             return choices, index, None
@@ -1534,8 +2839,10 @@ class PermissionManager:
         self,
         request: SandboxRequest,
         *,
+        revision: int,
         selected: str,
         prefix: str | None,
+        approved_revision: list[int] | None = None,
     ) -> bool:
         """Persist a remembered approval selected through the sandbox command prompt."""
         similar = selected.startswith("similar_")
@@ -1549,12 +2856,18 @@ class PermissionManager:
             scope=scope,
         )
         try:
-            if scope is ApprovalChoice.SESSION:
-                self._session_overrides.sandboxed_command_rules.append(rule)
-            else:
-                updated_user = self._user_configuration.model_copy(deep=True)
-                updated_user.sandboxed_command_rules.append(rule)
-                self._replace_user_configuration(updated_user)
+            with self.policy_update():
+                if not self.sandbox_policy_revision_current(revision):
+                    return False
+                if scope is ApprovalChoice.SESSION:
+                    self._session_overrides.sandboxed_command_rules.append(rule)
+                    self._policy_revision += 1
+                else:
+                    updated_user = self._user_configuration.model_copy(deep=True)
+                    updated_user.sandboxed_command_rules.append(rule)
+                    self._replace_user_configuration(updated_user)
+                if approved_revision is not None:
+                    approved_revision.append(self._policy_revision)
         except OSError:
             return False
         telemetry_audit(
@@ -1663,20 +2976,27 @@ class PermissionManager:
             ValueError: If the scope cannot store approvals.
             OSError: If the changed persistent policy cannot be written.
         """
-        rules = list(self.sandboxed_command_rules(scope))
-        remaining = [rule for rule in rules if rule.id != rule_id]
-        if len(remaining) == len(rules):
-            return False
         if scope is ApprovalChoice.SESSION:
-            self._session_overrides.sandboxed_command_rules = remaining
+            with self.policy_update():
+                rules = list(self.sandboxed_command_rules(scope))
+                remaining = [rule for rule in rules if rule.id != rule_id]
+                if len(remaining) == len(rules):
+                    return False
+                self._session_overrides.sandboxed_command_rules = remaining
+                self._policy_revision += 1
         else:
-            updated_user = self._user_configuration.model_copy(deep=True)
-            updated_user.sandboxed_command_rules = [
-                rule
-                for rule in updated_user.sandboxed_command_rules
-                if rule.id != rule_id or rule.scope is not scope
-            ]
-            self._replace_user_configuration(updated_user)
+            with self.policy_update():
+                rules = list(self.sandboxed_command_rules(scope))
+                remaining = [rule for rule in rules if rule.id != rule_id]
+                if len(remaining) == len(rules):
+                    return False
+                updated_user = self._user_configuration.model_copy(deep=True)
+                updated_user.sandboxed_command_rules = [
+                    rule
+                    for rule in updated_user.sandboxed_command_rules
+                    if rule.id != rule_id or rule.scope is not scope
+                ]
+                self._replace_user_configuration(updated_user)
         telemetry_audit("sandbox.permission_rule_removed", scope=scope.value, rule_id=rule_id)
         return True
 
@@ -1686,9 +3006,290 @@ class PermissionManager:
         Returns:
             tuple[HostCommandRule, ...]: Independent copies of active host rules.
         """
-        return tuple(
-            rule.model_copy(deep=True) for rule in self._session_overrides.host_command_rules
+        with self._host_rules_lock:
+            return tuple(
+                rule.model_copy(deep=True) for rule in self._session_overrides.host_command_rules
+            )
+
+    def trusted_host_command_rules(self) -> tuple[HostCommandRule, ...]:
+        """List human-installed no-prompt grants in every managed scope.
+
+        Returns:
+            tuple[HostCommandRule, ...]: Detached grants with no command contents.
+        """
+        with self.policy_update():
+            return tuple(
+                rule.model_copy(deep=True)
+                for rule in (
+                    *self._session_overrides.trusted_host_command_rules,
+                    *(
+                        self._user_configuration.trusted_host_command_rules
+                        if self._namespace_catalog_path is not None
+                        else ()
+                    ),
+                )
+            )
+
+    def _trusted_host_signature(
+        self, source: str, cwd: Path, tool_id: str, scope: ApprovalChoice
+    ) -> str | None:
+        """Bind exact shell context to the selected grant scope and current authority."""
+        root = self._workspace_root
+        if root is None or tool_id != "request_host_command" or not cwd.is_relative_to(root):
+            return None
+        try:
+            identity = root.stat()
+            cwd.stat()
+            relative = cwd.relative_to(root)
+            if not cwd.is_dir() or cwd.resolve() != cwd:
+                return None
+            context: tuple[object, ...] = (source, str(relative), os.environ.get("PATH"), tool_id)
+            if scope is not ApprovalChoice.USER:
+                context += (str(root), identity.st_dev, identity.st_ino, self._workspace_id)
+            if scope is ApprovalChoice.SESSION:
+                scratch = self.temporary_directory
+                scratch_identity = scratch.stat()
+                context += (str(scratch), scratch_identity.st_dev, scratch_identity.st_ino)
+        except OSError:
+            return None
+        return sha256_digest(repr(context))
+
+    def matching_trusted_host_command_rule(
+        self,
+        source: str,
+        cwd: Path,
+        tool_id: str,
+        *,
+        workspace: Path | None = None,
+        environment: dict[str, str] | None = None,
+    ) -> HostCommandRule | None:
+        """Find a current human-installed grant for one exact explicit host command.
+
+        Args:
+            source (str): Opaque shell source to execute.
+            cwd (Path): Canonical process working directory.
+            tool_id (str): Registered explicit host tool identity.
+            workspace (Path | None): Optional request workspace to bind at execution admission.
+            environment (dict[str, str] | None): Exact host environment for final admission.
+
+        Returns:
+            HostCommandRule | None: Matching no-prompt grant, if one is active.
+        """
+        with self.policy_update():
+            if self._namespace_recovery_decision() is not None or (
+                workspace is not None and workspace != self._workspace_root
+            ):
+                return None
+            if environment is not None:
+                scratch = self.temporary_directory
+                expected = {
+                    "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                    "LANG": "C",
+                    "WORKSPACE_ROOT": str(self._workspace_root),
+                    "TMPDIR": str(scratch),
+                    "TMP": str(scratch),
+                    "TEMP": str(scratch),
+                    "XDG_CACHE_HOME": str(scratch / "cache"),
+                }
+                if environment != expected:
+                    return None
+            signatures: dict[ApprovalChoice, str | None] = {}
+            for rule in (
+                *self._session_overrides.trusted_host_command_rules,
+                *(
+                    self._user_configuration.trusted_host_command_rules
+                    if self._namespace_catalog_path is not None
+                    else ()
+                ),
+            ):
+                if rule.scope not in signatures:
+                    signatures[rule.scope] = self._trusted_host_signature(
+                        source, cwd, tool_id, rule.scope
+                    )
+                if rule.signature == signatures[rule.scope]:
+                    return rule.model_copy(deep=True)
+            return None
+
+    def trust_host_command(
+        self, source: str, scope: ApprovalChoice = ApprovalChoice.SESSION
+    ) -> HostCommandRule:
+        """Install one human-approved no-prompt grant for the workspace-root host shell.
+
+        Args:
+            source (str): Exact shell command provided through trusted user interaction.
+            scope (ApprovalChoice): Session, workspace, or user lifetime.
+
+        Returns:
+            HostCommandRule: Revocable grant without command contents.
+
+        Raises:
+            ValueError: If the command or trusted workspace identity is unavailable.
+        """
+        if not source.strip() or scope not in {
+            ApprovalChoice.SESSION,
+            ApprovalChoice.WORKSPACE,
+            ApprovalChoice.USER,
+        }:
+            raise ValueError("An exact host command is required.")
+        with self.policy_update():
+            if self._namespace_recovery_decision() is not None:
+                raise ValueError("Permission policy recovery is required before trusting host use.")
+            if self._workspace_root is None:
+                raise ValueError("A current workspace is required for a trusted host grant.")
+            signature = self._trusted_host_signature(
+                source, self._workspace_root, "request_host_command", scope
+            )
+            if signature is None:
+                raise ValueError("The workspace identity is unavailable.")
+            rule = HostCommandRule(
+                signature=signature,
+                cwd=VirtualPath.WORKSPACE,
+                source="<exact command>",
+                scope=scope,
+            )
+            self._store_trusted_host_rule(rule)
+        telemetry_audit("host_command.trusted_rule_added", rule_id=rule.id, scope=scope.value)
+        self._append_audit(
+            "host_command.trusted_rule_added",
+            {"rule_id": rule.id, "command_hash": sha256_digest(source), "scope": scope.value},
         )
+        return rule.model_copy(deep=True)
+
+    def _store_trusted_host_rule(self, rule: HostCommandRule) -> None:
+        """Store a reviewed grant in the trusted session or user-policy layer."""
+        if rule.scope is ApprovalChoice.SESSION:
+            self._session_overrides.trusted_host_command_rules.append(rule)
+            self._policy_revision += 1
+        else:
+            if self._namespace_catalog_path is None or self._user_configuration_path is None:
+                raise ValueError("A validated durable user permission policy is required.")
+            updated = self._user_configuration.model_copy(deep=True)
+            updated.trusted_host_command_rules.append(rule)
+            self._replace_user_configuration(updated)
+
+    def remember_trusted_host_command_rule_if_current(
+        self, request: SandboxRequest, scope: ApprovalChoice, revision: int
+    ) -> tuple[HostCommandRule, int] | None:
+        """Persist the selected grant only while the reviewed host context remains current.
+
+        Args:
+            request (SandboxRequest): Exact host request approved by fresh human input.
+            scope (ApprovalChoice): Selected session, workspace, or user lifetime.
+            revision (int): Policy revision at the reviewed host prompt.
+
+        Returns:
+            tuple[HostCommandRule, int] | None: Installed grant and its policy revision,
+                or None if authority became stale.
+        """
+        with self.policy_update():
+            if (
+                revision != self._policy_revision
+                or self._namespace_recovery_decision() is not None
+                or not request.paths_are_current()
+                or request.workspace != self._workspace_root
+                or request.source != request.execution_source
+            ):
+                return None
+            signature = self._trusted_host_signature(
+                request.source, request.cwd, "request_host_command", scope
+            )
+            if signature is None:
+                return None
+            relative = request.cwd.relative_to(request.workspace)
+            rule = HostCommandRule(
+                signature=signature,
+                cwd=(
+                    VirtualPath.WORKSPACE
+                    if relative == Path(".")
+                    else f"{VirtualPath.WORKSPACE}/{relative.as_posix()}"
+                ),
+                source="<exact command>",
+                scope=scope,
+            )
+            self._store_trusted_host_rule(rule)
+            installed_revision = self._policy_revision
+        telemetry_audit("host_command.trusted_rule_added", rule_id=rule.id, scope=scope.value)
+        self._append_audit(
+            "host_command.trusted_rule_added",
+            {
+                "rule_id": rule.id,
+                "command_hash": sha256_digest(request.source),
+                "scope": scope.value,
+            },
+        )
+        return rule.model_copy(deep=True), installed_revision
+
+    def remove_trusted_host_command_rule(
+        self, rule_id: str, scope: ApprovalChoice = ApprovalChoice.SESSION
+    ) -> bool:
+        """Revoke one human-installed no-prompt host grant.
+
+        Args:
+            rule_id (str): Identifier of the grant to revoke.
+            scope (ApprovalChoice): Scope containing the grant.
+
+        Returns:
+            bool: Whether the grant was removed.
+        """
+        with self.policy_update():
+            rules = (
+                self._session_overrides.trusted_host_command_rules
+                if scope is ApprovalChoice.SESSION
+                else self._user_configuration.trusted_host_command_rules
+            )
+            remaining = [rule for rule in rules if rule.id != rule_id]
+            if len(remaining) == len(rules) or any(
+                rule.scope is not scope for rule in rules if rule.id == rule_id
+            ):
+                return False
+            removed = next(rule for rule in rules if rule.id == rule_id)
+            if scope is ApprovalChoice.SESSION:
+                self._session_overrides.trusted_host_command_rules = remaining
+                self._policy_revision += 1
+            else:
+                updated = self._user_configuration.model_copy(deep=True)
+                updated.trusted_host_command_rules = remaining
+                self._replace_user_configuration(updated)
+        telemetry_audit("host_command.trusted_rule_removed", rule_id=rule_id, scope=scope.value)
+        self._append_audit(
+            "host_command.trusted_rule_removed",
+            {"rule_id": rule_id, "signature": removed.signature, "scope": scope.value},
+        )
+        return True
+
+    def record_host_boundary(
+        self,
+        event_name: str,
+        command: str,
+        *,
+        attempt_id: str | None = None,
+        offer_id: str | None = None,
+        source: str | None = None,
+        rule_id: str | None = None,
+        outcome: str | None = None,
+    ) -> None:
+        """Durably audit a host admission or execution event without command material.
+
+        Args:
+            event_name (str): Fixed host boundary event name.
+            command (str): Executed shell source, retained only as a digest.
+            attempt_id (str | None): Bound command attempt identifier.
+            offer_id (str | None): One-time host offer identifier.
+            source (str | None): Authorization or denial category.
+            rule_id (str | None): Exact session rule or trusted grant identifier.
+            outcome (str | None): Process outcome, if execution settled.
+        """
+        payload: dict[str, object] = {"command_hash": sha256_digest(command)}
+        for name, value in (
+            ("attempt_id", attempt_id),
+            ("offer_id", offer_id),
+            ("source", source),
+            ("rule_id", rule_id),
+            ("outcome", outcome),
+        ):
+            if value is not None:
+                payload[name] = value
+        self._append_audit(event_name, payload)
 
     def matching_host_command_rule(self, request: SandboxRequest) -> HostCommandRule | None:
         """Find an exact host rule for the current bound command context.
@@ -1700,16 +3301,22 @@ class PermissionManager:
             HostCommandRule | None: Matching session approval, if present.
         """
         signature = request.host_command_signature()
-        return next(
-            (
-                rule.model_copy(deep=True)
-                for rule in self._session_overrides.host_command_rules
-                if rule.signature == signature
-                and self._host_runtime_bindings.get(rule.id)
-                == request.host_command_runtime_signature()
-            ),
-            None,
-        )
+        with self._host_rules_lock:
+            if not any(
+                rule.signature == signature for rule in self._session_overrides.host_command_rules
+            ):
+                return None
+        runtime_signature = request.host_command_runtime_signature()
+        with self._host_rules_lock:
+            return next(
+                (
+                    rule.model_copy(deep=True)
+                    for rule in self._session_overrides.host_command_rules
+                    if rule.signature == signature
+                    and self._host_runtime_bindings.get(rule.id) == runtime_signature
+                ),
+                None,
+            )
 
     def remember_host_command_rule(self, request: SandboxRequest) -> HostCommandRule:
         """Record one explicitly approved exact host retry for this session.
@@ -1719,7 +3326,22 @@ class PermissionManager:
 
         Returns:
             HostCommandRule: New revocable host-only decision.
+
+        Raises:
+            ValueError: If the session host rules changed while preparing the approval.
         """
+        with self._host_rules_lock:
+            host_rules_revision = self._host_rules_revision
+        rule, runtime_signature = self._prepare_host_command_rule(request)
+        with self._host_rules_lock:
+            if host_rules_revision != self._host_rules_revision:
+                raise ValueError("Session host rules changed while preparing the approval.")
+            self._publish_host_command_rule(rule, runtime_signature)
+        return self._record_host_command_rule(request, rule)
+
+    @staticmethod
+    def _prepare_host_command_rule(request: SandboxRequest) -> tuple[HostCommandRule, str]:
+        """Prepare the signature and identity without holding policy or host-rule locks."""
         relative_cwd = request.cwd.relative_to(request.workspace)
         rule = HostCommandRule(
             signature=request.host_command_signature(),
@@ -1730,12 +3352,84 @@ class PermissionManager:
             ),
             source=request.source if "/" not in request.source else "<path-bearing-command>",
         )
+
+        return rule, request.host_command_runtime_signature()
+
+    def _publish_host_command_rule(self, rule: HostCommandRule, runtime_signature: str) -> None:
+        """Publish a prepared host rule while holding the host-rule lock."""
         self._session_overrides.host_command_rules.append(rule)
-        self._host_runtime_bindings[rule.id] = request.host_command_runtime_signature()
+        self._host_runtime_bindings[rule.id] = runtime_signature
+        self._host_rules_revision += 1
+
+    def _record_host_command_rule(
+        self, request: SandboxRequest, rule: HostCommandRule
+    ) -> HostCommandRule:
+        """Audit and detach a published host rule."""
         telemetry_audit(
             "host_command.rule_added", workspace_id=request.workspace_id, rule_id=rule.id
         )
+        self._append_audit(
+            "host_command.rule_added",
+            {"rule_id": rule.id, "command_hash": sha256_digest(request.execution_source)},
+        )
         return rule.model_copy(deep=True)
+
+    def remember_host_command_rule_if_current(
+        self, request: SandboxRequest, revision: int
+    ) -> HostCommandRule | None:
+        """Record an exact host approval only while its policy revision remains current.
+
+        Args:
+            request (SandboxRequest): Unchanged context approved at the host boundary.
+            revision (int): Policy revision captured with the reviewed decision.
+
+        Returns:
+            HostCommandRule | None: The recorded rule, or None if policy or host rules changed.
+        """
+        with self._host_rules_lock:
+            host_revision = self._host_rules_revision
+        rule, runtime_signature = self._prepare_host_command_rule(request)
+        with self.policy_update(), self._host_rules_lock:
+            if (
+                revision != self._policy_revision
+                or host_revision != self._host_rules_revision
+                or self._namespace_recovery_decision() is not None
+            ):
+                return None
+            self._publish_host_command_rule(rule, runtime_signature)
+        return self._record_host_command_rule(request, rule)
+
+    async def remember_host_command_rule_if_current_async(
+        self, request: SandboxRequest, revision: int
+    ) -> HostCommandRule | None:
+        """Record an exact host approval without blocking on a policy transaction.
+
+        Args:
+            request (SandboxRequest): Unchanged context approved at the host boundary.
+            revision (int): Policy revision captured with the reviewed decision.
+
+        Returns:
+            HostCommandRule | None: The recorded rule, or None if policy or host rules changed.
+
+        Raises:
+            asyncio.CancelledError: If cancelled while waiting for the policy transaction.
+        """
+        with self._host_rules_lock:
+            host_revision = self._host_rules_revision
+        rule, runtime_signature = self._prepare_host_command_rule(request)
+        await self._acquire_policy_lock_async()
+        try:
+            with self._host_rules_lock:
+                if (
+                    revision != self._policy_revision
+                    or host_revision != self._host_rules_revision
+                    or self._namespace_recovery_decision() is not None
+                ):
+                    return None
+                self._publish_host_command_rule(rule, runtime_signature)
+        finally:
+            self._policy_lock.release()
+        return self._record_host_command_rule(request, rule)
 
     def remove_host_command_rule(self, rule_id: str) -> bool:
         """Revoke one session host approval by identifier.
@@ -1746,14 +3440,18 @@ class PermissionManager:
         Returns:
             bool: Whether a matching rule was removed.
         """
-        before = len(self._session_overrides.host_command_rules)
-        self._session_overrides.host_command_rules = [
-            rule for rule in self._session_overrides.host_command_rules if rule.id != rule_id
-        ]
-        removed = len(self._session_overrides.host_command_rules) != before
+        with self._host_rules_lock:
+            before = len(self._session_overrides.host_command_rules)
+            self._session_overrides.host_command_rules = [
+                rule for rule in self._session_overrides.host_command_rules if rule.id != rule_id
+            ]
+            removed = len(self._session_overrides.host_command_rules) != before
+            if removed:
+                self._host_runtime_bindings.pop(rule_id, None)
+                self._host_rules_revision += 1
         if removed:
-            self._host_runtime_bindings.pop(rule_id, None)
             telemetry_audit("host_command.rule_removed", rule_id=rule_id)
+            self._append_audit("host_command.rule_removed", {"rule_id": rule_id})
         return removed
 
     def request_permission(
@@ -1773,6 +3471,8 @@ class PermissionManager:
         Returns:
             ApprovalChoice: Selected denial or approval lifetime. Cancellation denies.
         """
+        if self.confirmation_decision() is True:
+            return ApprovalChoice.ONCE
         choices, index = self._permission_options(fresh_only)
         active_interaction = interaction if interaction is not None else self._interaction
         active_interaction.info(prompt)
@@ -1805,6 +3505,8 @@ class PermissionManager:
             ProblemException: If the interaction does not provide asynchronous input.
             asyncio.CancelledError: If native asynchronous input is cancelled.
         """
+        if self.confirmation_decision() is True:
+            return ApprovalChoice.ONCE
         choices, index = self._permission_options(fresh_only)
         active_interaction = interaction if interaction is not None else self._interaction
         async_interaction = require_async_interaction(active_interaction, "permission approval")
@@ -1849,23 +3551,27 @@ class PermissionManager:
         scope: ApprovalChoice,
     ) -> tuple[str, ...]:
         """Install exact, deduplicated allow rules for one approved operation set."""
-        if scope is ApprovalChoice.USER:
-            existing = self._user_configuration.rules
-        elif scope is ApprovalChoice.WORKSPACE:
-            existing = self._configuration.rules
+        if scope is ApprovalChoice.SESSION:
+            with self.policy_update():
+                additions = self._approval_additions(
+                    operations, self._session_overrides.rules, scope
+                )
+                self._session_overrides.rules.extend(additions)
+                if additions:
+                    self._policy_revision += 1
         else:
-            existing = self._session_overrides.rules
-        additions = self._approval_additions(operations, existing, scope)
-        if scope is ApprovalChoice.USER:
-            updated = self._user_configuration.model_copy(deep=True)
-            updated.rules.extend(additions)
-            self._replace_user_configuration(updated)
-        elif scope is ApprovalChoice.WORKSPACE:
-            updated = self._configuration.model_copy(deep=True)
-            updated.rules.extend(additions)
-            self._replace_configuration(updated)
-        else:
-            self._session_overrides.rules.extend(additions)
+            with self.policy_update():
+                if scope is ApprovalChoice.USER:
+                    current = self._user_configuration
+                else:
+                    current = self._configuration
+                additions = self._approval_additions(operations, current.rules, scope)
+                updated = current.model_copy(deep=True)
+                updated.rules.extend(additions)
+                if scope is ApprovalChoice.USER:
+                    self._replace_user_configuration(updated)
+                else:
+                    self._replace_configuration(updated)
         return tuple(rule.id for rule in additions)
 
     async def _remember_approval_async(
@@ -1873,12 +3579,14 @@ class PermissionManager:
         operations: Operations,
         *,
         scope: ApprovalChoice,
-    ) -> tuple[tuple[str, ...], asyncio.CancelledError | None]:
-        """Persist remembered policy on a bounded worker, then publish it on the owner."""
+    ) -> RememberedApproval:
+        """Return rule IDs, retained cancellation, and whether the policy was applied."""
         if scope is ApprovalChoice.SESSION:
             await self._acquire_policy_lock_async()
             try:
-                return self._remember_approval(operations, scope=scope), None
+                return RememberedApproval(
+                    self._remember_approval(operations, scope=scope), None, True
+                )
             finally:
                 self._policy_lock.release()
 
@@ -1891,6 +3599,27 @@ class PermissionManager:
         if path is None:
             raise ValueError(f"Permission policy path is unavailable for {scope.value} approval.")
 
+        owned = False
+        try:
+            while not owned:
+                owned = self._async_policy_write_lock.acquire(blocking=False)
+                if not owned:
+                    await asyncio.sleep(0.01)
+            return await self._remember_persistent_approval_async(
+                operations, scope=scope, path=path
+            )
+        finally:
+            if owned:
+                self._async_policy_write_lock.release()
+
+    async def _remember_persistent_approval_async(
+        self,
+        operations: Operations,
+        *,
+        scope: ApprovalChoice,
+        path: Path,
+    ) -> RememberedApproval:
+        """Write and publish one serialized approval, retaining cancellation and applied state."""
         cancellation = None
         while True:
             await self._acquire_policy_lock_async()
@@ -1906,25 +3635,18 @@ class PermissionManager:
             finally:
                 self._policy_lock.release()
 
-            _, stopped = await self._run_blocking_settled_async(
+            written, stopped = await self._run_blocking_settled_async(
                 self._persist_configuration_candidate,
                 path,
                 updated,
+                revision,
             )
             cancellation = cancellation or stopped
-
-            cancellation = await self._acquire_policy_lock_after_write_async(cancellation)
-            try:
-                if revision != self._policy_revision:
-                    continue
-                if scope is ApprovalChoice.USER:
-                    self._user_configuration = updated
-                else:
-                    self._configuration = updated
-                self._policy_revision += 1
-            finally:
-                self._policy_lock.release()
-            return tuple(rule.id for rule in additions), cancellation
+            if not written:
+                if cancellation is not None:
+                    return RememberedApproval((), cancellation, False)
+                continue
+            return RememberedApproval(tuple(rule.id for rule in additions), cancellation, True)
 
     @staticmethod
     def _approval_additions(
@@ -1960,33 +3682,31 @@ class PermissionManager:
     async def _acquire_policy_lock_async(self) -> None:
         """Wait for policy ownership without blocking the current event loop."""
         while not self._policy_lock.acquire(blocking=False):
-            await asyncio.sleep(0.01)
-
-    async def _acquire_policy_lock_after_write_async(
-        self,
-        cancellation: asyncio.CancelledError | None,
-    ) -> asyncio.CancelledError | None:
-        """Retain ownership through publication after a durable policy write settles."""
-        while not self._policy_lock.acquire(blocking=False):
-            try:
-                await asyncio.sleep(0.01)
-            except asyncio.CancelledError as error:
-                cancellation = cancellation or error
-        return cancellation
+            await asyncio.sleep(_POLICY_LOCK_POLL_SECONDS)
 
     def _persist_configuration_candidate(
         self,
         path: Path,
         configuration: PermissionConfiguration | UserPermissionConfiguration,
-    ) -> None:
-        """Write a detached policy candidate while serializing all policy writers."""
+        revision: int,
+    ) -> bool:
+        """Persist and publish one current policy candidate in the same transaction."""
         with self.policy_update():
-            self._persist_configuration(path, configuration)
+            if revision != self._policy_revision:
+                return False
+            self._persist_checked(path, configuration)
+            if isinstance(configuration, UserPermissionConfiguration):
+                self._user_configuration = configuration
+            else:
+                self._configuration = configuration
+            self._policy_revision += 1
+            return True
 
     async def _run_blocking_settled_async(
         self,
         function: Callable[..., Any],
         *args: Any,
+        _owned_failures: list[tuple[asyncio.CancelledError, BaseException]] | None = None,
     ) -> tuple[Any, asyncio.CancelledError | None]:
         """Wait for bounded synchronous work and retain cancellation until its outcome is known."""
         pending = asyncio.ensure_future(
@@ -2009,6 +3729,8 @@ class PermissionManager:
             result = pending.result()
         except BaseException as error:
             if cancellation is not None:
+                if _owned_failures is not None:
+                    _owned_failures.append((cancellation, error))
                 cancellation.add_note(
                     f"The blocking permission operation also stopped with {type(error).__name__}."
                 )
@@ -2042,8 +3764,75 @@ class PermissionManager:
         with self._policy_lock:
             return self._evaluate_policy(operations)
 
+    def evaluate_with_revision(self, operations: Operations) -> tuple[PolicyDecision, int]:
+        """Evaluate operations and capture the policy revision in one transaction.
+
+        Args:
+            operations (Operations): Complete normalized effects to evaluate.
+
+        Returns:
+            tuple[PolicyDecision, int]: The policy decision and its revision.
+        """
+        with self._policy_lock:
+            return self.evaluate(operations), self._policy_revision
+
+    def host_gate_enable_revision(self, operations: Operations) -> int | None:
+        """Identify a host request blocked only by the user-changeable eligibility gate.
+
+        Args:
+            operations (Operations): Complete exact explicit host process plan.
+
+        Returns:
+            int | None: Current policy revision if a session gate can be offered.
+        """
+        with self.policy_update():
+            if self._namespace_recovery_decision() is not None or not operations:
+                return None
+            if any(
+                operation.action is not Action.PROCESS_EXECUTE
+                or not isinstance(operation.target, ProcessTarget)
+                or operation.target.boundary is not ProcessBoundary.HOST
+                for operation in operations
+            ):
+                return None
+            if self.effective_configuration.limits.allow_host_processes:
+                return None
+            if self._managed_host_prohibited():
+                return None
+            if any(
+                self._evaluate_operation_policy(operation).decision is Decision.DENY
+                for operation in operations
+            ):
+                return None
+            return self._policy_revision
+
+    def enable_host_gate_if_current(self, operations: Operations, revision: int) -> bool:
+        """Enable session host eligibility only while the reviewed policy stays current.
+
+        Args:
+            operations (Operations): Exact plan offered to the human.
+            revision (int): Policy revision shown before the gate prompt.
+
+        Returns:
+            bool: Whether a session gate was enabled.
+        """
+        with self.policy_update():
+            if self.host_gate_enable_revision(operations) != revision:
+                return False
+            self._session_overrides.limits = self._session_overrides.limits.model_copy(
+                update={"allow_host_processes": True}
+            )
+            self._policy_revision += 1
+        self._audit_policy_change(
+            "permission.limit_set", PolicyScope.SESSION, limit="allow_host_processes", enabled=True
+        )
+        return True
+
     async def evaluate_async(self, operations: Operations) -> PolicyDecision:
         """Evaluate one operation plan without blocking on a concurrent policy update.
+
+        Retry a bounded number of times if policy changes across an awaited boundary; persistent
+        churn returns a fail-closed stale decision.
 
         Args:
             operations (Operations): Complete normalized effects to evaluate.
@@ -2054,14 +3843,58 @@ class PermissionManager:
         Raises:
             asyncio.CancelledError: If boundary checks are cancelled after filesystem work settles.
         """
-        await self._acquire_policy_lock_async()
-        try:
-            return await self._evaluate_policy_async(operations)
-        finally:
-            self._policy_lock.release()
+        result, _ = await self.evaluate_with_revision_async(operations)
+        return result
+
+    async def evaluate_with_revision_async(
+        self, operations: Operations
+    ) -> tuple[PolicyDecision, int | None]:
+        """Evaluate operations and capture a revision without blocking policy updates.
+
+        Args:
+            operations (Operations): Complete normalized effects to evaluate.
+
+        Returns:
+            tuple[PolicyDecision, int | None]: Decision and revision, or a stale denial and None.
+
+        Raises:
+            asyncio.CancelledError: If boundary checks are cancelled after filesystem work settles.
+        """
+        for _ in range(_ASYNC_POLICY_ATTEMPTS):
+            await self._acquire_policy_lock_async()
+            try:
+                revision = self._policy_revision
+                result = await self._evaluate_policy_async(operations)
+                if revision == self._policy_revision:
+                    return result, revision
+            finally:
+                self._policy_lock.release()
+        return self._stale_policy_decision(), None
+
+    @staticmethod
+    def _stale_policy_decision() -> PolicyDecision:
+        """Fail closed when policy keeps changing during asynchronous evaluation."""
+        return PolicyDecision(
+            decision=Decision.DENY,
+            reason="Permission policy changed repeatedly during evaluation.",
+            sources=("policy:stale",),
+        )
 
     async def _evaluate_policy_async(self, operations: Operations) -> PolicyDecision:
-        """Evaluate a stable policy snapshot with filesystem boundaries off the owner loop."""
+        """Evaluate one policy pass with filesystem boundaries off the owner loop."""
+        managed_present = (
+            self._managed_policy is not None
+            or self._managed_error is not None
+            or self._managed_policy_store.may_be_installed()
+        )
+        if self._namespace_catalog_path is not None or managed_present:
+            namespace, cancellation = await self._run_blocking_settled_async(
+                self._namespace_recovery_decision
+            )
+            if cancellation is not None:
+                raise cancellation
+            if namespace is not None:
+                return namespace
         if not operations:
             return self._compose_policy_decisions(operations, ())
         decisions = []
@@ -2085,8 +3918,66 @@ class PermissionManager:
 
     def _evaluate_policy(self, operations: Operations) -> PolicyDecision:
         """Evaluate a policy snapshot while the caller owns the policy lock."""
+        if namespace := self._namespace_recovery_decision():
+            return namespace
         decisions = tuple(self._evaluate_operation(operation) for operation in operations)
         return self._compose_policy_decisions(operations, decisions)
+
+    def _namespace_recovery_decision(self) -> PolicyDecision | None:
+        """Refuse pending resets and stale policy namespaces before admission."""
+        if error := self._managed_current_error():
+            return PolicyDecision(
+                decision=Decision.DENY,
+                reason=f"Administrator policy recovery required: {error}",
+                sources=("managed:recovery_required",),
+            )
+        for scope in ("workspace", "user"):
+            if error := self._namespace_errors.get(scope):
+                return PolicyDecision(
+                    decision=Decision.DENY,
+                    reason=f"Permission policy recovery required: {error}",
+                    sources=(f"namespace:{scope}:recovery_required",),
+                )
+        if changed := self._live_namespace_error():
+            scope, error = changed
+            self._namespace_errors[scope] = error
+            self._policy_revision += 1
+            return PolicyDecision(
+                decision=Decision.DENY,
+                reason=f"Permission policy recovery required: {error}",
+                sources=(f"namespace:{scope}:recovery_required",),
+            )
+        return None
+
+    def require_policy_ready(self) -> None:
+        """Stop interactive startup when a trusted policy requires recovery.
+
+        Raises:
+            PermissionNamespaceError: If a managed or durable policy cannot admit tools.
+        """
+        with self.policy_update():
+            denial = self._namespace_recovery_decision()
+            if denial is None:
+                return
+            source = denial.sources[0]
+            if source == "managed:recovery_required":
+                path = self._managed_policy_store.expectation_path or "administrator policy"
+                mitigation = (
+                    "Have an administrator repair the protected policy, then restart the "
+                    "application."
+                )
+            elif source == "namespace:user:recovery_required":
+                path = self._user_configuration_path or "user policy"
+                mitigation = (
+                    "Restore or repair the user policy and registry, then restart the application."
+                )
+            else:
+                path = self._configuration_path or "workspace policy"
+                mitigation = (
+                    "Restore or repair the workspace policy and registry, then restart the "
+                    "application."
+                )
+            raise PermissionNamespaceError(path, f"{denial.reason} {mitigation}")
 
     @staticmethod
     def _compose_policy_decisions(
@@ -2100,6 +3991,8 @@ class PermissionManager:
                 reason="The tool plan requires no authority.",
                 sources=("no_authority",),
             )
+        if len(decisions) == 1:
+            return decisions[0]
         for selected in (Decision.DENY, Decision.ASK, Decision.ALLOW):
             determining = tuple(item for item in decisions if item.decision is selected)
             if determining:
@@ -2128,11 +4021,14 @@ class PermissionManager:
             scope (PolicyScope): Workspace persistence or process-local lifetime.
         """
         if scope is PolicyScope.WORKSPACE:
-            updated = self._configuration.model_copy(deep=True)
-            updated.defaults[action] = decision
-            self._replace_configuration(updated)
+            with self.policy_update():
+                updated = self._configuration.model_copy(deep=True)
+                updated.defaults[action] = decision
+                self._replace_configuration(updated)
         else:
-            self._session_overrides.defaults[action] = decision
+            with self.policy_update():
+                self._session_overrides.defaults[action] = decision
+                self._policy_revision += 1
         self._audit_policy_change(
             "permission.default_set",
             scope,
@@ -2151,16 +4047,20 @@ class PermissionManager:
             bool: Whether the selected layer changed.
         """
         if scope is PolicyScope.SESSION:
-            changed = self._session_overrides.defaults.pop(action, None) is not None
+            with self.policy_update():
+                changed = self._session_overrides.defaults.pop(action, None) is not None
+                if changed:
+                    self._policy_revision += 1
             if changed:
                 self._audit_policy_change("permission.default_reset", scope, action=action.value)
             return changed
         default = PermissionConfiguration().defaults[action]
-        if self._configuration.defaults.get(action, Decision.DENY) is default:
-            return False
-        updated = self._configuration.model_copy(deep=True)
-        updated.defaults[action] = default
-        self._replace_configuration(updated)
+        with self.policy_update():
+            if self._configuration.defaults.get(action, Decision.DENY) is default:
+                return False
+            updated = self._configuration.model_copy(deep=True)
+            updated.defaults[action] = default
+            self._replace_configuration(updated)
         self._audit_policy_change("permission.default_reset", scope, action=action.value)
         return True
 
@@ -2179,16 +4079,20 @@ class PermissionManager:
         Raises:
             ValueError: If another active rule already uses the same identifier.
         """
-        if any(
-            existing.id == rule.id for existing in (*self.persistent_rules, *self.session_rules)
-        ):
-            raise ValueError(f"Permission rule '{rule.id}' already exists.")
-        if scope is PolicyScope.WORKSPACE:
-            updated = self._configuration.model_copy(deep=True)
-            updated.rules.append(rule)
-            self._replace_configuration(updated)
-        else:
-            self._session_overrides.rules.append(rule)
+        rule = rule.model_copy(deep=True)
+        with self.policy_update():
+            if any(
+                existing.id == rule.id
+                for existing in (*self._configuration.rules, *self._session_overrides.rules)
+            ):
+                raise ValueError(f"Permission rule '{rule.id}' already exists.")
+            if scope is PolicyScope.WORKSPACE:
+                updated = self._configuration.model_copy(deep=True)
+                updated.rules.append(rule)
+                self._replace_configuration(updated)
+            else:
+                self._session_overrides.rules.append(rule)
+                self._policy_revision += 1
         self._audit_policy_change(
             "permission.rule_added", scope, rule_id=rule.id, decision=rule.decision.value
         )
@@ -2208,19 +4112,28 @@ class PermissionManager:
         Returns:
             bool: Whether a rule was removed.
         """
-        rules = (
-            list(self._configuration.rules)
-            if scope is PolicyScope.WORKSPACE
-            else self._session_overrides.rules
-        )
-        for index, rule in enumerate(rules):
-            if rule.id == rule_id:
-                rules.pop(index)
-                if scope is PolicyScope.WORKSPACE:
+        if scope is PolicyScope.SESSION:
+            with self.policy_update():
+                rules = self._session_overrides.rules
+                removed = next(
+                    (index for index, rule in enumerate(rules) if rule.id == rule_id), None
+                )
+                if removed is not None:
+                    rules.pop(removed)
+                    self._policy_revision += 1
+        else:
+            with self.policy_update():
+                rules = list(self._configuration.rules)
+                removed = next(
+                    (index for index, rule in enumerate(rules) if rule.id == rule_id), None
+                )
+                if removed is not None:
+                    rules.pop(removed)
                     updated = self._configuration.model_copy(update={"rules": rules}, deep=True)
                     self._replace_configuration(updated)
-                self._audit_policy_change("permission.rule_removed", scope, rule_id=rule_id)
-                return True
+        if removed is not None:
+            self._audit_policy_change("permission.rule_removed", scope, rule_id=rule_id)
+            return True
         return False
 
     def preset(self, preset_id: str) -> PermissionPreset:
@@ -2259,15 +4172,16 @@ class PermissionManager:
             PresetReplacementPreview: Exact default and rule replacement plus a scope revision.
         """
         preset = self.preset(preset_id)
-        return PresetReplacementPreview(
-            preset=preset,
-            scope=scope,
-            removed_defaults=self._defaults_for_scope(scope),
-            installed_defaults=dict(preset.defaults),
-            removed_rules=self._rules_for_scope(scope),
-            installed_rules=self._rules_from_preset(preset, scope),
-            scope_revision=self._scope_revision(scope),
-        )
+        with self.policy_update():
+            return PresetReplacementPreview(
+                preset=preset,
+                scope=scope,
+                removed_defaults=self._defaults_for_scope(scope),
+                installed_defaults=dict(preset.defaults),
+                removed_rules=self._rules_for_scope(scope),
+                installed_rules=self._rules_from_preset(preset, scope),
+                scope_revision=self._scope_revision(scope),
+            )
 
     def replace_preset(self, preview: PresetReplacementPreview) -> None:
         """Atomically replace the defaults and rules described by a current preview.
@@ -2278,9 +4192,26 @@ class PermissionManager:
         Raises:
             ValueError: If the preview is stale or installs an identifier active in another layer.
         """
+        with self.policy_update():
+            self._replace_preset_locked(preview)
+        self._audit_policy_change(
+            "permission.preset_replaced",
+            preview.scope,
+            preset_id=preview.preset.metadata.id,
+            revision=preview.preset.metadata.revision,
+        )
+
+    def _replace_preset_locked(self, preview: PresetReplacementPreview) -> None:
+        """Validate and publish a scoped preset while policy writers are serialized."""
+        session_revision = None
+        host_rules_revision = None
+        if preview.scope is PolicyScope.SESSION:
+            session_revision = self._policy_revision
+            with self._host_rules_lock:
+                host_rules_revision = self._host_rules_revision
         if preview.scope_revision != self._scope_revision(preview.scope):
             raise ValueError("Permission preset preview is stale; generate a new preview.")
-        replacement = list(preview.installed_rules)
+        replacement = [rule.model_copy(deep=True) for rule in preview.installed_rules]
         other_scope = (
             PolicyScope.SESSION if preview.scope is PolicyScope.WORKSPACE else PolicyScope.WORKSPACE
         )
@@ -2291,19 +4222,23 @@ class PermissionManager:
                 f"Permission rule '{collision}' already exists in {other_scope.value}."
             )
         if preview.scope is PolicyScope.WORKSPACE:
-            updated = self._configuration.model_copy(
-                update={"defaults": preview.installed_defaults, "rules": replacement}, deep=True
-            )
-            self._replace_configuration(updated)
+            with self.policy_update():
+                if preview.scope_revision != self._scope_revision(preview.scope):
+                    raise ValueError("Permission preset preview is stale; generate a new preview.")
+                updated = self._configuration.model_copy(
+                    update={"defaults": preview.installed_defaults, "rules": replacement}, deep=True
+                )
+                self._replace_configuration(updated)
         else:
-            self._session_overrides.defaults = dict(preview.installed_defaults)
-            self._session_overrides.rules = replacement
-        self._audit_policy_change(
-            "permission.preset_replaced",
-            preview.scope,
-            preset_id=preview.preset.metadata.id,
-            revision=preview.preset.metadata.revision,
-        )
+            with self._host_rules_lock:
+                if (
+                    session_revision != self._policy_revision
+                    or host_rules_revision != self._host_rules_revision
+                ):
+                    raise ValueError("Permission preset preview is stale; generate a new preview.")
+                self._session_overrides.defaults = dict(preview.installed_defaults)
+                self._session_overrides.rules = replacement
+                self._policy_revision += 1
 
     def set_limit(
         self,
@@ -2315,23 +4250,27 @@ class PermissionManager:
         """Set one boolean enforcement limit.
 
         Args:
-            name (str): ``deny_private_networks`` or ``allow_host_processes``.
+            name (str): ``deny_private_networks``, ``deny_local_networks``, or
+                ``allow_host_processes``.
             value (bool): New boolean value.
             scope (PolicyScope): Workspace persistence or process-local lifetime.
 
         Raises:
             ValueError: If ``name`` is not a supported boolean limit.
         """
-        if name not in {"deny_private_networks", "allow_host_processes"}:
+        if name not in {"deny_private_networks", "deny_local_networks", "allow_host_processes"}:
             raise ValueError(f"Unknown boolean permission limit '{name}'.")
         if scope is PolicyScope.WORKSPACE:
-            updated = self._configuration.model_copy(deep=True)
-            updated.limits = updated.limits.model_copy(update={name: value})
-            self._replace_configuration(updated)
+            with self.policy_update():
+                updated = self._configuration.model_copy(deep=True)
+                updated.limits = updated.limits.model_copy(update={name: value})
+                self._replace_configuration(updated)
         else:
-            self._session_overrides.limits = self._session_overrides.limits.model_copy(
-                update={name: value}
-            )
+            with self.policy_update():
+                self._session_overrides.limits = self._session_overrides.limits.model_copy(
+                    update={name: value}
+                )
+                self._policy_revision += 1
         self._audit_policy_change("permission.limit_set", scope, limit=name, enabled=value)
 
     def update_limit_values(
@@ -2358,37 +4297,60 @@ class PermissionManager:
         """
         if name not in {"readable_roots", "writable_roots", "network_origins"}:
             raise ValueError(f"Unknown collection permission limit '{name}'.")
-        if name == "network_origins" or value in {"workspace", "loop-temp", "system-temp"}:
+        if name == "network_origins" or value in {
+            "workspace",
+            "app-temp",
+            "system-temp",
+        }:
             normalized = value
         else:
             path = Path(value)
             if not path.is_absolute() and self._workspace_root is not None:
                 path = self._workspace_root / path
             normalized = canonical_path(path)
-        source = (
-            self._configuration.limits
-            if scope is PolicyScope.WORKSPACE
-            else self.effective_configuration.limits
-        )
-        values = list(getattr(source, name))
-        if add:
-            if normalized in values:
-                return False
-            if name == "network_origins" and values == ["*"] and normalized != "*":
-                values.clear()
-            values.append(normalized)
-        else:
-            if normalized not in values:
-                return False
-            values.remove(normalized)
+
+        def revised_values(current: tuple[str, ...]) -> tuple[str, ...] | None:
+            """Build the updated collection or report that no change is needed."""
+            values = list(current)
+            if add:
+                if normalized in values:
+                    return None
+                if name == "network_origins" and values == ["*"] and normalized != "*":
+                    values.clear()
+                values.append(normalized)
+            else:
+                if normalized not in values:
+                    return None
+                values.remove(normalized)
+            return tuple(values)
+
         if scope is PolicyScope.WORKSPACE:
-            updated = self._configuration.model_copy(deep=True)
-            updated.limits = updated.limits.model_copy(update={name: tuple(values)})
-            self._replace_configuration(updated)
+            with self.policy_update():
+                values = revised_values(getattr(self._configuration.limits, name))
+                if values is None:
+                    return False
+                updated = self._configuration.model_copy(deep=True)
+                updated.limits = updated.limits.model_copy(update={name: values})
+                updated.limit_classifications = updated.limit_classifications.model_copy(
+                    update={
+                        name: LimitClassification.HARD,
+                        "sources": {**updated.limit_classifications.sources, name: "user"},
+                    }
+                )
+                self._replace_configuration(updated)
         else:
-            self._session_overrides.limits = self._session_overrides.limits.model_copy(
-                update={name: tuple(values)}
-            )
+            with self.policy_update():
+                current = getattr(self._session_overrides.limits, name)
+                if current is None:
+                    current = getattr(self._configuration.limits, name)
+                values = revised_values(current)
+                if values is None:
+                    return False
+                self._session_overrides.limits = self._session_overrides.limits.model_copy(
+                    update={name: values}
+                )
+                self._session_overrides.limit_classifications[name] = LimitClassification.HARD
+                self._policy_revision += 1
         self._audit_policy_change(
             "permission.limit_value_updated",
             scope,
@@ -2396,6 +4358,43 @@ class PermissionManager:
             operation="add" if add else "remove",
         )
         return True
+
+    def classify_limit(
+        self,
+        name: str,
+        classification: LimitClassification,
+        *,
+        scope: PolicyScope = PolicyScope.WORKSPACE,
+    ) -> None:
+        """Record a trusted choice for one scoped collection limit.
+
+        Args:
+            name (str): Read roots, write roots, or network origins.
+            classification (LimitClassification): Hard or approval-controlled behavior.
+            scope (PolicyScope): Durable workspace or current session.
+
+        Raises:
+            ValueError: If the field or classification is invalid.
+        """
+        if name not in {"readable_roots", "writable_roots", "network_origins"}:
+            raise ValueError(f"Unknown collection permission limit '{name}'.")
+        selected = LimitClassification(classification)
+        with self.policy_update():
+            if scope is PolicyScope.WORKSPACE:
+                updated = self._configuration.model_copy(deep=True)
+                updated.limit_classifications = updated.limit_classifications.model_copy(
+                    update={
+                        name: selected,
+                        "sources": {**updated.limit_classifications.sources, name: "user"},
+                    }
+                )
+                self._replace_configuration(updated)
+            else:
+                self._session_overrides.limit_classifications[name] = selected
+                self._policy_revision += 1
+        self._audit_policy_change(
+            "permission.limit_classified", scope, limit=name, classification=selected.value
+        )
 
     def reset_limit(self, name: str, *, scope: PolicyScope = PolicyScope.SESSION) -> bool:
         """Reset one limit to its inherited or application value.
@@ -2413,19 +4412,22 @@ class PermissionManager:
         if name not in _LIMIT_NAMES:
             raise ValueError(f"Unknown permission limit '{name}'.")
         if scope is PolicyScope.SESSION:
-            if getattr(self._session_overrides.limits, name) is None:
-                return False
-            self._session_overrides.limits = self._session_overrides.limits.model_copy(
-                update={name: None}
-            )
+            with self.policy_update():
+                if getattr(self._session_overrides.limits, name) is None:
+                    return False
+                self._session_overrides.limits = self._session_overrides.limits.model_copy(
+                    update={name: None}
+                )
+                self._policy_revision += 1
             self._audit_policy_change("permission.limit_reset", scope, limit=name)
             return True
         default = getattr(PolicyLimits(), name)
-        if getattr(self._configuration.limits, name) == default:
-            return False
-        updated = self._configuration.model_copy(deep=True)
-        updated.limits = updated.limits.model_copy(update={name: default})
-        self._replace_configuration(updated)
+        with self.policy_update():
+            if getattr(self._configuration.limits, name) == default:
+                return False
+            updated = self._configuration.model_copy(deep=True)
+            updated.limits = updated.limits.model_copy(update={name: default})
+            self._replace_configuration(updated)
         self._audit_policy_change("permission.limit_reset", scope, limit=name)
         return True
 
@@ -2435,9 +4437,13 @@ class PermissionManager:
         Returns:
             bool: Whether any session policy state was cleared.
         """
-        changed = self._session_overrides != SessionPolicyOverrides()
-        self._session_overrides = SessionPolicyOverrides()
-        self._host_runtime_bindings.clear()
+        with self.policy_update(), self._host_rules_lock:
+            changed = self._session_overrides != SessionPolicyOverrides()
+            self._session_overrides = SessionPolicyOverrides()
+            self._host_runtime_bindings.clear()
+            self._host_rules_revision += 1
+            if changed:
+                self._policy_revision += 1
         if changed:
             self._audit_policy_change("permission.session_reset", PolicyScope.SESSION)
         return changed
@@ -2449,6 +4455,8 @@ class PermissionManager:
     ) -> PermissionLoadResult:
         """Reload the workspace policy according to the configured failure policy.
 
+        Retain the active workspace policy when its configured file is missing.
+
         Args:
             interaction (Interaction | None): Invocation interaction used for recovery prompts, or
                 ``None`` to use the manager's configured interaction.
@@ -2457,10 +4465,24 @@ class PermissionManager:
             PermissionLoadResult: Whether new policy loaded or the active policy was retained.
 
         Raises:
-            PermissionConfigurationError: If loading fails in strict mode.
+            PermissionConfigurationError: If loading fails in strict mode or a pending reset
+                requires recovery.
             ShutdownRequested: If the user exits interactive recovery.
         """
         active_interaction = interaction if interaction is not None else self._interaction
+        with self.policy_update():
+            self._load_managed_policy()
+            self._policy_revision += 1
+            telemetry_audit(
+                "permission.managed_reloaded",
+                status=(
+                    "invalid"
+                    if self._managed_error
+                    else "active"
+                    if self._managed_policy is not None
+                    else "unavailable"
+                ),
+            )
         result = self._load_configuration(
             retain_on_failure=True,
             interaction=active_interaction,
@@ -2468,32 +4490,195 @@ class PermissionManager:
         self._load_user_configuration()
         return result
 
-    def reset_configuration(self) -> Path | None:
-        """Archive an invalid workspace policy and replace it with supervised defaults.
+    def reset_configuration(self, scope: str) -> Path | None:
+        """Archive one policy and replace it with its built-in defaults.
+
+        Leave a pending marker if the reset does not complete so later file-based loads refuse.
+
+        Args:
+            scope (str): Exact ``workspace`` or ``user`` policy namespace to reset.
 
         Returns:
-            Path | None: Backup path for the invalid policy, or None when no local file existed.
+            Path | None: Backup path for the prior policy, or None when no file existed.
 
         Raises:
-            ValueError: If this manager has no configuration path.
-            OSError: If the invalid policy cannot be archived or defaults cannot be persisted.
+            ValueError: If the scope is invalid or its configuration path is unavailable.
+            PermissionNamespaceError: If a durable policy namespace requires recovery.
+            OSError: If the policy is stale or busy, or reset state cannot be written.
         """
-        if self._configuration_path is None:
-            raise ValueError("An in-memory PermissionManager cannot reset configuration.")
+        if scope not in {"workspace", "user"}:
+            raise ValueError(f"Unknown permission policy scope '{scope}'.")
+        path = self._configuration_path if scope == "workspace" else self._user_configuration_path
+        if path is None:
+            if scope == "workspace":
+                raise ValueError("An in-memory PermissionManager cannot reset configuration.")
+            raise ValueError("A user permission policy path is not configured.")
+        if error := self._namespace_errors.get(scope):
+            raise PermissionNamespaceError(path, error)
         with self.policy_update():
-            backup_path = None
-            if self._configuration_path.exists():
-                timestamp = local_now().strftime("%Y%m%dT%H%M%S%f%z")
-                backup_path = self._configuration_path.with_name(
-                    f"{self._configuration_path.name}.{timestamp}.bak"
+            revision = self._policy_revision
+            expected = (
+                (
+                    self._failed_workspace_revision
+                    if self._failed_workspace_revision is not None
+                    else self._workspace_storage_revision
                 )
-                self._configuration_path.replace(backup_path)
-            configuration = PermissionConfiguration()
-            self._persist(configuration)
-            self._configuration = configuration
-            self._policy_revision += 1
-        self._audit_policy_change("permission.configuration_reset", PolicyScope.WORKSPACE)
+                if scope == "workspace"
+                else (
+                    self._failed_user_revision
+                    if self._failed_user_revision is not None
+                    else self._user_storage_revision
+                )
+            )
+            with self._storage_lock(path):
+                if revision != self._policy_revision:
+                    raise OSError("Permission policy changed; reload before retrying.")
+                if namespace := self._namespace_recovery_decision():
+                    raise PermissionNamespaceError(path, namespace.reason)
+                self._check_storage_revision(path, expected)
+                marker = path.with_name(path.name + _RESET_PENDING_SUFFIX)
+                descriptor = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                os.close(descriptor)
+                backup_path = None
+                if path.exists():
+                    timestamp = local_now().strftime("%Y%m%dT%H%M%S%f%z")
+                    backup_path = path.with_name(f"{path.name}.{timestamp}.bak")
+                    descriptor = os.open(backup_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    try:
+                        placeholder = os.fstat(descriptor)
+                    finally:
+                        os.close(descriptor)
+                    try:
+                        path.replace(backup_path)
+                    except BaseException:
+                        try:
+                            current = backup_path.lstat()
+                        except OSError:
+                            pass
+                        else:
+                            if (current.st_dev, current.st_ino) == (
+                                placeholder.st_dev,
+                                placeholder.st_ino,
+                            ):
+                                backup_path.unlink(missing_ok=True)
+                        raise
+                configuration = (
+                    PermissionConfiguration(
+                        namespace_generation=self._configuration.namespace_generation
+                    )
+                    if scope == "workspace"
+                    else UserPermissionConfiguration(
+                        namespace_generation=self._user_configuration.namespace_generation
+                    )
+                )
+                saved_revision = self._persist_configuration(path, configuration)
+                marker.unlink()
+                if scope == "workspace":
+                    self._workspace_storage_revision = saved_revision
+                    self._configuration = configuration
+                    self._failed_workspace_revision = None
+                else:
+                    self._user_storage_revision = saved_revision
+                    self._failed_user_revision = None
+                    self._user_configuration = configuration
+                self._policy_revision += 1
+        self._audit_policy_change(
+            "permission.configuration_reset",
+            PolicyScope.WORKSPACE if scope == "workspace" else PolicyScope.SESSION,
+            namespace=scope,
+        )
         return backup_path
+
+    def initialize_policy_namespace(self, scope: str, identity: str, *, authorized: bool) -> None:
+        """Initialize a missing policy namespace after a trusted explicit action.
+
+        Args:
+            scope (str): Exact `workspace` or `user` namespace.
+            identity (str): Expected workspace UUID or user-data root.
+            authorized (bool): Whether a trusted human or authenticated deployment client
+                supplied this explicit operation.
+
+        Raises:
+            ValueError: If durable namespaces are unavailable or scope is unknown.
+            PermissionNamespaceError: If authorization, identity, or existing state conflicts.
+        """
+        catalog = self._namespace_catalog_path
+        if catalog is None:
+            raise ValueError("Durable permission namespaces are not configured.")
+        if scope == "workspace":
+            path = self._configuration_path
+            expected = self._workspace_id
+        elif scope == "user":
+            path = self._user_configuration_path
+            expected = self._user_namespace_identity
+        else:
+            raise ValueError(f"Unknown permission namespace scope '{scope}'.")
+        if path is None or not authorized or identity != expected:
+            raise PermissionNamespaceError(
+                path or catalog,
+                "Trusted authorization and the exact namespace identity are required.",
+            )
+        self._validate_namespace_catalog(path, catalog)
+        with self._storage_lock(path):
+            if os.path.lexists(path) or self._policy_backup_exists(path):
+                raise PermissionNamespaceError(
+                    path,
+                    "Existing policy or backup data requires restore or recovery, "
+                    "not initialization.",
+                )
+            if os.path.lexists(path.with_name(path.name + _RESET_PENDING_SUFFIX)):
+                raise PermissionNamespaceError(path, "A pending policy reset requires recovery.")
+            with closing(sqlite3.connect(catalog, timeout=5)) as connection, connection:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    "CREATE TABLE IF NOT EXISTS policy_namespaces ("
+                    "scope TEXT NOT NULL, identity TEXT NOT NULL, generation TEXT NOT NULL, "
+                    "status TEXT NOT NULL, legacy_hash TEXT, PRIMARY KEY(scope, identity))"
+                )
+                existing = connection.execute(
+                    "SELECT status FROM policy_namespaces WHERE scope=? AND identity=?",
+                    (scope, identity),
+                ).fetchone()
+                if existing is not None:
+                    raise PermissionNamespaceError(
+                        path,
+                        "Existing namespace reservation requires recovery, not initialization.",
+                    )
+                if scope == "user" and identity != str(catalog.parent):
+                    raise PermissionNamespaceError(
+                        path, "User identity does not match the independent registry."
+                    )
+                active = connection.execute(
+                    "SELECT canonical_path FROM workspace_locations WHERE workspace_id=? "
+                    "AND status='active'",
+                    (self._workspace_id,),
+                ).fetchall()
+                if (
+                    len(active) != 1
+                    or self._workspace_root is None
+                    or active[0][0] != str(self._workspace_root)
+                ):
+                    raise PermissionNamespaceError(
+                        path, "Workspace identity does not match the independent registry."
+                    )
+                connection.execute(
+                    "INSERT INTO policy_namespaces(scope,identity,generation,status,legacy_hash) "
+                    "VALUES (?,?,?,?,NULL)",
+                    (scope, identity, uuid4().hex, "reserved_new"),
+                )
+        configuration = self._read_namespaced_configuration(path, scope, identity)
+        with self.policy_update():
+            if scope == "workspace":
+                self._configuration = configuration
+            else:
+                self._user_configuration = configuration
+            self._namespace_errors.pop(scope, None)
+            self._policy_revision += 1
+        self._audit_policy_change(
+            "permission.namespace_initialized",
+            PolicyScope.WORKSPACE if scope == "workspace" else PolicyScope.SESSION,
+            namespace=scope,
+        )
 
     def explain(self, tool: str, action: Action, resource: str) -> PolicyDecision:
         """Evaluate one concrete operation without prompting or recording.
@@ -2537,7 +4722,7 @@ class PermissionManager:
 
         Raises:
             ValueError: If this manager has no configuration path.
-            OSError: If the configuration cannot be written.
+            OSError: If the policy is stale or busy, or the configuration cannot be written.
         """
         self._persist(self._configuration)
 
@@ -2545,26 +4730,188 @@ class PermissionManager:
         if self._configuration_path is None:
             raise ValueError("An in-memory PermissionManager cannot persist configuration.")
         with self.policy_update():
-            self._persist_configuration(self._configuration_path, configuration)
+            self._persist_checked(self._configuration_path, configuration)
+
+    @staticmethod
+    def _read_storage_revision(path: Path) -> bytes | None:
+        """Read the exact policy bytes, distinguishing a missing policy from an empty file."""
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            return None
+        return path.read_bytes()
+
+    @staticmethod
+    @contextmanager
+    def _storage_lock(path: Path) -> Iterator[None]:
+        """Exclusively own the stable advisory lock for one cooperative policy transaction."""
+        try:
+            locking = import_module("fcntl")
+            windows_lock = False
+        except ModuleNotFoundError:
+            try:
+                locking = import_module("msvcrt")
+                windows_lock = True
+            except ModuleNotFoundError as error:
+                raise OSError(errno.ENOTSUP, "Native policy locking is unavailable.") from error
+        path.parent.mkdir(mode=constants.PRIVATE_DIRECTORY_MODE, parents=True, exist_ok=True)
+        lock = path.with_name(path.name + ".lock")
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NONBLOCK", 0)
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        else:
+            try:
+                existing = lock.lstat()
+            except FileNotFoundError:
+                flags |= os.O_EXCL
+            else:
+                if not stat.S_ISREG(existing.st_mode) or existing.st_nlink != 1:
+                    raise OSError("Unsafe policy lock file.")
+        descriptor = os.open(lock, flags, 0o600)
+        try:
+            details = os.fstat(descriptor)
+            current = lock.lstat()
+            if (
+                not stat.S_ISREG(details.st_mode)
+                or details.st_nlink != 1
+                or (details.st_dev, details.st_ino) != (current.st_dev, current.st_ino)
+            ):
+                raise OSError("Unsafe policy lock file.")
+            if windows_lock:
+                locking.locking(descriptor, locking.LK_NBLCK, 1)
+            else:
+                locking.flock(descriptor, locking.LOCK_EX | locking.LOCK_NB)
+            yield
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    def _policy_backup_exists(path: Path) -> bool:
+        """Report backup evidence, refusing an unverifiable policy directory listing."""
+        try:
+            with os.scandir(path.parent) as entries:
+                return any(
+                    entry.name.startswith(f"{path.name}.") and entry.name.endswith(".bak")
+                    for entry in entries
+                )
+        except OSError as error:
+            raise PermissionNamespaceError(
+                path, "Policy backup evidence cannot be inspected."
+            ) from error
+
+    @staticmethod
+    def _archive_policy_revision(path: Path, revision: bytes, name: str, label: str) -> None:
+        """Preserve exact policy bytes before a recoverable namespace migration."""
+        backup = path.with_name(f"{path.name}.{name}.bak")
+        try:
+            descriptor = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            try:
+                descriptor = os.open(backup, os.O_RDONLY | os.O_NOFOLLOW)
+                with os.fdopen(descriptor, "rb") as stream:
+                    details = os.fstat(stream.fileno())
+                    if (
+                        not stat.S_ISREG(details.st_mode)
+                        or details.st_nlink != 1
+                        or details.st_uid != os.getuid()
+                        or details.st_mode & 0o022
+                        or stream.read() != revision
+                    ):
+                        raise PermissionNamespaceError(
+                            path, f"{label} policy backup generation does not match."
+                        ) from None
+            except OSError as error:
+                raise PermissionNamespaceError(
+                    path, f"{label} policy backup provenance is invalid."
+                ) from error
+        else:
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(revision)
+                stream.flush()
+                os.fsync(stream.fileno())
+
+    def _check_storage_revision(self, path: Path, expected: bytes | None) -> None:
+        """Reject a policy changed since its active revision was loaded."""
+        if self._namespace_catalog_path is not None:
+            current, mode = self._read_namespaced_file(path)
+            if mode is None or mode & 0o022:
+                raise PermissionNamespaceError(path, "Policy file provenance is invalid.")
+        else:
+            current = self._read_storage_revision(path)
+        if current != expected:
+            raise OSError("Permission policy changed; reload before retrying.")
+
+    def _persist_checked(
+        self, path: Path, configuration: PermissionConfiguration | UserPermissionConfiguration
+    ) -> None:
+        """Publish only when the manager still owns the loaded storage revision."""
+        user_scope = isinstance(configuration, UserPermissionConfiguration)
+        if user_scope and (error := self._namespace_errors.get("user")):
+            raise PermissionNamespaceError(path, error)
+        if not user_scope and (error := self._namespace_errors.get("workspace")):
+            raise PermissionNamespaceError(path, error)
+        expected = self._user_storage_revision if user_scope else self._workspace_storage_revision
+        revision = self._policy_revision
+        with self._storage_lock(path):
+            if revision != self._policy_revision:
+                raise OSError("Permission policy changed; reload before retrying.")
+            if namespace := self._namespace_recovery_decision():
+                raise PermissionNamespaceError(path, namespace.reason)
+            self._require_completed_reset(path)
+            self._check_storage_revision(path, expected)
+            revision = self._persist_configuration(path, configuration)
+            if user_scope:
+                self._user_storage_revision = revision
+                self._failed_user_revision = None
+            else:
+                self._workspace_storage_revision = revision
+                self._failed_workspace_revision = None
 
     @staticmethod
     def _persist_configuration(
         path: Path,
         configuration: PermissionConfiguration | UserPermissionConfiguration,
-    ) -> None:
-        """Atomically persist one validated permission configuration to its owning path."""
-        path.parent.mkdir(parents=True, exist_ok=True)
+    ) -> bytes:
+        """Stage a policy without following an existing final-component link, then replace it.
+
+        Without no-follow support, an existing staging entry prevents the write.
+        """
+        path.parent.mkdir(mode=constants.PRIVATE_DIRECTORY_MODE, parents=True, exist_ok=True)
         payload = configuration.model_dump(mode="json")
         temporary_path = path.with_suffix(path.suffix + ".tmp")
-        temporary_path.write_text(yaml.safe_dump(payload, sort_keys=False), "utf-8")
+        content = f"# app-revision: {uuid4().hex}\n" + yaml.safe_dump(payload, sort_keys=False)
+        flags = os.O_WRONLY | os.O_CREAT
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW | os.O_NONBLOCK
+        else:
+            flags |= os.O_EXCL
+        descriptor = os.open(temporary_path, flags, 0o600)
+        try:
+            details = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(details.st_mode)
+                or details.st_nlink != 1
+                or details.st_uid != os.getuid()
+                or details.st_mode & 0o022
+            ):
+                raise OSError("Unsafe policy staging file.")
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
+                descriptor = -1
+                os.ftruncate(stream.fileno(), 0)
+                stream.write(content)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
         temporary_path.replace(path)
+        return content.encode("utf-8")
 
     def _replace_configuration(self, configuration: PermissionConfiguration) -> None:
         """Persist and activate one workspace policy transactionally."""
         with self.policy_update():
             self._persist(configuration)
-            self._configuration = configuration
-            self._policy_revision += 1
+            with self.policy_update():
+                self._configuration = configuration
+                self._policy_revision += 1
 
     def _replace_user_configuration(self, configuration: UserPermissionConfiguration) -> None:
         """Persist and activate one user-wide remembered-approval policy transactionally."""
@@ -2572,9 +4919,10 @@ class PermissionManager:
         if self._user_configuration_path is None:
             raise ValueError("A user permission policy path is not configured.")
         with self.policy_update():
-            self._persist_configuration(self._user_configuration_path, configuration)
-            self._user_configuration = configuration
-            self._policy_revision += 1
+            self._persist_checked(self._user_configuration_path, configuration)
+            with self.policy_update():
+                self._user_configuration = configuration
+                self._policy_revision += 1
 
     def _rules_for_scope(self, scope: PolicyScope) -> tuple[PermissionRule, ...]:
         """Return deep-copied rules from one exact policy layer."""
@@ -2621,11 +4969,15 @@ class PermissionManager:
 
     def _scope_revision(self, scope: PolicyScope) -> str:
         """Return a semantic revision of the exact layer a replacement would overwrite."""
-        payload = (
-            self._configuration.model_dump(mode="json")
-            if scope is PolicyScope.WORKSPACE
-            else self._session_overrides.model_dump(mode="json")
-        )
+        if scope is PolicyScope.WORKSPACE:
+            payload = self._configuration.model_dump(mode="json")
+        else:
+            with self._host_rules_lock:
+                host_rules = tuple(self._session_overrides.host_command_rules)
+            snapshot = self._session_overrides.model_copy(
+                update={"host_command_rules": list(host_rules)}
+            )
+            payload = snapshot.model_dump(mode="json")
         encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         return f"sha256:{sha256_digest(encoded)}"
 
@@ -2633,7 +4985,7 @@ class PermissionManager:
         """Return a user-facing summary of selected policy layers.
 
         Args:
-            view (str): ``all``, ``workspace``, ``session``, or ``effective``.
+            view (str): ``all``, ``workspace``, ``session``, ``effective``, or ``managed``.
 
         Returns:
             str: Requested defaults, limits, rules, and their policy sources.
@@ -2641,10 +4993,37 @@ class PermissionManager:
         Raises:
             ValueError: If ``view`` is not supported.
         """
-        if view not in {"all", "workspace", "session", "effective"}:
+        if view not in {"all", "workspace", "session", "effective", "managed"}:
             raise ValueError(f"Unknown permission policy view '{view}'.")
+        with self.policy_update():
+            self._managed_current_error()
         path = str(self._configuration_path) if self._configuration_path else "in memory"
         lines = [f"Permission policy: {path}"]
+        if self._managed_error is not None:
+            lines.append(f"  Managed enforcement: recovery required ({self._managed_error})")
+        elif self._managed_policy is None:
+            lines.append("  Managed enforcement: unavailable (no protected installation)")
+        else:
+            managed = self._managed_policy.policy
+            lines.append(
+                f"  Managed enforcement: active identity={managed.identity} "
+                f"revision={managed.revision} source={self._managed_policy_store.directory}"
+            )
+            if view in {"all", "managed"}:
+                lines.append(
+                    f"  Managed restrictions: require_sandbox={managed.require_sandbox}, "
+                    f"forbid_host={managed.forbid_host}, "
+                    f"deny_local_networks={managed.deny_local_networks}, "
+                    f"forbid_yolo={managed.forbid_yolo}, rules={len(managed.rules)}"
+                )
+                lines.extend(f"    {self._describe_rule(rule)}" for rule in managed.rules)
+        if self._namespace_catalog_path is not None:
+            for scope in ("workspace", "user"):
+                lines.append(
+                    f"  {scope} namespace identity: {self.policy_namespace_identity(scope)}"
+                )
+                if error := self._namespace_errors.get(scope):
+                    lines.append(f"  {scope} namespace recovery required: {error}")
         if view in {"all", "workspace"}:
             lines.extend(self._describe_configuration("Workspace policy", self._configuration))
         if view in {"all", "session"}:
@@ -2656,8 +5035,8 @@ class PermissionManager:
                 )
             )
         lines.append(
-            "Precedence: protected boundary > deny rule > exact allow rule > ask rule > "
-            "allow rule > default"
+            "Precedence: protected and managed boundaries > deny rule > managed fresh human > "
+            "exact allow rule > ask rule > allow rule > default"
         )
         return "\n".join(lines)
 
@@ -2691,7 +5070,15 @@ class PermissionManager:
                 if annotate_sources
                 else ""
             )
-            lines.append(f"    {name}: {rendered}{source}")
+            if name in {"readable_roots", "writable_roots", "network_origins"}:
+                classification = getattr(configuration.limit_classifications, name).value
+                provenance = configuration.limit_classifications.sources[name]
+                lines.append(
+                    f"    {name}: {rendered}{source} "
+                    f"(classification={classification}, source={provenance})"
+                )
+            else:
+                lines.append(f"    {name}: {rendered}{source}")
         rules = configuration.rules
         lines.append("  Rules:" if rules else "  Rules: none")
         if rules:
@@ -2756,38 +5143,500 @@ class PermissionManager:
             f"resource={target or rule.resource or '*'}{description}{source}"
         )
 
-    def _read_configuration(self) -> PermissionConfiguration:
+    def _read_configuration(
+        self, *, retain_on_missing: bool = False
+    ) -> PermissionConfiguration | None:
         """Read and validate the configured policy without changing active state."""
-        if self._configuration_path is None or not self._configuration_path.exists():
-            return PermissionConfiguration()
+        if self._configuration_path is None:
+            return None if retain_on_missing else PermissionConfiguration()
+        if self._namespace_catalog_path is not None:
+            return self._read_namespaced_configuration(
+                self._configuration_path, "workspace", self._workspace_id
+            )
+        if not self._configuration_path.exists():
+            self._require_completed_reset()
+            if not self._configuration_path.exists():
+                return None if retain_on_missing else PermissionConfiguration()
         try:
-            payload = yaml.safe_load(self._configuration_path.read_text("utf-8"))
-            return PermissionConfiguration.model_validate(payload or {})
+            revision = self._configuration_path.read_bytes()
+            self._failed_workspace_revision = revision
+            payload = yaml.safe_load(revision.decode("utf-8"))
+            values = payload or {}
+            if isinstance(values, dict) and "limit_classifications" not in values:
+                values = {
+                    **values,
+                    "limit_classifications": PolicyLimitClassifications(
+                        readable_roots=LimitClassification.HARD,
+                        writable_roots=LimitClassification.HARD,
+                        network_origins=LimitClassification.HARD,
+                        sources={
+                            "readable_roots": "legacy",
+                            "writable_roots": "legacy",
+                            "network_origins": "legacy",
+                        },
+                    ).model_dump(mode="json"),
+                }
+            configuration = PermissionConfiguration.model_validate(values)
+            self._workspace_storage_revision = revision
+            self._failed_workspace_revision = None
+            return configuration
         except (OSError, UnicodeError, ValueError, yaml.YAMLError) as exc:
             raise PermissionConfigurationError(self._configuration_path, str(exc)) from exc
 
-    def _read_user_configuration(self) -> UserPermissionConfiguration:
-        """Read and validate the user-wide approval policy without changing active state."""
-        if self._user_configuration_path is None or not self._user_configuration_path.exists():
-            return UserPermissionConfiguration()
+    @staticmethod
+    def _read_namespaced_file(path: Path) -> tuple[bytes | None, int | None]:
+        """Read one policy inode without following its final link or accepting a swapped file."""
+        if path.parent.resolve() != path.parent:
+            raise PermissionNamespaceError(path, "Policy directory has an aliased ancestor.")
         try:
-            payload = yaml.safe_load(self._user_configuration_path.read_text("utf-8"))
-            return UserPermissionConfiguration.model_validate(payload or {})
+            details = path.lstat()
+        except FileNotFoundError:
+            return None, None
+        except OSError as error:
+            raise PermissionNamespaceError(path, str(error)) from error
+        if not hasattr(os, "O_NOFOLLOW"):
+            raise PermissionNamespaceError(path, "No-follow policy loading is unavailable.")
+        try:
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError as error:
+            raise PermissionNamespaceError(path, "Policy file changed during loading.") from error
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or opened.st_nlink != 1
+                or opened.st_uid != os.getuid()
+                or (opened.st_dev, opened.st_ino) != (details.st_dev, details.st_ino)
+            ):
+                raise PermissionNamespaceError(path, "Policy file provenance is invalid.")
+            with os.fdopen(descriptor, "rb") as stream:
+                descriptor = -1
+                revision = stream.read()
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+        try:
+            current = path.lstat()
+        except OSError as error:
+            raise PermissionNamespaceError(path, "Policy file changed during loading.") from error
+        if (current.st_dev, current.st_ino) != (details.st_dev, details.st_ino):
+            raise PermissionNamespaceError(path, "Policy file changed during loading.")
+        return revision, opened.st_mode
+
+    def _live_namespace_error(self) -> tuple[str, str] | None:
+        """Check live reset markers and durable namespace identity before admission."""
+        catalog = self._namespace_catalog_path
+        if catalog is None:
+            for scope, path in (
+                ("workspace", self._configuration_path),
+                ("user", self._user_configuration_path),
+            ):
+                if path is None:
+                    continue
+                try:
+                    self._require_completed_reset(path)
+                except PermissionConfigurationError as error:
+                    return scope, error.message
+            return None
+        workspace_path = self._configuration_path
+        user_path = self._user_configuration_path
+        if workspace_path is None or user_path is None:
+            return "workspace", "Durable policy paths are unavailable."
+        try:
+            catalog_before = self._validate_namespace_catalog(workspace_path, catalog)
+            uri = f"file:{quote(str(catalog), safe='/')}?mode=ro"
+            with closing(sqlite3.connect(uri, uri=True, timeout=5)) as connection:
+                active = connection.execute(
+                    "SELECT canonical_path FROM workspace_locations WHERE workspace_id=? "
+                    "AND status='active'",
+                    (self._workspace_id,),
+                ).fetchall()
+                if (
+                    len(active) != 1
+                    or self._workspace_root is None
+                    or active[0][0] != str(self._workspace_root)
+                ):
+                    return "workspace", "Workspace identity changed; reload or restore policy."
+                scopes = (
+                    (
+                        "workspace",
+                        self._workspace_id,
+                        self._configuration.namespace_generation,
+                        workspace_path,
+                        self._workspace_storage_revision,
+                    ),
+                    (
+                        "user",
+                        self._user_namespace_identity,
+                        self._user_configuration.namespace_generation,
+                        user_path,
+                        self._user_storage_revision,
+                    ),
+                )
+                for scope, identity, generation, path, expected in scopes:
+                    try:
+                        self._require_completed_reset(path)
+                    except PermissionConfigurationError as error:
+                        return scope, error.message
+                    row = connection.execute(
+                        "SELECT generation,status FROM policy_namespaces "
+                        "WHERE scope=? AND identity=?",
+                        (scope, identity),
+                    ).fetchone()
+                    if row != (generation, "initialized") or expected is None:
+                        return scope, "Policy namespace generation or reservation changed."
+                    try:
+                        revision, mode = self._read_namespaced_file(path)
+                    except PermissionNamespaceError as error:
+                        return scope, error.message
+                    if revision != expected or mode is None or mode & 0o022:
+                        return scope, "Policy changed since loading; reload before admission."
+            catalog_after = self._validate_namespace_catalog(workspace_path, catalog)
+            if catalog_before != catalog_after:
+                return "workspace", "Independent policy registry changed during admission."
+        except (OSError, sqlite3.Error, PermissionNamespaceError) as error:
+            return "workspace", f"Independent policy registry is unavailable: {error}"
+        return None
+
+    def _read_namespaced_configuration(
+        self,
+        path: Path,
+        scope: str,
+        identity: str | None,
+    ) -> PermissionConfiguration | UserPermissionConfiguration:
+        """Reconcile a durable policy with its independent namespace reservation."""
+        if identity is None or self._namespace_catalog_path is None:
+            raise PermissionNamespaceError(path, "Policy namespace identity is unavailable.")
+        catalog = self._namespace_catalog_path
+        self._validate_namespace_catalog(path, catalog)
+        with self._storage_lock(path):
+            self._require_completed_reset(path)
+            revision, file_mode = self._read_namespaced_file(path)
+            try:
+                payload = yaml.safe_load(revision.decode("utf-8")) if revision is not None else None
+                if revision is not None and not isinstance(payload, dict):
+                    raise ValueError("Policy document must be a mapping.")
+                model = (
+                    PermissionConfiguration if scope == "workspace" else UserPermissionConfiguration
+                )
+                if (
+                    revision is not None
+                    and scope == "workspace"
+                    and payload.get("namespace_generation") is None
+                ):
+                    limits = payload.setdefault("limits", {})
+                    if isinstance(limits, dict):
+                        limits.setdefault("deny_local_networks", True)
+                if revision is not None and payload.get("namespace_generation") is not None:
+                    fields = set(model.model_fields)
+                    if payload.get("version") == 1:
+                        if scope == "user" and set(payload) == fields - {
+                            "trusted_host_command_rules"
+                        }:
+                            payload["trusted_host_command_rules"] = []
+                        elif scope == "workspace" and set(payload) == fields:
+                            limits = payload.get("limits")
+                            if isinstance(limits, dict) and set(limits) == set(
+                                PolicyLimits.model_fields
+                            ) - {"deny_local_networks"}:
+                                limits["deny_local_networks"] = True
+                    if set(payload) != fields:
+                        raise ValueError("Marked policy fields are incomplete.")
+                    if scope == "workspace":
+                        required = {
+                            "limits": set(PolicyLimits.model_fields),
+                            "limit_classifications": set(PolicyLimitClassifications.model_fields),
+                            "defaults": {action.value for action in Action},
+                        }
+                        if any(
+                            not isinstance(payload[name], dict) or payload[name].keys() != fields
+                            for name, fields in required.items()
+                        ):
+                            raise ValueError("Marked policy limits or provenance are incomplete.")
+                configuration = model.model_validate(payload) if revision is not None else None
+            except (UnicodeError, ValueError, yaml.YAMLError) as error:
+                raise PermissionNamespaceError(
+                    path, f"Policy content is invalid: {error}"
+                ) from error
+            generation = configuration.namespace_generation if configuration is not None else None
+            if revision is not None and file_mode & 0o022:
+                private_ancestor = False
+                if generation is None:
+                    for ancestor in (path.parent, *path.parent.parents):
+                        try:
+                            ensure_private_directory(ancestor, create=False)
+                        except (OSError, ValueError):
+                            continue
+                        private_ancestor = True
+                        break
+                if not private_ancestor:
+                    raise PermissionNamespaceError(path, "Policy file provenance is invalid.")
+            with closing(sqlite3.connect(catalog, timeout=5)) as connection, connection:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    "CREATE TABLE IF NOT EXISTS policy_namespaces ("
+                    "scope TEXT NOT NULL, identity TEXT NOT NULL, generation TEXT NOT NULL, "
+                    "status TEXT NOT NULL, legacy_hash TEXT, PRIMARY KEY(scope, identity))"
+                )
+                if scope == "user" and identity != str(catalog.parent):
+                    raise PermissionNamespaceError(
+                        path, "User policy identity does not match the data registry."
+                    )
+                try:
+                    active = connection.execute(
+                        "SELECT canonical_path FROM workspace_locations WHERE workspace_id=? "
+                        "AND status='active'",
+                        (self._workspace_id,),
+                    ).fetchall()
+                except sqlite3.Error as error:
+                    raise PermissionNamespaceError(
+                        path, "Independent workspace registry is invalid."
+                    ) from error
+                if (
+                    len(active) != 1
+                    or self._workspace_root is None
+                    or active[0][0] != str(self._workspace_root)
+                ):
+                    raise PermissionNamespaceError(
+                        path, "Workspace policy identity does not match the registry."
+                    )
+                row = connection.execute(
+                    "SELECT generation,status,legacy_hash FROM policy_namespaces "
+                    "WHERE scope=? AND identity=?",
+                    (scope, identity),
+                ).fetchone()
+                if row is None:
+                    if revision is None:
+                        if (
+                            not self._bootstrap_pristine_policy
+                            or self._policy_backup_exists(path)
+                            or os.path.lexists(path.with_name(path.name + _RESET_PENDING_SUFFIX))
+                        ):
+                            raise PermissionNamespaceError(
+                                path,
+                                "Policy namespace is missing or ambiguous. Restore existing "
+                                "policy data or use trusted /permissions initialize with the "
+                                "expected scope and identity.",
+                            )
+                        reserved_generation = uuid4().hex
+                        connection.execute(
+                            "INSERT INTO policy_namespaces(scope,identity,generation,status,"
+                            "legacy_hash) VALUES (?,?,?,'reserved_new',NULL)",
+                            (scope, identity, reserved_generation),
+                        )
+                        row = (reserved_generation, "reserved_new", None)
+                    elif generation is not None:
+                        raise PermissionNamespaceError(
+                            path, "Policy marker has no independent registry anchor."
+                        )
+                    else:
+                        reserved_generation = uuid4().hex
+                        connection.execute(
+                            "INSERT INTO policy_namespaces(scope,identity,generation,status,"
+                            "legacy_hash) VALUES (?,?,?,?,?)",
+                            (
+                                scope,
+                                identity,
+                                reserved_generation,
+                                "reserved_legacy",
+                                sha256_digest(revision),
+                            ),
+                        )
+                        row = (reserved_generation, "reserved_legacy", sha256_digest(revision))
+            recorded_generation, status, legacy_hash = row
+            if status == "initialized":
+                if configuration is None or generation != recorded_generation:
+                    raise PermissionNamespaceError(
+                        path, "Initialized policy is missing or has a mismatched generation."
+                    )
+                if configuration.version == 1:
+                    if self._read_namespaced_file(path)[0] != revision:
+                        raise PermissionNamespaceError(
+                            path, "Policy changed during schema migration."
+                        )
+                    self._archive_policy_revision(
+                        path, revision, f"{recorded_generation}.schema-v1", "Schema"
+                    )
+                    if self._read_namespaced_file(path)[0] != revision:
+                        raise PermissionNamespaceError(
+                            path, "Policy changed during schema migration."
+                        )
+                    configuration.version = 2
+                    revision = self._persist_configuration(path, configuration)
+                    telemetry_audit("permission.policy_schema_migrated", scope=scope, version=2)
+                    self._append_audit(
+                        "permission.policy_schema_migrated", {"scope": scope, "version": 2}
+                    )
+            elif status == "reserved_new":
+                if configuration is None:
+                    if self._policy_backup_exists(path):
+                        raise PermissionNamespaceError(
+                            path, "Reserved new policy has backup evidence requiring recovery."
+                        )
+                    configuration = model(namespace_generation=recorded_generation)
+                    revision = self._persist_configuration(path, configuration)
+                elif generation != recorded_generation:
+                    raise PermissionNamespaceError(
+                        path, "Reserved new policy generation does not match."
+                    )
+                with closing(sqlite3.connect(catalog, timeout=5)) as connection, connection:
+                    connection.execute(
+                        "UPDATE policy_namespaces SET status='initialized' "
+                        "WHERE scope=? AND identity=? AND generation=? AND status='reserved_new'",
+                        (scope, identity, recorded_generation),
+                    )
+            elif status == "reserved_legacy":
+                if configuration is None:
+                    raise PermissionNamespaceError(path, "Reserved legacy policy is missing.")
+                if generation is None and sha256_digest(revision) == legacy_hash:
+                    self._archive_policy_revision(
+                        path, revision, f"{recorded_generation}.legacy", "Legacy"
+                    )
+                    if scope == "workspace":
+                        configuration.limit_classifications = PolicyLimitClassifications(
+                            readable_roots=LimitClassification.HARD,
+                            writable_roots=LimitClassification.HARD,
+                            network_origins=LimitClassification.HARD,
+                            sources={
+                                "readable_roots": "legacy",
+                                "writable_roots": "legacy",
+                                "network_origins": "legacy",
+                            },
+                        )
+                    configuration.namespace_generation = recorded_generation
+                    configuration.version = 2
+                    if self._read_storage_revision(path) != revision:
+                        raise PermissionNamespaceError(
+                            path, "Legacy policy changed during migration."
+                        )
+                    revision = self._persist_configuration(path, configuration)
+                    telemetry_audit("permission.policy_legacy_migrated", scope=scope, version=2)
+                    self._append_audit(
+                        "permission.policy_legacy_migrated", {"scope": scope, "version": 2}
+                    )
+                elif generation != recorded_generation:
+                    raise PermissionNamespaceError(
+                        path, "Reserved policy generation or legacy content does not match."
+                    )
+                with closing(sqlite3.connect(catalog, timeout=5)) as connection, connection:
+                    connection.execute(
+                        "UPDATE policy_namespaces SET status='initialized' "
+                        "WHERE scope=? AND identity=? AND generation=? "
+                        "AND status='reserved_legacy'",
+                        (scope, identity, recorded_generation),
+                    )
+            else:
+                raise PermissionNamespaceError(path, "Policy namespace reservation is invalid.")
+            if scope == "workspace":
+                self._workspace_storage_revision = revision
+                self._failed_workspace_revision = None
+            else:
+                self._user_storage_revision = revision
+                self._failed_user_revision = None
+            return configuration
+
+    def _validate_namespace_catalog(self, path: Path, catalog: Path) -> tuple[int, int]:
+        """Validate the independent policy registry and return its device and inode."""
+        try:
+            catalog_details = catalog.lstat()
+            parent_details = catalog.parent.lstat()
+        except OSError as error:
+            raise PermissionNamespaceError(
+                path, "Independent policy registry is missing."
+            ) from error
+        if (
+            not stat.S_ISREG(catalog_details.st_mode)
+            or catalog_details.st_nlink != 1
+            or not stat.S_ISDIR(parent_details.st_mode)
+            or any(
+                details.st_uid != os.getuid() or details.st_mode & 0o022
+                for details in (catalog_details, parent_details)
+            )
+        ):
+            raise PermissionNamespaceError(path, "Independent policy registry is untrusted.")
+        return catalog_details.st_dev, catalog_details.st_ino
+
+    def _require_completed_reset(self, path: Path | None = None) -> None:
+        """Refuse policy loading while a reset marker remains."""
+        path = self._configuration_path if path is None else path
+        if path is None:
+            return
+        marker = path.with_name(path.name + _RESET_PENDING_SUFFIX)
+        try:
+            marker.lstat()
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            raise PermissionConfigurationError(path, str(exc)) from exc
+        raise PermissionNamespaceError(
+            path, "A policy reset is pending; inspect and recover the policy before retrying."
+        )
+
+    def _read_user_configuration(self) -> UserPermissionConfiguration | None:
+        """Read and validate the user-wide approval policy without changing active state."""
+        if self._namespace_catalog_path is not None and self._user_configuration_path is not None:
+            return self._read_namespaced_configuration(
+                self._user_configuration_path, "user", self._user_namespace_identity
+            )
+        if self._user_configuration_path is None:
+            self._user_storage_revision = None
+            self._failed_user_revision = None
+            return None
+        if not self._user_configuration_path.exists():
+            self._require_completed_reset(self._user_configuration_path)
+            if not self._user_configuration_path.exists():
+                self._user_storage_revision = None
+                self._failed_user_revision = None
+                return None
+        try:
+            revision = self._user_configuration_path.read_bytes()
+            self._failed_user_revision = revision
+            payload = yaml.safe_load(revision.decode("utf-8"))
+            configuration = UserPermissionConfiguration.model_validate(payload or {})
+            self._user_storage_revision = revision
+            self._failed_user_revision = None
+            return configuration
         except (OSError, UnicodeError, ValueError, yaml.YAMLError) as exc:
             raise PermissionConfigurationError(self._user_configuration_path, str(exc)) from exc
 
     def _load_user_configuration(self) -> None:
-        """Load user-wide approvals and fail closed if their file is invalid."""
-        try:
-            configuration = self._read_user_configuration()
-        except PermissionConfigurationError as exc:
-            if self._load_policy is PermissionLoadPolicy.ERROR:
-                raise
-            configuration = UserPermissionConfiguration()
-            self._report_user_configuration_error(exc)
+        """Load user rules, retaining only restrictions if their file is unavailable."""
         with self.policy_update():
-            self._user_configuration = configuration
-            self._policy_revision += 1
+            if self._namespace_catalog_path is None and self._user_configuration_path is not None:
+                self._require_completed_reset(self._user_configuration_path)
+            try:
+                if (
+                    self._namespace_catalog_path is not None
+                    and self._user_configuration_path is not None
+                ):
+                    self._require_completed_reset(self._user_configuration_path)
+                configuration = self._read_user_configuration()
+            except PermissionNamespaceError as exc:
+                if self._namespace_catalog_path is None:
+                    raise
+                self._namespace_errors["user"] = exc.message
+                configuration = None
+            except PermissionConfigurationError as exc:
+                self._require_completed_reset(self._user_configuration_path)
+                if isinstance(exc.__cause__, OSError):
+                    raise
+                if self.yolo or self._load_policy is PermissionLoadPolicy.ERROR:
+                    raise
+                configuration = None
+                self._report_user_configuration_error(exc)
+            if configuration is None:
+                configuration = UserPermissionConfiguration(
+                    rules=[
+                        rule
+                        for rule in self._user_configuration.rules
+                        if rule.decision is not Decision.ALLOW
+                    ]
+                )
+            else:
+                self._namespace_errors.pop("user", None)
+            with self.policy_update():
+                self._user_configuration = configuration
+                self._policy_revision += 1
 
     def _load_configuration(
         self,
@@ -2797,34 +5646,67 @@ class PermissionManager:
     ) -> PermissionLoadResult:
         """Load configuration and completely handle the selected failure policy."""
         while True:
-            try:
-                configuration = self._read_configuration()
-            except PermissionConfigurationError as exc:
-                if self._load_policy is PermissionLoadPolicy.ERROR:
-                    raise
-                if self._load_policy is PermissionLoadPolicy.AUTO:
-                    self._report_configuration_error(exc)
-                    if retain_on_failure:
-                        return PermissionLoadResult.RETAINED
-                    with self.policy_update():
-                        self._configuration = PermissionConfiguration()
-                        self._policy_revision += 1
-                    return PermissionLoadResult.DEFAULTED
-                active_interaction = interaction if interaction is not None else self._interaction
-                if active_interaction is None:
-                    raise
-                choice = self._recover_configuration_interactively(
-                    exc,
-                    interaction=active_interaction,
-                    retain_on_failure=retain_on_failure,
-                )
-                if choice is PermissionLoadResult.LOADED:
-                    continue
-                return choice
             with self.policy_update():
-                self._configuration = configuration
-                self._policy_revision += 1
-            return PermissionLoadResult.LOADED
+                if self._namespace_catalog_path is None:
+                    self._require_completed_reset()
+                try:
+                    if self._namespace_catalog_path is not None:
+                        self._require_completed_reset()
+                    configuration = self._read_configuration(retain_on_missing=retain_on_failure)
+                except PermissionNamespaceError as exc:
+                    if self._namespace_catalog_path is None:
+                        raise
+                    self._namespace_errors["workspace"] = exc.message
+                    self._workspace_storage_revision = None
+                    return PermissionLoadResult.RETAINED
+                except PermissionConfigurationError as exc:
+                    self._require_completed_reset()
+                    if isinstance(exc.__cause__, OSError):
+                        raise
+                    if self.yolo or self._load_policy is PermissionLoadPolicy.ERROR:
+                        raise
+                    if self._load_policy is PermissionLoadPolicy.AUTO:
+                        self._report_configuration_error(exc)
+                        if retain_on_failure:
+                            return PermissionLoadResult.RETAINED
+                        self._workspace_storage_revision = self._failed_workspace_revision
+                        with self.policy_update():
+                            self._configuration = PermissionConfiguration()
+                            self._policy_revision += 1
+                        return PermissionLoadResult.DEFAULTED
+                    active_interaction = (
+                        interaction if interaction is not None else self._interaction
+                    )
+                    if active_interaction is None:
+                        raise
+                    failure = exc
+                    revision = self._policy_revision
+                else:
+                    if configuration is None:
+                        return PermissionLoadResult.RETAINED
+                    classifications = configuration.limit_classifications
+                    if (
+                        classifications.sources["readable_roots"] == "legacy"
+                        and classifications.readable_roots is LimitClassification.HARD
+                        and set(configuration.limits.readable_roots)
+                        == set(PolicyLimits().readable_roots)
+                    ):
+                        configuration.limit_classifications = classifications.model_copy(
+                            update={"readable_roots": LimitClassification.APPROVAL}
+                        )
+                    self._namespace_errors.pop("workspace", None)
+                    with self.policy_update():
+                        self._configuration = configuration
+                        self._policy_revision += 1
+                    return PermissionLoadResult.LOADED
+            choice = self._recover_configuration_interactively(
+                failure,
+                interaction=active_interaction,
+                retain_on_failure=retain_on_failure,
+                revision=revision,
+            )
+            if choice is not PermissionLoadResult.LOADED:
+                return choice
 
     def _recover_configuration_interactively(
         self,
@@ -2832,6 +5714,7 @@ class PermissionManager:
         *,
         interaction: Interaction,
         retain_on_failure: bool,
+        revision: int,
     ) -> PermissionLoadResult:
         """Report one failure and return the user's selected recovery outcome."""
         problem = Problem.from_exception(
@@ -2862,15 +5745,30 @@ class PermissionManager:
         )
         if choice == "retry":
             return PermissionLoadResult.LOADED
+        if choice == "exit" or choice is False:
+            raise ShutdownRequested()
+        with self.policy_update():
+            if revision != self._policy_revision:
+                return PermissionLoadResult.LOADED
+            return self._finish_configuration_recovery(
+                choice, interaction=interaction, retain_on_failure=retain_on_failure
+            )
+
+    def _finish_configuration_recovery(
+        self,
+        choice: object,
+        *,
+        interaction: Interaction,
+        retain_on_failure: bool,
+    ) -> PermissionLoadResult:
+        """Apply a still-current policy recovery decision."""
         if choice == "reset":
-            backup_path = self.reset_configuration()
+            backup_path = self.reset_configuration("workspace")
             interaction.info(
                 "Reset permission policy to supervised defaults; "
                 f"archived invalid file at {backup_path}."
             )
             return PermissionLoadResult.DEFAULTED
-        if choice == "exit" or choice is False:
-            raise ShutdownRequested()
         if retain_on_failure:
             interaction.warning("Keeping the current permission policy.")
             return PermissionLoadResult.RETAINED
@@ -2938,7 +5836,49 @@ class PermissionManager:
         return self._evaluate_operation_policy(operation)
 
     def _evaluate_operation_policy(self, operation: Operation) -> PolicyDecision:
-        """Evaluate rules and defaults after the non-overridable boundary allows an operation."""
+        """Merge managed restrictions with user rules after fixed boundaries allow an operation."""
+        managed = self._managed_rule_decision(operation)
+        if managed is not None and managed.decision is Decision.DENY:
+            return managed
+        user = self._evaluate_user_operation_policy(operation)
+        if user.decision is Decision.DENY:
+            return user
+        return managed if managed is not None else user
+
+    def _managed_host_prohibited(self) -> bool:
+        """Report a loaded administrator requirement that forbids host execution."""
+        policy = self._managed_policy
+        return policy is not None and (policy.policy.require_sandbox or policy.policy.forbid_host)
+
+    def _managed_rule_decision(self, operation: Operation) -> PolicyDecision | None:
+        """Return the strongest matching administrator rule, if any."""
+        snapshot = self._managed_policy
+        if snapshot is None:
+            return None
+        matching = tuple(rule for rule in snapshot.policy.rules if self._matches(rule, operation))
+        for effect in (Decision.DENY, Decision.ASK):
+            selected = tuple(rule for rule in matching if rule.decision is effect)
+            if selected:
+                denied = effect is Decision.DENY or self.yolo
+                return PolicyDecision(
+                    decision=Decision.DENY if denied else Decision.ASK,
+                    reason=(
+                        "Administrator policy denies this operation."
+                        if effect is Decision.DENY
+                        else "Administrator policy requires a fresh human decision; YOLO cannot "
+                        "satisfy it."
+                        if self.yolo
+                        else "Administrator policy requires a fresh human decision."
+                    ),
+                    sources=tuple(
+                        f"managed:{'deny' if effect is Decision.DENY else 'human'}:{rule.id}"
+                        for rule in selected
+                    ),
+                )
+        return None
+
+    def _evaluate_user_operation_policy(self, operation: Operation) -> PolicyDecision:
+        """Evaluate user rules and defaults after protected constraints."""
         matching = [
             (ApprovalChoice.USER.value, rule)
             for rule in self._user_configuration.rules
@@ -2998,6 +5938,21 @@ class PermissionManager:
 
     def _boundary_decision(self, operation: Operation) -> PolicyDecision | None:
         target = operation.target
+        if (
+            isinstance(target, ProcessTarget)
+            and target.boundary is ProcessBoundary.HOST
+            and self._managed_host_prohibited()
+        ):
+            name = (
+                "sandbox_required"
+                if self._managed_policy.policy.require_sandbox
+                else "host_forbidden"
+            )
+            return PolicyDecision(
+                decision=Decision.DENY,
+                reason="Administrator policy prohibits host process execution.",
+                sources=(f"managed:{name}",),
+            )
         limits = self.effective_configuration.limits
         if isinstance(target, FileTarget):
             if self._is_protected_path(
@@ -3025,6 +5980,7 @@ class PermissionManager:
             isinstance(target, ProcessTarget)
             and target.boundary is ProcessBoundary.HOST
             and not limits.allow_host_processes
+            and not self.yolo
         ):
             return self._limit_denial("host_process", "allow_host_processes")
         return None
@@ -3036,9 +5992,17 @@ class PermissionManager:
             if getattr(self._session_overrides.limits, field) is not None
             else PolicyScope.WORKSPACE
         )
+        reason = f"The {scope.value} {name} boundary denied this operation."
+        if field == "allow_host_processes":
+            reason += (
+                " A user may enable session host-process eligibility with "
+                "/permissions limit set session host-process allow. This does not approve "
+                "a command or override other policy denies. A host command has the host "
+                "user's authority and needs a separate fresh decision."
+            )
         return PolicyDecision(
             decision=Decision.DENY,
-            reason=f"The {scope.value} {name} boundary denied this operation.",
+            reason=reason,
             sources=(f"limit:{scope.value}:{field}",),
         )
 
@@ -3089,7 +6053,7 @@ class PermissionManager:
         """Resolve one configured filesystem root token or absolute path."""
         if configured == "workspace":
             return self._workspace_root.resolve() if self._workspace_root else None
-        if configured == "loop-temp":
+        if configured == "app-temp":
             return self.temporary_directory
         if configured == "system-temp":
             return Path(tempfile.gettempdir()).resolve()
@@ -3120,6 +6084,9 @@ class PermissionManager:
     async def check_boundaries_async(self, operations: Operations) -> PolicyDecision | None:
         """Check planned effects against filesystem boundaries without blocking the owner loop.
 
+        Retry a bounded number of times if policy changes during a boundary check; persistent
+        churn returns a fail-closed stale decision.
+
         Args:
             operations (Operations): Future typed effects to check.
 
@@ -3132,20 +6099,35 @@ class PermissionManager:
         """
         if not operations:
             return None
-        await self._acquire_policy_lock_async()
-        try:
-            for operation in operations:
-                denial = await self._boundary_decision_async(operation)
-                if denial is not None:
+        for _ in range(_ASYNC_POLICY_ATTEMPTS):
+            await self._acquire_policy_lock_async()
+            try:
+                revision = self._policy_revision
+                denial = None
+                for operation in operations:
+                    denial = await self._boundary_decision_async(operation)
+                    if denial is not None:
+                        break
+                if revision == self._policy_revision:
                     return denial
-            return None
-        finally:
-            self._policy_lock.release()
+            finally:
+                self._policy_lock.release()
+        return self._stale_policy_decision()
 
     def _is_protected_path(self, resource: str, *, mutation: bool, recursive: bool = False) -> bool:
         """Protect control data and the working root without following a mutation's leaf link."""
         requested = Path(resource)
         path = requested.parent.resolve() / requested.name if mutation else requested.resolve()
+        managed = self._managed_policy_store.directory
+        expectation = self._managed_policy_store.expectation_path
+        if managed is not None and (
+            path.is_relative_to(managed) or mutation and recursive and managed.is_relative_to(path)
+        ):
+            return True
+        if expectation is not None and (
+            path == expectation or mutation and recursive and expectation.is_relative_to(path)
+        ):
+            return True
         temporary = self.temporary_directory
         if mutation and (path == temporary or recursive and temporary.is_relative_to(path)):
             return True
@@ -3248,10 +6230,17 @@ class PermissionManager:
 
     def _audit(self, result: AuthorizationResult) -> None:
         """Append one independently durable, timestamped permission decision."""
-        payload = result.model_dump(mode="json")
+        payload = self._recordable_result(result).model_dump(mode="json")
+        if not payload["operations"] and result.operations:
+            payload["operation_count"] = len(result.operations)
         self._append_audit("permission.decided", payload)
 
-    async def _audit_async(self, result: AuthorizationResult) -> None:
+    async def _audit_async(
+        self,
+        result: AuthorizationResult,
+        *,
+        _owned_failures: list[tuple[asyncio.CancelledError, BaseException]],
+    ) -> None:
         """Append one permission decision through bounded asynchronous worker admission."""
         if self._audit_store is None or self._workspace_id is None:
             return
@@ -3274,6 +6263,7 @@ class PermissionManager:
             pending.result()
         except Exception as error:  # noqa: BLE001  # audits must not change policy outcomes
             if cancellation is not None:
+                _owned_failures.append((cancellation, error))
                 cancellation.add_note(f"Permission audit also stopped with {type(error).__name__}.")
                 raise cancellation
             telemetry_error(

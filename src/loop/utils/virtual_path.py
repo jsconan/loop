@@ -134,34 +134,6 @@ class VirtualPath:
         """
         return tuple(sorted(self._roots.items(), key=lambda pair: len(pair[0]), reverse=True))
 
-    @staticmethod
-    def translate_shell_source(source: str, aliases: Mapping[str, Path]) -> str:
-        """Replace declared literal virtual roots without reconstructing POSIX shell syntax.
-
-        Args:
-            source (str): Opaque model-authored POSIX shell source.
-            aliases (Mapping[str, Path]): Configured virtual roots mapped to shell-safe aliases.
-
-        Returns:
-            str: Source with path-segment root occurrences replaced in one pass. A bare
-                directory root gains a trailing slash so tools traverse the alias symlink.
-            Environment-variable prefixes are excluded because the shell expands their values.
-        """
-        if not aliases:
-            return source
-        aliases = {root: path for root, path in aliases.items() if not root.startswith("$")}
-        if not aliases:
-            return source
-        roots = "|".join(re.escape(root) for root in sorted(aliases, key=len, reverse=True))
-        pattern = re.compile(rf"(?<![\w./~%-])({roots})(?=/|$|[^\w.-])")
-        return pattern.sub(
-            lambda match: (
-                str(aliases[match.group(1)])
-                + ("" if match.end() < len(source) and source[match.end()] == "/" else "/")
-            ),
-            source,
-        )
-
     def metadata(self, value: object, fields: tuple[tuple[str, ...], ...]) -> object:
         """Render declared metadata fields using their configured public paths.
 

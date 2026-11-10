@@ -14,19 +14,24 @@ from dataclasses import is_dataclass
 from enum import Enum
 from functools import partial
 from pathlib import Path
-from threading import BoundedSemaphore, Event, Lock, get_ident
+from threading import Event, Lock, get_ident
 from time import perf_counter
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import BaseModel, ValidationError
 
 from ..commands.models import CommandArgumentError
 from ..commands.utils import parse_model_arguments
-from ..constants import OMIT, Omit
+from ..constants import (
+    OMIT,
+    SHELL_COMMAND_OPTION,
+    SHELL_COMMAND_PATH,
+    Omit,
+)
 from ..errors import Problem, ProblemException, log_problem
 from ..execution import CommandExecutionService
 from ..instructions import InstructionsManager
-from ..interaction import Interaction
+from ..interaction import Interaction, require_async_interaction
 from ..models import (
     ToolDefinition,
     ToolExecutionResult,
@@ -35,6 +40,7 @@ from ..models import (
 from ..permissions import (
     Action,
     Decision,
+    Operation,
     OperationPlan,
     OperationPlanner,
     Operations,
@@ -42,25 +48,43 @@ from ..permissions import (
     ProcessBoundary,
     ProcessTarget,
 )
+from ..telemetry import telemetry_audit
 from ..utils import (
     VirtualPath,
-    await_value_async,
+    WorkerCapacity,
+    WorkerEntry,
     callable_name,
-    close_awaitable,
     has_running_event_loop,
     is_async_callable,
+    settle_future_async,
 )
 from .context import ToolContext
 from .file_observations import FileObservations
 from .models import (
+    ToolExecutionAdmissionRejected,
     ToolExecutionCancelled,
+    ToolExecutionInterrupted,
+    ToolExecutionNotStarted,
+    ToolExecutionOutcomeUnknown,
     ToolPreflight,
     ToolRegistrationError,
     ToolRuntimeSettings,
     ToolStatus,
 )
-from .tool import Tool, ToolRegistration
+from .tool import (
+    OwnedToolTask,
+    PlatformArgumentCapability,
+    Tool,
+    ToolRegistration,
+    _cancel_unstarted_borrowed_task,
+    _close_unstarted_coroutine,
+    _release_unhosted_work,
+    _start_borrowed_awaitable,
+)
 from .utils import serialize_tool_problem
+
+if TYPE_CHECKING:
+    from ..session import SessionManager
 
 _LOGGER = logging.getLogger(__name__)
 _TOOL_WORKER_COUNT = 4
@@ -102,7 +126,16 @@ class ToolExecutionPortal:
         if get_ident() == self._owner_thread:
             result = callback(*args, **kwargs)
             if inspect.isawaitable(result):
-                close_awaitable(result)
+                if isinstance(result, OwnedToolTask):
+                    if result.task is None:
+                        try:
+                            result.reserve()
+                        except RuntimeError:
+                            pass
+                        else:
+                            result.close()
+                elif inspect.iscoroutine(result):
+                    _close_unstarted_coroutine(result)
                 raise ProblemException(
                     Problem(
                         code="tool.async_required",
@@ -284,6 +317,8 @@ class ToolRegistry:
             ``None`` to use an independent default instance.
         execution_service (CommandExecutionService | None): Injected command execution service, or
             ``None`` to reject execution-capable tools before invocation.
+        session_manager (SessionManager | None): Selected session owner for detached command
+            leases, or ``None`` until an application instance binds it.
     """
 
     _tools: dict[str, Tool]
@@ -292,11 +327,12 @@ class ToolRegistry:
     _registration_problems: list[Problem]
     _settings: ToolRuntimeSettings
     _execution_service: CommandExecutionService | None
+    _session_manager: SessionManager | None
     _async_runner: asyncio.Runner | None
     _runner_thread: int | None
     _runner_lock: Lock
     _executor: ThreadPoolExecutor
-    _worker_slots: BoundedSemaphore
+    _worker_slots: WorkerCapacity
     _closed: bool
 
     def __init__(
@@ -306,6 +342,7 @@ class ToolRegistry:
         permission_manager: PermissionManager | None = None,
         settings: ToolRuntimeSettings | None = None,
         execution_service: CommandExecutionService | None = None,
+        session_manager: SessionManager | None = None,
     ) -> None:
         self._tools = {}
         self._registration_problems = []
@@ -313,6 +350,7 @@ class ToolRegistry:
         self._permission_manager = permission_manager or PermissionManager(interaction=interaction)
         self._settings = settings or ToolRuntimeSettings()
         self._execution_service = execution_service
+        self._session_manager = session_manager
         self._async_runner = None
         self._runner_thread = None
         self._runner_lock = Lock()
@@ -320,23 +358,38 @@ class ToolRegistry:
             max_workers=_TOOL_WORKER_COUNT,
             thread_name_prefix="loop-tool",
         )
-        self._worker_slots = BoundedSemaphore(_TOOL_WORKER_COUNT + _TOOL_WORKER_QUEUE_SIZE)
+        self._worker_slots = WorkerCapacity(_TOOL_WORKER_COUNT + _TOOL_WORKER_QUEUE_SIZE)
         self._closed = False
         for tool in tools or ():
             self.register(tool)
 
     def close(self) -> None:
-        """Settle dispatched tools and release registry-owned execution resources."""
+        """Settle dispatched tools and release registry-owned execution resources.
+
+        Raises:
+            RuntimeError: If the running event loop still owns unsettled worker dispatch.
+        """
         with self._runner_lock:
             if self._closed:
                 return
+            if has_running_event_loop() and self._worker_slots.busy:
+                raise RuntimeError("Wait for tool dispatch to settle before closing on its loop.")
             self._closed = True
             async_runner = self._async_runner
-        self._executor.shutdown(wait=True, cancel_futures=False)
+            executor = self._executor
+        executor.shutdown(wait=True, cancel_futures=False)
         if async_runner is not None:
             async_runner.close()
         if self._execution_service is not None:
             self._execution_service.close()
+
+    def bind_session_manager(self, session_manager: SessionManager) -> None:
+        """Bind a selected session before public command dispatch begins.
+
+        Args:
+            session_manager (SessionManager): Owner whose native lease protects detached jobs.
+        """
+        self._session_manager = session_manager
 
     def _sync_runner(self) -> asyncio.Runner | None:
         """Return the registry-owned runner only to its synchronous owner thread."""
@@ -346,7 +399,7 @@ class ToolRegistry:
             if self._closed:
                 return None
             if self._async_runner is None:
-                self._async_runner = asyncio.Runner()
+                self._async_runner = asyncio.Runner(loop_factory=asyncio.new_event_loop)
                 self._runner_thread = get_ident()
             elif self._runner_thread != get_ident():
                 return None
@@ -369,25 +422,21 @@ class ToolRegistry:
         if is_async_callable(function) and runner is None:
             raise self._async_required(tool)
         result = function(*args)
-        if inspect.isawaitable(result):
+        seen_awaitables = []
+        while isinstance(result, OwnedToolTask) or inspect.isawaitable(result):
+            if any(result is seen for seen in seen_awaitables):
+                raise RuntimeError("Tool callback returned cyclic awaitables.")
+            seen_awaitables.append(result)
             if runner is None:
-                runner = self._sync_runner()
+                try:
+                    runner = self._sync_runner()
+                except BaseException as interruption:
+                    _release_unhosted_work(result, interruption=interruption)
+                    raise
             if runner is None:
-                close_awaitable(result)
+                _release_unhosted_work(result)
                 raise self._async_required(tool)
-            if isinstance(result, asyncio.Future) and result.get_loop() is not runner.get_loop():
-                raise ProblemException(
-                    Problem(
-                        code="tool.loop_mismatch",
-                        title="Tool event loop mismatch",
-                        detail=(
-                            f"Tool '{tool.name}' returned a result attached to a different "
-                            "event loop."
-                        ),
-                        operation=tool.name,
-                    )
-                )
-            result = runner.run(await_value_async(result))
+            result = tool.resolve_awaitable(result, runner)
         return result
 
     async def _invoke_async(
@@ -400,15 +449,48 @@ class ToolRegistry:
     ) -> Any:
         """Invoke callbacks and retain cancellation while owned returned tasks settle."""
         if is_async_callable(function):
-            result = function(*args)
+            callback = OwnedToolTask(function(*args))
+            future = callback.claim(asyncio.get_running_loop())
+            try:
+                result = await self._await_owned_future_async(future)
+            except asyncio.CancelledError:
+                if cancellation_event is not None:
+                    cancellation_event.set()
+                await self._settle_returned_future_async(future, callback)
+                if not future.cancelled():
+                    failure = future.exception()
+                    if failure is None:
+                        await self._settle_cancelled_callback_result_async(
+                            future.result(), operation
+                        )
+                    self._log_callback_failure(failure, operation)
+                raise
         else:
             result = await self._run_worker_async(
                 function,
                 *args,
                 cancellation_event=cancellation_event,
                 operation=operation,
+                cancel_pending=True,
             )
-        if inspect.isawaitable(result):
+        seen_awaitables = []
+        while isinstance(result, OwnedToolTask) or inspect.isawaitable(result):
+            if any(result is previous for previous in seen_awaitables):
+                raise RuntimeError("Tool callback returned cyclic awaitables.")
+            seen_awaitables.append(result)
+            borrowed_wrapper = None
+            if inspect.iscoroutine(result):
+                result = OwnedToolTask(result)
+            elif not isinstance(result, (OwnedToolTask, asyncio.Future)):
+                result = _start_borrowed_awaitable(result)
+                borrowed_wrapper = result
+            owned = result if isinstance(result, OwnedToolTask) else None
+            if owned is not None:
+                loop = asyncio.get_running_loop()
+                if owned.task is None or owned.task.get_loop() is loop:
+                    result = owned.claim(loop)
+                else:
+                    result = owned.task
             if (
                 isinstance(result, asyncio.Future)
                 and result.get_loop() is not asyncio.get_running_loop()
@@ -423,18 +505,60 @@ class ToolRegistry:
                         ),
                     )
                 )
-            if isinstance(result, asyncio.Future):
-                try:
-                    return await asyncio.shield(result)
-                except asyncio.CancelledError:
-                    if cancellation_event is not None:
-                        cancellation_event.set()
-                    await self._cancel_returned_future_async(result)
-                    if not result.cancelled():
-                        self._log_callback_failure(result.exception(), operation)
-                    raise
-            result = await result
+            try:
+                result = await self._await_owned_future_async(result)
+            except asyncio.CancelledError:
+                if cancellation_event is not None:
+                    cancellation_event.set()
+                if borrowed_wrapper is not None:
+                    _cancel_unstarted_borrowed_task(borrowed_wrapper)
+                await self._settle_returned_future_async(result, owned)
+                if not result.cancelled():
+                    failure = result.exception()
+                    if failure is None:
+                        await self._settle_cancelled_callback_result_async(
+                            result.result(), operation
+                        )
+                    self._log_callback_failure(failure, operation)
+                raise
         return result
+
+    async def _settle_cancelled_callback_result_async(self, result: Any, operation: str) -> None:
+        """Release returned work without admitting a cancelled callback's continuation."""
+        seen = []
+        while isinstance(result, OwnedToolTask) or inspect.isawaitable(result):
+            if any(result is previous for previous in seen):
+                return
+            seen.append(result)
+            owned = result if isinstance(result, OwnedToolTask) else None
+            if owned is not None:
+                if (
+                    owned.task is not None
+                    and owned.task.get_loop() is not asyncio.get_running_loop()
+                ):
+                    return
+                try:
+                    owned.reserve()
+                except RuntimeError:
+                    return
+                if owned.task is None:
+                    owned.close()
+                    return
+                result = owned.task
+            if not isinstance(result, asyncio.Future):
+                if inspect.iscoroutine(result):
+                    _close_unstarted_coroutine(result)
+                return
+            if result.get_loop() is not asyncio.get_running_loop():
+                return
+            await self._settle_returned_future_async(result, owned)
+            if result.cancelled():
+                return
+            failure = result.exception()
+            if failure is not None:
+                self._log_callback_failure(failure, operation)
+                return
+            result = result.result()
 
     async def _run_worker_async(
         self,
@@ -443,32 +567,56 @@ class ToolRegistry:
         cancellation_event: Event | None = None,
         operation: str = "tool callback",
         settled_cancellation: Callable[[asyncio.CancelledError], None] | None = None,
+        cancel_pending: bool = False,
+        not_started_token: object | None = None,
     ) -> Any:
         """Run a sync callback with bounded admission and settle it after cancellation."""
-        if self._closed or not self._worker_slots.acquire(blocking=False):
-            raise ProblemException(
-                Problem(
-                    code="tool.dispatch_busy",
-                    title="Tool dispatch busy",
-                    detail="Synchronous tool capacity is full; retry after active work settles.",
+        token = object()
+        gate = None
+        future = None
+        try:
+            if self._closed or not self._worker_slots.acquire(token):
+                unavailable = self._worker_slots.quarantined
+                raise ProblemException(
+                    Problem(
+                        code="tool.dispatch_unavailable" if unavailable else "tool.dispatch_busy",
+                        title="Tool dispatch unavailable" if unavailable else "Tool dispatch busy",
+                        detail=(
+                            "Worker pool unavailable after submission failure; restart Loop "
+                            "or recreate the registry."
+                            if unavailable
+                            else (
+                                "Synchronous tool capacity is full; "
+                                "retry after active work settles."
+                            )
+                        ),
+                    )
                 )
-            )
-        call_context = contextvars.copy_context()
-        try:
-            future = asyncio.get_running_loop().run_in_executor(
-                self._executor,
-                call_context.run,
-                function,
-                *args,
-            )
-        except Exception:
-            self._worker_slots.release()
-            raise
-        try:
-            return await asyncio.shield(future)
+            call_context = contextvars.copy_context()
+            gate = WorkerEntry(self._worker_slots, token)
+            operation_call = partial(call_context.run, function, *args)
+            with self._runner_lock:
+                if self._closed:
+                    raise ProblemException(
+                        Problem(
+                            code="tool.dispatch_busy",
+                            title="Tool dispatch busy",
+                            detail="Synchronous tool capacity is full or unavailable.",
+                        )
+                    )
+                future = gate.submit(self._executor, asyncio.get_running_loop(), operation_call)
+            return await self._await_owned_future_async(future)
         except asyncio.CancelledError as cancellation:
+            if future is None:
+                raise
             if cancellation_event is not None:
                 cancellation_event.set()
+            if cancel_pending and gate is not None and gate.cancel_before_start():
+                if future.cancelled():
+                    gate.release()
+                if settled_cancellation is not None:
+                    raise ToolExecutionNotStarted(not_started_token) from cancellation
+                raise
             settled = asyncio.create_task(asyncio.wait({future}))
             while not settled.done():
                 try:
@@ -480,30 +628,108 @@ class ToolRegistry:
                 worker_error = future.exception()
                 if worker_error is None:
                     result = future.result()
-                    if (
+                    owned = result if isinstance(result, OwnedToolTask) else None
+                    if owned is not None:
+                        if (
+                            owned.task is not None
+                            and owned.task.get_loop() is not asyncio.get_running_loop()
+                        ):
+                            result = owned.task
+                        else:
+                            try:
+                                owned.reserve()
+                            except RuntimeError:
+                                raise cancellation from None
+                            if owned.task is not None:
+                                result = owned.task
+                    if owned is not None and owned.task is None:
+                        owned.close()
+                    elif (
                         isinstance(result, asyncio.Future)
                         and result.get_loop() is asyncio.get_running_loop()
                     ):
-                        await self._cancel_returned_future_async(result)
+                        await self._settle_returned_future_async(result, owned)
                         if not result.cancelled():
                             if settled_cancellation is not None:
                                 settled_cancellation(cancellation)
                                 return result.result()
                             worker_error = result.exception()
+                            if worker_error is None:
+                                await self._settle_cancelled_callback_result_async(
+                                    result.result(), operation
+                                )
                     elif inspect.isawaitable(result):
-                        close_awaitable(result)
+                        if inspect.iscoroutine(result):
+                            _close_unstarted_coroutine(result)
                     elif settled_cancellation is not None:
                         settled_cancellation(cancellation)
                         return result
                 self._log_callback_failure(worker_error, operation)
             raise
+        except BaseException as interruption:
+            if (
+                isinstance(interruption, Exception)
+                and gate is not None
+                and future is None
+                and gate.submission_attempted
+                and not gate.submission_confirmed
+            ):
+                self._worker_slots.quarantine()
+                problem = Problem.from_exception(
+                    interruption,
+                    code="tool.dispatch_unavailable",
+                    title="Tool dispatch unavailable",
+                    detail=(
+                        "Worker pool unavailable after submission failure; restart Loop "
+                        "or recreate the registry."
+                    ),
+                    operation=operation,
+                )
+                log_problem(_LOGGER, problem, interruption)
+                raise ProblemException(problem) from interruption
+            if (
+                gate is not None
+                and future is not None
+                and (not cancel_pending or not gate.cancel_before_start())
+            ):
+                if not future.done():
+                    await settle_future_async(future)
+                if not future.cancelled():
+                    failure = future.exception()
+                    if failure is None:
+                        await self._settle_cancelled_callback_result_async(
+                            future.result(), operation
+                        )
+                    elif failure is not interruption:
+                        interruption.add_note(
+                            f"The blocking operation also stopped with {type(failure).__name__}."
+                        )
+            raise
         finally:
-            self._worker_slots.release()
+            if gate is None:
+                self._worker_slots.release(token)
+            else:
+                if future is None:
+                    try:
+                        gate.cancel_before_start()
+                    finally:
+                        try:
+                            if gate.submission_attempted and not gate.submission_confirmed:
+                                self._worker_slots.quarantine()
+                        finally:
+                            if not gate.submission_confirmed:
+                                self._worker_slots.release(token)
+                elif cancel_pending:
+                    gate.cancel_before_start()
 
     @staticmethod
     def _log_callback_failure(error: BaseException | None, operation: str) -> None:
         """Report an unexpected callback failure once while cancellation settles."""
-        if error is None or isinstance(error, ProblemException):
+        if isinstance(error, ToolExecutionAdmissionRejected):
+            error = error.__cause__
+        elif isinstance(error, ProblemException):
+            return
+        if error is None:
             return
         problem = Problem.from_exception(
             error,
@@ -515,15 +741,27 @@ class ToolRegistry:
         log_problem(_LOGGER, problem, error)
 
     @staticmethod
-    async def _cancel_returned_future_async(future: asyncio.Future[Any]) -> None:
-        """Cancel an owned returned future once and drain it through repeated cancellation."""
-        if not future.done():
-            future.cancel()
-        while not future.done():
-            try:
-                await asyncio.wait({future})
-            except asyncio.CancelledError:
-                continue
+    async def _await_owned_future_async(future: asyncio.Future[Any]) -> Any:
+        """Wait for an owned future without cancelling it or losing a shielded error."""
+        protected = asyncio.shield(future)
+
+        def consume_error(completed: asyncio.Future[Any]) -> None:
+            """Drain a result that may arrive after the waiting task is cancelled."""
+            if not completed.cancelled():
+                completed.exception()
+
+        protected.add_done_callback(consume_error)
+        await asyncio.wait({protected})
+        return protected.result()
+
+    @staticmethod
+    async def _settle_returned_future_async(
+        future: asyncio.Future[Any], owned: OwnedToolTask | None = None
+    ) -> None:
+        """Settle returned work, cancelling it only when ownership was explicitly transferred."""
+        if owned is not None:
+            owned.cancel()
+        await settle_future_async(future)
 
     @property
     def interaction(self) -> Interaction | None:
@@ -588,6 +826,15 @@ class ToolRegistry:
             list[Tool]: Registered tools.
         """
         return sorted(self._tools.values(), key=lambda tool: tool.name.casefold())
+
+    @property
+    def private_argument_names(self) -> frozenset[str]:
+        """Return registered names whose model arguments must never enter session history.
+
+        Returns:
+            frozenset[str]: Names carrying private argument metadata across aliases.
+        """
+        return frozenset(name for name, tool in self._tools.items() if tool.private_arguments)
 
     def view(self) -> ToolRegistryView:
         """Return a live agent-facing view of this registry.
@@ -745,6 +992,7 @@ class ToolRegistry:
                     return True
                 if registered.required and (
                     self._interaction is None
+                    or self._permission_manager.yolo is True
                     or self._interaction.prompt(
                         f"Required tool '{tool_name}' is unavailable:",
                         exit_commands=(),
@@ -762,12 +1010,28 @@ class ToolRegistry:
         return True
 
     def definitions(self) -> list[ToolDefinition]:
-        """Return definitions for all registered tools.
+        """Return definitions supported by the current execution service.
 
         Returns:
-            list[ToolDefinition]: Function-tool definitions in registration order.
+            list[ToolDefinition]: Supported function-tool definitions in registration order.
         """
-        return [tool.definition() for tool in self._tools.values()]
+        definitions = []
+        for tool in self._tools.values():
+            if tool.platform_capability and not self._platform_capability(tool.platform_capability):
+                continue
+            definition = tool.definition()
+            for item in tool.platform_argument_capabilities:
+                item = cast(PlatformArgumentCapability, item)
+                if not self._platform_capability(item.capability):
+                    definition.parameters["properties"].pop(item.argument)
+                    definition.parameters["required"].remove(item.argument)
+            definitions.append(definition)
+        return definitions
+
+    def _platform_capability(self, name: str) -> bool:
+        """Check the live native backend's declared capability set."""
+        capabilities = getattr(self._execution_service, "backend_capabilities", frozenset())
+        return isinstance(capabilities, frozenset) and name in capabilities
 
     def call(
         self,
@@ -794,8 +1058,8 @@ class ToolRegistry:
             permission_manager (PermissionManager | None): Invocation policy overriding the
                 registry default.
             call_id (str | None): Stable model request identifier exposed to context-aware tools.
-            execution_started (Callable[[], None] | None): Callback invoked immediately before
-                the validated and authorized tool function runs.
+            execution_started (Callable[[], None] | None): Callback invoked after authorization
+                and before dispatch, for durable execution intent or interruption checks.
             file_observations (FileObservations | None): Frozen view supplied to this generation,
                 or ``None`` for standalone dispatch without model context.
             cancellation_event (Event | None): Run cancellation signal passed to context-aware
@@ -805,6 +1069,8 @@ class ToolRegistry:
             str: The serialized tool result or a model-readable error.
 
         Raises:
+            ToolExecutionInterrupted: If Ctrl+C settles the tool with a known result.
+            ToolExecutionOutcomeUnknown: If an entered invocation has no authoritative result.
             ValueError: If the tool requires a context but none is provided.
         """
         output, _ = self.call_with_timing(
@@ -830,6 +1096,7 @@ class ToolRegistry:
         permission_manager: PermissionManager | None = None,
         call_id: str | None = None,
         execution_started: Callable[[], None] | None = None,
+        execution_admission: Callable[[], bool] | None = None,
         file_observations: FileObservations | None = None,
         cancellation_event: Event | None = None,
     ) -> tuple[str, float]:
@@ -842,8 +1109,10 @@ class ToolRegistry:
             instructions_manager (InstructionsManager | None): Active instruction manager.
             permission_manager (PermissionManager | None): Invocation permission policy.
             call_id (str | None): Stable model request identifier exposed to context-aware tools.
-            execution_started (Callable[[], None] | None): Callback invoked immediately before
-                the validated and authorized tool function runs.
+            execution_started (Callable[[], None] | None): Callback invoked after authorization
+                and before dispatch, for durable execution intent or interruption checks.
+            execution_admission (Callable[[], bool] | None): Optional final admission check on
+                the thread that starts the tool.
             file_observations (FileObservations | None): Frozen view supplied to this generation,
                 or ``None`` for standalone dispatch without model context.
             cancellation_event (Event | None): Run cancellation signal passed to context-aware
@@ -854,6 +1123,9 @@ class ToolRegistry:
                 and authorization failures have a zero duration because no tool ran.
 
         Raises:
+            ToolExecutionAdmissionRejected: If final admission is refused.
+            ToolExecutionInterrupted: If Ctrl+C settles the tool with a known result.
+            ToolExecutionOutcomeUnknown: If an entered invocation has no authoritative result.
             ValueError: If the tool requires a context but none is provided.
         """
         tool = self._tools.get(name)
@@ -891,15 +1163,45 @@ class ToolRegistry:
             cancellation_event=cancellation_event,
             file_observations=file_observations,
         )
+        if sync_runner is not None:
+            try:
+                with self._runner_lock:
+                    if self._closed:
+                        return self._problem(
+                            "tool.dispatch_busy",
+                            "Tool dispatch busy",
+                            "Synchronous tool capacity is full; retry after active work settles.",
+                            tool.name or "tool",
+                        ), 0
+                    sync_runner.get_loop()
+            except Exception as error:  # noqa: BLE001  # pylint: disable=broad-except
+                # Runner setup has the same failure contract as tool execution.
+                problem = Problem.from_exception(
+                    error,
+                    code="tool.execution_failed",
+                    title="Tool execution failed",
+                    detail=f"Tool '{tool.name}' failed.",
+                    operation=tool.name,
+                )
+                log_problem(_LOGGER, problem, error)
+                return serialize_tool_problem(problem), 0
         if execution_started is not None:
             execution_started()
         started = perf_counter()
-        output = tool.execute(
-            plan.arguments,
-            context,
-            async_runner=sync_runner,
-            async_runner_factory=self._sync_runner,
-        ).output
+        try:
+            output = tool.execute(
+                plan.arguments,
+                context,
+                async_runner=sync_runner,
+                async_runner_factory=self._sync_runner,
+                execution_admission=execution_admission,
+            ).output
+        except ToolExecutionInterrupted as interruption:
+            output = self._model_result(interruption.output, instructions_manager, tool, context)
+            normalized = ToolExecutionInterrupted(output, perf_counter() - started)
+            for note in getattr(interruption, "__notes__", ()):
+                normalized.add_note(note)
+            raise normalized from interruption
         return self._model_result(
             output,
             instructions_manager,
@@ -932,10 +1234,10 @@ class ToolRegistry:
             permission_manager (PermissionManager | None): Invocation policy overriding the
                 registry default.
             call_id (str | None): Stable model request identifier exposed to context-aware tools.
-            execution_started (Callable[[], Any] | None): Callback invoked immediately before
-                the validated and authorized tool function runs; async callbacks run on the owner
-                loop and sync callbacks run in a bounded worker. Returned owner-loop tasks/futures
-                settle on cancellation without starting the tool.
+            execution_started (Callable[[], Any] | None): Callback invoked after authorization
+                and before dispatch; async callbacks run on the owner loop and sync callbacks run
+                in a bounded worker. Returned owner-loop tasks/futures settle on cancellation
+                without starting the tool.
             file_observations (FileObservations | None): Frozen view supplied to this generation,
                 or ``None`` for standalone dispatch without model context.
             cancellation_event (Event | None): Run cancellation signal passed to context-aware
@@ -948,6 +1250,7 @@ class ToolRegistry:
             ValueError: If the tool requires a context but none is provided.
             ToolExecutionCancelled: If cancellation settles a synchronous tool with a known
                 normalized output and execution duration.
+            ToolExecutionOutcomeUnknown: If an entered invocation has no authoritative result.
             asyncio.CancelledError: If dispatch is cancelled without an authoritative result.
         """
         output, _ = await self.call_with_timing_async(
@@ -973,6 +1276,7 @@ class ToolRegistry:
         permission_manager: PermissionManager | None = None,
         call_id: str | None = None,
         execution_started: Callable[[], Any] | None = None,
+        execution_admission: Callable[[], bool] | None = None,
         file_observations: FileObservations | None = None,
         cancellation_event: Event | None = None,
     ) -> tuple[str, float]:
@@ -985,10 +1289,12 @@ class ToolRegistry:
             instructions_manager (InstructionsManager | None): Active instruction manager.
             permission_manager (PermissionManager | None): Invocation permission policy.
             call_id (str | None): Stable model request identifier exposed to context-aware tools.
-            execution_started (Callable[[], Any] | None): Callback invoked immediately before
-                the validated and authorized tool function runs; async callbacks run on the owner
-                loop and sync callbacks run in a bounded worker. Returned owner-loop tasks/futures
-                settle on cancellation without starting the tool.
+            execution_started (Callable[[], Any] | None): Callback invoked after authorization
+                and before dispatch; async callbacks run on the owner loop and sync callbacks run
+                in a bounded worker. Returned owner-loop tasks/futures settle on cancellation
+                without starting the tool.
+            execution_admission (Callable[[], bool] | None): Optional final admission check on
+                the thread that starts the tool.
             file_observations (FileObservations | None): Frozen view supplied to this generation,
                 or ``None`` for standalone dispatch without model context.
             cancellation_event (Event | None): Run cancellation signal passed to context-aware
@@ -999,9 +1305,11 @@ class ToolRegistry:
                 and authorization failures have a zero duration because no tool ran.
 
         Raises:
+            ToolExecutionAdmissionRejected: If final admission is refused.
             ValueError: If the tool requires a context but none is provided.
             ToolExecutionCancelled: If cancellation settles a synchronous tool with a known
                 normalized output and execution duration.
+            ToolExecutionOutcomeUnknown: If an entered invocation has no authoritative result.
             asyncio.CancelledError: If dispatch is cancelled without an authoritative result.
         """
         tool = self._tools.get(name)
@@ -1061,6 +1369,7 @@ class ToolRegistry:
         worker_context = None
         active_context = context
         cancellation = None
+        not_started_token = object()
 
         def retain_cancellation(error: asyncio.CancelledError) -> None:
             """Retain interruption while a completed synchronous result is normalized."""
@@ -1090,28 +1399,52 @@ class ToolRegistry:
                     cancellation_event=active_context.cancellation_event,
                     operation=tool.name or "tool",
                     settled_cancellation=retain_cancellation,
+                    cancel_pending=True,
+                    not_started_token=not_started_token,
                 )
+                if cancellation is not None:
+                    return value
+                owned = value if isinstance(value, OwnedToolTask) else None
+                if owned is not None:
+                    loop = asyncio.get_running_loop()
+                    if owned.task is None or owned.task.get_loop() is loop:
+                        try:
+                            value = owned.claim(loop)
+                        except RuntimeError as error:
+                            raise ToolExecutionOutcomeUnknown(
+                                "Tool work returned a handle owned by another dispatcher."
+                            ) from error
+                    else:
+                        value = owned.task
                 if (
                     isinstance(value, asyncio.Future)
                     and value.get_loop() is asyncio.get_running_loop()
                 ):
                     try:
-                        return await asyncio.shield(value)
+                        return await self._await_owned_future_async(value)
                     except asyncio.CancelledError as error:
                         if active_context.cancellation_event is not None:
                             active_context.cancellation_event.set()
-                        await self._cancel_returned_future_async(value)
+                        await self._settle_returned_future_async(value, owned)
                         if value.cancelled():
                             raise
                         retain_cancellation(error)
                         return value.result()
                 return value
 
-            result = await tool.execute_async(
-                plan.arguments,
-                active_context,
-                sync_dispatch=dispatch_sync_async,
-            )
+            try:
+                result = await tool.execute_async(
+                    plan.arguments,
+                    active_context,
+                    sync_dispatch=dispatch_sync_async,
+                    execution_admission=execution_admission,
+                    settled_cancellation=retain_cancellation,
+                    pending_cancellation=lambda: cancellation,
+                )
+            except ToolExecutionNotStarted as error:
+                if error._invocation is not not_started_token:
+                    raise asyncio.CancelledError from error
+                raise
         finally:
             if worker_context is not None:
                 context.file_versions.update(worker_context.file_versions)
@@ -1409,7 +1742,7 @@ class ToolRegistry:
         resolved = {}
         for name, value in arguments.items():
             metadata = tool.arguments_model.model_fields[name].metadata
-            if "loop:virtual-path" in metadata:
+            if VirtualPath.METADATA_KEY in metadata:
                 resolved[name] = instructions_manager.virtual_paths.resolve(str(value))
             else:
                 resolved[name] = value
@@ -1539,6 +1872,7 @@ class ToolRegistry:
                 else None
             ),
             execution_service=context.execution_service,
+            session_manager=context.session_manager,
             file_versions={},
             read_versions={},
             cancellation_event=context.cancellation_event,
@@ -1553,6 +1887,8 @@ class ToolRegistry:
         instructions_manager: InstructionsManager | None,
     ) -> str | None:
         """Return a serialized denial or authorize the complete operation plan."""
+        if tool.requires_fresh_host_approval:
+            return self._authorize_host(tool, operations, interaction, permission_manager)
         if tool.execution_authorization:
             return self._authorization_unavailable(tool, operations)
 
@@ -1578,6 +1914,10 @@ class ToolRegistry:
         instructions_manager: InstructionsManager | None,
     ) -> str | None:
         """Return a serialized denial or asynchronously authorize the complete operation plan."""
+        if tool.requires_fresh_host_approval:
+            return await self._authorize_host_async(
+                tool, operations, interaction, permission_manager
+            )
         if tool.execution_authorization:
             return self._authorization_unavailable(tool, operations)
 
@@ -1592,6 +1932,219 @@ class ToolRegistry:
 
         if result.decision is Decision.DENY:
             return self._denied_problem(tool, result.reason)
+        return None
+
+    @staticmethod
+    def _explicit_host_operation(operations: Operations) -> Operation | None:
+        """Require the registered explicit tool's exact single host shell effect."""
+        if len(operations) != 1:
+            return None
+        operation = operations[0]
+        if operation.action is not Action.PROCESS_EXECUTE:
+            return None
+        target = operation.target
+        if (
+            not isinstance(target, ProcessTarget)
+            or target.boundary is not ProcessBoundary.HOST
+            or len(target.argv) != 3
+            or target.argv[:2] != (SHELL_COMMAND_PATH, SHELL_COMMAND_OPTION)
+        ):
+            return None
+        return operation
+
+    @staticmethod
+    def _trusted_host_rule(operation: Operation, permission_manager: PermissionManager) -> bool:
+        """Match only one exact explicit host process against human session grants."""
+        target = cast(ProcessTarget, operation.target)
+        return bool(
+            permission_manager.matching_trusted_host_command_rule(
+                target.argv[2], Path(target.cwd), operation.tool_id
+            )
+        )
+
+    @staticmethod
+    def _record_host_denial(
+        permission_manager: PermissionManager, operation: Operation | None, source: str
+    ) -> None:
+        """Persist a minimized denial before the host coordinator receives a request."""
+        target = operation.target if operation is not None else None
+        command = target.argv[2] if isinstance(target, ProcessTarget) else ""
+        permission_manager.record_host_boundary("host_command.denied", command, source=source)
+        telemetry_audit("host_command.denied", source=source)
+
+    def _authorize_host(
+        self,
+        tool: Tool,
+        operations: Operations,
+        interaction: Interaction | None,
+        permission_manager: PermissionManager,
+    ) -> str | None:
+        """Admit an explicit host request without a generic process approval prompt."""
+        active_interaction = interaction if interaction is not None else self._interaction
+        operation = self._explicit_host_operation(operations)
+        if operation is None:
+            self._record_host_denial(permission_manager, None, "invalid_plan")
+            return self._problem(
+                "host_command.invalid_request",
+                "Host command unavailable",
+                "An exact bound host shell operation is required.",
+                tool.name or "tool",
+            )
+        policy = permission_manager.evaluate(operations)
+        if policy.decision is Decision.DENY:
+            revision = permission_manager.host_gate_enable_revision(operations)
+            if (
+                revision is None
+                or active_interaction is None
+                or (getattr(active_interaction, "supports_fresh_host_approval", False) is not True)
+            ):
+                self._record_host_denial(permission_manager, operation, "policy")
+                return self._denied_problem(tool, policy.reason)
+            active_interaction.info(
+                "Enable host-process eligibility for this session? This allows future explicit "
+                "host requests to ask for approval; it does not approve any command."
+            )
+            answer = active_interaction.prompt(
+                "Enable session host-process eligibility?",
+                exit_commands=None,
+                choices={"deny": "Deny", "enable": "Enable for this session"},
+                index={"deny": "N", "enable": "Y"},
+            )
+            if answer != "enable" or not permission_manager.enable_host_gate_if_current(
+                operations, revision
+            ):
+                self._record_host_denial(
+                    permission_manager, operation, "eligibility_declined_or_stale"
+                )
+                return self._denied_problem(tool, "Host eligibility was declined or changed.")
+            policy = permission_manager.evaluate(operations)
+        if policy.decision is Decision.DENY:
+            self._record_host_denial(permission_manager, operation, "policy")
+            return self._denied_problem(tool, policy.reason)
+        if not self._trusted_host_rule(operation, permission_manager) and (
+            permission_manager.yolo is not True
+            and (
+                active_interaction is None
+                or getattr(active_interaction, "supports_fresh_host_approval", False) is not True
+            )
+        ):
+            self._record_host_denial(permission_manager, operation, "fresh_input_unavailable")
+            return self._problem(
+                "host_command.denied",
+                "Host command denied",
+                "Fresh interactive host approval is unavailable.",
+                tool.name or "tool",
+            )
+        return None
+
+    async def _authorize_host_async(
+        self,
+        tool: Tool,
+        operations: Operations,
+        interaction: Interaction | None,
+        permission_manager: PermissionManager,
+    ) -> str | None:
+        """Admit a host plan with native asynchronous gate input when needed."""
+        active_interaction = interaction if interaction is not None else self._interaction
+        operation = self._explicit_host_operation(operations)
+        if operation is None:
+            await self._run_worker_async(
+                partial(self._record_host_denial, permission_manager, None, "invalid_plan"),
+                operation="host denial audit",
+            )
+            return self._problem(
+                "host_command.invalid_request",
+                "Host command unavailable",
+                "An exact bound host shell operation is required.",
+                tool.name or "tool",
+            )
+        policy = await permission_manager.evaluate_async(operations)
+        if policy.decision is Decision.DENY:
+            revision = await self._run_worker_async(
+                partial(permission_manager.host_gate_enable_revision, operations),
+                operation="host gate eligibility",
+            )
+            if (
+                revision is None
+                or active_interaction is None
+                or (getattr(active_interaction, "supports_fresh_host_approval", False) is not True)
+            ):
+                await self._run_worker_async(
+                    partial(self._record_host_denial, permission_manager, operation, "policy"),
+                    operation="host denial audit",
+                )
+                return self._denied_problem(tool, policy.reason)
+            active_interaction.info(
+                "Enable host-process eligibility for this session? This allows future explicit "
+                "host requests to ask for approval; it does not approve any command."
+            )
+            answer = await require_async_interaction(
+                active_interaction, "host eligibility"
+            ).prompt_async(
+                "Enable session host-process eligibility?",
+                exit_commands=None,
+                choices={"deny": "Deny", "enable": "Enable for this session"},
+                index={"deny": "N", "enable": "Y"},
+            )
+            if answer != "enable":
+                await self._run_worker_async(
+                    partial(
+                        self._record_host_denial,
+                        permission_manager,
+                        operation,
+                        "eligibility_declined",
+                    ),
+                    operation="host denial audit",
+                )
+                return self._denied_problem(tool, "Host eligibility was declined.")
+            enabled = await self._run_worker_async(
+                partial(permission_manager.enable_host_gate_if_current, operations, revision),
+                operation="host gate enablement",
+            )
+            if not enabled:
+                await self._run_worker_async(
+                    partial(
+                        self._record_host_denial,
+                        permission_manager,
+                        operation,
+                        "eligibility_stale",
+                    ),
+                    operation="host denial audit",
+                )
+                return self._denied_problem(tool, "Host eligibility was declined or changed.")
+            policy = await permission_manager.evaluate_async(operations)
+        if policy.decision is Decision.DENY:
+            await self._run_worker_async(
+                partial(self._record_host_denial, permission_manager, operation, "policy"),
+                operation="host denial audit",
+            )
+            return self._denied_problem(tool, policy.reason)
+        trusted = await self._run_worker_async(
+            partial(self._trusted_host_rule, operation, permission_manager),
+            operation="trusted host policy",
+        )
+        if not trusted and (
+            permission_manager.yolo is not True
+            and (
+                active_interaction is None
+                or getattr(active_interaction, "supports_fresh_host_approval", False) is not True
+            )
+        ):
+            await self._run_worker_async(
+                partial(
+                    self._record_host_denial,
+                    permission_manager,
+                    operation,
+                    "fresh_input_unavailable",
+                ),
+                operation="host denial audit",
+            )
+            return self._problem(
+                "host_command.denied",
+                "Host command denied",
+                "Fresh interactive host approval is unavailable.",
+                tool.name or "tool",
+            )
         return None
 
     def _authorization_unavailable(
@@ -1696,6 +2249,7 @@ class ToolRegistry:
             execution_service=self._execution_service
             if tool.execution_authorization or tool.requires_execution_service
             else None,
+            session_manager=self._session_manager,
             cancellation_event=cancellation_event,
             additional_authorizer_async=(
                 authorize_additional_async if permission_manager is not None else None
@@ -1735,6 +2289,15 @@ class ToolRegistryView:
         return self._registry.tools
 
     @property
+    def private_argument_names(self) -> frozenset[str]:
+        """Expose the registry's argument privacy policy through its live view.
+
+        Returns:
+            frozenset[str]: Registered private-argument tool names.
+        """
+        return self._registry.private_argument_names
+
+    @property
     def names(self) -> list[str]:
         """Return the registry's current tool names.
 
@@ -1753,10 +2316,10 @@ class ToolRegistryView:
         return self._registry.registration_problems
 
     def definitions(self) -> list[ToolDefinition]:
-        """Return definitions for the registry's current tools.
+        """Return live model definitions supported by the current execution service.
 
         Returns:
-            list[ToolDefinition]: Function-tool definitions in registration order.
+            list[ToolDefinition]: Supported function-tool definitions in registration order.
         """
         return self._registry.definitions()
 
@@ -1770,6 +2333,7 @@ class ToolRegistryView:
         permission_manager: PermissionManager | None = None,
         call_id: str | None = None,
         execution_started: Callable[[], None] | None = None,
+        execution_admission: Callable[[], bool] | None = None,
         file_observations: FileObservations | None = None,
         cancellation_event: Event | None = None,
     ) -> tuple[str, float]:
@@ -1782,9 +2346,11 @@ class ToolRegistryView:
             instructions_manager (InstructionsManager | None): Active instruction manager.
             permission_manager (PermissionManager | None): Invocation permission policy.
             call_id (str | None): Stable model request identifier.
-            execution_started (Callable[[], Any] | None): Callback run before tool execution;
+            execution_started (Callable[[], Any] | None): Callback run before tool dispatch;
                 async callbacks run on the owner loop and sync callbacks run in a bounded worker.
                 Returned owner-loop tasks/futures settle on cancellation without starting the tool.
+            execution_admission (Callable[[], bool] | None): Optional final admission check on
+                the thread that starts the tool.
             file_observations (FileObservations | None): Frozen view supplied to this generation,
                 or ``None`` for standalone dispatch without model context.
             cancellation_event (Event | None): Run cancellation signal passed to context-aware
@@ -1792,6 +2358,9 @@ class ToolRegistryView:
 
         Returns:
             tuple[str, float]: Serialized result and tool-function duration in seconds.
+
+        Raises:
+            ToolExecutionAdmissionRejected: If final admission is refused.
         """
         return self._registry.call_with_timing(
             name,
@@ -1801,6 +2370,7 @@ class ToolRegistryView:
             permission_manager=permission_manager,
             call_id=call_id,
             execution_started=execution_started,
+            execution_admission=execution_admission,
             file_observations=file_observations,
             cancellation_event=cancellation_event,
         )
@@ -1815,6 +2385,7 @@ class ToolRegistryView:
         permission_manager: PermissionManager | None = None,
         call_id: str | None = None,
         execution_started: Callable[[], Any] | None = None,
+        execution_admission: Callable[[], bool] | None = None,
         file_observations: FileObservations | None = None,
         cancellation_event: Event | None = None,
     ) -> tuple[str, float]:
@@ -1827,9 +2398,11 @@ class ToolRegistryView:
             instructions_manager (InstructionsManager | None): Active instruction manager.
             permission_manager (PermissionManager | None): Invocation permission policy.
             call_id (str | None): Stable model request identifier.
-            execution_started (Callable[[], Any] | None): Callback run before tool execution;
+            execution_started (Callable[[], Any] | None): Callback run before tool dispatch;
                 async callbacks run on the owner loop and sync callbacks run in a bounded worker.
                 Returned owner-loop tasks/futures settle on cancellation without starting the tool.
+            execution_admission (Callable[[], bool] | None): Optional final admission check on
+                the thread that starts the tool.
             file_observations (FileObservations | None): Frozen view supplied to this generation,
                 or ``None`` for standalone dispatch without model context.
             cancellation_event (Event | None): Run cancellation signal passed to context-aware
@@ -1838,6 +2411,7 @@ class ToolRegistryView:
         Returns:
             tuple[str, float]: Serialized result and tool-function duration in seconds.
         Raises:
+            ToolExecutionAdmissionRejected: If final admission is refused.
             ToolExecutionCancelled: If a cancelled synchronous invocation has a known result.
             asyncio.CancelledError: If dispatch is cancelled without an authoritative result.
         """
@@ -1849,6 +2423,7 @@ class ToolRegistryView:
             permission_manager=permission_manager,
             call_id=call_id,
             execution_started=execution_started,
+            execution_admission=execution_admission,
             file_observations=file_observations,
             cancellation_event=cancellation_event,
         )

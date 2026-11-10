@@ -84,3 +84,24 @@ def test_call_command_forwards_quoted_run_command_text_without_tool_specific_rew
         "run_command",
         ("git status", "cwd=."),
     )
+
+
+def test_call_command_forwards_direct_terminal_input_without_session_message():
+    """The CLI passes user-controlled terminal text directly to the registered tool."""
+    interaction = Mock(spec=Interaction)
+    registry = Mock()
+    registry.tools = []
+    registry.command.return_value = ToolExecutionResult("accepted")
+    manager = CommandManager(interaction=interaction)
+    manager.register_provider(ToolCommands(registry, InstructionsManager()))
+
+    manager.call(
+        "call",
+        'control_command_terminal handle=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa action=write content="hello world"',
+    )
+
+    assert registry.command.call_args.args == (
+        "control_command_terminal",
+        ("handle=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "action=write", "content=hello world"),
+    )
+    interaction.tool_result.assert_called_once()

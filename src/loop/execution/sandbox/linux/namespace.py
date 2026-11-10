@@ -15,12 +15,87 @@ from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ....permissions.protection import is_protected_external_read
 from .host import protected_path, runtime_read_files, runtime_read_roots
 from .paths import mount_arguments, python_runtime_mounts
 from .seccomp import descriptor_filter
 
 if TYPE_CHECKING:
     from ..contracts import SandboxRequest
+
+_SYSTEM_ALTERNATIVES = Path("/etc/alternatives")
+_MAX_SYSTEM_ALIAS_HOPS = 40
+
+
+def _normalize_alias_target(link: Path, value: Path) -> Path:
+    """Refuse to collapse a parent traversal across a still-unresolved symlink."""
+    raw = value if value.is_absolute() else link.parent / value
+    current = Path(raw.anchor)
+    for component in raw.parts[1:]:
+        if component == "..":
+            if current.is_symlink():
+                raise ValueError("System alias crosses an unresolved symlink parent.")
+            current = current.parent
+        else:
+            current /= component
+    return current
+
+
+def _runtime_executable_aliases(
+    request: SandboxRequest, runtime_roots: tuple[tuple[Path, Path], ...]
+) -> tuple[tuple[Path, Path], ...]:
+    """Recreate only missing links for selected, authenticated system executables."""
+    roots = tuple(dict.fromkeys(path for pair in runtime_roots for path in pair))
+    identities = request.executable_identities
+    if not isinstance(identities, tuple):
+        return ()
+    aliases = []
+    for _, spelling, resolved, device, inode in identities:
+        if not all(
+            any(path.is_relative_to(root) for root in roots) for path in (spelling, resolved)
+        ):
+            continue
+        if protected_path(spelling, allow_root_owned_hardlinks=True) != resolved:
+            raise ValueError("Native system executable authority changed.")
+        details = resolved.stat()
+        if (details.st_dev, details.st_ino) != (device, inode):
+            raise ValueError("Native system executable identity changed.")
+        current = spelling
+        visited = set()
+        for _ in range(_MAX_SYSTEM_ALIAS_HOPS + 1):
+            link = next(
+                (part for part in reversed((current, *current.parents)) if part.is_symlink()), None
+            )
+            if link is None:
+                if current.resolve(strict=True) != resolved:
+                    raise ValueError("Native system executable alias target changed.")
+                break
+            if current in visited:
+                raise ValueError("Native system executable alias is cyclic.")
+            visited.add(current)
+            value = link.readlink()
+            target = _normalize_alias_target(link, value)
+            remainder = current.relative_to(link)
+            if not any(target.is_relative_to(root) for root in roots) and not any(
+                target.is_relative_to(root)
+                for root in (request.workspace, *request.read_roots, *request.write_roots)
+            ):
+                if target.parent != _SYSTEM_ALTERNATIVES or is_protected_external_read(target):
+                    raise ValueError("Selected system executable alias is unavailable.")
+                target_directory = target.is_dir()
+                canonical = protected_path(
+                    target,
+                    directory=target_directory,
+                    allow_root_owned_hardlinks=not target_directory,
+                )
+                if not any(canonical.is_relative_to(root) for root in roots):
+                    raise ValueError("Native system executable alias is unsafe.")
+                aliases.append((target, canonical))
+                target = canonical
+            current = target / remainder
+        else:
+            raise ValueError("Native system executable alias exceeds its bound.")
+    return tuple(dict.fromkeys(aliases))
 
 
 def _runtime_path_alias_mounts(
@@ -55,9 +130,7 @@ def _runtime_path_alias_mounts(
             if not link.is_symlink():
                 continue
             value = link.readlink()
-            target = Path(
-                os.path.normpath(str(value if value.is_absolute() else link.parent / value))
-            )
+            target = _normalize_alias_target(link, value)
             resolved = link.resolve(strict=True)
             if target.resolve(strict=True) != resolved:
                 raise ValueError("Native runtime PATH link changed during binding.")
@@ -77,8 +150,6 @@ def _runtime_path_alias_mounts(
                     *runtime_files,
                     *request_directories,
                     *(alias.parent for alias in request.read_aliases),
-                    *(alias.parent for _, alias, _ in request.aliases),
-                    *(target for _, _, target in request.aliases),
                     *(
                         path
                         for other_spelling, path in request.path_roots
@@ -106,8 +177,6 @@ def _runtime_path_alias_mounts(
                 *runtime_files,
                 *request_directories,
                 *(alias_path.parent for alias_path in request.read_aliases),
-                *(alias_path.parent for _, alias_path, _ in request.aliases),
-                *(alias_target for _, _, alias_target in request.aliases),
                 *(path for _, path in request.path_roots),
             )
         ):
@@ -121,8 +190,6 @@ def _runtime_path_alias_mounts(
         canonical for spelling, canonical in request.path_roots if spelling not in covered_spellings
     )
     request_directories.update(alias.parent for alias in request.read_aliases)
-    request_directories.update(alias.parent for _, alias, _ in request.aliases)
-    request_directories.update(target for _, _, target in request.aliases)
 
     if any(
         left != right and (left.is_relative_to(right) or right.is_relative_to(left))
@@ -225,17 +292,17 @@ def namespace_arguments(
             executable_identities,
             system_roots=tuple(path for _, path in runtime_bindings),
         )
-        if any(
-            root not in request.read_roots or root not in request.automatic_tool_reads
-            for root, _ in python_mounts
-        ):
+        if any(root not in request.read_roots for root, _ in python_mounts):
             raise ValueError("Native Python runtime authority changed during preparation.")
         covered_paths, runtime_aliases = _runtime_path_alias_mounts(
             request,
             tuple(runtime_bindings),
             tuple(path for path, _ in file_bindings),
             scratch,
-            tuple((alias, root) for root, alias in python_mounts),
+            (
+                *tuple((alias, root) for root, alias in python_mounts),
+                *_runtime_executable_aliases(request, tuple(runtime_bindings)),
+            ),
         )
         runtime_mounts.extend(runtime_aliases)
         with mount_arguments(
@@ -244,6 +311,7 @@ def namespace_arguments(
             empty_mask=empty_mask,
             skip_path_roots=covered_paths,
             skip_executable_roots=tuple(canonical for _, canonical in runtime_bindings),
+            runtime_roots=tuple(dict.fromkeys(path for pair in runtime_bindings for path in pair)),
         ) as (mounts, sources):
             data = descriptor_filter(deadline=request.deadline)
             if stream.write(data) != len(data):
@@ -275,4 +343,20 @@ def namespace_arguments(
                 "--seccomp",
                 str(stream.fileno()),
             )
-            yield arguments, (*runtime_descriptors, *sources, stream.fileno())
+            inherited = (*runtime_descriptors, *sources, stream.fileno())
+            distinct = list(arguments)
+            seen: set[int] = set()
+            duplicates = []
+            for index, value in enumerate(arguments):
+                if value not in ("--bind-fd", "--ro-bind-fd"):
+                    continue
+                descriptor = int(arguments[index + 1])
+                if descriptor in seen:
+                    duplicate = os.dup(descriptor)
+                    runtime.callback(os.close, duplicate)
+                    distinct[index + 1] = str(duplicate)
+                    duplicates.append(duplicate)
+                seen.add(descriptor)
+            arguments = tuple(distinct)
+            inherited = (*inherited, *duplicates)
+            yield arguments, inherited

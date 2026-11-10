@@ -10,7 +10,7 @@ from contextlib import ExitStack, aclosing, nullcontext
 from datetime import datetime
 from functools import partial
 from time import perf_counter, sleep
-from typing import Any
+from typing import Any, Never
 
 from .. import constants
 from ..backend import (
@@ -40,8 +40,16 @@ from ..models import (
 from ..permissions import PermissionManager
 from ..session import SessionManager, SessionRecoveryState
 from ..telemetry import telemetry_activity, telemetry_span, telemetry_trace_event
-from ..tooling.file_observations import FileObservations
-from ..tooling.models import ToolExecutionCancelled
+from ..tooling import (
+    FileObservations,
+    ToolExecutionAdmissionRejected,
+    ToolExecutionCancelled,
+    ToolExecutionInterrupted,
+    ToolExecutionNotStarted,
+    ToolExecutionOutcomeUnknown,
+    ToolRegistry,
+    ToolRegistryView,
+)
 from ..tooling.utils import serialize_tool_problem
 from ..utils import (
     PathReference,
@@ -52,9 +60,23 @@ from ..utils import (
     utc_now,
 )
 from .agent import Agent
-from .models import AgentRecoveryStatus, AgentRunRecoveryRequired, AgentRunResult, ToolCallCancelled
+from .models import (
+    AgentRecoveryStatus,
+    AgentRunRecoveryRequired,
+    AgentRunResult,
+    ToolCallCancelled,
+    ToolCallInterrupted,
+)
 
 _LOGGER = logging.getLogger(__name__)
+_UNKNOWN_TOOL_WARNING = (
+    "A previous tool may already have run; its outcome is unknown. "
+    "A new action may repeat its effects. The old call will not be replayed."
+)
+_UNSTARTED_RETRY_WARNING = (
+    "The retry could not start. The earlier tool outcome is still unknown; "
+    "inspect it before requesting another action."
+)
 
 
 class AgentRunner:
@@ -371,7 +393,8 @@ class AgentRunner:
 
         Args:
             confirmed (bool): Skip the run-level prompt after a recovery command or new message.
-                Unknown tool outcomes still require confirmation. Defaults to ``False``.
+                Unknown tool outcomes require confirmation outside YOLO. In YOLO, a newer user
+                message can continue without replaying them. Defaults to ``False``.
 
         Returns:
             AgentRecoveryStatus: Recovered run result and whether unresolved recovery remains.
@@ -391,9 +414,24 @@ class AgentRunner:
             state = self._session_manager.recovery_state
             if state is None:
                 return AgentRecoveryStatus(pending=False)
-            if not confirmed and not self._interaction.confirm(
-                "This session stopped during an agent run. Recover and continue it?",
-                default=False,
+            if (
+                self._permission_manager.yolo is True
+                and not (confirmed and state.superseded)
+                and any(pending.status == "outcome_unknown" for pending in state.pending_calls)
+            ):
+                self._permission_manager.confirmation_decision(certain=False)
+                self._interaction.warning(
+                    "Recovery requires an explicit decision: a tool may already have run. "
+                    "Inspect the outcome before requesting a new action."
+                )
+                return AgentRecoveryStatus(pending=True)
+            if (
+                not confirmed
+                and self._interaction.confirm(
+                    "This session stopped during an agent run. Recover and continue it?",
+                    default=False,
+                )
+                is not True
             ):
                 return AgentRecoveryStatus(pending=True)
             with self._session_manager.execution():
@@ -401,7 +439,11 @@ class AgentRunner:
                     self._session_manager.begin_run_retry()
                 if self._session_manager.session.active_run_id is None:
                     self._session_manager.begin_run()
-                return AgentRecoveryStatus(pending=False, result=self._recover(state))
+                result = self._recover(state)
+                return AgentRecoveryStatus(
+                    pending=result.stop_reason is AgentRunStopReason.RECOVERY_REQUIRED,
+                    result=result,
+                )
 
     async def recover_session_async(self, *, confirmed: bool = False) -> AgentRecoveryStatus:
         """Execute an approved recovery plan using asynchronous interaction and tools.
@@ -409,7 +451,8 @@ class AgentRunner:
         Args:
             confirmed (bool): Whether a recovery command or new message already approved the
                 run-level recovery prompt. Unknown tool outcomes still require their own
-                confirmation. Defaults to ``False``.
+                confirmation outside YOLO. In YOLO, a newer user message can continue without
+                replaying them. Defaults to ``False``.
 
         Returns:
             AgentRecoveryStatus: Recovered run result and whether unresolved recovery remains.
@@ -428,9 +471,24 @@ class AgentRunner:
             state = self._session_manager.recovery_state
             if state is None:
                 return AgentRecoveryStatus(pending=False)
-            if not confirmed and not await self._confirm_async(
-                "This session stopped during an agent run. Recover and continue it?",
-                default=False,
+            if (
+                self._permission_manager.yolo is True
+                and not (confirmed and state.superseded)
+                and any(pending.status == "outcome_unknown" for pending in state.pending_calls)
+            ):
+                self._permission_manager.confirmation_decision(certain=False)
+                self._interaction.warning(
+                    "Recovery requires an explicit decision: a tool may already have run. "
+                    "Inspect the outcome before requesting a new action."
+                )
+                return AgentRecoveryStatus(pending=True)
+            if (
+                not confirmed
+                and await self._confirm_async(
+                    "This session stopped during an agent run. Recover and continue it?",
+                    default=False,
+                )
+                is not True
             ):
                 return AgentRecoveryStatus(pending=True)
             with self._session_manager.execution():
@@ -438,7 +496,11 @@ class AgentRunner:
                     await self._session_manager.begin_run_retry_async()
                 if self._session_manager.session.active_run_id is None:
                     await self._session_manager.begin_run_async()
-                return AgentRecoveryStatus(pending=False, result=await self._recover_async(state))
+                result = await self._recover_async(state)
+                return AgentRecoveryStatus(
+                    pending=result.stop_reason is AgentRunStopReason.RECOVERY_REQUIRED,
+                    result=result,
+                )
 
     def _recover(self, state: SessionRecoveryState) -> AgentRunResult:
         """Continue one approved recovery plan from its durable execution boundary."""
@@ -484,6 +546,7 @@ class AgentRunner:
             ),
             prepare_context=self._backend.prepare_context,
         )
+        warned_unknown = False
         for pending in state.pending_calls:
             self._checkpoint()
             if pending.status == "result_available":
@@ -492,17 +555,36 @@ class AgentRunner:
                 self._persist_interrupted_tool_result(pending.call, not_started=True)
                 continue
             retry = True
+            retry_generation = None
             if pending.status == "outcome_unknown":
-                with interaction_operation(pending.call.call_id):
-                    retry = self._interaction.confirm(
-                        f"Tool '{pending.call.name}' may already have run. Retry it?",
-                        default=False,
-                    )
+                retry_generation = self._permission_manager.recovery_retry_generation()
+                if retry_generation is None:
+                    if not state.superseded:
+                        self._permission_manager.confirmation_decision(certain=False)
+                        raise AgentRunRecoveryRequired
+                    if not warned_unknown:
+                        self._interaction.warning(_UNKNOWN_TOOL_WARNING)
+                        warned_unknown = True
+                    retry = False
+                else:
+                    with interaction_operation(pending.call.call_id):
+                        retry = self._interaction.confirm(
+                            f"Tool '{pending.call.name}' may already have run. Retry it?",
+                            default=False,
+                        )
+                    if not self._permission_manager.recovery_retry_current(retry_generation):
+                        raise AgentRunRecoveryRequired
+                    if retry is not True and retry is not False:
+                        raise AgentRunRecoveryRequired
             if not retry:
                 self._persist_interrupted_tool_result(pending.call)
                 continue
             tools.extend(
-                self._execute_tool_calls((pending.call,), present=pending.status == "not_started")
+                self._execute_tool_calls(
+                    (pending.call,),
+                    present=pending.status == "not_started",
+                    retry_generation=retry_generation,
+                )
             )
 
     async def _recover_tools_async(
@@ -521,6 +603,7 @@ class AgentRunner:
             pending_calls,
             prepare_context=self._backend.prepare_context,
         )
+        warned_unknown = False
         for pending in state.pending_calls:
             await self._checkpoint_async()
             if pending.status == "result_available":
@@ -529,18 +612,35 @@ class AgentRunner:
                 await self._persist_interrupted_tool_result_async(pending.call, not_started=True)
                 continue
             retry = True
+            retry_generation = None
             if pending.status == "outcome_unknown":
-                with interaction_operation(pending.call.call_id):
-                    retry = await self._confirm_async(
-                        f"Tool '{pending.call.name}' may already have run. Retry it?",
-                        default=False,
-                    )
+                retry_generation = self._permission_manager.recovery_retry_generation()
+                if retry_generation is None:
+                    if not state.superseded:
+                        self._permission_manager.confirmation_decision(certain=False)
+                        raise AgentRunRecoveryRequired
+                    if not warned_unknown:
+                        self._interaction.warning(_UNKNOWN_TOOL_WARNING)
+                        warned_unknown = True
+                    retry = False
+                else:
+                    with interaction_operation(pending.call.call_id):
+                        retry = await self._confirm_async(
+                            f"Tool '{pending.call.name}' may already have run. Retry it?",
+                            default=False,
+                        )
+                    if not self._permission_manager.recovery_retry_current(retry_generation):
+                        raise AgentRunRecoveryRequired
+                    if retry is not True and retry is not False:
+                        raise AgentRunRecoveryRequired
             if not retry:
                 await self._persist_interrupted_tool_result_async(pending.call)
                 continue
             tools.extend(
                 await self._execute_tool_calls_async(
-                    (pending.call,), present=pending.status == "not_started"
+                    (pending.call,),
+                    present=pending.status == "not_started",
+                    retry_generation=retry_generation,
                 )
             )
 
@@ -586,7 +686,7 @@ class AgentRunner:
                         )
                     )
                     self._model_selection.record_response(response.model)
-                    self._session_manager.add_response(response)
+                    self._session_manager.add_response(self._stored_response(response))
                     if self._steering_pending():
                         self._cancel_pending_tools()
                         return self._record_run_result(
@@ -726,7 +826,7 @@ class AgentRunner:
                         )
                     )
                     await self._model_selection.record_response_async(response.model)
-                    await self._session_manager.add_response_async(response)
+                    await self._session_manager.add_response_async(self._stored_response(response))
                     if self._steering_pending():
                         await self._cancel_pending_tools_async()
                         return await self._record_run_result_async(
@@ -764,7 +864,7 @@ class AgentRunner:
                             f"Agent has reached the {self._max_turns}-turn safety limit. "
                             "Do you want to continue?"
                         )
-                        if not await self._confirm_async(prompt, default=False):
+                        if await self._confirm_async(prompt, default=False) is not True:
                             break
                         turns_since_confirmation = 0
 
@@ -891,6 +991,7 @@ class AgentRunner:
         tool_calls: tuple[ToolCall, ...],
         *,
         present: bool,
+        retry_generation: int | None = None,
     ) -> tuple[ToolExecutionMetrics, ...]:
         """Execute and persist canonical tool requests from one durable boundary."""
         instructions = self._instructions_manager
@@ -909,9 +1010,15 @@ class AgentRunner:
                             tool_call,
                             instructions=instructions,
                             present=present,
+                            retry_generation=retry_generation,
                         )
                     )
         except (RunInterrupted, RunStopRequested):
+            if self._interrupted_tools is not None:
+                self._interrupted_tools.extend(executions)
+            raise
+        except ToolCallInterrupted as error:
+            executions.append(error.metrics)
             if self._interrupted_tools is not None:
                 self._interrupted_tools.extend(executions)
             raise
@@ -922,6 +1029,7 @@ class AgentRunner:
         tool_calls: tuple[ToolCall, ...],
         *,
         present: bool,
+        retry_generation: int | None = None,
     ) -> tuple[ToolExecutionMetrics, ...]:
         """Execute tool requests sequentially through async registry dispatch."""
         instructions = self._instructions_manager
@@ -940,6 +1048,7 @@ class AgentRunner:
                             tool_call,
                             instructions=instructions,
                             present=present,
+                            retry_generation=retry_generation,
                         )
                     )
         except (RunInterrupted, RunStopRequested):
@@ -954,74 +1063,148 @@ class AgentRunner:
             raise
         return tuple(executions)
 
+    def _stored_call(self, call: ToolCall) -> ToolCall:
+        """Redact registered private arguments even when a tool has a custom name."""
+        tools = self._agent.tools
+        private_names = (
+            tools.private_argument_names
+            if isinstance(tools, (ToolRegistry, ToolRegistryView))
+            else frozenset()
+        )
+        return call.for_storage(redact_arguments=call.name in private_names)
+
+    def _stored_response(self, response: Response) -> Response:
+        """Persist a response copy without private tool arguments while executing the original."""
+        items = tuple(
+            self._stored_call(item) if isinstance(item, ToolCall) else item
+            for item in response.items
+        )
+        if all(saved is original for saved, original in zip(items, response.items)):
+            return response
+        calls = tuple(self._stored_call(call) for call in response.tool_calls)
+        return response.model_copy(update={"items": items, "tool_calls": calls})
+
+    def _reject_unstarted_retry(self, call: ToolCall, result: str, duration: float) -> Never:
+        """Report the failed retry without settling the earlier unknown outcome."""
+        telemetry_trace_event(
+            "tool.response",
+            payload={"call_id": call.call_id, "output": result},
+            duration_seconds=duration,
+        )
+        self._interaction.tool_result(result)
+        self._interaction.warning(_UNSTARTED_RETRY_WARNING)
+        raise AgentRunRecoveryRequired
+
     def _execute_tool_call(
         self,
         tool_call: ToolCall,
         *,
         instructions: InstructionsManager,
         present: bool,
+        retry_generation: int | None = None,
     ) -> ToolExecutionMetrics:
         """Execute, trace, and persist one tool request inside its correlation span."""
         self._checkpoint(steer=True)
+        displayed_call = self._stored_call(tool_call)
         telemetry_trace_event(
             "tool.request",
             payload={
                 "call_id": tool_call.call_id,
                 "name": tool_call.name,
-                "arguments": tool_call.arguments,
+                "arguments": displayed_call.arguments,
             },
         )
         if present:
             self._session_manager.add_tool_call_event(tool_call.call_id)
-        self._interaction.tool_call(tool_call.name, tool_call.arguments)
+        self._interaction.tool_call(tool_call.name, displayed_call.arguments)
+
+        admitted = False
 
         def execution_started() -> None:
             """Honor a stop after approval and before recording the execution boundary."""
             self._checkpoint(steer=True)
             self._session_manager.record_tool_execution_started(tool_call.call_id)
 
-        tool_result, duration = self._agent.tools.call_with_timing(
-            tool_call.name,
-            tool_call.arguments,
-            interaction=self._interaction,
-            instructions_manager=instructions,
-            permission_manager=self._permission_manager,
-            call_id=tool_call.call_id,
-            cancellation_event=(
-                self._run_control.cancellation_event if self._run_control is not None else None
-            ),
-            **(
-                {"file_observations": self._file_observations}
-                if self._file_observations is not None
-                else {}
-            ),
-            execution_started=execution_started,
-        )
-        if self._file_observations is not None:
-            self._file_observations.observe_result(tool_call, tool_result, include_reads=False)
-        telemetry_trace_event(
-            "tool.response",
-            payload={"call_id": tool_call.call_id, "output": tool_result},
-            duration_seconds=duration,
-        )
+        def admit_retry(generation: int) -> bool:
+            """Record successful policy admission at the callable's dispatch boundary."""
+            nonlocal admitted
+            admitted = self._permission_manager.recovery_retry_current(generation)
+            return admitted
+
+        interruption = None
         try:
-            payload = json.loads(tool_result)
-        except json.JSONDecodeError:
-            payload = None
-        succeeded = isinstance(payload, dict) and payload.get("ok") is True
-        self._session_manager.add_tool_call(
-            call_id=tool_call.call_id,
-            output=tool_result,
-            working_directory=str(instructions.working_directory or self._working_directory),
-            active_skills=instructions.active_skill_identities,
-            succeeded=succeeded,
-            duration_seconds=duration,
-        )
-        return ToolExecutionMetrics(
+            tool_result, duration = self._agent.tools.call_with_timing(
+                tool_call.name,
+                tool_call.arguments,
+                interaction=self._interaction,
+                instructions_manager=instructions,
+                permission_manager=self._permission_manager,
+                call_id=tool_call.call_id,
+                cancellation_event=(
+                    self._run_control.cancellation_event if self._run_control is not None else None
+                ),
+                **(
+                    {"file_observations": self._file_observations}
+                    if self._file_observations is not None
+                    else {}
+                ),
+                **(
+                    {"execution_admission": partial(admit_retry, retry_generation)}
+                    if retry_generation is not None
+                    else {}
+                ),
+                execution_started=execution_started,
+            )
+        except ToolExecutionAdmissionRejected as error:
+            if error.__cause__ is not None:
+                raise error.__cause__
+            raise AgentRunRecoveryRequired from None
+        except ToolExecutionOutcomeUnknown as error:
+            raise AgentRunRecoveryRequired from error
+        except ToolExecutionInterrupted as error:
+            interruption = error
+            tool_result, duration = error.output, error.duration
+        if retry_generation is not None and not admitted:
+            self._reject_unstarted_retry(tool_call, tool_result, duration)
+        try:
+            if self._file_observations is not None:
+                self._file_observations.observe_result(tool_call, tool_result, include_reads=False)
+            telemetry_trace_event(
+                "tool.response",
+                payload={"call_id": tool_call.call_id, "output": tool_result},
+                duration_seconds=duration,
+            )
+            try:
+                payload = json.loads(tool_result)
+            except json.JSONDecodeError:
+                payload = None
+            succeeded = isinstance(payload, dict) and payload.get("ok") is True
+            self._session_manager.add_tool_call(
+                call_id=tool_call.call_id,
+                output=tool_result,
+                working_directory=str(instructions.working_directory or self._working_directory),
+                active_skills=instructions.active_skill_identities,
+                succeeded=succeeded,
+                duration_seconds=duration,
+            )
+        except KeyboardInterrupt as repeated:
+            if interruption is None:
+                raise
+            interruption.add_note(
+                "Tool result publication may be incomplete; inspect recovery before retrying."
+            )
+            raise interruption from repeated
+        metrics = ToolExecutionMetrics(
             name=tool_call.name,
             duration_seconds=duration,
             succeeded=succeeded,
         )
+        if interruption is not None:
+            completed = ToolCallInterrupted(metrics)
+            for note in getattr(interruption, "__notes__", ()):
+                completed.add_note(note)
+            raise completed from interruption
+        return metrics
 
     async def _execute_tool_call_async(
         self,
@@ -1029,25 +1212,35 @@ class AgentRunner:
         *,
         instructions: InstructionsManager,
         present: bool,
+        retry_generation: int | None = None,
     ) -> ToolExecutionMetrics:
         """Execute, trace, and persist one tool request through async dispatch."""
         await self._checkpoint_async(steer=True)
+        displayed_call = self._stored_call(tool_call)
         telemetry_trace_event(
             "tool.request",
             payload={
                 "call_id": tool_call.call_id,
                 "name": tool_call.name,
-                "arguments": tool_call.arguments,
+                "arguments": displayed_call.arguments,
             },
         )
         if present:
             await self._session_manager.add_tool_call_event_async(tool_call.call_id)
-        self._interaction.tool_call(tool_call.name, tool_call.arguments)
+        self._interaction.tool_call(tool_call.name, displayed_call.arguments)
+
+        admitted = False
 
         async def execution_started_async() -> None:
             """Persist execution intent after approval and before invoking the tool."""
             await self._checkpoint_async(steer=True)
             await self._session_manager.record_tool_execution_started_async(tool_call.call_id)
+
+        def admit_retry(generation: int) -> bool:
+            """Record successful policy admission at the callable's dispatch boundary."""
+            nonlocal admitted
+            admitted = self._permission_manager.recovery_retry_current(generation)
+            return admitted
 
         cancellation = None
         try:
@@ -1066,11 +1259,31 @@ class AgentRunner:
                     if self._file_observations is not None
                     else {}
                 ),
+                **(
+                    {"execution_admission": partial(admit_retry, retry_generation)}
+                    if retry_generation is not None
+                    else {}
+                ),
                 execution_started=execution_started_async,
             )
+        except ToolExecutionAdmissionRejected as error:
+            if error.__cause__ is not None:
+                raise error.__cause__
+            raise AgentRunRecoveryRequired from None
+        except ToolExecutionOutcomeUnknown as error:
+            raise AgentRunRecoveryRequired from error
+        except ToolExecutionNotStarted as error:
+            if retry_generation is not None and not admitted:
+                raise
+            cancellation = error
+            tool_result = self._interrupted_tool_output(tool_call, not_started=True)
+            duration = 0
         except ToolExecutionCancelled as error:
             cancellation = error
             tool_result, duration = error.output, error.duration
+
+        if retry_generation is not None and not admitted:
+            self._reject_unstarted_retry(tool_call, tool_result, duration)
 
         publication = asyncio.create_task(
             self._record_tool_result_async(tool_call, instructions, tool_result, duration)
@@ -1202,7 +1415,7 @@ class AgentRunner:
                     if not_started
                     else (
                         f"Tool '{call.name}' was interrupted and its external outcome is unknown. "
-                        "Do not assume the operation failed."
+                        "Do not assume the operation failed; a new action may repeat its effects."
                     )
                 ),
                 severity="warning",
@@ -1484,6 +1697,7 @@ class AgentRunner:
     def _query_with_recovery(self) -> Response | None:
         """Request one response while escalating exhausted failures to the user."""
         recovery = None
+        yolo_retries = 0
         while True:
             self._checkpoint(steer=True)
             try:
@@ -1526,9 +1740,15 @@ class AgentRunner:
                     prompt = "Partial output was discarded. Retry the complete response?"
                 if error.retry_after is not None and error.retry_after > 0:
                     prompt = f"{prompt[:-1]} after at least {error.retry_after:g} seconds?"
-                if not self._interaction.confirm(prompt, default=False):
+                if self._permission_manager.yolo is True and yolo_retries:
+                    self._permission_manager.confirmation_decision(certain=False)
                     self._session_manager.record_run_failure()
                     raise AgentRunRecoveryRequired from error
+                if self._interaction.confirm(prompt, default=False) is not True:
+                    self._session_manager.record_run_failure()
+                    raise AgentRunRecoveryRequired from error
+                if self._permission_manager.yolo is True:
+                    yolo_retries += 1
                 if error.retry_after is not None and error.retry_after > 0:
                     delay = min(error.retry_after, 60.0)
                     self._interaction.info(f"Retrying in {delay:g} seconds...")
@@ -1552,6 +1772,7 @@ class AgentRunner:
             asyncio.CancelledError: If an async query or user interaction is cancelled.
         """
         recovery = None
+        yolo_retries = 0
         while True:
             await self._checkpoint_async(steer=True)
             try:
@@ -1594,9 +1815,15 @@ class AgentRunner:
                     prompt = "Partial output was discarded. Retry the complete response?"
                 if error.retry_after is not None and error.retry_after > 0:
                     prompt = f"{prompt[:-1]} after at least {error.retry_after:g} seconds?"
-                if not await self._confirm_async(prompt, default=False):
+                if self._permission_manager.yolo is True and yolo_retries:
+                    self._permission_manager.confirmation_decision(certain=False)
                     await self._session_manager.record_run_failure_async()
                     raise AgentRunRecoveryRequired from error
+                if await self._confirm_async(prompt, default=False) is not True:
+                    await self._session_manager.record_run_failure_async()
+                    raise AgentRunRecoveryRequired from error
+                if self._permission_manager.yolo is True:
+                    yolo_retries += 1
                 if error.retry_after is not None and error.retry_after > 0:
                     delay = min(error.retry_after, 60.0)
                     self._interaction.info(f"Retrying in {delay:g} seconds...")

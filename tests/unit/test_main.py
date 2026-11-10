@@ -10,6 +10,7 @@ import pytest
 from loop import ShutdownRequested
 from loop import main as application
 from loop.configuration import ApplicationSettings
+from loop.permissions import PermissionNamespaceError
 from loop.workspace import Workspace, WorkspaceSwitchRequested
 
 
@@ -96,6 +97,37 @@ def test_run_application_reports_runtime_failure_and_closes(monkeypatch):
     runtime.close_async.assert_awaited_once_with()
 
 
+def test_policy_recovery_reports_repair_path_without_starting_model(monkeypatch):
+    """CLI startup reports one actionable policy failure and ends before model work."""
+    interaction = Mock()
+    error = PermissionNamespaceError(Path("/policy"), "Restore or repair the policy.")
+    monkeypatch.setattr(application, "ConsoleInteraction", Mock(return_value=interaction))
+    runtime = Mock(create=Mock(side_effect=error))
+    monkeypatch.setattr(application, "ApplicationRuntime", runtime)
+    monkeypatch.setattr(application, "register_shutdown_signals", Mock())
+    monkeypatch.setattr(application, "_LOGGER", Mock())
+
+    application.run_application()
+
+    problem = interaction.report.call_args.args[0]
+    assert problem.code == "permission.policy_recovery_required"
+    assert problem.severity == "fatal"
+    assert "/policy" in problem.detail
+    assert "Restore or repair" in problem.detail
+    runtime.create.assert_called_once()
+
+
+def test_policy_recovery_before_console_setup_still_closes_cleanly(monkeypatch):
+    """An early policy failure needs no console to release process telemetry."""
+    error = PermissionNamespaceError(Path("/policy"), "Restore the policy.")
+    monkeypatch.setattr(application, "ConsoleInteraction", Mock(side_effect=error))
+    monkeypatch.setattr(application, "_LOGGER", Mock())
+
+    application.run_application()
+
+    application.set_telemetry.assert_called_once_with(None)
+
+
 def test_run_application_clears_telemetry_when_failure_prevents_runtime(monkeypatch):
     """Failure before runtime ownership clears any process telemetry facade."""
     monkeypatch.setattr(
@@ -117,6 +149,50 @@ def test_run_application_rejects_an_active_event_loop():
             application.run_application()
 
     asyncio.run(scenario())
+
+
+def test_headless_policy_initialization_uses_explicit_host_cli(monkeypatch):
+    """The direct CLI operation provisions a named namespace without a model or prompt."""
+    manager = Mock()
+    monkeypatch.setattr(application, "PermissionManager", Mock(return_value=manager))
+    monkeypatch.setattr(application.sys, "argv", ["loop", "--initialize-policy", "workspace", "id"])
+
+    application.run_application()
+
+    manager.initialize_policy_namespace.assert_called_once_with("workspace", "id", authorized=True)
+    manager.close.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    "arguments", [["loop", "--initialize-policy"], ["loop", "--initialize-policy", "user"]]
+)
+def test_headless_policy_initialization_requires_scope_and_identity(monkeypatch, arguments):
+    """Incomplete provisioning fails with a non-success CLI result."""
+    monkeypatch.setattr(application.sys, "argv", arguments)
+    with pytest.raises(SystemExit, match="Usage: loop --initialize-policy"):
+        application.run_application()
+
+
+def test_headless_policy_initialization_rejects_namespace_errors(monkeypatch):
+    """A registry or identity failure remains a non-success, actionable CLI outcome."""
+    manager = Mock()
+    manager.initialize_policy_namespace.side_effect = PermissionNamespaceError(
+        Path("/policy"), "Identity mismatch."
+    )
+    monkeypatch.setattr(application, "PermissionManager", Mock(return_value=manager))
+    monkeypatch.setattr(application.sys, "argv", ["loop", "--initialize-policy", "user", "wrong"])
+
+    with pytest.raises(SystemExit, match="Identity mismatch"):
+        application.run_application()
+    manager.close.assert_called_once_with()
+
+
+def test_headless_policy_initialization_requires_workspace_identity(monkeypatch):
+    """Provisioning cannot create policy without a registered workspace UUID."""
+    repository = application.WorkspaceRepository.return_value
+    repository.initialize.return_value.id = None
+    with pytest.raises(ValueError, match="Workspace identity is unavailable"):
+        application._initialize_policy_namespace("workspace", "id")
 
 
 @pytest.mark.parametrize("with_interaction", [False, True])

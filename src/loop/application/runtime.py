@@ -12,6 +12,7 @@ from typing import Self
 from ..backend import OpenAIBackend
 from ..configuration import ApplicationSettings, ConfigurationCommands, ConfigurationManager
 from ..conversation import ConversationCommands, ConversationRecoveryCommands, SessionController
+from ..conversation.interaction import ApprovalInteraction
 from ..execution import CommandExecutionService
 from ..instructions import InstructionsManager
 from ..interaction import AsyncInteractionInput, Interaction
@@ -45,7 +46,7 @@ class ApplicationRuntime:
         cleanup_callbacks (list[Callable[[], object]] | None): Acquired-resource cleanup actions in
             acquisition order. Defaults to telemetry and optional logging cleanup.
         session_controller (SessionController | None): Optional responsive conversation owner.
-            Defaults to the synchronous loop for legacy interaction adapters.
+            Defaults to the synchronous loop for interaction adapters without async input.
     """
 
     _loop: Loop
@@ -112,6 +113,7 @@ class ApplicationRuntime:
 
         Raises:
             ValueError: If the workspace has not been initialized.
+            PermissionNamespaceError: If a trusted policy requires recovery before model work.
         """
         if workspace.id is None:
             raise ValueError("Application runtime requires an initialized workspace.")
@@ -173,10 +175,32 @@ class ApplicationRuntime:
                 configuration_path=workspace_paths.permissions,
                 user_configuration_path=paths.user_permissions,
                 audit_path=paths.permissions_audit,
+                protected_host_roots=(
+                    paths.configuration_root,
+                    paths.data_root,
+                    paths.state_root,
+                ),
                 workspace_id=workspace.id,
+                namespace_catalog_path=paths.workspace_catalog,
+                bootstrap_pristine_policy=True,
+                user_namespace_identity=str(paths.data_root),
                 interaction=active_interaction,
+                yolo=settings.app.yolo,
             )
             cls._track_close(permission_manager, cleanup_callbacks)
+            permission_manager.require_policy_ready()
+            active_interaction = ApprovalInteraction(active_interaction, permission_manager)
+            if settings.app.yolo and permission_manager.yolo:
+                active_interaction.warning(
+                    "YOLO mode is active (source: "
+                    f"{configuration.source_for('app.yolo')}). Eligible requests will run "
+                    "without confirmation, including explicit host commands."
+                )
+            elif settings.app.yolo:
+                active_interaction.warning(
+                    "The saved YOLO setting is inactive because administrator policy prohibits "
+                    "automatic approval. Explicit activation is required after policy permits it."
+                )
             execution_service = CommandExecutionService.for_host()
             execution_tracked = cls._track_close(execution_service, cleanup_callbacks)
             tool_registry = create_default_tool_registry(
@@ -208,20 +232,20 @@ class ApplicationRuntime:
                 ),
                 permission_manager=permission_manager,
                 session_manager=session_manager,
-                agent_name=settings.loop.agent_name,
-                model=settings.loop.model,
-                temperature=settings.loop.temperature,
-                reasoning_effort=settings.loop.reasoning_effort,
+                agent_name=settings.app.agent_name,
+                model=settings.app.model,
+                temperature=settings.app.temperature,
+                reasoning_effort=settings.app.reasoning_effort,
                 on_model_select=(
                     None
-                    if configuration.source_for("loop.model") == "environment"
-                    else lambda model: configuration.set("loop.model", model)
+                    if configuration.source_for("app.model") == "environment"
+                    else lambda model: configuration.set("app.model", model)
                 ),
-                stream=settings.loop.stream,
-                debug=settings.loop.debug,
-                compaction_threshold=settings.loop.compaction_threshold,
-                prompt_on_recoverable_error=settings.loop.prompt_on_recoverable_error,
-                max_agent_turns=settings.loop.max_agent_turns,
+                stream=settings.app.stream,
+                debug=settings.app.debug,
+                compaction_threshold=settings.app.compaction_threshold,
+                prompt_on_recoverable_error=settings.app.prompt_on_recoverable_error,
+                max_agent_turns=settings.app.max_agent_turns,
                 run_control=session_controller.control if session_controller is not None else None,
                 main_app=main_app,
                 refresh_sandbox_backend=getattr(execution_service, "refresh_backend", None),
@@ -247,6 +271,9 @@ class ApplicationRuntime:
                     runtime.apply_configuration_changes,
                     apply_async=runtime.apply_configuration_async,
                     apply_many_async=runtime.apply_configuration_changes_async,
+                    validate_yolo=permission_manager.validate_yolo_activation,
+                    yolo_active=lambda: permission_manager.yolo,
+                    yolo_gate=permission_manager.suspend_yolo_decisions,
                 )
             )
             loop.register_command_provider(

@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import os
+import stat
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, Literal
 
@@ -14,6 +15,8 @@ from pydantic import SecretStr
 
 from .. import constants
 from ..models import CommandCapability
+from ..utils import ensure_private_directory, open_selected_file
+from ..utils.path import has_extended_access_acl
 from .models import (
     ApplicationSettings,
     ConfigurationEntry,
@@ -37,16 +40,16 @@ _ENVIRONMENT_FIELDS = {
     "OPENAI_HYPERPARAMETER_POLICY": ("backend", "hyperparameter_policy"),
     "USER_AGENT": ("web", "user_agent"),
     "LOOP_COMMAND_TIMEOUT": ("tools", "command_timeout"),
-    "LOOP_AGENT_NAME": ("loop", "agent_name"),
+    "LOOP_AGENT_NAME": ("app", "agent_name"),
     "LOOP_CONVERSATION_INPUT_MODE": ("conversation", "input_mode"),
-    "LOOP_MODEL": ("loop", "model"),
-    "LOOP_TEMPERATURE": ("loop", "temperature"),
-    "LOOP_REASONING_EFFORT": ("loop", "reasoning_effort"),
-    "LOOP_STREAM": ("loop", "stream"),
-    "LOOP_DEBUG": ("loop", "debug"),
-    "LOOP_COMPACTION_THRESHOLD": ("loop", "compaction_threshold"),
-    "LOOP_PROMPT_ON_RECOVERABLE_ERROR": ("loop", "prompt_on_recoverable_error"),
-    "LOOP_MAX_AGENT_TURNS": ("loop", "max_agent_turns"),
+    "LOOP_MODEL": ("app", "model"),
+    "LOOP_TEMPERATURE": ("app", "temperature"),
+    "LOOP_REASONING_EFFORT": ("app", "reasoning_effort"),
+    "LOOP_STREAM": ("app", "stream"),
+    "LOOP_DEBUG": ("app", "debug"),
+    "LOOP_COMPACTION_THRESHOLD": ("app", "compaction_threshold"),
+    "LOOP_PROMPT_ON_RECOVERABLE_ERROR": ("app", "prompt_on_recoverable_error"),
+    "LOOP_MAX_AGENT_TURNS": ("app", "max_agent_turns"),
     "LOOP_LOG_LEVEL": ("logging", "level"),
     "LOOP_LOG_MAX_BYTES": ("logging", "max_bytes"),
     "LOOP_LOG_BACKUP_COUNT": ("logging", "backup_count"),
@@ -76,7 +79,7 @@ class ConfigurationManager:
     _session_values: dict[str, Any]
 
     def __init__(self, path: Path | str, workspace_path: Path | str | None = None) -> None:
-        self._path = Path(path).expanduser().resolve()
+        self._path = Path(path).expanduser().absolute()
         self._workspace_path = (
             Path(workspace_path).expanduser().resolve() if workspace_path is not None else None
         )
@@ -118,6 +121,11 @@ class ConfigurationManager:
 
         Returns:
             ApplicationSettings: Immutable settings resolved from environment, TOML, and defaults.
+                Saved version-one ``[loop]`` settings are read as ``[app]`` settings.
+
+        Raises:
+            ValueError: If both application section names appear, an untrusted source tries to
+                control YOLO, or a saved activation cannot be verified.
         """
         if environment is None:
             environment = os.environ
@@ -157,6 +165,10 @@ class ConfigurationManager:
 
         Returns:
             ApplicationSettings: Fresh effective settings.
+
+        Raises:
+            ValueError: If the reloaded configuration has ambiguous application sections or an
+                untrusted YOLO activation.
         """
         return self.load(self._environment if environment is None else environment)
 
@@ -220,10 +232,20 @@ class ConfigurationManager:
 
         Returns:
             str: ``"session"``, ``"environment"``, ``"workspace"``, ``"user"``, or
-                ``"default"``.
+                ``"default"``. YOLO reports user scope for its saved value.
         """
         self._split_path(dotted_path)
         return self._sources.get(dotted_path, "default")
+
+    @property
+    def saved_yolo(self) -> bool:
+        """Return the trusted user setting independently of a session override.
+
+        Returns:
+            bool: Whether the user configuration enables YOLO on restart.
+        """
+        table = self._document.get("app")
+        return table.unwrap().get("yolo", False) is True if isinstance(table, Mapping) else False
 
     def set(
         self,
@@ -231,6 +253,7 @@ class ConfigurationManager:
         value: Any,
         *,
         scope: Literal["user", "workspace"] = "workspace",
+        before_save: Callable[[], None] | None = None,
     ) -> ApplicationSettings:
         """Set one TOML value and return the validated effective configuration.
 
@@ -238,11 +261,23 @@ class ConfigurationManager:
             dotted_path (str): Dot-separated configuration field path.
             value (Any): Replacement value stored in the TOML document.
             scope (Literal["user", "workspace"]): Durable destination. Defaults to workspace.
+            before_save (Callable[[], None] | None): Optional trusted validation while the
+                destination lock is held, immediately before publication.
 
         Returns:
             ApplicationSettings: Validated configuration after the edit.
+
+        Raises:
+            ValueError: If YOLO is assigned to workspace scope, given an ambiguous value, or
+                enabled from an untrusted user destination.
         """
         with self._lock_for(scope):
+            if dotted_path == "app.yolo" and scope != "user":
+                raise ValueError("app.yolo can only be saved for the user or this session.")
+            if dotted_path == "app.yolo":
+                value = self._normalize_yolo_value(value)
+                if value:
+                    self._require_yolo_destination()
             sections = self._split_path(dotted_path)
             document = self._document_for_write(scope)
             original = tomlkit.dumps(document)
@@ -256,14 +291,16 @@ class ConfigurationManager:
             table[sections[1]] = value
             try:
                 self._validate_candidate()
-            except Exception:
+                if before_save is not None:
+                    before_save()
+                self._save_scope(scope)
+            except BaseException:
                 if scope == "workspace" and self._workspace_path is not None:
                     self._workspace_document = tomlkit.parse(original)
                 else:
                     self._document = tomlkit.parse(original)
                 self._resolve()
                 raise
-            self._save_scope(scope)
             return self._resolve()
 
     def set_session(self, dotted_path: str, value: Any) -> ApplicationSettings:
@@ -275,8 +312,13 @@ class ConfigurationManager:
 
         Returns:
             ApplicationSettings: Validated effective configuration after the edit.
+
+        Raises:
+            ValueError: If YOLO is given a value other than true or false.
         """
         self._split_path(dotted_path)
+        if dotted_path == "app.yolo":
+            value = self._normalize_yolo_value(value)
         self._session_values[dotted_path] = value
         try:
             return self._resolve()
@@ -378,6 +420,8 @@ class ConfigurationManager:
         """
         if scope == "user":
             return self.set(dotted_path, self._default_value(dotted_path), scope="user")
+        if dotted_path == "app.yolo":
+            raise ValueError("Workspace configuration cannot control app.yolo.")
         with self._lock_for(scope):
             section, field = self._split_path(dotted_path)
             document = self._document_for_write(scope)
@@ -450,21 +494,86 @@ class ConfigurationManager:
         )
         with os.fdopen(descriptor, "w", encoding="utf-8") as output:
             output.write(tomlkit.dumps(document))
+            os.fchmod(output.fileno(), constants.PRIVATE_FILE_MODE)
         temporary.replace(path)
-        path.chmod(constants.PRIVATE_FILE_MODE)
         return path
 
     def _read_document(self) -> tomlkit.TOMLDocument:
         """Return the current comment-preserving TOML document, or a default if absent."""
         if not self.path.exists():
             return self._default_document()
-        return tomlkit.parse(self.path.read_text(encoding="utf-8"))
+        raw = self.path.read_bytes()
+        document = self._normalize_legacy_app_section(tomlkit.parse(raw.decode("utf-8")))
+        table = document.get("app")
+        if isinstance(table, Mapping) and "yolo" in table:
+            value = document.unwrap()["app"]["yolo"]
+            if not isinstance(value, bool):
+                raise ValueError("Persistent app.yolo must be a TOML boolean.")
+            if value:
+                self._verify_trusted_yolo_source(raw)
+        return document
+
+    @staticmethod
+    def _normalize_legacy_app_section(
+        document: tomlkit.TOMLDocument,
+    ) -> tomlkit.TOMLDocument:
+        """Read saved version-one ``[loop]`` settings under the current ``[app]`` name."""
+        if isinstance(document.get("loop"), Mapping):
+            if "app" in document:
+                raise ValueError("Configuration cannot contain both [loop] and [app].")
+            document["app"] = document.pop("loop")
+        return document
+
+    @staticmethod
+    def _normalize_yolo_value(value: Any) -> bool:
+        """Accept only an explicit boolean for trusted YOLO configuration."""
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str) and value.strip().lower() in {"true", "false"}:
+            return value.strip().lower() == "true"
+        raise ValueError("app.yolo requires true or false.")
+
+    def _verify_trusted_yolo_source(self, raw: bytes) -> None:
+        """Reject a persistent activation whose owner or inode cannot be verified."""
+        path = self.path
+        try:
+            self._require_yolo_destination()
+            before = path.lstat()
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_uid != os.getuid()
+                or before.st_nlink != 1
+                or stat.S_IMODE(before.st_mode) != constants.PRIVATE_FILE_MODE
+            ):
+                raise ValueError("Persistent app.yolo requires an owner-controlled user config.")
+            descriptor = open_selected_file(path.parent, path, (before.st_dev, before.st_ino))
+            with os.fdopen(descriptor, "rb") as stream:
+                if has_extended_access_acl(stream.fileno()):
+                    raise ValueError("Persistent app.yolo config has an extended access ACL.")
+                content = stream.read()
+            after = path.lstat()
+            if content != raw or (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino):
+                raise ValueError("Persistent app.yolo changed while its source was verified.")
+        except (OSError, ValueError) as error:
+            raise ValueError(f"Persistent app.yolo source is untrusted: {error}") from error
+
+    def _require_yolo_destination(self) -> None:
+        """Keep a persistent activation in real, private storage outside the workspace."""
+        if self._workspace_path is not None and self.path.resolve().is_relative_to(
+            self._workspace_path.parent.parent
+        ):
+            raise ValueError("Persistent app.yolo config cannot be inside the workspace.")
+        ensure_private_directory(self.path.parent, create=False)
+        if self.path.is_symlink():
+            raise ValueError("Persistent app.yolo cannot use an aliased user config.")
 
     def _read_workspace_document(self) -> tomlkit.TOMLDocument:
         """Return the sparse workspace document or an empty document."""
         if self._workspace_path is None or not self._workspace_path.exists():
             return tomlkit.document()
-        return tomlkit.parse(self._workspace_path.read_text(encoding="utf-8"))
+        return self._normalize_legacy_app_section(
+            tomlkit.parse(self._workspace_path.read_text(encoding="utf-8"))
+        )
 
     def _document_for_write(self, scope: Literal["user", "workspace"]) -> tomlkit.TOMLDocument:
         """Reload and return the requested durable configuration document."""
@@ -514,7 +623,11 @@ class ConfigurationManager:
         sources = self._configured_sources(
             values, "user" if self._workspace_path is not None else "workspace"
         )
+        if "app.yolo" in sources:
+            sources["app.yolo"] = "user"
         workspace_values = workspace_document.unwrap()
+        if isinstance(workspace_values.get("app"), Mapping) and "yolo" in workspace_values["app"]:
+            raise ValueError("Workspace configuration cannot control app.yolo.")
         for section, table in workspace_values.items():
             if section == "config_version":
                 continue
@@ -590,9 +703,7 @@ class ConfigurationManager:
         """Build the complete commented default TOML document."""
         document = tomlkit.document()
         document.add(
-            tomlkit.comment(
-                "Loop workspace configuration. Environment variables override values here."
-            )
+            tomlkit.comment("Workspace configuration. Environment variables override values here.")
         )
         default_values = ConfigurationManager._stored_defaults()
         document.add("config_version", default_values["config_version"])

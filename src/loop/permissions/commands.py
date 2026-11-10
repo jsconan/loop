@@ -1,5 +1,6 @@
 """Expose scoped operation-policy management as a user command."""
 
+import shlex
 from typing import Annotated
 
 from ..commands import CommandArgumentError, CommandContext, CommandRegistration, CommandRemainder
@@ -10,6 +11,7 @@ from .models import (
     Action,
     ApprovalChoice,
     Decision,
+    LimitClassification,
     PermissionLoadResult,
     PermissionPreset,
     PermissionRule,
@@ -43,10 +45,12 @@ _COLLECTION_LIMITS = {
 }
 _BOOLEAN_LIMITS = {
     "private-network": "deny_private_networks",
+    "local-network": "deny_local_networks",
     "host-process": "allow_host_processes",
 }
 _BOOLEAN_LIMIT_POLARITY = {
     "private-network": "deny",
+    "local-network": "deny",
     "host-process": "allow",
 }
 _LIMIT_FIELDS = {**_COLLECTION_LIMITS, **_BOOLEAN_LIMITS}
@@ -88,7 +92,7 @@ class PermissionCommands:
             CommandRegistration(
                 self.permissions,
                 name="permissions",
-                description="Inspect and manage workspace and session operation policy.",
+                description="Inspect and manage workspace, user and session operation policy.",
                 completion=self._completion(),
                 capabilities=frozenset(
                     {CommandCapability.CONTEXT_READ, CommandCapability.CONTEXT_UPDATE}
@@ -101,7 +105,7 @@ class PermissionCommands:
         context: CommandContext,
         arguments: Annotated[tuple[str, ...], CommandRemainder()] = (),
     ) -> None:
-        """Show, explain, or change workspace and session operation policy.
+        """Show, explain, or change workspace, user and session operation policy.
 
         Args:
             context (CommandContext): Interaction and capability snapshot for this invocation.
@@ -172,12 +176,35 @@ class PermissionCommands:
         if arguments == ("help",):
             context.interaction.info(self._help())
             return
-        if arguments == ("session", "reset"):
-            if manager.reset_session():
-                context.interaction.info("Cleared every session permission override.")
-            else:
-                context.interaction.warning("Session permission overrides were already empty.")
+        if len(arguments) == 3 and arguments[0] == "initialize":
+            _, scope, identity = arguments
+            expected = manager.policy_namespace_identity(scope)
+            if identity != expected:
+                raise ValueError(
+                    f"Namespace identity does not match; inspect /permissions show for {scope}."
+                )
+            context.interaction.info(
+                f"Initializing the absent {scope} permission policy for identity {identity!r}. "
+                "Existing policy and backup data will be preserved; conflicting state is refused."
+            )
+            manager.initialize_policy_namespace(scope, identity, authorized=True)
+            context.interaction.info(f"Initialized the {scope} permission policy.")
             return
+        if arguments[:1] == ("reset",) and len(arguments) in {1, 2}:
+            scope = arguments[1] if len(arguments) == 2 else "session"
+            if scope == "session":
+                if manager.reset_session():
+                    context.interaction.info("Cleared every session permission override.")
+                else:
+                    context.interaction.warning("Session permission overrides were already empty.")
+                return
+            if scope in {"workspace", "user"}:
+                archive = manager.reset_configuration(scope)
+                context.interaction.info(
+                    f"Reset the {scope} permission policy to built-in defaults; "
+                    f"prior policy archive: {archive or 'none'}."
+                )
+                return
         if len(arguments) == 4 and arguments[0] == "explain":
             _, tool, raw_action, resource = arguments
             decision = manager.explain(tool, Action(raw_action), resource)
@@ -234,7 +261,7 @@ class PermissionCommands:
         )
 
     def _host_rules(self, context: CommandContext, arguments: tuple[str, ...]) -> None:
-        """List or revoke exact host approvals for the current session."""
+        """Manage exact retry approvals and human-installed no-prompt host grants."""
         manager = self._permission_manager
         if not arguments or arguments == ("list",):
             rules = manager.host_command_rules()
@@ -250,7 +277,59 @@ class PermissionCommands:
                 else "No matching host command approval."
             )
             return
-        raise ValueError("Use /permissions host list or host remove <id>.")
+        if arguments == ("trusted",):
+            rules = manager.trusted_host_command_rules()
+            context.interaction.info(
+                "Trusted host grants:\n"
+                + (
+                    "\n".join(
+                        f"{rule.scope.value} {rule.id} {rule.cwd} {rule.source}" for rule in rules
+                    )
+                    or "none"
+                )
+            )
+            return
+        if arguments[0] == "untrust" and len(arguments) in {2, 3}:
+            scope = ApprovalChoice(arguments[1]) if len(arguments) == 3 else ApprovalChoice.SESSION
+            context.interaction.info(
+                "Removed trusted host grant."
+                if manager.remove_trusted_host_command_rule(arguments[-1], scope)
+                else "No matching trusted host grant."
+            )
+            return
+        if arguments[0] == "trust" and len(arguments) in {2, 3}:
+            if getattr(context.interaction, "supports_fresh_host_approval", False) is not True:
+                raise ValueError("Trusted host grants require fresh human host input.")
+            scope = ApprovalChoice(arguments[1]) if len(arguments) == 3 else ApprovalChoice.SESSION
+            command = arguments[-1]
+            context.interaction.info(
+                f"Trust this exact workspace-root command for {scope.value}: {command!r}\n"
+                "The sandbox restrictions will not apply. It will run with the host user's "
+                "authority, subject to independent OS and outer-environment restrictions, "
+                "without another prompt each time the agent explicitly requests it. "
+                "Repeated requests can repeat effects. Host-process eligibility and policy "
+                "denials still apply."
+            )
+            choice = (
+                "trust"
+                if manager.confirmation_decision() is True
+                else context.interaction.prompt(
+                    "Install this exact no-prompt host grant?",
+                    exit_commands=None,
+                    choices={"deny": "Deny", "trust": f"Trust for {scope.value}"},
+                )
+            )
+            if choice == "trust":
+                rule = manager.trust_host_command(command, scope)
+                context.interaction.info(f"Trusted {scope.value} host grant {rule.id} installed.")
+            else:
+                context.interaction.info("Trusted host grant was not installed.")
+            return
+        raise ValueError(
+            "Use /permissions host list|remove <id>|trusted|"
+            "trust [session|workspace|user] '<command>'|"
+            "untrust [session|workspace|user] <id>."
+        )
 
     def _change_preset(
         self,
@@ -289,7 +368,7 @@ class PermissionCommands:
             if preview.preset.confirmation_warning:
                 context.interaction.warning(preview.preset.confirmation_warning)
             prompt = self._replacement_prompt(preview)
-            if not context.interaction.confirm(prompt, default=False):
+            if context.interaction.confirm(prompt, default=False) is not True:
                 context.interaction.warning("Permission preset replacement was not approved.")
                 return
             manager.replace_preset(preview)
@@ -348,9 +427,13 @@ class PermissionCommands:
                 resource=None if resource == "*" else resource,
                 description=description[0] if description else None,
             )
-            if self._is_broad_rule(rule) and not context.interaction.confirm(
-                self._broad_rule_prompt(rule, scope),
-                default=False,
+            if (
+                self._is_broad_rule(rule)
+                and context.interaction.confirm(
+                    self._broad_rule_prompt(rule, scope),
+                    default=False,
+                )
+                is not True
             ):
                 context.interaction.warning("Permission rule creation was not approved.")
                 return
@@ -444,6 +527,18 @@ class PermissionCommands:
                 f"{scope.value.title()} permission limit {label} set to {decision}."
             )
             return
+        if len(arguments) == 4 and arguments[0] == "classify":
+            _, raw_scope, label, raw_classification = arguments
+            if label not in _COLLECTION_LIMITS:
+                raise ValueError("Classify requires a collection permission limit.")
+            scope = PolicyScope(raw_scope)
+            classification = LimitClassification(raw_classification)
+            manager.classify_limit(_COLLECTION_LIMITS[label], classification, scope=scope)
+            context.interaction.info(
+                f"{scope.value.title()} permission limit {label} is {classification.value}; "
+                "the saved limit value was unchanged."
+            )
+            return
         if len(arguments) == 3 and arguments[0] == "reset":
             _, raw_scope, label = arguments
             if label not in _LIMIT_FIELDS:
@@ -477,7 +572,19 @@ class PermissionCommands:
                     rendered = ", ".join(value) or "none"
                 else:
                     rendered = str(value).lower()
-                lines.append(f"  {label}: {rendered}")
+                if label in _COLLECTION_LIMITS:
+                    classifications = (
+                        self._permission_manager.configuration.limit_classifications
+                        if selected_scope is PolicyScope.WORKSPACE
+                        else self._permission_manager.effective_configuration.limit_classifications
+                    )
+                    classification = getattr(classifications, field).value
+                    source = classifications.sources[field]
+                    lines.append(
+                        f"  {label}: {rendered} (classification={classification}, source={source})"
+                    )
+                else:
+                    lines.append(f"  {label}: {rendered}")
             sections.append(
                 f"{selected_scope.value.title()} permission limits:\n" + "\n".join(lines)
             )
@@ -618,6 +725,9 @@ class PermissionCommands:
             values=(
                 CompletionValue("list", "Show recorded session host approvals."),
                 CompletionValue("remove", "Revoke a recorded session host approval."),
+                CompletionValue("trusted", "Show exact no-prompt host grants."),
+                CompletionValue("trust", "Trust one exact workspace-root host command."),
+                CompletionValue("untrust", "Revoke a no-prompt host grant."),
             ),
             children={
                 "remove": CommandCompletion(
@@ -625,7 +735,81 @@ class PermissionCommands:
                         CompletionValue(rule.id, rule.source)
                         for rule in self._permission_manager.host_command_rules()
                     )
+                ),
+                "untrust": CommandCompletion(
+                    values=tuple(
+                        CompletionValue(scope.value, f"Revoke a {scope.value} grant.")
+                        for scope in (
+                            ApprovalChoice.SESSION,
+                            ApprovalChoice.WORKSPACE,
+                            ApprovalChoice.USER,
+                        )
+                    ),
+                    provider=lambda: tuple(
+                        CompletionValue(rule.id, rule.source)
+                        for rule in self._permission_manager.trusted_host_command_rules()
+                        if rule.scope is ApprovalChoice.SESSION
+                    ),
+                    children={
+                        scope.value: CommandCompletion(
+                            provider=lambda selected=scope: tuple(
+                                CompletionValue(rule.id, rule.source)
+                                for rule in self._permission_manager.trusted_host_command_rules()
+                                if rule.scope is selected
+                            )
+                        )
+                        for scope in (
+                            ApprovalChoice.SESSION,
+                            ApprovalChoice.WORKSPACE,
+                            ApprovalChoice.USER,
+                        )
+                    },
+                ),
+                "trust": CommandCompletion(
+                    values=(
+                        CompletionValue("'command here'", "Exact quoted shell source."),
+                        *(
+                            CompletionValue(scope.value, f"Trust for {scope.value}.")
+                            for scope in (
+                                ApprovalChoice.SESSION,
+                                ApprovalChoice.WORKSPACE,
+                                ApprovalChoice.USER,
+                            )
+                        ),
+                    ),
+                    children={
+                        scope.value: CommandCompletion(
+                            values=(
+                                CompletionValue("'command here'", "Exact quoted shell source."),
+                            )
+                        )
+                        for scope in (
+                            ApprovalChoice.SESSION,
+                            ApprovalChoice.WORKSPACE,
+                            ApprovalChoice.USER,
+                        )
+                    },
+                ),
+            },
+        )
+        initialize = CommandCompletion(
+            values=(
+                CompletionValue(
+                    "workspace",
+                    "Initialize the workspace policy namespace.",
+                    required_capabilities=frozenset({CommandCapability.SESSION_IDLE}),
+                ),
+                CompletionValue(
+                    "user",
+                    "Initialize the user-wide policy namespace.",
+                    required_capabilities=frozenset({CommandCapability.SESSION_IDLE}),
+                ),
+            ),
+            children={
+                scope: CommandCompletion(
+                    provider=lambda selected=scope: self._namespace_identity_values(selected)
                 )
+                for scope in ("workspace", "user")
             },
         )
         return CommandCompletion(
@@ -637,12 +821,19 @@ class PermissionCommands:
                 ),
                 CompletionValue(
                     "reload",
-                    "Reload only the workspace YAML policy.",
+                    "Reload workspace, user, and protected administrator policy.",
                     required_capabilities=frozenset({CommandCapability.SESSION_IDLE}),
                 ),
                 CompletionValue(
-                    "session",
-                    "Manage the complete process-local policy overlay.",
+                    "initialize",
+                    "Initialize an absent durable policy namespace with its exact identity.",
+                    required_capabilities=frozenset(
+                        {CommandCapability.CONTEXT_UPDATE, CommandCapability.SESSION_IDLE}
+                    ),
+                ),
+                CompletionValue(
+                    "reset",
+                    "Clear session overrides or reset a selected complete policy.",
                     required_capabilities=frozenset({CommandCapability.SESSION_IDLE}),
                 ),
                 CompletionValue(
@@ -690,11 +881,15 @@ class PermissionCommands:
                 "show": CommandCompletion(
                     values=tuple(
                         CompletionValue(value, f"Show the {value} policy view.")
-                        for value in ("effective", "workspace", "session")
+                        for value in ("effective", "workspace", "session", "managed")
                     )
                 ),
-                "session": CommandCompletion(
-                    values=(CompletionValue("reset", "Clear every session override."),)
+                "reset": CommandCompletion(
+                    values=(
+                        CompletionValue("workspace", "Archive and reset the workspace policy."),
+                        CompletionValue("user", "Archive and reset the user-wide policy."),
+                        CompletionValue("session", "Clear every session override."),
+                    )
                 ),
                 "explain": explain,
                 "default": default,
@@ -702,6 +897,7 @@ class PermissionCommands:
                 "sandbox": sandbox,
                 "host": host,
                 "limit": limit,
+                "initialize": initialize,
                 "preset": preset,
             },
         )
@@ -744,6 +940,7 @@ class PermissionCommands:
         )
         boolean_values = (
             CompletionValue("private-network", "Access to private network targets."),
+            CompletionValue("local-network", "Communication within one sandbox attempt."),
             CompletionValue("host-process", "Processes run with this application's host access."),
         )
 
@@ -800,12 +997,31 @@ class PermissionCommands:
                 ),
             },
         )
+        scoped_classify = CommandCompletion(
+            values=scopes,
+            children={
+                scope.value: CommandCompletion(
+                    values=collection_values,
+                    children={
+                        label: CommandCompletion(
+                            values=tuple(
+                                CompletionValue(item.value, f"Select {item.value} behavior.")
+                                for item in LimitClassification
+                            )
+                        )
+                        for label in _COLLECTION_LIMITS
+                    },
+                )
+                for scope in PolicyScope
+            },
+        )
         return CommandCompletion(
             values=(
                 CompletionValue("list", "List limits in both scopes or one selected scope."),
                 CompletionValue("set", "Set a scoped boolean limit."),
                 CompletionValue("add", "Add a root or origin to a scoped limit."),
                 CompletionValue("remove", "Remove a root or origin from a scoped limit."),
+                CompletionValue("classify", "Choose whether a collection is a hard ceiling."),
                 CompletionValue("reset", "Restore a bootstrap or inherited limit."),
             ),
             children={
@@ -813,6 +1029,7 @@ class PermissionCommands:
                 "set": scoped_boolean,
                 "add": scoped_collection("add"),
                 "remove": scoped_collection("remove"),
+                "classify": scoped_classify,
                 "reset": scoped_reset,
             },
         )
@@ -831,6 +1048,21 @@ class PermissionCommands:
                 f"{preset.metadata.title} (revision {preset.metadata.revision})",
             )
             for preset in self._permission_manager.presets
+        )
+
+    def _namespace_identity_values(self, scope: str) -> tuple[CompletionValue, ...]:
+        """Return the exact quoted identity only for a configured durable namespace."""
+        try:
+            identity = self._permission_manager.policy_namespace_identity(scope)
+        except ValueError:
+            return ()
+        return (
+            CompletionValue(
+                shlex.quote(identity),
+                "Exact identity shown by /permissions show.",
+                display=identity,
+                required_capabilities=frozenset({CommandCapability.SESSION_IDLE}),
+            ),
         )
 
     def _limit_values(self, scope: PolicyScope, name: str) -> tuple[CompletionValue, ...]:
@@ -861,7 +1093,10 @@ class PermissionCommands:
         """Return root tokens suitable for adding a filesystem limit."""
         return (
             CompletionValue("workspace", "The active project workspace."),
-            CompletionValue("loop-temp", "Loop-owned temporary files; allowed by default."),
+            CompletionValue(
+                "app-temp",
+                "Application-owned temporary files; allowed by default.",
+            ),
             CompletionValue(
                 "system-temp",
                 "All OS temporary files; "
@@ -965,16 +1200,19 @@ class PermissionCommands:
     @staticmethod
     def _usage() -> str:
         return (
-            "Usage: /permissions [show [effective|workspace|session] | "
-            "help | reload | session reset | "
+            "Usage: /permissions [show [effective|workspace|session|managed] | "
+            "help | reload | initialize <workspace|user> <identity> | "
+            "reset [workspace|user|session] | "
             "preset <list|show|diff|replace> ... | "
             "explain <tool> <action> <resource> | default set <workspace|session> <action> "
             "<decision> | default reset <workspace|session> <action> | rule add "
             "<workspace|session> <decision> [tool|*] [action|*] [resource|*] [description] | "
             "rule [list [workspace|session]] | rule remove <workspace|session> <rule-id> | "
             "sandbox list | sandbox remove <session|workspace|user> <rule-id> | "
-            "host list | host remove <rule-id> | "
-            "limit [list [workspace|session]] | limit <set|add|remove|reset> "
+            "host <list|trusted> | host remove <rule-id> | "
+            "host trust [session|workspace|user] '<command>' | "
+            "host untrust [session|workspace|user] <rule-id> | "
+            "limit [list [workspace|session]] | limit <set|add|remove|reset|classify> "
             "<workspace|session> <name> [value]]"
         )
 
@@ -990,15 +1228,31 @@ class PermissionCommands:
             "  /permissions default set workspace filesystem.delete deny\n"
             "  /permissions rule add session allow read_text_file filesystem.read '*'\n"
             "  /permissions limit add workspace read-root system-temp\n"
+            "  /permissions limit classify workspace read-root approval\n"
+            "  /permissions initialize workspace <identity-from-show>\n"
+            "  /permissions initialize user <identity-from-show>\n"
+            "  /permissions reset\n"
+            "  /permissions reset user\n"
             "  /permissions limit set session host-process allow\n"
             "  /permissions sandbox list\n"
             "  /permissions host list\n"
+            "  /permissions host trust workspace 'printf hello'\n"
+            "  /permissions host trusted\n"
+            "  /permissions host untrust <session|workspace|user> <id>\n"
+            "  /permissions show managed\n"
             "\n"
             "Presets replace only the explicitly selected workspace or session defaults and rules. "
             "They never replace enforcement limits or the other policy layer; replace prompts for "
-            "confirmation and diff previews the exact policy change.\n\n"
+            "confirmation and diff previews the exact policy change. Initialization requires "
+            "the exact identity shown by /permissions show and an absent policy and backup.\n\n"
             "Sandboxed command approvals are sandbox-only; list or remove them with "
             "/permissions sandbox. A prelaunch host failure can receive an exact session "
-            "approval; list or revoke it with /permissions host. Retries after possible "
-            "effects require a fresh one-time decision."
+            "approval; list or revoke it with /permissions host. A human can install an exact "
+            "workspace-root grant in session, workspace or user scope with /permissions host "
+            "trust; it never changes the host-process eligibility gate. The explicit host "
+            "approval prompt also offers those grant scopes. Retries after possible effects "
+            "require a fresh one-time decision."
+            " Protected administrator policy is installed outside user and workspace paths; "
+            "show managed reports its identity and revision or an unavailable/recovery state. "
+            "Reload binds a changed protected revision before new requests can use it."
         )

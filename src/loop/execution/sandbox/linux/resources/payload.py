@@ -1,8 +1,11 @@
 """Enter the original enforcing payload from the installed receiver's private setup input."""
 
 import base64
+import fcntl
 import os
+import stat
 import sys
+import termios
 from pathlib import Path
 from typing import Any
 
@@ -40,14 +43,45 @@ def _bound_host_file(value: dict[str, Any], role: str) -> Any:
 def _enter_and_execute(request: Any, value: dict[str, Any]) -> None:
     """Enter trusted bootstrap, discard private stdin and irreversibly start the payload."""
     from loop.execution.sandbox.linux.bootstrap import enter_bootstrap, execute_payload
+    from loop.execution.sandbox.linux.constants import NATIVE_TRACKING_PATH
 
     library = _bound_host_file(value, "apparmor")
+    tracking = value["tracking"]
+    if (
+        not isinstance(tracking, list)
+        or len(tracking) != 3
+        or any(
+            not isinstance(item, int) or isinstance(item, bool) or item < 0 for item in tracking[:2]
+        )
+        or not isinstance(tracking[2], str)
+    ):
+        raise ValueError("Invalid generation tracking input.")
     enter_bootstrap(library, value["namespace"], value["uid"])
-    descriptor = os.open("/dev/null", os.O_RDONLY | os.O_CLOEXEC)
-    try:
-        os.dup2(descriptor, 0)
-    finally:
-        os.close(descriptor)
+    if request.terminal:
+        if not os.isatty(1) or not os.isatty(2):
+            raise ValueError("Interactive payload lacks its receiver-owned terminal slave.")
+        os.dup2(1, 0)
+        if os.getsid(0) != os.getpid():
+            os.setsid()
+        fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+    else:
+        descriptor = os.open("/dev/null", os.O_RDONLY | os.O_CLOEXEC)
+        try:
+            os.dup2(descriptor, 0)
+        finally:
+            os.close(descriptor)
+    egress_fd = value.get("egress_fd")
+    origins = getattr(request, "egress_origins", ())
+    if isinstance(origins, tuple) and origins:
+        if not isinstance(egress_fd, int) or isinstance(egress_fd, bool) or egress_fd <= 2:
+            raise ValueError("Mediated egress descriptor is unavailable.")
+        if not stat.S_ISSOCK(os.fstat(egress_fd).st_mode):
+            raise ValueError("Mediated egress descriptor is not a socket.")
+    elif egress_fd is not None:
+        raise ValueError("Unexpected mediated egress descriptor.")
+    network_filter = value.get("local_network_filter")
+    if (network_filter is None) != request.local_network:
+        raise ValueError("Local-network filter and request authority differ.")
     execute_payload(
         request,
         library,
@@ -58,6 +92,13 @@ def _enter_and_execute(request: Any, value: dict[str, Any]) -> None:
         value["namespace"],
         value["uid"],
         reservation=_bound_host_file(value, "reservation"),
+        tracking=(NATIVE_TRACKING_PATH, (tracking[0], tracking[1]), tracking[2]),
+        **({"egress_descriptor": egress_fd} if egress_fd is not None else {}),
+        **(
+            {"local_network_filter": base64.b64decode(network_filter, validate=True)}
+            if network_filter is not None
+            else {}
+        ),
     )
 
 

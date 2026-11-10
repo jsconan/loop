@@ -14,7 +14,8 @@ from loop import (
     SessionTarget,
     UserPermissionConfiguration,
 )
-from loop.permissions import HostCommandRule, PermissionPreset
+from loop import constants as app_constants
+from loop.permissions import HostCommandRule, PermissionPreset, PolicyLimitClassifications
 
 
 @pytest.fixture(autouse=True)
@@ -34,6 +35,20 @@ def test_actions_map_to_distinct_prompt_icons():
         Action.PROCESS_EXECUTE: "⚙️",
         Action.SESSION_MUTATE: "💾",
     }
+
+
+def test_limit_classification_requires_complete_known_provenance():
+    """Policy metadata cannot omit a classified limit or invent its source."""
+    with pytest.raises(ValidationError, match="classification provenance is invalid"):
+        PolicyLimitClassifications(sources={"readable_roots": "user"})
+    with pytest.raises(ValidationError, match="classification provenance is invalid"):
+        PolicyLimitClassifications(
+            sources={
+                "readable_roots": "unknown",
+                "writable_roots": "builtin",
+                "network_origins": "builtin",
+            }
+        )
 
 
 def test_operations_expose_stable_resource_representations():
@@ -79,7 +94,7 @@ def test_policy_configuration_has_a_versioned_complete_default():
     """The editable YAML schema exposes a version and every action fallback."""
     configuration = PermissionConfiguration()
 
-    assert configuration.version == 1
+    assert configuration.version == 2
     assert set(configuration.defaults) == set(Action)
     assert configuration.defaults[Action.FILESYSTEM_READ] is Decision.ALLOW
 
@@ -114,6 +129,23 @@ def test_host_rule_rejects_real_paths_and_malformed_virtual_context(change):
         HostCommandRule.model_validate(values)
 
 
+def test_user_policy_accepts_only_distinct_durable_host_grants():
+    """Persisted user policy refuses session grants and duplicate host grant identities."""
+    rule = {
+        "id": "same",
+        "signature": "a" * 64,
+        "cwd": "$WORKSPACE_ROOT",
+        "source": "<exact command>",
+        "scope": "user",
+    }
+    with pytest.raises(ValueError, match="durable scopes"):
+        UserPermissionConfiguration.model_validate(
+            {"trusted_host_command_rules": [{**rule, "scope": "session"}]}
+        )
+    with pytest.raises(ValueError, match="distinct IDs"):
+        UserPermissionConfiguration.model_validate({"trusted_host_command_rules": [rule, rule]})
+
+
 def test_permission_presets_reject_duplicate_rule_identifiers():
     """A preset rule set cannot contain ambiguous rule identifiers."""
     with pytest.raises(ValueError, match="rule identifiers must be unique"):
@@ -134,8 +166,9 @@ def test_permission_presets_reject_duplicate_rule_identifiers():
         )
 
 
-def test_builtin_permission_presets_are_sorted_and_have_stable_hashes():
-    """Packaged presets load in catalog order and expose deterministic content hashes."""
+def test_builtin_permission_presets_are_sorted_and_have_stable_hashes(monkeypatch):
+    """Packaged presets ignore app branding and expose stable catalog hashes."""
+    monkeypatch.setattr(app_constants, "APP_NAME", "renamed-app")
     presets = PermissionPreset.builtin_presets()
 
     assert [preset.metadata.id for preset in presets] == [
@@ -206,7 +239,7 @@ def test_builtin_permission_presets_reject_duplicates_but_retains_one_for_recove
     """Strict loading rejects duplicate IDs while recovery retains one usable preset."""
     defaults = "\n".join(f"  {action.value}: deny" for action in Action)
     payload = (
-        "version: 1\nkind: loop.permission-preset\nmetadata:\n"
+        "version: 1\nkind: app.permission-preset\nmetadata:\n"
         "  id: duplicate\n  revision: '1'\n  title: Duplicate\n"
         "  description: Invalid\ndefaults:\n"
         f"{defaults}\nrules: []\n"

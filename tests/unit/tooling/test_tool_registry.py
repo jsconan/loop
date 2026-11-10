@@ -3,9 +3,12 @@
 import asyncio
 import contextvars
 import importlib
+import inspect
 import io
 import json
+import sys
 import tempfile
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -21,6 +24,7 @@ from loop import (
     ApprovalChoice,
     ContextReference,
     Decision,
+    FileTarget,
     Message,
     NetworkTarget,
     Operation,
@@ -49,13 +53,14 @@ from loop.constants import MAX_TOOL_RESULT_BYTES
 from loop.execution import CommandExecutionService
 from loop.execution.coordinator import LocalHostCommandExecutor
 from loop.execution.sandbox import CommandProcessResult, SandboxOutcome, SandboxRequest
-from loop.execution.sandbox.macos import MacOSSeatbeltBackend
+from loop.execution.sandbox.macos.backend import MacOSSeatbeltBackend
 from loop.instructions import InstructionsManager
 from loop.interaction import ConsoleInteraction, Interaction
-from loop.permissions import CommandAnalysis, PermissionRule
+from loop.permissions import CommandAnalysis, PermissionRule, PolicyScope
 from loop.permissions.protection import protected_workspace_paths
 from loop.tooling import (
     FileObservations,
+    OwnedToolTask,
     ToolContext,
     ToolPreflightResult,
     ToolRegistration,
@@ -66,6 +71,7 @@ from loop.tooling import (
     ToolStatus,
 )
 from loop.tooling import tool as declare_tool
+from loop.tooling.models import ToolExecutionNotStarted, ToolExecutionOutcomeUnknown
 from loop.tooling.tool_registry import ToolExecutionPortal
 from loop.utils import VirtualPath, cached_path, content_digest
 from tests.scheduling import deliver_callbacks
@@ -75,11 +81,125 @@ tool_registry_module = importlib.import_module("loop.tooling.tool_registry")
 
 def _approving_interaction():
     """Provide explicit native approval for path-boundary test requests."""
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=Interaction, supports_fresh_host_approval=True)
     interaction.prompt.side_effect = lambda message, **kwargs: (
         "deny" if "without the OS sandbox" in message else "approve"
     )
     return interaction
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_yolo_admits_exact_registered_host_tool_without_fresh_input(tmp_path, asynchronous):
+    """A registered explicit host tool passes its fresh-input gate only in YOLO mode."""
+    target = ProcessTarget(
+        argv=("/bin/sh", "-c", "printf host"),
+        cwd=str(tmp_path),
+        boundary=ProcessBoundary.HOST,
+    )
+
+    def plan(arguments):
+        """Bind the declared host tool to its exact shell effect."""
+        return OperationPlan(
+            arguments=arguments,
+            operations=(
+                Operation(tool_id="host_extension", action=Action.PROCESS_EXECUTE, target=target),
+            ),
+        )
+
+    @declare_tool(
+        actions={Action.PROCESS_EXECUTE},
+        operation_planner=plan,
+        requires_execution_service=True,
+        requires_fresh_host_approval=True,
+    )
+    def host_extension(context: ToolContext) -> str:
+        """Report admission without starting a real host process."""
+        return "admitted"
+
+    interaction = Mock(spec=Interaction, supports_fresh_host_approval=False)
+    manager = PermissionManager(tmp_path, yolo=True)
+    registry = ToolRegistry(
+        [host_extension],
+        interaction=interaction,
+        permission_manager=manager,
+        execution_service=Mock(),
+    )
+    output = (
+        asyncio.run(registry.call_async("host_extension", "{}"))
+        if asynchronous
+        else registry.call("host_extension", "{}")
+    )
+    assert result_value(output) == "admitted"
+    interaction.prompt.assert_not_called()
+    manager.set_yolo(False)
+    denied = (
+        asyncio.run(registry.call_async("host_extension", "{}"))
+        if asynchronous
+        else registry.call("host_extension", "{}")
+    )
+    assert json.loads(denied)["problem"]["code"] == "tool.denied"
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize(
+    "shape",
+    ["empty", "wrong_action", "sandbox", "short", "shell"],
+)
+def test_explicit_host_tool_rejects_unbound_operation_plans(tmp_path, asynchronous, shape):
+    """A host-marked extension cannot bypass exact registered shell-plan validation."""
+    target = ProcessTarget(
+        argv=("/bin/sh", "-c", "printf host"),
+        cwd=str(tmp_path),
+        boundary=ProcessBoundary.HOST,
+    )
+    if shape == "wrong_action":
+        target = FileTarget(path=str(tmp_path / "file"))
+    elif shape == "sandbox":
+        target = target.model_copy(update={"boundary": ProcessBoundary.SANDBOXED})
+    elif shape == "short":
+        target = target.model_copy(update={"argv": ("/bin/sh", "-c")})
+    elif shape == "shell":
+        target = target.model_copy(update={"argv": ("/bin/echo", "-c", "printf host")})
+    planned = (
+        ()
+        if shape == "empty"
+        else (
+            Operation(
+                tool_id="host_extension",
+                action=Action.FILESYSTEM_READ
+                if shape == "wrong_action"
+                else Action.PROCESS_EXECUTE,
+                target=target,
+            ),
+        )
+    )
+
+    def plan(arguments):
+        """Return the selected malformed host effect."""
+        return OperationPlan(arguments=arguments, operations=planned)
+
+    @declare_tool(
+        actions={Action.PROCESS_EXECUTE, Action.FILESYSTEM_READ},
+        operation_planner=plan,
+        requires_execution_service=True,
+        requires_fresh_host_approval=True,
+    )
+    def host_extension(context: ToolContext) -> str:
+        """Expose an inert extension behind host-plan authorization."""
+        return "unreachable"
+
+    registry = ToolRegistry(
+        [host_extension],
+        permission_manager=PermissionManager(tmp_path),
+        execution_service=Mock(),
+    )
+    output = (
+        asyncio.run(registry.call_async("host_extension", "{}"))
+        if asynchronous
+        else registry.call("host_extension", "{}")
+    )
+
+    assert json.loads(output)["problem"]["code"] == "host_command.invalid_request"
 
 
 def result_value(output: str):
@@ -95,8 +215,17 @@ def _permission_manager_mock():
     permissions.temporary_directory = Path(tempfile.gettempdir())
     permissions.check_boundaries.return_value = None
     permissions.check_boundaries_async.return_value = None
+    permissions.sandbox_scope_limit.return_value = None
+    permissions.sandbox_write_root_limit.return_value = None
+    permissions.sandbox_network_limit.return_value = None
     permissions.temporary_directory_allows_private_names = False
     return permissions
+
+
+def _approve_sandbox_request(_request, **kwargs):
+    """Give a mocked sandbox approval the revision required at admission."""
+    kwargs["approved_revision"].append(1)
+    return True
 
 
 @declare_tool()
@@ -591,7 +720,7 @@ def test_register_admits_ready_tools_and_returns_registration_status():
 
 def test_register_skips_unavailable_optional_tools_and_reports_the_problem():
     """Optional readiness failures stay out of the catalog and notify the active user."""
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=Interaction, supports_fresh_host_approval=True)
     registry = ToolRegistry(interaction=interaction)
 
     @declare_tool(
@@ -643,7 +772,7 @@ def test_register_converts_unexpected_preflight_errors_and_logs_them(monkeypatch
 @pytest.mark.parametrize("raises", [False, True])
 def test_register_halts_when_the_user_rejects_a_broken_required_tool(raises):
     """Broken required tools warn the user and halt when the user chooses to halt."""
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=Interaction, supports_fresh_host_approval=True)
     interaction.prompt.return_value = "halt"
     preflight = (
         Mock(side_effect=RuntimeError("broken check"))
@@ -668,9 +797,27 @@ def test_register_halts_when_the_user_rejects_a_broken_required_tool(raises):
     assert interaction.prompt.call_args.kwargs["index"] == {"halt": "Q", "continue": "C"}
 
 
+def test_yolo_reports_broken_required_tool_without_choosing_recovery(tmp_path):
+    """No-prompt mode treats a missing required tool as unavailable instead of guessing."""
+    interaction = Mock(spec=Interaction)
+    manager = PermissionManager(tmp_path, yolo=True)
+
+    @declare_tool(
+        preflight=lambda: ToolPreflightResult(ToolStatus.BROKEN, "Required dependency missing."),
+        required=True,
+    )
+    def required() -> None:
+        """Require the missing dependency."""
+
+    registry = ToolRegistry(interaction=interaction, permission_manager=manager)
+    with pytest.raises(ToolRegistrationError, match="Required dependency missing"):
+        registry.register(required)
+    interaction.prompt.assert_not_called()
+
+
 def test_register_continues_without_a_broken_required_tool_when_selected():
     """The explicit continue choice skips a broken required tool without halting."""
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=Interaction, supports_fresh_host_approval=True)
     interaction.prompt.return_value = "continue"
 
     @declare_tool(
@@ -689,7 +836,7 @@ def test_register_continues_without_a_broken_required_tool_when_selected():
 
 def test_register_admits_degraded_tools_after_warning():
     """Degraded tools remain available after their warning is logged and displayed."""
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=Interaction, supports_fresh_host_approval=True)
 
     @declare_tool(preflight=lambda: ToolPreflightResult(ToolStatus.DEGRADED, "Limited capability."))
     def degraded() -> None:
@@ -731,8 +878,8 @@ def test_independent_registries_allow_the_same_name_and_isolate_runtime_state():
         """Calculate a number."""
         return number
 
-    first_interaction = Mock(spec=Interaction)
-    second_interaction = Mock(spec=Interaction)
+    first_interaction = Mock(spec=Interaction, supports_fresh_host_approval=True)
+    second_interaction = Mock(spec=Interaction, supports_fresh_host_approval=True)
     first_permissions = _permission_manager_mock()
     second_permissions = _permission_manager_mock()
     first = ToolRegistry(
@@ -835,10 +982,10 @@ def test_sync_runner_is_created_once_for_concurrent_callers(monkeypatch, contend
     real_runner = asyncio.Runner
     second_thread: Thread | None = None
 
-    def create_runner():
+    def create_runner(**kwargs):
         """Hold the first runner creation to expose an unsynchronized check-then-act race."""
         with created_runners_lock:
-            runner = real_runner()
+            runner = real_runner(**kwargs)
             created_runners.append(runner)
             first_runner = len(created_runners) == 1
         if first_runner:
@@ -1120,6 +1267,566 @@ def test_async_tool_worker_admission_is_bounded():
     assert len(invocation_count) == 8
 
 
+@pytest.mark.parametrize("callback", [False, True])
+def test_cancelled_queued_worker_never_enters_callable(callback, monkeypatch):
+    """Canceling a queued callback or tool never starts it after capacity frees."""
+
+    async def scenario():
+        """Occupy all workers, queue one invocation, then cancel it."""
+        loop = asyncio.get_running_loop()
+        all_started, submitted = asyncio.Event(), asyncio.Event()
+        release = Event()
+        lock = Lock()
+        active = []
+        effects = []
+        original = ThreadPoolExecutor.submit
+        submissions = 0
+
+        def observe_submission(executor, function, *args):
+            """Signal after the target reaches the occupied worker queue."""
+            nonlocal submissions
+            future = original(executor, function, *args)
+            submissions += 1
+            if submissions == 5:
+                submitted.set()
+            return future
+
+        def hold(number: int) -> str:
+            """Occupy a worker until the test releases the group."""
+            with lock:
+                active.append(number)
+                if len(active) == 4:
+                    loop.call_soon_threadsafe(all_started.set)
+            assert release.wait(timeout=5)
+            return "done"
+
+        def effect() -> str:
+            """Record an incorrectly entered callable."""
+            effects.append("entered")
+            return "unexpected"
+
+        registry = ToolRegistry([hold, effect])
+        monkeypatch.setattr(ThreadPoolExecutor, "submit", observe_submission)
+        holders = [
+            asyncio.create_task(registry.call_async("hold", json.dumps({"number": number})))
+            for number in range(4)
+        ]
+        target = None
+        queued = []
+        try:
+            await all_started.wait()
+            target = asyncio.create_task(
+                registry.call_async("effect", "{}", execution_started=effect if callback else None)
+            )
+            await submitted.wait()
+            target.cancel()
+            await deliver_callbacks()
+            await deliver_callbacks()
+            assert target.done()
+            with pytest.raises(asyncio.CancelledError):
+                await target
+            assert effects == []
+            queued = [
+                asyncio.create_task(registry.call_async("hold", json.dumps({"number": number})))
+                for number in range(4, 8)
+            ]
+            finished, _ = await asyncio.wait(queued, return_when=asyncio.FIRST_COMPLETED)
+            assert len(finished) == 1
+            assert (
+                json.loads(next(iter(finished)).result())["problem"]["code"] == "tool.dispatch_busy"
+            )
+        finally:
+            release.set()
+            await asyncio.gather(
+                *holders, *queued, *([target] if target is not None else []), return_exceptions=True
+            )
+            await asyncio.to_thread(registry.close)
+        assert effects == []
+
+    asyncio.run(scenario())
+
+
+def test_interruption_between_worker_submission_and_wait_cannot_start_tool():
+    """An interruption at the wait boundary prevents a submitted tool from entering."""
+    effects = []
+
+    def effect() -> str:
+        """Record an incorrectly admitted tool."""
+        effects.append("entered")
+        return "unexpected"
+
+    registry = ToolRegistry([effect])
+    source, first_line = inspect.getsourcelines(ToolRegistry._run_worker_async)
+    await_index = next(
+        i for i, line in enumerate(source) if "return await self._await_owned" in line
+    )
+    wait_line = first_line + await_index
+
+    def interrupt(frame, event, argument):
+        """Interrupt the worker path immediately before its wait begins."""
+        if (
+            event == "line"
+            and frame.f_code is ToolRegistry._run_worker_async.__code__
+            and frame.f_lineno == wait_line
+        ):
+            sys.settrace(None)
+            raise KeyboardInterrupt
+        return interrupt
+
+    async def scenario():
+        """Interrupt the submitted operation before the event loop can release its gate."""
+        previous = sys.gettrace()
+        sys.settrace(interrupt)
+        try:
+            with pytest.raises(KeyboardInterrupt):
+                await registry.call_async("effect", "{}")
+        finally:
+            sys.settrace(previous)
+        await deliver_callbacks()
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        registry.close()
+    assert effects == []
+
+
+def test_owner_loop_close_refuses_unsettled_worker_without_deadlock():
+    """A synchronous close cannot block the loop before a worker starts."""
+    effects = []
+    close_errors = []
+
+    def effect() -> str:
+        """Record the original operation after the owner loop admits it."""
+        effects.append("entered")
+        return "done"
+
+    registry = ToolRegistry([effect])
+
+    async def scenario():
+        """Attempt close before the queued worker's owner-loop signal."""
+        loop = asyncio.get_running_loop()
+        task = asyncio.create_task(registry.call_async("effect", "{}"))
+
+        def close_while_active():
+            """Capture the synchronous refusal without stopping the owner loop."""
+            try:
+                registry.close()
+            except RuntimeError as error:
+                close_errors.append(str(error))
+
+        loop.call_soon(close_while_active)
+        assert result_value(await task) == "done"
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        registry.close()
+    assert close_errors == ["Wait for tool dispatch to settle before closing on its loop."]
+    assert effects == ["entered"]
+
+
+def test_close_after_admission_prevents_new_worker_submission():
+    """Registry close wins before a previously admitted caller reaches submission."""
+    effects = []
+    closed = Event()
+
+    def effect() -> str:
+        """Record an incorrectly submitted operation."""
+        effects.append("entered")
+        return "unexpected"
+
+    registry = ToolRegistry([effect])
+    method = ToolRegistry._run_worker_async
+    source, first_line = inspect.getsourcelines(method)
+    target = first_line + next(
+        index for index, line in enumerate(source) if line.strip() == "with self._runner_lock:"
+    )
+
+    def close_at_submission(frame, event, argument):
+        """Close from another thread after admission and before lifecycle revalidation."""
+        if event == "line" and frame.f_code is method.__code__ and frame.f_lineno == target:
+            sys.settrace(None)
+
+            def close_registry():
+                """Close without blocking the event loop."""
+                try:
+                    registry.close()
+                finally:
+                    closed.set()
+
+            closer = Thread(target=close_registry)
+            closer.start()
+            assert closed.wait(timeout=5)
+            closer.join(timeout=5)
+        return close_at_submission
+
+    async def scenario():
+        """Observe the public dispatch refusal after the close wins."""
+        previous = sys.gettrace()
+        sys.settrace(close_at_submission)
+        try:
+            output = await registry.call_async("effect", "{}")
+        finally:
+            sys.settrace(previous)
+        assert json.loads(output)["problem"]["code"] == "tool.dispatch_busy"
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        registry.close()
+    assert effects == []
+
+
+def test_interruption_after_worker_admission_does_not_leak_capacity():
+    """A registry remains usable after interruption at the admission boundary."""
+
+    def effect() -> str:
+        """Return a visible result after successful admission."""
+        return "completed"
+
+    registry = ToolRegistry([effect])
+    source, first_line = inspect.getsourcelines(tool_registry_module.WorkerCapacity.acquire)
+    target = first_line + next(
+        index for index, line in enumerate(source) if line.strip() == "return True"
+    )
+
+    def interrupt(frame, event, argument):
+        """Interrupt immediately after adding the admission token."""
+        if (
+            event == "line"
+            and frame.f_code is tool_registry_module.WorkerCapacity.acquire.__code__
+            and frame.f_lineno == target
+        ):
+            sys.settrace(None)
+            raise KeyboardInterrupt
+        return interrupt
+
+    async def scenario():
+        """Interrupt the first call and complete a second on the same registry."""
+        previous = sys.gettrace()
+        sys.settrace(interrupt)
+        try:
+            with pytest.raises(KeyboardInterrupt):
+                await registry.call_async("effect", "{}")
+        finally:
+            sys.settrace(previous)
+        assert result_value(await registry.call_async("effect", "{}")) == "completed"
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        registry.close()
+
+
+def test_worker_submission_cancellation_releases_registry_capacity(monkeypatch):
+    """Cancellation while submitting a tool returns its bounded admission slot."""
+
+    def effect() -> str:
+        """Return a result when the registry accepts a later call."""
+        return "recovered"
+
+    registry = ToolRegistry([effect])
+
+    async def scenario():
+        """Interrupt before submission and then dispatch another tool normally."""
+        with monkeypatch.context() as scoped:
+            scoped.setattr(
+                tool_registry_module.WorkerEntry, "submit", Mock(side_effect=asyncio.CancelledError)
+            )
+            with pytest.raises(asyncio.CancelledError):
+                await registry.call_async("effect", "{}")
+        assert result_value(await registry.call_async("effect", "{}")) == "recovered"
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        registry.close()
+
+
+@pytest.mark.parametrize("outcome", ["success", "failure", "cancelled"])
+@pytest.mark.parametrize("cancel_pending", [False, True])
+def test_exceptional_worker_wait_settles_entered_tool(monkeypatch, outcome, cancel_pending):
+    """An unexpected interruption waits for the entered worker on the owner loop."""
+    registry = ToolRegistry()
+    release = Event()
+    effects = []
+
+    async def scenario():
+        """Interrupt a wait while an entered callback still needs the owner loop."""
+        loop = asyncio.get_running_loop()
+        started = asyncio.Event()
+
+        def effect():
+            """Settle only when the owner loop releases this worker."""
+            loop.call_soon_threadsafe(started.set)
+            assert release.wait(timeout=5)
+            effects.append("settled")
+            if outcome == "failure":
+                raise ValueError("worker failed")
+            if outcome == "cancelled":
+                raise asyncio.CancelledError
+
+        async def interrupted_wait(future):
+            """Interrupt only after worker entry."""
+            await started.wait()
+            loop.call_soon(release.set)
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(registry, "_await_owned_future_async", interrupted_wait)
+        with pytest.raises(KeyboardInterrupt) as captured:
+            await registry._run_worker_async(effect, cancel_pending=cancel_pending)
+        assert effects == ["settled"]
+        if outcome == "failure":
+            assert captured.value.__notes__ == [
+                "The blocking operation also stopped with ValueError."
+            ]
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release.set()
+        registry.close()
+
+
+@pytest.mark.parametrize("preclaimed", [False, True])
+def test_exceptional_wait_releases_completed_owned_result(monkeypatch, preclaimed):
+    """A completed but unconsumed owned result is handled without taking another owner."""
+    registry = ToolRegistry()
+
+    async def scenario():
+        """Interrupt after the worker has returned its owned coroutine."""
+
+        async def child():
+            """Return a result if its original owner starts it."""
+            return "owned"
+
+        coroutine = child()
+        handle = OwnedToolTask(coroutine)
+        if preclaimed:
+            handle.reserve()
+
+        async def interrupted_wait(future):
+            """Wait until the worker has completed, then interrupt before consuming it."""
+            await asyncio.shield(future)
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(registry, "_await_owned_future_async", interrupted_wait)
+        with pytest.raises(KeyboardInterrupt):
+            await registry._run_worker_async(lambda: handle, cancel_pending=True)
+        if preclaimed:
+            assert inspect.getcoroutinestate(coroutine) == inspect.CORO_CREATED
+            assert await handle.start(asyncio.get_running_loop()) == "owned"
+        else:
+            assert inspect.getcoroutinestate(coroutine) == inspect.CORO_CLOSED
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        registry.close()
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_foreign_not_started_marker_does_not_claim_this_tool_was_unstarted(asynchronous):
+    """A nested operation cannot certify that its already-entered caller never started."""
+    effects = []
+
+    def sync_tool() -> str:
+        """Commit an effect and report another invocation's cancellation."""
+        effects.append("entered")
+        raise ToolExecutionNotStarted(object())
+
+    async def async_tool() -> str:
+        """Commit an effect and await another invocation's cancelled future."""
+        effects.append("entered")
+        future = asyncio.get_running_loop().create_future()
+        future.set_exception(ToolExecutionNotStarted(object()))
+        return await future
+
+    function = async_tool if asynchronous else sync_tool
+    registry = ToolRegistry([function])
+    try:
+        with pytest.raises(asyncio.CancelledError) as captured:
+            asyncio.run(registry.call_async(function.__name__, "{}"))
+    finally:
+        registry.close()
+
+    assert not isinstance(captured.value, ToolExecutionNotStarted)
+    assert effects == ["entered"]
+
+
+def test_registry_rejects_foreign_dispatch_not_started_marker(monkeypatch):
+    """Only the current dispatch can certify that its callable was never entered."""
+
+    async def effect() -> str:
+        """Represent an effect whose nested invocation returned a foreign marker."""
+        return "unused"
+
+    async def foreign_marker(*args, **kwargs):
+        """Propagate another dispatch's not-started marker at the tool boundary."""
+        raise ToolExecutionNotStarted(object())
+
+    monkeypatch.setattr(Tool, "execute_async", foreign_marker)
+    registry = ToolRegistry([effect])
+    try:
+        with pytest.raises(asyncio.CancelledError) as captured:
+            asyncio.run(registry.call_async("effect", "{}"))
+        assert not isinstance(captured.value, ToolExecutionNotStarted)
+    finally:
+        registry.close()
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_effectful_tool_returning_preclaimed_work_has_unknown_outcome(asynchronous):
+    """A different owner's work cannot turn an entered tool into an ordinary failure."""
+    effects = []
+
+    async def foreign():
+        """Produce a result only when the original owner starts this work."""
+        return "foreign"
+
+    handle = OwnedToolTask(foreign())
+    handle.reserve()
+
+    def effect() -> str:
+        """Record the tool effect before returning another owner's work."""
+        effects.append("entered")
+        return handle
+
+    registry = ToolRegistry([effect])
+    try:
+        with pytest.raises(ToolExecutionOutcomeUnknown):
+            if asynchronous:
+                asyncio.run(registry.call_async("effect", "{}"))
+            else:
+                registry.call("effect", "{}")
+        with asyncio.Runner() as owner:
+            task = handle.start(owner.get_loop())
+
+            async def receive():
+                """Await the original owner's independent task."""
+                return await task
+
+            assert owner.run(receive()) == "foreign"
+    finally:
+        registry.close()
+    assert effects == ["entered"]
+
+
+def test_failed_async_tool_planning_preserves_existing_event_loop():
+    """A refused plan does not initialize a runner or replace the caller's loop."""
+    effects = []
+
+    async def effect() -> None:
+        """Record an admitted effect."""
+        effects.append(True)
+
+    def refuse(_arguments):
+        """Reject planning before the async tool needs a runner."""
+        raise ValueError("synthetic refusal")
+
+    def exercise():
+        """Own and restore the event-loop state within an isolated thread."""
+        prior = asyncio.new_event_loop()
+        asyncio.set_event_loop(prior)
+        registry = ToolRegistry([ToolRegistration(effect, operation_planner=refuse)])
+        try:
+            output = json.loads(registry.call("effect", "{}"))
+            assert output["problem"]["code"] == "tool.planning_failed"
+            assert asyncio.get_event_loop() is prior
+            assert effects == []
+        finally:
+            registry.close()
+            asyncio.set_event_loop(None)
+            prior.close()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        executor.submit(exercise).result(timeout=5)
+
+
+def test_interrupted_async_tool_dispatch_preserves_existing_event_loop():
+    """Interrupted admission leaves the caller's loop intact through registry closure."""
+    effects = []
+
+    async def effect() -> None:
+        """Record an admitted effect."""
+        effects.append(True)
+
+    def interrupt():
+        """Interrupt before the tool is dispatched."""
+        raise KeyboardInterrupt
+
+    def exercise():
+        """Isolate the thread's caller-owned event-loop binding."""
+        prior = asyncio.new_event_loop()
+        asyncio.set_event_loop(prior)
+        registry = ToolRegistry([effect])
+        try:
+            with pytest.raises(KeyboardInterrupt):
+                registry.call("effect", "{}", execution_started=interrupt)
+            assert asyncio.get_event_loop() is prior
+            registry.close()
+            assert asyncio.get_event_loop() is prior
+            assert effects == []
+        finally:
+            registry.close()
+            asyncio.set_event_loop(None)
+            prior.close()
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        executor.submit(exercise).result(timeout=5)
+
+
+def test_async_tool_closed_during_planning_does_not_start():
+    """Closure during planning cannot resurrect an uninitialized coroutine runner."""
+    effects = []
+
+    async def effect() -> None:
+        """Record an admitted effect."""
+        effects.append(True)
+
+    def close_during_plan(arguments):
+        """Close the owner after it creates its runner but before dispatch."""
+        registry.close()
+        return OperationPlan(arguments=arguments)
+
+    registry = ToolRegistry([ToolRegistration(effect, operation_planner=close_during_plan)])
+    started = Mock()
+    try:
+        output = json.loads(registry.call("effect", "{}", execution_started=started))
+        assert output["problem"]["code"] == "tool.dispatch_busy"
+        started.assert_not_called()
+        assert effects == []
+    finally:
+        registry.close()
+
+
+def test_async_tool_runner_initialization_failure_is_reported(monkeypatch, caplog):
+    """A failed runner setup is logged without starting the tool or leaking its error."""
+    effects = []
+
+    async def effect() -> None:
+        """Record an admitted effect."""
+        effects.append(True)
+
+    failed = Mock(spec=asyncio.Runner)
+    failed.get_loop.side_effect = OSError("private loop setup detail")
+    monkeypatch.setattr(tool_registry_module.asyncio, "Runner", lambda **_kwargs: failed)
+    registry = ToolRegistry([effect])
+    started = Mock()
+    try:
+        output = json.loads(registry.call("effect", "{}", execution_started=started))
+        assert output["problem"]["code"] == "tool.execution_failed"
+        assert "private loop setup detail" not in output["problem"]["detail"]
+        started.assert_not_called()
+        assert effects == []
+        assert len(caplog.records) == 1
+        assert caplog.records[0].__dict__["error.type"] == "tool.execution_failed"
+        assert caplog.records[0].__dict__["exception.type"] == "builtins.OSError"
+    finally:
+        registry.close()
+
+
 def test_cancellation_waits_for_sync_tool_settlement():
     """Cancelling async dispatch signals its worker and waits for the actual outcome."""
     started = Event()
@@ -1253,6 +1960,140 @@ def test_cancelled_worker_does_not_start_or_await_additional_execution(during_st
     assert all(result.cr_frame is None for result in returned)
 
 
+@pytest.mark.parametrize("started", [False, True])
+@pytest.mark.parametrize("boundary", ["tool", "sync_callback", "async_callback"])
+def test_cancelled_dispatch_preserves_preclaimed_owned_work(started, boundary):
+    """Cancellation neither takes another owner's work nor loses its own signal."""
+
+    async def scenario():
+        """Interrupt a tool or callback before it returns a preclaimed handle."""
+        loop = asyncio.get_running_loop()
+        foreign_started = asyncio.Event()
+        foreign_release = asyncio.Event()
+        boundary_started = asyncio.Event()
+        worker_release = Event()
+        effects = []
+
+        async def foreign():
+            """Complete only when its original owner releases it."""
+            foreign_started.set()
+            await foreign_release.wait()
+            effects.append("foreign completed")
+            return "foreign result"
+
+        handle = OwnedToolTask(foreign())
+        if started:
+            foreign_task = handle.claim(loop)
+            await foreign_started.wait()
+        else:
+            handle.reserve()
+            foreign_task = None
+
+        def worker():
+            """Return the other owner's handle after interruption."""
+            loop.call_soon_threadsafe(boundary_started.set)
+            assert worker_release.wait(timeout=5)
+            return handle
+
+        async def async_callback():
+            """Return the other owner's handle while settling cancellation."""
+            try:
+                boundary_started.set()
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                return handle
+
+        def calculate():
+            """Run the worker only when this is the tool boundary."""
+            if boundary == "tool":
+                return worker()
+            effects.append("tool")
+            return "done"
+
+        before = worker if boundary == "sync_callback" else async_callback
+        registry = ToolRegistry([calculate])
+        task = asyncio.create_task(
+            registry.call_async(
+                "calculate", "{}", execution_started=None if boundary == "tool" else before
+            )
+        )
+        try:
+            await boundary_started.wait()
+            task.cancel()
+            await deliver_callbacks()
+            worker_release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            if foreign_task is None:
+                foreign_task = handle.start(loop)
+            assert not foreign_task.cancelling()
+            foreign_release.set()
+            assert await foreign_task == "foreign result"
+            assert effects == ["foreign completed"]
+        finally:
+            worker_release.set()
+            foreign_release.set()
+            await asyncio.gather(task, return_exceptions=True)
+            await asyncio.to_thread(registry.close)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("started", [False, True])
+def test_cancelled_final_outcome_preserves_preclaimed_owned_work(started):
+    """A final nested handle cannot transfer another owner's work after interruption."""
+
+    async def scenario():
+        """Return a preclaimed handle while settling an interrupted tool."""
+        ready, foreign_ready, release = (asyncio.Event() for _ in range(3))
+
+        async def foreign():
+            """Wait for the original owner to finish the operation."""
+            foreign_ready.set()
+            await release.wait()
+            return "foreign result"
+
+        handle = OwnedToolTask(foreign())
+        if started:
+            foreign_task = handle.claim(asyncio.get_running_loop())
+            await foreign_ready.wait()
+        else:
+            handle.reserve()
+            foreign_task = None
+
+        async def child():
+            """Return the other owner's handle on cancellation."""
+            try:
+                ready.set()
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                return handle
+
+        async def calculate() -> str:
+            """Return a final child outcome."""
+            return await OwnedToolTask(child(), final_result=True)
+
+        registry = ToolRegistry([calculate])
+        task = asyncio.create_task(registry.call_async("calculate", "{}"))
+        try:
+            await ready.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError) as caught:
+                await task
+            assert not hasattr(caught.value, "output")
+            if foreign_task is None:
+                foreign_task = handle.start(asyncio.get_running_loop())
+            assert not foreign_task.cancelling()
+            release.set()
+            assert await foreign_task == "foreign result"
+        finally:
+            release.set()
+            await asyncio.gather(task, return_exceptions=True)
+            await asyncio.to_thread(registry.close)
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("during_start", [False, True])
 @pytest.mark.parametrize("outcome", ["success", "failure", "cancelled"])
 def test_cancelled_callback_retrieves_its_completed_future_without_starting_more_work(
@@ -1332,7 +2173,7 @@ def test_cancelled_callback_retrieves_its_completed_future_without_starting_more
 @pytest.mark.parametrize("repeated", [False, True])
 @pytest.mark.parametrize("outcome", ["success", "failure", "problem", "cancelled"])
 def test_cancelled_start_callback_settles_returned_task_without_invoking_tool(
-    caplog, signal, repeated, outcome
+    caplog, monkeypatch, signal, repeated, outcome
 ):
     """Cancellation after callback worker return owns cleanup and never admits the tool body."""
     started, awaiting, cancelling, finish = (asyncio.Event() for _ in range(4))
@@ -1340,17 +2181,15 @@ def test_cancelled_start_callback_settles_returned_task_without_invoking_tool(
     invoked, completed = [], []
     owned = None
 
-    class CallbackTask(asyncio.Task):
-        """Expose direct and shielded waits through the task's public completion interface."""
+    shield = asyncio.shield
 
-        def __await__(self):
+    def observe_shield(value):
+        """Expose when dispatch starts waiting for the owned task."""
+        if owned is not None and value is owned.task:
             awaiting.set()
-            return super().__await__()
+        return shield(value)
 
-        def add_done_callback(self, callback, *, context=None):
-            """Expose when shield subscribes to this task's completion."""
-            awaiting.set()
-            return super().add_done_callback(callback, context=context)
+    monkeypatch.setattr(asyncio, "shield", observe_shield)
 
     async def before_execution():
         """Finish owned callback cleanup even when cancellation has revoked tool execution."""
@@ -1389,7 +2228,8 @@ def test_cancelled_start_callback_settles_returned_task_without_invoking_tool(
     async def scenario():
         """Cancel at the returned task's public await subscription without timing delays."""
         nonlocal owned
-        owned = CallbackTask(before_execution())
+        owned = OwnedToolTask(before_execution())
+        owned_task = owned.start(asyncio.get_running_loop())
         await started.wait()
         task = asyncio.create_task(
             registry.call_with_timing_async(
@@ -1409,21 +2249,21 @@ def test_cancelled_start_callback_settles_returned_task_without_invoking_tool(
                 asyncio.get_running_loop().call_soon(advanced.set_result, None)
                 await advanced
             assert not task.done()
-            assert not owned.done()
+            assert not owned_task.done()
             assert completed == []
             assert cancellation is None or cancellation.is_set()
             finish.set()
             with pytest.raises(asyncio.CancelledError) as captured:
                 await task
             assert not hasattr(captured.value, "output")
-            assert owned.done()
-            assert owned.cancelled() is (outcome == "cancelled")
+            assert owned_task.done()
+            assert owned_task.cancelled() is (outcome == "cancelled")
             assert completed == [True]
             assert invoked == []
         finally:
             finish.set()
             task.cancel()
-            await asyncio.gather(task, owned, return_exceptions=True)
+            await asyncio.gather(task, owned_task, return_exceptions=True)
 
     try:
         asyncio.run(scenario())
@@ -1535,7 +2375,8 @@ def test_foreign_future_ownership_is_preserved_during_dispatch_cancellation(canc
                 with pytest.raises(asyncio.CancelledError):
                     await task
             else:
-                assert json.loads(await task)["problem"]["code"] == "tool.loop_mismatch"
+                with pytest.raises(ToolExecutionOutcomeUnknown):
+                    await task
         finally:
             release.set()
             await asyncio.gather(task, return_exceptions=True)
@@ -1547,6 +2388,78 @@ def test_foreign_future_ownership_is_preserved_during_dispatch_cancellation(canc
         registry.close()
         future.cancel()
         foreign_loop.close()
+
+
+@pytest.mark.parametrize("callback", [False, True])
+@pytest.mark.parametrize("clear_cancellation", [False, True])
+def test_cancellation_settles_returned_task_already_cancelling(
+    monkeypatch, callback, clear_cancellation
+):
+    """Borrowed cleanup finishes even when its cancellation state has been cleared."""
+    started, cleaning, attached, release = (asyncio.Event() for _ in range(4))
+    completed = []
+    owned = None
+    shield = asyncio.shield
+
+    async def effect():
+        """Finish cleanup after its first cancellation request."""
+        try:
+            started.set()
+            await asyncio.Event().wait()
+        finally:
+            if clear_cancellation:
+                asyncio.current_task().uncancel()
+            cleaning.set()
+            await release.wait()
+            completed.append(True)
+
+    def invoke():
+        """Return owned work or an ordinary value after the callback."""
+        return "done" if callback else owned
+
+    def execution_started():
+        """Return owned work from the execution-start callback."""
+        return owned
+
+    def observe_shield(value):
+        """Expose when dispatch is waiting for the owned task."""
+        if value is owned:
+            attached.set()
+        return shield(value)
+
+    monkeypatch.setattr(asyncio, "shield", observe_shield)
+    registry = ToolRegistry([invoke])
+
+    async def scenario():
+        """Interrupt dispatch while its returned task is already settling."""
+        nonlocal owned
+        owned = asyncio.create_task(effect())
+        await started.wait()
+        owned.cancel()
+        await cleaning.wait()
+        dispatch = asyncio.create_task(
+            registry.call_async(
+                "invoke", "{}", execution_started=execution_started if callback else None
+            )
+        )
+        try:
+            await attached.wait()
+            dispatch.cancel()
+            await deliver_callbacks()
+            assert not owned.done()
+            assert not dispatch.done()
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await dispatch
+            assert completed == [True]
+        finally:
+            release.set()
+            await asyncio.gather(dispatch, owned, return_exceptions=True)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        registry.close()
 
 
 @pytest.mark.parametrize("signal", [False, True])
@@ -1562,7 +2475,7 @@ def test_returned_task_cancellation_signals_context_and_retains_its_final_outcom
 
     def observe_shield(value):
         """Expose when dispatch owns the returned task's result."""
-        if value is owned:
+        if owned is not None and value is owned.task:
             awaiting.set()
         return shield(value)
 
@@ -1581,7 +2494,7 @@ def test_returned_task_cancellation_signals_context_and_retains_its_final_outcom
             return "confirmed"
 
     def invoke():
-        """Return the actual owner-loop task from a synchronous callback."""
+        """Transfer the owned task from a synchronous callback."""
         return owned
 
     registry = ToolRegistry([invoke])
@@ -1589,7 +2502,8 @@ def test_returned_task_cancellation_signals_context_and_retains_its_final_outcom
     async def scenario():
         """Cancel only after the returned task is being awaited and settle repeated cancellation."""
         nonlocal owned
-        owned = asyncio.create_task(effect())
+        owned = OwnedToolTask(effect())
+        owned_task = owned.start(asyncio.get_running_loop())
         task = asyncio.create_task(
             registry.call_async("invoke", "{}", cancellation_event=cancellation)
         )
@@ -1608,15 +2522,15 @@ def test_returned_task_cancellation_signals_context_and_retains_its_final_outcom
                 assert output == {"ok": True, "result": "confirmed"}
         finally:
             finish.set()
-            if not owned.done():
+            if not owned_task.done():
                 owned.cancel()
-            await asyncio.gather(task, owned, return_exceptions=True)
+            await asyncio.gather(task, owned_task, return_exceptions=True)
 
     try:
         asyncio.run(scenario())
     finally:
         registry.close()
-    assert owned.done()
+    assert owned.task.done()
     if fails:
         assert len(caplog.records) == 1
         assert caplog.records[0].__dict__["error.type"] == "tool.execution_failed"
@@ -1664,7 +2578,67 @@ def test_worker_failure_is_logged_when_cancellation_waits_for_settlement(caplog)
     assert "private failure detail" not in records[0].getMessage()
 
 
-def test_cancelled_executor_future_settles_without_reading_its_exception():
+@pytest.mark.parametrize("failure", ["refusal", "oserror", "problem"])
+def test_cancelled_worker_reports_only_unexpected_admission_failures(caplog, failure):
+    """Cancellation retains unexpected policy-check diagnostics without logging refusal."""
+    started = Event()
+    release = Event()
+    cancellation = Event()
+    effects = []
+
+    @declare_tool
+    def effect() -> None:
+        """Record an admitted synthetic effect."""
+        effects.append(True)
+
+    def admission() -> bool:
+        """Settle after cancellation with a refusal or a failed policy check."""
+        started.set()
+        assert release.wait(timeout=5), "test synchronization was not released"
+        if failure == "oserror":
+            raise OSError("private policy detail")
+        if failure == "problem":
+            raise ProblemException(
+                Problem(
+                    code="policy.unavailable", title="Unavailable", detail="private policy detail"
+                )
+            )
+        return False
+
+    registry = ToolRegistry([effect])
+
+    async def dispatch():
+        """Cancel while the worker is still evaluating admission."""
+        task = asyncio.create_task(
+            registry.call_with_timing_async(
+                "effect", "{}", execution_admission=admission, cancellation_event=cancellation
+            )
+        )
+        assert await asyncio.to_thread(started.wait, 5)
+        task.cancel()
+        assert await asyncio.to_thread(cancellation.wait, 5)
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    try:
+        asyncio.run(dispatch())
+    finally:
+        release.set()
+        registry.close()
+    assert effects == []
+    records = [record for record in caplog.records if record.name == "loop.tooling.tool_registry"]
+    if failure != "refusal":
+        assert len(records) == 1
+        assert records[0].__dict__["error.type"] == "tool.callback_failed"
+        expected = "builtins.OSError" if failure == "oserror" else "loop.errors.ProblemException"
+        assert records[0].__dict__["exception.type"] == expected
+        assert "private policy detail" not in records[0].getMessage()
+    else:
+        assert records == []
+
+
+def test_cancelled_executor_future_settles_without_reading_its_exception(monkeypatch):
     """A cancelled executor future still releases worker admission during settlement."""
 
     @declare_tool
@@ -1675,16 +2649,11 @@ def test_cancelled_executor_future_settles_without_reading_its_exception():
     registry = ToolRegistry([calculate])
 
     async def dispatch():
-        loop = asyncio.get_running_loop()
-        original = loop.run_in_executor
-        future = loop.create_future()
+        future = Future()
         future.cancel()
-        loop.run_in_executor = lambda *_args, **_kwargs: future
-        try:
-            with pytest.raises(asyncio.CancelledError):
-                await registry.call_async("calculate", "{}")
-        finally:
-            loop.run_in_executor = original
+        monkeypatch.setattr(ThreadPoolExecutor, "submit", lambda *_args, **_kwargs: future)
+        with pytest.raises(asyncio.CancelledError):
+            await registry.call_async("calculate", "{}")
 
     try:
         asyncio.run(dispatch())
@@ -1741,6 +2710,47 @@ def test_worker_context_relays_interaction_and_instruction_effects_and_returns_r
     assert result["result"] == {"allowed": True}
     assert result["read_versions"] == {"cache://reference": None}
     assert service_threads == [owner_thread, owner_thread]
+
+
+@pytest.mark.parametrize("native_async", [False, True])
+@pytest.mark.parametrize("answer", [True, False, "pending"])
+def test_tool_confirmation_requires_explicit_boolean_approval(native_async, answer):
+    """A nested foreign future cannot approve either a sync or native async tool."""
+    effects = []
+    foreign = asyncio.new_event_loop()
+    future = foreign.create_future()
+    interaction = Mock(spec=Interaction)
+    interaction.confirm_async = AsyncMock(return_value=future if answer == "pending" else answer)
+    interaction.prompt_async = AsyncMock()
+
+    def sync_effect(context: ToolContext) -> bool:
+        """Record an effect only if the user explicitly approved it."""
+        if context.confirm("Proceed?"):
+            effects.append("committed")
+            return True
+        return False
+
+    async def async_effect(context: ToolContext) -> bool:
+        """Record an effect only if the user explicitly approved it."""
+        if await context.confirm_async("Proceed?"):
+            effects.append("committed")
+            return True
+        return False
+
+    function = async_effect if native_async else sync_effect
+    registry = ToolRegistry([function], interaction=interaction)
+    try:
+        output = asyncio.run(registry.call_async(function.__name__, "{}"))
+        if answer == "pending":
+            assert json.loads(output)["problem"]["code"] == "tool.invalid_confirmation"
+        else:
+            assert result_value(output) is (answer is True)
+        assert effects == (["committed"] if answer is True else [])
+        assert not future.done()
+    finally:
+        registry.close()
+        future.cancel()
+        foreign.close()
 
 
 def test_additional_authorization_rechecks_exact_dynamic_operations_on_owner():
@@ -1982,7 +2992,7 @@ def test_native_async_tool_uses_async_context_authorization_on_the_owner():
 
 
 def test_sync_callable_rejects_future_bound_to_another_loop():
-    """Both registry modes reject a tool result owned by a different event loop."""
+    """Both registry modes retain unknown outcomes for foreign-loop tool results."""
     foreign_loop = asyncio.new_event_loop()
     foreign_future = foreign_loop.create_future()
     foreign_future.set_result("unowned")
@@ -1995,14 +3005,13 @@ def test_sync_callable_rejects_future_bound_to_another_loop():
     registry = ToolRegistry([return_foreign_future])
 
     try:
-        synchronous = json.loads(registry.call("return_foreign_future", "{}"))
-        asynchronous = json.loads(asyncio.run(registry.call_async("return_foreign_future", "{}")))
+        with pytest.raises(ToolExecutionOutcomeUnknown):
+            registry.call("return_foreign_future", "{}")
+        with pytest.raises(ToolExecutionOutcomeUnknown):
+            asyncio.run(registry.call_async("return_foreign_future", "{}"))
     finally:
         registry.close()
         foreign_loop.close()
-
-    assert synchronous["problem"]["code"] == "tool.loop_mismatch"
-    assert asynchronous["problem"]["code"] == "tool.loop_mismatch"
 
 
 def test_registry_reuses_a_runner_for_async_planners_in_sync_dispatch():
@@ -2033,6 +3042,35 @@ def test_registry_reuses_a_runner_for_async_planners_in_sync_dispatch():
     assert first == second == 7
     assert len(loop_ids) == 4
     assert len(set(loop_ids)) == 1
+
+
+@pytest.mark.parametrize("async_dispatch", [False, True])
+def test_registry_accepts_explicitly_owned_planner_work(async_dispatch):
+    """Both dispatch modes resolve a planner's explicitly owned coroutine."""
+
+    async def prepare(arguments):
+        """Produce one normalized plan on the dispatch loop."""
+        return OperationPlan(arguments=arguments)
+
+    def planner(arguments):
+        """Transfer one unstarted planner coroutine."""
+        return OwnedToolTask(prepare(arguments))
+
+    @declare_tool(operation_planner=planner)
+    def calculate(number: int) -> int:
+        """Return the planned number."""
+        return number
+
+    registry = ToolRegistry([calculate])
+    try:
+        output = (
+            asyncio.run(registry.call_async("calculate", '{"number": 3}'))
+            if async_dispatch
+            else registry.call("calculate", '{"number": 3}')
+        )
+        assert result_value(output) == 3
+    finally:
+        registry.close()
 
 
 def test_sync_dispatch_rejects_awaitable_planners_inside_a_running_loop():
@@ -2180,8 +3218,8 @@ def test_sync_async_planner_rejects_a_foreign_loop_future():
     assert json.loads(output)["problem"]["code"] == "tool.loop_mismatch"
 
 
-def test_worker_submission_failure_releases_bounded_admission(monkeypatch):
-    """A failed executor submission becomes a typed result and frees its worker slot."""
+def test_worker_submission_failure_quarantines_ambiguous_executor(monkeypatch):
+    """An ambiguous failure refuses reuse while a fresh registry can dispatch normally."""
 
     @declare_tool
     def calculate() -> int:
@@ -2189,26 +3227,94 @@ def test_worker_submission_failure_releases_bounded_admission(monkeypatch):
         return 1
 
     registry = ToolRegistry([calculate])
+    replacement = ToolRegistry([calculate])
 
     async def dispatch():
-        loop = asyncio.get_running_loop()
         with monkeypatch.context() as scoped:
             scoped.setattr(
-                loop,
-                "run_in_executor",
+                ThreadPoolExecutor,
+                "submit",
                 Mock(side_effect=RuntimeError("executor unavailable")),
             )
             failed = await registry.call_async("calculate", "{}")
-        succeeded = await registry.call_async("calculate", "{}")
-        return failed, succeeded
+        unavailable = await registry.call_async("calculate", "{}")
+        succeeded = await replacement.call_async("calculate", "{}")
+        return failed, unavailable, succeeded
 
     try:
-        failed, succeeded = asyncio.run(dispatch())
+        failed, unavailable, succeeded = asyncio.run(dispatch())
+    finally:
+        registry.close()
+        replacement.close()
+
+    assert json.loads(failed)["problem"]["code"] == "tool.dispatch_unavailable"
+    assert json.loads(unavailable)["problem"]["code"] == "tool.dispatch_unavailable"
+    assert result_value(succeeded) == 1
+
+
+def test_interrupted_failed_submission_still_quarantines_registry(monkeypatch):
+    """Interrupted cancellation cannot reuse an ambiguously submitted registry worker."""
+
+    def calculate() -> int:
+        """Return a value only if the worker was safely admitted."""
+        return 1
+
+    registry = ToolRegistry([calculate])
+    try:
+        with monkeypatch.context() as scoped:
+            scoped.setattr(registry._executor, "submit", Mock(side_effect=RuntimeError))
+            scoped.setattr(
+                tool_registry_module.WorkerEntry,
+                "cancel_before_start",
+                Mock(side_effect=KeyboardInterrupt),
+            )
+            with pytest.raises(KeyboardInterrupt):
+                asyncio.run(registry.call_async("calculate", "{}"))
+        output = asyncio.run(registry.call_async("calculate", "{}"))
+        assert json.loads(output)["problem"]["code"] == "tool.dispatch_unavailable"
     finally:
         registry.close()
 
-    assert json.loads(failed)["problem"]["code"] == "tool.execution_failed"
-    assert result_value(succeeded) == 1
+
+def test_registry_quarantines_after_worker_thread_start_failure(monkeypatch, caplog):
+    """A thread-start failure cannot run an abandoned call or reuse an uncertain pool."""
+    effects = []
+    original_start = Thread.start
+
+    def effect() -> str:
+        """Record only the operation accepted by a fresh registry."""
+        effects.append("entered")
+        return "recovered"
+
+    def fail_worker_start(thread):
+        """Reject tool worker creation at the real thread-start boundary."""
+        if thread.name.startswith("loop-tool"):
+            raise RuntimeError("synthetic worker start failure")
+        return original_start(thread)
+
+    registry = ToolRegistry([effect])
+    replacement = ToolRegistry([effect])
+
+    async def scenario():
+        """Fail after queue insertion, then use an independently created registry."""
+        with monkeypatch.context() as scoped:
+            scoped.setattr(Thread, "start", fail_worker_start)
+            failed = await registry.call_async("effect", "{}")
+        assert json.loads(failed)["problem"]["code"] == "tool.dispatch_unavailable"
+        unavailable = await registry.call_async("effect", "{}")
+        assert json.loads(unavailable)["problem"]["code"] == "tool.dispatch_unavailable"
+        assert result_value(await replacement.call_async("effect", "{}")) == "recovered"
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        registry.close()
+        replacement.close()
+    assert effects == ["entered"]
+    assert any(
+        record.__dict__.get("error.type") == "tool.dispatch_unavailable"
+        for record in caplog.records
+    )
 
 
 def test_worker_dispatch_preserves_context_variables():
@@ -2337,6 +3443,25 @@ def test_owner_portal_runs_sync_calls_and_rejects_unawaited_owner_results():
         with pytest.raises(ProblemException, match="must be awaited"):
             portal.call(result)
 
+        coroutine = result()
+        with pytest.raises(ProblemException, match="must be awaited"):
+            portal.call(lambda: OwnedToolTask(coroutine))
+        assert inspect.getcoroutinestate(coroutine) == inspect.CORO_CLOSED
+
+        claimed_coroutine = result()
+        claimed = OwnedToolTask(claimed_coroutine)
+        claimed.reserve()
+        with pytest.raises(ProblemException, match="must be awaited"):
+            portal.call(lambda: claimed)
+        assert inspect.getcoroutinestate(claimed_coroutine) == inspect.CORO_CREATED
+        assert await claimed.start(asyncio.get_running_loop()) == "not awaited"
+
+        started = OwnedToolTask(result())
+        owner_task = started.claim(asyncio.get_running_loop())
+        with pytest.raises(ProblemException, match="must be awaited"):
+            portal.call(lambda: started)
+        assert await owner_task == "not awaited"
+
         future = asyncio.get_running_loop().create_future()
         with pytest.raises(ProblemException, match="must be awaited"):
             portal.call(lambda: future)
@@ -2376,7 +3501,11 @@ def test_worker_context_rejects_sync_prompt_without_native_async_input():
 
     try:
         output = asyncio.run(
-            registry.call_async("confirm", "{}", interaction=Mock(spec=Interaction))
+            registry.call_async(
+                "confirm",
+                "{}",
+                interaction=Mock(spec=Interaction, supports_fresh_host_approval=True),
+            )
         )
     finally:
         registry.close()
@@ -2451,6 +3580,47 @@ def test_worker_command_approval_uses_native_async_permission_and_interaction_me
     interaction.prompt_async.assert_awaited_once()
 
 
+def test_worker_legacy_read_review_uses_native_async_prompt(tmp_path):
+    """A synchronous command tool relays customized legacy scope review to native input."""
+    path = tmp_path / ".loop" / "permissions.yaml"
+    path.parent.mkdir()
+    path.write_text("version: 1\nlimits:\n  readable_roots: []\n", encoding="utf-8")
+    external = tmp_path.parent / "legacy-tool-root"
+    external.mkdir(exist_ok=True)
+    interaction = ConsoleInteraction(console=Console(file=io.StringIO()), markdown=False)
+    interaction.prompt_async = AsyncMock(return_value="review")
+    permissions = PermissionManager(tmp_path, interaction=interaction)
+    request = SandboxRequest.create(
+        source="printf text",
+        cwd=tmp_path,
+        workspace=tmp_path,
+        read_roots=(external,),
+        write_roots=(),
+        network=False,
+        environment={"PATH": "/usr/bin:/bin", "LANG": "C"},
+        policy_version="test",
+        deadline=1_000_000_000,
+        workspace_id="workspace-1",
+    )
+
+    @declare_tool
+    def review(context: ToolContext) -> bool:
+        """Review an external read scope before the sandbox command is authorized."""
+        return context.permission_manager.review_legacy_sandbox_read_limit(
+            request, context.interaction
+        )
+
+    registry = ToolRegistry([review], interaction=interaction, permission_manager=permissions)
+    try:
+        output = asyncio.run(registry.call_async("review", "{}", interaction=interaction))
+    finally:
+        registry.close()
+
+    assert result_value(output) is True
+    interaction.prompt_async.assert_awaited_once()
+    assert permissions.sandbox_scope_limit(request) is None
+
+
 def test_worker_proxy_can_await_native_async_method_from_its_worker_thread():
     """An async owner method called from a worker is scheduled on the owner loop."""
     interaction = ConsoleInteraction(console=Console(file=io.StringIO()), markdown=False)
@@ -2515,7 +3685,8 @@ def test_registry_view_forwards_definitions_and_timed_calls():
     registry.call_with_timing_async = AsyncMock(return_value=timed_result)
     view = ToolRegistryView(registry)
     execution_started = Mock()
-    interaction = Mock(spec=Interaction)
+    execution_admission = Mock(return_value=True)
+    interaction = Mock(spec=Interaction, supports_fresh_host_approval=True)
     instructions_manager = Mock(spec=InstructionsManager)
     instructions_manager.virtual_paths.metadata.side_effect = lambda value: value
     instructions_manager.virtual_paths.redact.side_effect = lambda value: value
@@ -2532,6 +3703,7 @@ def test_registry_view_forwards_definitions_and_timed_calls():
             permission_manager=permission_manager,
             call_id="call-123",
             execution_started=execution_started,
+            execution_admission=execution_admission,
             cancellation_event=cancellation_event,
         )
         == timed_result
@@ -2545,6 +3717,7 @@ def test_registry_view_forwards_definitions_and_timed_calls():
         permission_manager=permission_manager,
         call_id="call-123",
         execution_started=execution_started,
+        execution_admission=execution_admission,
         file_observations=None,
         cancellation_event=cancellation_event,
     )
@@ -2558,6 +3731,7 @@ def test_registry_view_forwards_definitions_and_timed_calls():
                 permission_manager=permission_manager,
                 call_id="async-call-456",
                 execution_started=execution_started,
+                execution_admission=execution_admission,
                 cancellation_event=cancellation_event,
             )
         )
@@ -2571,6 +3745,7 @@ def test_registry_view_forwards_definitions_and_timed_calls():
         permission_manager=permission_manager,
         call_id="async-call-456",
         execution_started=execution_started,
+        execution_admission=execution_admission,
         file_observations=None,
         cancellation_event=cancellation_event,
     )
@@ -2578,8 +3753,8 @@ def test_registry_view_forwards_definitions_and_timed_calls():
 
 def test_interaction_property_can_be_replaced_and_cleared():
     """The registry exposes mutable default interaction configuration."""
-    first = Mock(spec=Interaction)
-    second = Mock(spec=Interaction)
+    first = Mock(spec=Interaction, supports_fresh_host_approval=True)
+    second = Mock(spec=Interaction, supports_fresh_host_approval=True)
     registry = ToolRegistry(interaction=first)
 
     assert registry.interaction is first
@@ -2607,7 +3782,7 @@ def test_registry_exposes_and_replaces_runtime_settings():
 def test_registry_passes_replaced_runtime_settings_to_tool_context():
     """Context-aware tools receive the registry's current runtime settings."""
     registry = ToolRegistry(
-        interaction=Mock(spec=Interaction),
+        interaction=Mock(spec=Interaction, supports_fresh_host_approval=True),
         settings=ToolRuntimeSettings(user_agent="custom-agent"),
     )
     seen = []
@@ -2689,7 +3864,7 @@ def test_call_reports_unknown_tools():
 
 def test_call_routes_arguments_and_runtime_context():
     """Synchronous routing forwards arguments and builds context from the runtime interaction."""
-    registry = ToolRegistry(interaction=Mock(spec=Interaction))
+    registry = ToolRegistry(interaction=Mock(spec=Interaction, supports_fresh_host_approval=True))
     contexts = []
 
     @declare_tool
@@ -2699,7 +3874,7 @@ def test_call_routes_arguments_and_runtime_context():
         return context.tool_name
 
     registry.register(calculate)
-    runtime = Mock(spec=Interaction)
+    runtime = Mock(spec=Interaction, supports_fresh_host_approval=True)
     manager = Mock(spec=InstructionsManager)
     manager.agents_filenames = ("AGENTS.md",)
     manager.virtual_paths.metadata.side_effect = lambda value: value
@@ -2729,7 +3904,7 @@ def test_call_routes_arguments_and_runtime_context():
 
 def test_call_uses_default_or_no_context():
     """Synchronous routing retains context when no interaction capability exists."""
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=Interaction, supports_fresh_host_approval=True)
     registry = ToolRegistry(interaction=interaction)
     seen = []
 
@@ -2822,7 +3997,7 @@ def test_headless_interaction_requirement_is_structured():
 
 def test_call_with_timing_excludes_permission_confirmation(monkeypatch):
     """Tool timing begins after authorization and uses the policy manager's recorder."""
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=Interaction, supports_fresh_host_approval=True)
     interaction.prompt.return_value = ApprovalChoice.ONCE
     recorder = Mock()
     permissions = PermissionManager(interaction=interaction, recorder=recorder)
@@ -2851,7 +4026,10 @@ def test_call_with_timing_excludes_permission_confirmation(monkeypatch):
 def test_call_command_parses_model_parameters_before_shared_dispatch():
     """Command routing validates parameters while bypassing the permission policy."""
     permissions = _permission_manager_mock()
-    registry = ToolRegistry(interaction=Mock(spec=Interaction), permission_manager=permissions)
+    registry = ToolRegistry(
+        interaction=Mock(spec=Interaction, supports_fresh_host_approval=True),
+        permission_manager=permissions,
+    )
 
     @declare_tool
     def describe(count: int, label: str = "default") -> dict:
@@ -2949,7 +4127,7 @@ def test_call_async_routes_arguments_and_context():
         return context.tool_name
 
     registry.register(calculate)
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=Interaction, supports_fresh_host_approval=True)
 
     def execution_started():
         """Record the thread that persists tool execution intent."""
@@ -3151,6 +4329,71 @@ def test_async_execution_started_callback_is_awaited_before_tool_invocation():
 
     assert result_value(result) == "done"
     assert events == ["started", "tool"]
+
+
+def test_cancelled_async_execution_started_callback_cannot_admit_tool():
+    """An intent callback cannot admit tool effects after swallowing cancellation."""
+    registry = ToolRegistry()
+    effects = []
+
+    @declare_tool()
+    async def calculate() -> str:
+        """Record any incorrectly admitted execution."""
+        effects.append("tool")
+        return "done"
+
+    registry.register(calculate)
+
+    async def scenario():
+        started = asyncio.Event()
+
+        async def execution_started():
+            try:
+                started.set()
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                return
+
+        task = asyncio.create_task(
+            registry.call_async("calculate", "{}", execution_started=execution_started)
+        )
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert effects == []
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_native_async_tool_retains_settled_receipt():
+    """A tool that completes after cancellation reports its known effect receipt."""
+    registry = ToolRegistry()
+    effects = []
+
+    async def scenario():
+        started = asyncio.Event()
+
+        @declare_tool()
+        async def calculate() -> str:
+            """Complete an effect despite interruption."""
+            try:
+                started.set()
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                effects.append("effect")
+                return "confirmed"
+
+        registry.register(calculate)
+        task = asyncio.create_task(registry.call_async("calculate", "{}"))
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await task
+        assert result_value(caught.value.output) == "confirmed"
+        assert effects == ["effect"]
+
+    asyncio.run(scenario())
 
 
 def test_async_dispatch_keeps_event_loop_responsive_during_approval():
@@ -3357,6 +4600,8 @@ def test_observed_file_scope_does_not_change_command_working_directory(tmp_path,
     instructions.observe_path(nested, directory=True)
     permissions = _permission_manager_mock()
     permissions.check_boundaries.return_value = None
+    permissions.authorize_sandboxed_command.side_effect = _approve_sandbox_request
+    permissions.sandbox_policy_revision_current.return_value = True
     permissions.authorize.return_value = SimpleNamespace(decision=Decision.ALLOW)
     permissions.analyze_command.return_value = CommandAnalysis((), False, ())
     permissions.protected_sandbox_paths.return_value = protected_workspace_paths()
@@ -3380,19 +4625,19 @@ def test_observed_file_scope_does_not_change_command_working_directory(tmp_path,
         instructions_manager=instructions,
     )
 
-    assert result_value(output)["stdout"]["content"].strip() == "$WORKSPACE_ROOT"
+    assert result_value(output)["stdout"]["content"].strip() == str(tmp_path)
     request = permissions.authorize_sandboxed_command.call_args.args[0]
     assert request.cwd == tmp_path
 
 
 def test_command_workspace_prefix_selects_the_workspace_root(tmp_path, monkeypatch):
-    """The canonical workspace prefix renders and executes as the workspace root."""
+    """The canonical workspace prefix executes in the workspace root."""
     monkeypatch.setenv("PATH", "/usr/bin:/bin")
     (tmp_path / "scratch").mkdir(mode=0o700)
     instructions = InstructionsManager(
         runtime_environment=RuntimeEnvironment(tmp_path, tmp_path / "scratch")
     )
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=Interaction, supports_fresh_host_approval=True)
     interaction.prompt.return_value = "approve"
     permissions = PermissionManager(
         tmp_path,
@@ -3422,8 +4667,7 @@ def test_command_workspace_prefix_selects_the_workspace_root(tmp_path, monkeypat
         instructions_manager=instructions,
     )
 
-    assert result_value(output)["stdout"]["content"].strip() == "$WORKSPACE_ROOT"
-    assert str(tmp_path) not in output
+    assert result_value(output)["stdout"]["content"].strip() == str(tmp_path)
     interaction.prompt.assert_not_called()
     assert backend.run.call_args.args[0].cwd == tmp_path
 
@@ -3437,7 +4681,7 @@ def test_command_virtual_workspace_read_roots_do_not_expand_authority(tmp_path, 
     instructions = InstructionsManager(
         runtime_environment=RuntimeEnvironment(tmp_path, tmp_path / "scratch")
     )
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=Interaction, supports_fresh_host_approval=True)
     registry = ToolRegistry(
         [run_command],
         interaction=interaction,
@@ -3471,14 +4715,16 @@ def test_command_virtual_workspace_read_roots_do_not_expand_authority(tmp_path, 
     interaction.prompt.assert_not_called()
 
 
-def test_denied_command_virtualizes_offer_and_cached_output(tmp_path, monkeypatch):
-    """A public denial preserves usable workspace paths in diagnostics and cached output."""
+def test_denied_command_virtualizes_offer_and_preserves_cached_output(tmp_path, monkeypatch):
+    """A public denial virtualizes diagnostics while preserving command output."""
     instructions = InstructionsManager(runtime_environment=RuntimeEnvironment(tmp_path, None))
     interaction = _approving_interaction()
+    permissions = PermissionManager(tmp_path)
+    permissions.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
     registry = ToolRegistry(
         [run_command],
         interaction=interaction,
-        permission_manager=PermissionManager(tmp_path),
+        permission_manager=permissions,
         execution_service=CommandExecutionService(
             MacOSSeatbeltBackend(), LocalHostCommandExecutor()
         ),
@@ -3502,12 +4748,11 @@ def test_denied_command_virtualizes_offer_and_cached_output(tmp_path, monkeypatc
 
     problem = json.loads(output)["problem"]
     assert problem["code"] == "sandbox.denied", problem
-    assert str(tmp_path) not in output
     assert "$WORKSPACE_ROOT/.ssh/fake" in problem["metadata"]["host_offer"]
     assert any("$WORKSPACE_ROOT" in call.args[0] for call in interaction.info.call_args_list)
     handle = problem["metadata"]["stdout"]["handle"]
     path, _ = cached_path(handle)
-    assert "$WORKSPACE_ROOT" in path.read_text()
+    assert path.read_text() == backend.run.return_value.stdout
 
 
 def test_command_accepts_virtual_workspace_cwd(tmp_path, monkeypatch):
@@ -3540,7 +4785,7 @@ def test_command_accepts_virtual_workspace_cwd(tmp_path, monkeypatch):
 
 
 def test_command_output_and_failure_details_preserve_workspace_paths(tmp_path, monkeypatch):
-    """Command streams and diagnostics retain the advertised workspace paths."""
+    """Failed command streams preserve physical paths in captured text."""
     (tmp_path / "scratch").mkdir(mode=0o700)
     instructions = InstructionsManager(
         runtime_environment=RuntimeEnvironment(tmp_path, tmp_path / "scratch")
@@ -3568,10 +4813,9 @@ def test_command_output_and_failure_details_preserve_workspace_paths(tmp_path, m
         instructions_manager=instructions,
     )
 
-    assert str(tmp_path) not in output
     problem = json.loads(output)["problem"]
-    assert problem["metadata"]["stdout"]["content"] == "$WORKSPACE_ROOT/one\n"
-    assert problem["metadata"]["stderr"]["content"] == "failed at $WORKSPACE_ROOT/two\n"
+    assert problem["metadata"]["stdout"]["content"] == f"{tmp_path}/one\n"
+    assert problem["metadata"]["stderr"]["content"] == f"failed at {tmp_path}/two\n"
 
 
 def test_command_sandbox_failure_preserves_workspace_paths(tmp_path, monkeypatch):
@@ -3613,7 +4857,7 @@ def test_command_preserves_source_and_binds_concrete_roots(tmp_path, monkeypatch
     scratch = tmp_path.with_name(tmp_path.name + "-scratch")
     scratch.mkdir(mode=0o700)
     instructions = InstructionsManager(runtime_environment=RuntimeEnvironment(tmp_path, scratch))
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=Interaction, supports_fresh_host_approval=True)
     interaction.prompt.return_value = "approve"
     registry = ToolRegistry(
         [run_command],
@@ -3631,7 +4875,6 @@ def test_command_preserves_source_and_binds_concrete_roots(tmp_path, monkeypatch
         assert request.paths_are_current()
         assert request.source == 'cat $WORKSPACE_ROOT/a "$TMPDIR/b"'
         assert request.execution_source == request.source
-        assert request.aliases == ()
         assert request.scratch_root == scratch
         assert request.shell_environment()["TMPDIR"] == str(scratch)
         return CommandProcessResult(
@@ -3651,9 +4894,8 @@ def test_command_preserves_source_and_binds_concrete_roots(tmp_path, monkeypatch
         instructions_manager=instructions,
     )
 
-    assert result_value(output)["stdout"]["content"] == "$WORKSPACE_ROOT/a $TMPDIR/b"
+    assert result_value(output)["stdout"]["content"] == f"{tmp_path}/a {scratch}/b"
     interaction.prompt.assert_not_called()
-    assert str(tmp_path) not in output
     assert observed[0].paths_are_current()
 
 
@@ -3684,7 +4926,6 @@ def test_command_ignores_virtual_root_substrings(tmp_path, monkeypatch):
     assert result_value(output)["boundary"] == "sandbox"
     request = backend.run.call_args.args[0]
     assert request.execution_source == "echo /tmp-old"
-    assert request.aliases == ()
 
 
 def test_command_host_retry_preserves_source(tmp_path, monkeypatch):
@@ -3693,12 +4934,14 @@ def test_command_host_retry_preserves_source(tmp_path, monkeypatch):
     instructions = InstructionsManager(
         runtime_environment=RuntimeEnvironment(tmp_path, tmp_path / "scratch")
     )
-    interaction = Mock(spec=Interaction)
+    interaction = Mock(spec=Interaction, supports_fresh_host_approval=True)
     interaction.prompt.return_value = "approve"
+    permissions = PermissionManager(tmp_path)
+    permissions.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
     registry = ToolRegistry(
         [run_command],
         interaction=_approving_interaction(),
-        permission_manager=PermissionManager(tmp_path),
+        permission_manager=permissions,
         execution_service=CommandExecutionService(
             MacOSSeatbeltBackend(), LocalHostCommandExecutor()
         ),
@@ -3907,7 +5150,8 @@ def test_execution_capability_guards_renamed_and_second_tools(tmp_path, second_t
     backend.run.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
     permissions = _permission_manager_mock()
     permissions.check_boundaries.return_value = None
-    permissions.authorize_sandboxed_command.return_value = True
+    permissions.authorize_sandboxed_command.side_effect = _approve_sandbox_request
+    permissions.sandbox_policy_revision_current.return_value = True
     permissions.analyze_command.return_value = CommandAnalysis((), False, ())
     permissions.protected_sandbox_paths.return_value = protected_workspace_paths()
     registry = ToolRegistry(
@@ -3941,3 +5185,1220 @@ def test_renamed_executable_lookup_receives_declared_service():
 
     assert result_value(output)["status"] == "installed_on_host"
     assert service.resolve_executable.call_args.args[0].tool_name == "find_tool"
+
+
+@pytest.mark.parametrize("kind", ["started", "unstarted", "coroutine", "borrowed"])
+def test_cancelled_async_callback_settles_nested_work(kind):
+    """Nested work returned while cancellation settles cannot outlive the callback."""
+    registry = ToolRegistry()
+    events = []
+
+    @declare_tool()
+    async def calculate() -> str:
+        """Detect accidental admission of the tool."""
+        events.append("tool")
+        return "done"
+
+    registry.register(calculate)
+
+    async def scenario():
+        """Cancel a callback which returns nested work during cleanup."""
+        started = asyncio.Event()
+        release = asyncio.Event()
+        coroutine = None
+
+        async def child():
+            """Remain active until cancellation or explicit release."""
+            try:
+                await release.wait()
+                events.append("child")
+            except asyncio.CancelledError:
+                events.append("cancelled")
+
+        async def execution_started():
+            """Return different nested work after receiving cancellation."""
+            nonlocal coroutine
+            try:
+                started.set()
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                coroutine = child()
+                if kind == "coroutine":
+                    return coroutine
+                if kind == "borrowed":
+                    return asyncio.create_task(coroutine)
+                work = OwnedToolTask(coroutine)
+                if kind == "started":
+                    work.start(asyncio.get_running_loop())
+                return work
+
+        task = asyncio.create_task(
+            registry.call_async("calculate", "{}", execution_started=execution_started)
+        )
+        await started.wait()
+        task.cancel()
+        await deliver_callbacks()
+        if kind == "borrowed":
+            assert not task.done()
+            release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert "tool" not in events
+        assert inspect.getcoroutinestate(coroutine) == inspect.CORO_CLOSED
+
+    import inspect
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_returned_callback_task_settles_nested_owned_work():
+    """A callback's settled task cannot leave a nested owned task running."""
+    registry = ToolRegistry()
+    effects = []
+
+    @declare_tool()
+    async def calculate() -> str:
+        """Detect incorrectly admitted effects."""
+        effects.append("tool")
+        return "done"
+
+    registry.register(calculate)
+
+    async def scenario():
+        """Interrupt a returned task which returns another started owned handle."""
+        started = asyncio.Event()
+        nested = []
+
+        async def child():
+            """Wait until canceled by the invocation owner."""
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                effects.append("child cancelled")
+
+        async def outer():
+            """Return a started nested task after interruption."""
+            try:
+                started.set()
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                work = OwnedToolTask(child())
+                nested.append(work.start(asyncio.get_running_loop()))
+                return work
+
+        def execution_started():
+            """Transfer ownership of the callback operation."""
+            return OwnedToolTask(outer())
+
+        task = asyncio.create_task(
+            registry.call_async("calculate", "{}", execution_started=execution_started)
+        )
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert nested and nested[0].done()
+        assert "tool" not in effects
+
+    asyncio.run(scenario())
+
+
+def test_async_callback_awaits_all_nested_tasks_before_admission():
+    """Nested callback tasks settle before execution starts."""
+    registry = ToolRegistry()
+    events = []
+
+    @declare_tool()
+    async def calculate() -> str:
+        """Record the admitted tool invocation."""
+        events.append("tool")
+        return "done"
+
+    registry.register(calculate)
+
+    async def scenario():
+        """Keep the nested callback task pending until explicitly released."""
+        release = asyncio.Event()
+
+        async def child():
+            """Mark callback completion."""
+            await release.wait()
+            events.append("child")
+
+        async def outer():
+            """Return a second task."""
+            return asyncio.create_task(child())
+
+        async def execution_started():
+            """Return the outer callback task."""
+            return asyncio.create_task(outer())
+
+        task = asyncio.create_task(
+            registry.call_async("calculate", "{}", execution_started=execution_started)
+        )
+        await deliver_callbacks()
+        assert events == []
+        release.set()
+        assert result_value(await task) == "done"
+        assert events == ["child", "tool"]
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_sync_dispatch_does_not_admit_returned_owned_child():
+    """Retained registry interruption prevents starting nested owned work."""
+    registry = ToolRegistry()
+    effects = []
+
+    async def scenario():
+        """Cancel a returned owned task that produces an unstarted owned child."""
+        started = asyncio.Event()
+        invoked = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        children = []
+
+        async def child():
+            """Record an incorrectly admitted operation."""
+            effects.append("child")
+
+        async def outer():
+            """Return unstarted work while settling cancellation."""
+            try:
+                started.set()
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                coroutine = child()
+                children.append(coroutine)
+                return OwnedToolTask(coroutine)
+
+        work = OwnedToolTask(outer())
+        work.start(asyncio.get_running_loop())
+
+        @declare_tool()
+        def calculate() -> str:
+            """Return already-started owned work."""
+            loop.call_soon_threadsafe(invoked.set)
+            return work
+
+        registry.register(calculate)
+        task = asyncio.create_task(registry.call_async("calculate", "{}"))
+        await started.wait()
+        await invoked.wait()
+        await deliver_callbacks()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert effects == []
+        assert children and inspect.getcoroutinestate(children[0]) == inspect.CORO_CLOSED
+
+    import inspect
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_planner_rejects_cyclic_awaitables_without_executing_tool(asynchronous):
+    """Cyclic planner results are rejected without admitting an effect."""
+    invoked = []
+
+    async def planner(arguments):
+        """Return a completed future whose result is itself."""
+        future = asyncio.get_running_loop().create_future()
+        future.set_result(future)
+        return future
+
+    @declare_tool(operation_planner=planner)
+    def calculate(number: int) -> int:
+        """Record execution after planning."""
+        invoked.append(number)
+        return number
+
+    registry = ToolRegistry([calculate])
+    try:
+        with pytest.raises(RuntimeError, match="Tool callback returned cyclic awaitables"):
+            if asynchronous:
+                asyncio.run(registry.call_async("calculate", '{"number": 3}'))
+            else:
+                registry.call("calculate", '{"number": 3}')
+        assert invoked == []
+    finally:
+        registry.close()
+
+
+def test_planner_runner_setup_failure_closes_returned_coroutine(monkeypatch):
+    """A failed runner setup closes planner work before any tool can execute."""
+    created, invoked = [], []
+
+    async def prepare(arguments):
+        """Produce a plan only if runner setup succeeds."""
+        return OperationPlan(arguments=arguments)
+
+    def planner(arguments):
+        """Retain the coroutine so the test can verify its closure."""
+        coroutine = prepare(arguments)
+        created.append(coroutine)
+        return coroutine
+
+    @declare_tool(operation_planner=planner)
+    def calculate(number: int) -> int:
+        """Record execution after planning."""
+        invoked.append(number)
+        return number
+
+    registry = ToolRegistry([calculate])
+    monkeypatch.setattr(
+        tool_registry_module.asyncio,
+        "Runner",
+        Mock(side_effect=OSError("synthetic runner setup failure")),
+    )
+    try:
+        result = json.loads(registry.call("calculate", '{"number": 3}'))
+        assert result["problem"]["code"] == "tool.planning_failed"
+        assert inspect.getcoroutinestate(created[0]) == inspect.CORO_CLOSED
+        assert invoked == []
+    finally:
+        registry.close()
+
+
+@pytest.mark.parametrize("callback", [False, True])
+def test_foreign_owned_task_is_neither_driven_nor_cancelled(callback):
+    """A foreign owned task remains with its loop when tool dispatch rejects it."""
+    foreign_loop = asyncio.new_event_loop()
+    effects = []
+
+    async def work():
+        """Detect any execution of the foreign task."""
+        effects.append("foreign work")
+
+    owned = OwnedToolTask(work())
+    foreign_task = owned.start(foreign_loop)
+
+    def calculate():
+        """Return foreign work when it is the tool result."""
+        return "done" if callback else owned
+
+    def execution_started():
+        """Return foreign work when it is the callback result."""
+        return owned
+
+    registry = ToolRegistry([calculate])
+    try:
+        if callback:
+            with pytest.raises(ProblemException) as caught:
+                asyncio.run(
+                    registry.call_async("calculate", "{}", execution_started=execution_started)
+                )
+            assert caught.value.problem.code == "tool.loop_mismatch"
+        else:
+            with pytest.raises(ToolExecutionOutcomeUnknown):
+                asyncio.run(registry.call_async("calculate", "{}"))
+        assert not foreign_task.done()
+        assert effects == []
+    finally:
+        registry.close()
+        foreign_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            foreign_loop.run_until_complete(foreign_task)
+        foreign_loop.run_until_complete(asyncio.sleep(0))
+        foreign_loop.close()
+
+
+def test_async_callback_resolves_custom_awaitable_before_tool_execution():
+    """A callback's custom awaitable settles before the tool is admitted."""
+    events = []
+
+    class CallbackResult:
+        """Represent an awaitable that is neither a coroutine nor a future."""
+
+        def __await__(self):
+            async def resolve():
+                """Complete the callback before the tool body begins."""
+                events.append("callback")
+
+            return resolve().__await__()
+
+    def execution_started():
+        """Return a custom callback awaitable."""
+        return CallbackResult()
+
+    def calculate():
+        """Record the admitted invocation."""
+        events.append("tool")
+        return "done"
+
+    registry = ToolRegistry([calculate])
+    try:
+        output = asyncio.run(
+            registry.call_async("calculate", "{}", execution_started=execution_started)
+        )
+        assert result_value(output) == "done"
+        assert events == ["callback", "tool"]
+    finally:
+        registry.close()
+
+
+def test_cancelled_custom_callback_cannot_admit_tool():
+    """A custom awaitable cannot admit execution by suppressing cancellation."""
+    events = []
+
+    async def scenario():
+        """Interrupt the callback while its custom awaitable is suspended."""
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        class CallbackResult:
+            """Represent borrowed custom callback work."""
+
+            def __await__(self):
+                async def resolve():
+                    """Finish only after the work's owner releases it."""
+                    started.set()
+                    await release.wait()
+                    events.append("callback settled")
+
+                return resolve().__await__()
+
+        def execution_started():
+            """Return custom callback work."""
+            return CallbackResult()
+
+        def calculate():
+            """Record any execution after cancellation."""
+            events.append("tool")
+            return "done"
+
+        registry = ToolRegistry([calculate])
+        try:
+            task = asyncio.create_task(
+                registry.call_async("calculate", "{}", execution_started=execution_started)
+            )
+            await started.wait()
+            task.cancel()
+            await deliver_callbacks()
+            assert not task.done()
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert events == ["callback settled"]
+        finally:
+            await asyncio.to_thread(registry.close)
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_custom_callback_preserves_borrowed_future():
+    """A custom wrapper cannot transfer ownership of its caller's future."""
+
+    async def scenario():
+        """Cancel dispatch while the wrapped borrowed future is pending."""
+        started = asyncio.Event()
+        future = asyncio.get_running_loop().create_future()
+        effects = []
+
+        class CallbackResult:
+            """Delegate to a caller-owned future."""
+
+            def __await__(self):
+                started.set()
+                return future.__await__()
+
+        def calculate():
+            """Record an incorrectly admitted tool."""
+            effects.append("tool")
+            return "done"
+
+        registry = ToolRegistry([calculate])
+        try:
+            task = asyncio.create_task(
+                registry.call_async("calculate", "{}", execution_started=CallbackResult)
+            )
+            await started.wait()
+            task.cancel()
+            await deliver_callbacks()
+            assert not task.done()
+            assert not future.cancelled()
+            future.set_result(None)
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert effects == []
+        finally:
+            await asyncio.to_thread(registry.close)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("callback", [False, True])
+def test_cancelled_worker_does_not_close_returned_borrowed_awaitable(callback):
+    """A worker returning after cancellation cannot close borrowed work."""
+
+    async def scenario():
+        """Interrupt a worker before it returns a borrowed custom awaitable."""
+        started, release = Event(), Event()
+        future = asyncio.get_running_loop().create_future()
+        effects = []
+
+        class BorrowedResult:
+            """Make an incorrect close observable on the owner's future."""
+
+            def __await__(self):
+                return future.__await__()
+
+            def close(self):
+                future.cancel()
+
+        def worker():
+            """Return borrowed work once the owner permits completion."""
+            started.set()
+            release.wait(timeout=5)
+            return BorrowedResult()
+
+        def calculate():
+            """Record an incorrectly admitted callback, or return tool work."""
+            if callback:
+                effects.append("tool")
+                return "done"
+            return worker()
+
+        registry = ToolRegistry([calculate])
+        try:
+            task = asyncio.create_task(
+                registry.call_async(
+                    "calculate", "{}", execution_started=worker if callback else None
+                )
+            )
+            assert await asyncio.to_thread(started.wait, 5)
+            task.cancel()
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert not future.cancelled()
+            assert effects == []
+        finally:
+            release.set()
+            future.cancel()
+            await asyncio.to_thread(registry.close)
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_callback_does_not_close_nested_borrowed_awaitable():
+    """A callback settling cancellation does not close a returned borrowed awaitable."""
+
+    async def scenario():
+        """Return a borrowed wrapper from a callback's cancellation handler."""
+        started = asyncio.Event()
+        future = asyncio.get_running_loop().create_future()
+
+        class BorrowedResult:
+            """Make an incorrect close observable on the owner's future."""
+
+            def __await__(self):
+                return future.__await__()
+
+            def close(self):
+                future.cancel()
+
+        async def before():
+            """Return borrowed work without starting it."""
+            try:
+                started.set()
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                return BorrowedResult()
+
+        def calculate():
+            """Return a value only if incorrectly admitted."""
+            return "unexpected"
+
+        registry = ToolRegistry([calculate])
+        try:
+            task = asyncio.create_task(
+                registry.call_async("calculate", "{}", execution_started=before)
+            )
+            await started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert not future.cancelled()
+        finally:
+            future.cancel()
+            await asyncio.to_thread(registry.close)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("callback", [False, True])
+def test_cancelled_custom_wrapper_does_not_start_work(callback, monkeypatch):
+    """Cancellation before a borrowed wrapper's first turn does not admit work."""
+    effects = []
+    original_shield = asyncio.shield
+
+    def interrupt_before_start(future):
+        """Interrupt just before waiting on the new custom-awaitable wrapper."""
+        if isinstance(future, asyncio.Task) and future.get_coro().__name__ == "await_value_async":
+            raise asyncio.CancelledError
+        return original_shield(future)
+
+    class CustomResult:
+        """Represent work that must not start after interruption."""
+
+        def __await__(self):
+            async def resolve():
+                """Record forbidden entry into the borrowed work."""
+                effects.append("started")
+                return "done"
+
+            return resolve().__await__()
+
+    def calculate():
+        """Return custom tool work or record an incorrectly admitted callback."""
+        if callback:
+            effects.append("tool")
+            return "done"
+        return CustomResult()
+
+    monkeypatch.setattr(asyncio, "shield", interrupt_before_start)
+    registry = ToolRegistry([calculate])
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(
+                registry.call_async(
+                    "calculate", "{}", execution_started=CustomResult if callback else None
+                )
+            )
+        assert effects == []
+    finally:
+        registry.close()
+
+
+def test_cancelled_custom_tool_awaitable_retains_receipt():
+    """A custom tool awaitable retains its result while propagating cancellation."""
+    effects = []
+
+    async def scenario():
+        """Interrupt the caller while its borrowed tool work settles."""
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        class ToolResult:
+            """Complete a side effect while its caller is interrupted."""
+
+            def __await__(self):
+                async def resolve():
+                    """Return the known outcome after cancellation."""
+                    started.set()
+                    await release.wait()
+                    effects.append("committed")
+                    return "confirmed"
+
+                return resolve().__await__()
+
+        def calculate():
+            """Return custom tool work."""
+            return ToolResult()
+
+        registry = ToolRegistry([calculate])
+        try:
+            task = asyncio.create_task(registry.call_async("calculate", "{}"))
+            await started.wait()
+            task.cancel()
+            await deliver_callbacks()
+            assert not task.done()
+            release.set()
+            with pytest.raises(asyncio.CancelledError) as caught:
+                await task
+            assert result_value(caught.value.output) == "confirmed"
+            assert effects == ["committed"]
+        finally:
+            await asyncio.to_thread(registry.close)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("declared_final", [False, True])
+def test_awaited_owned_result_requires_final_declaration(declared_final):
+    """Only an explicitly final child outcome becomes the interrupted tool receipt."""
+    effects = []
+
+    async def scenario():
+        """Interrupt an async tool while its owned child settles."""
+        started = asyncio.Event()
+
+        async def effect():
+            """Return a confirmed result after a synthetic side effect."""
+            try:
+                started.set()
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                effects.append("committed")
+                return "confirmed"
+
+        @declare_tool()
+        async def calculate() -> str:
+            """Await the owned operation as the tool's final step."""
+            return await OwnedToolTask(effect(), final_result=declared_final)
+
+        registry = ToolRegistry([calculate])
+        try:
+            task = asyncio.create_task(registry.call_async("calculate", "{}"))
+            await started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError) as caught:
+                await task
+            if declared_final:
+                assert result_value(caught.value.output) == "confirmed"
+            else:
+                assert not hasattr(caught.value, "output")
+            assert effects == ["committed"]
+        finally:
+            await asyncio.to_thread(registry.close)
+
+    asyncio.run(scenario())
+
+
+def test_intermediate_owned_result_never_admits_following_work_after_cancel():
+    """An intermediate result cannot become a final receipt or resume tool effects."""
+    effects = []
+
+    async def scenario():
+        """Interrupt an intermediate owned operation in an async tool."""
+        started = asyncio.Event()
+
+        async def child():
+            """Complete one intermediate step during cancellation."""
+            try:
+                started.set()
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                effects.append("child")
+                return "partial"
+
+        @declare_tool()
+        async def calculate() -> str:
+            """Run two steps, the second of which must not start."""
+            await OwnedToolTask(child())
+            effects.append("later")
+            return "finished"
+
+        registry = ToolRegistry([calculate])
+        try:
+            task = asyncio.create_task(registry.call_async("calculate", "{}"))
+            await started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError) as caught:
+                await task
+            assert not hasattr(caught.value, "output")
+            assert effects == ["child"]
+        finally:
+            await asyncio.to_thread(registry.close)
+
+    asyncio.run(scenario())
+
+
+def test_final_result_does_not_start_nested_custom_work_after_cancellation():
+    """A declared final outcome cannot start returned custom work after interruption."""
+    effects = []
+
+    async def scenario():
+        """Return a borrowed custom awaitable from a settling final operation."""
+        started = asyncio.Event()
+
+        class Deferred:
+            """Represent work which has not started."""
+
+            def __await__(self):
+                async def resolve():
+                    """Record any incorrectly admitted execution."""
+                    effects.append("deferred")
+                    return "unexpected"
+
+                return resolve().__await__()
+
+        async def child():
+            """Return deferred work while settling interruption."""
+            try:
+                started.set()
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                return Deferred()
+
+        @declare_tool()
+        async def calculate() -> str:
+            """Declare the owned child as the final outcome."""
+            return await OwnedToolTask(child(), final_result=True)
+
+        registry = ToolRegistry([calculate])
+        try:
+            task = asyncio.create_task(registry.call_async("calculate", "{}"))
+            await started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError) as caught:
+                await task
+            assert not hasattr(caught.value, "output")
+            assert effects == []
+        finally:
+            await asyncio.to_thread(registry.close)
+
+    asyncio.run(scenario())
+
+
+def test_final_result_nested_admission_failure_is_execution_failure(caplog):
+    """A nested failure after an effect cannot report the invocation as unstarted."""
+    effects = []
+
+    async def scenario():
+        """Return an already-failed borrowed future after cancellation."""
+        started = asyncio.Event()
+
+        async def child():
+            """Commit an effect and return the nested failure."""
+            try:
+                started.set()
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                effects.append("committed")
+                future = asyncio.get_running_loop().create_future()
+                future.set_exception(tool_registry_module.ToolExecutionAdmissionRejected())
+                return future
+
+        @declare_tool()
+        async def calculate() -> str:
+            """Declare the child as the final outcome."""
+            return await OwnedToolTask(child(), final_result=True)
+
+        registry = ToolRegistry([calculate])
+        try:
+            task = asyncio.create_task(registry.call_async("calculate", "{}"))
+            await started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError) as caught:
+                await task
+            assert json.loads(caught.value.output)["problem"]["code"] == "tool.execution_failed"
+            assert effects == ["committed"]
+            assert any(
+                record.__dict__.get("error.type") == "tool.execution_failed"
+                for record in caplog.records
+            )
+        finally:
+            await asyncio.to_thread(registry.close)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("native_tool", [False, True])
+@pytest.mark.parametrize("cancel_dispatch", [False, True])
+def test_foreign_final_marker_is_not_tool_receipt(native_tool, cancel_dispatch):
+    """An unrelated task's final marker cannot become this invocation's receipt."""
+
+    async def scenario():
+        """Cancel an independently owned operation while a tool is waiting for it."""
+        started = asyncio.Event()
+
+        async def foreign_child():
+            """Return an unrelated receipt when its own owner cancels it."""
+            try:
+                started.set()
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                return "unrelated receipt"
+
+        async def foreign_operation():
+            """Expose the foreign operation's explicitly final outcome."""
+            return await OwnedToolTask(foreign_child(), final_result=True)
+
+        foreign = asyncio.create_task(foreign_operation())
+
+        async def async_calculate():
+            """Await a task owned by another operation."""
+            return await foreign
+
+        def sync_calculate():
+            """Return a task owned by another operation."""
+            return foreign
+
+        calculate = async_calculate if native_tool else sync_calculate
+        registry = ToolRegistry([calculate])
+        try:
+            task = asyncio.create_task(registry.call_async(calculate.__name__, "{}"))
+            await started.wait()
+            await deliver_callbacks()
+            if cancel_dispatch:
+                task.cancel()
+            foreign.cancel()
+            with pytest.raises(asyncio.CancelledError) as caught:
+                await task
+            assert not hasattr(caught.value, "output")
+        finally:
+            await asyncio.to_thread(registry.close)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    ["child_failure", "admission_failure", "finally_failure", "finally_admission", "caught"],
+)
+def test_final_owned_outcome_respects_enclosing_tool_cleanup(outcome, caplog):
+    """Actual parent outcomes supersede a declared child outcome during cleanup."""
+
+    async def scenario():
+        """Interrupt the declared final child and settle its parent."""
+        started = asyncio.Event()
+
+        async def child():
+            """Settle the child during cancellation."""
+            try:
+                started.set()
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                if outcome == "child_failure":
+                    raise ValueError("child failure")
+                if outcome == "admission_failure":
+                    raise tool_registry_module.ToolExecutionAdmissionRejected
+                return "child result"
+
+        @declare_tool()
+        async def calculate() -> str:
+            """Return the declared final outcome unless cleanup changes it."""
+            try:
+                return await OwnedToolTask(child(), final_result=True)
+            except asyncio.CancelledError:
+                if outcome == "caught":
+                    return "parent result"
+                raise
+            finally:
+                if outcome == "finally_failure":
+                    raise ValueError("parent cleanup failure")
+                if outcome == "finally_admission":
+                    raise tool_registry_module.ToolExecutionAdmissionRejected
+
+        registry = ToolRegistry([calculate])
+        try:
+            task = asyncio.create_task(registry.call_async("calculate", "{}"))
+            await started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError) as caught:
+                await task
+            result = json.loads(caught.value.output)
+            if outcome == "caught":
+                assert result["result"] == "parent result"
+            else:
+                assert result["problem"]["code"] == "tool.execution_failed"
+                assert any(
+                    record.__dict__.get("error.type") == "tool.execution_failed"
+                    for record in caplog.records
+                )
+        finally:
+            await asyncio.to_thread(registry.close)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("second_interrupt", [False, True])
+def test_sync_interrupted_owned_receipt_is_normalized_and_propagated(second_interrupt):
+    """Synchronous Ctrl+C carries the final receipt through registry normalization."""
+    effects = []
+
+    def interrupt():
+        """Interrupt the runner after the tool has started."""
+        raise KeyboardInterrupt
+
+    async def child():
+        """Commit an effect and return its outcome during cancellation."""
+        try:
+            asyncio.get_running_loop().call_soon(interrupt)
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            if second_interrupt:
+                asyncio.get_running_loop().call_soon(interrupt)
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+            effects.append("committed")
+            return "confirmed"
+
+    @declare_tool()
+    async def calculate() -> str:
+        """Declare the child outcome as final."""
+        return await OwnedToolTask(child(), final_result=True)
+
+    registry = ToolRegistry([calculate])
+    try:
+        with pytest.raises(KeyboardInterrupt) as caught:
+            registry.call_with_timing("calculate", "{}")
+        assert result_value(caught.value.output) == "confirmed"
+        assert caught.value.duration >= 0
+        assert effects == ["committed"]
+        if second_interrupt:
+            assert caught.value.__notes__ == ["Tool cleanup also stopped with KeyboardInterrupt."]
+    finally:
+        registry.close()
+
+
+@pytest.mark.parametrize("outcome", ["cancelled", "failed", "returned"])
+def test_cancelled_async_start_callback_preserves_signal_and_reports_failure(outcome, caplog):
+    """Cancelled start callbacks settle, signal cancellation, and never admit a tool."""
+    signal, effects = Event(), []
+
+    def calculate():
+        """Record forbidden execution after cancellation."""
+        effects.append("tool")
+        return "done"
+
+    async def scenario():
+        """Cancel while the asynchronous start callback is waiting."""
+        started = asyncio.Event()
+
+        async def execution_started():
+            """Choose the callback's terminal outcome after cancellation."""
+            try:
+                started.set()
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                if outcome == "failed":
+                    raise RuntimeError("private callback cleanup failure")
+                if outcome == "cancelled":
+                    raise
+                return
+
+        registry = ToolRegistry([calculate])
+        try:
+            task = asyncio.create_task(
+                registry.call_async(
+                    "calculate",
+                    "{}",
+                    execution_started=execution_started,
+                    cancellation_event=signal,
+                )
+            )
+            await started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert signal.is_set()
+            assert effects == []
+        finally:
+            await asyncio.to_thread(registry.close)
+
+    asyncio.run(scenario())
+    if outcome == "failed":
+        assert len(caplog.records) == 1
+        assert caplog.records[0].__dict__["error.type"] == "tool.callback_failed"
+        assert "private callback cleanup failure" not in caplog.records[0].getMessage()
+    else:
+        assert not caplog.records
+
+
+@pytest.mark.parametrize("outcome", ["cycle", "cancelled", "failure", "foreign", "foreign_owned"])
+def test_cancelled_callback_settles_nested_future_outcomes(outcome, caplog):
+    """Nested callback cleanup preserves foreign ownership and reports failures once."""
+    foreign_loop = asyncio.new_event_loop()
+    foreign_future = foreign_loop.create_future()
+    foreign_owned = None
+    foreign_task = None
+    effects = []
+
+    async def foreign_work():
+        """Detect accidental execution on a foreign owner loop."""
+        effects.append("foreign")
+
+    if outcome == "foreign_owned":
+        foreign_owned = OwnedToolTask(foreign_work())
+        foreign_task = foreign_owned.start(foreign_loop)
+
+    def calculate():
+        """Detect tool execution after cancellation."""
+        effects.append("tool")
+        return "done"
+
+    async def scenario():
+        """Return a nested future from the callback's cancellation handler."""
+        started = asyncio.Event()
+
+        async def execution_started():
+            """Return a controlled cleanup result after cancellation."""
+            try:
+                started.set()
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                if outcome == "foreign":
+                    return foreign_future
+                if outcome == "foreign_owned":
+                    return foreign_owned
+                future = asyncio.get_running_loop().create_future()
+                if outcome == "cycle":
+                    future.set_result(future)
+                elif outcome == "cancelled":
+                    future.cancel()
+                else:
+                    future.set_exception(RuntimeError("private nested failure"))
+                return future
+
+        registry = ToolRegistry([calculate])
+        try:
+            task = asyncio.create_task(
+                registry.call_async("calculate", "{}", execution_started=execution_started)
+            )
+            await started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert not foreign_future.done()
+            assert foreign_task is None or not foreign_task.done()
+            assert effects == []
+        finally:
+            await asyncio.to_thread(registry.close)
+
+    try:
+        asyncio.run(scenario())
+        if outcome == "failure":
+            assert len(caplog.records) == 1
+            assert caplog.records[0].__dict__["error.type"] == "tool.callback_failed"
+            assert "private nested failure" not in caplog.records[0].getMessage()
+        else:
+            assert not caplog.records
+    finally:
+        foreign_future.cancel()
+        if foreign_task is not None:
+            foreign_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                foreign_loop.run_until_complete(foreign_task)
+            foreign_loop.run_until_complete(asyncio.sleep(0))
+        foreign_loop.close()
+
+
+def test_cancelled_callback_worker_preserves_foreign_owned_task():
+    """A cancelled worker cannot claim or cancel a task on another loop."""
+    foreign_loop = asyncio.new_event_loop()
+    entered, release = Event(), Event()
+    effects = []
+
+    async def foreign_work():
+        """Detect accidental execution of foreign owned work."""
+        effects.append("foreign")
+
+    owned = OwnedToolTask(foreign_work())
+    foreign_task = owned.start(foreign_loop)
+
+    def execution_started():
+        """Return foreign work after cancellation reaches the worker."""
+        entered.set()
+        assert release.wait(timeout=5), "test synchronization was not released"
+        return owned
+
+    def calculate():
+        """Detect tool execution after cancellation."""
+        effects.append("tool")
+        return "done"
+
+    async def scenario():
+        """Cancel dispatch while the callback worker is still active."""
+        registry = ToolRegistry([calculate])
+        task = asyncio.create_task(
+            registry.call_async("calculate", "{}", execution_started=execution_started)
+        )
+        try:
+            await asyncio.to_thread(entered.wait)
+            task.cancel()
+            await deliver_callbacks()
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert not foreign_task.done()
+            assert effects == []
+        finally:
+            release.set()
+            await asyncio.gather(task, return_exceptions=True)
+            await asyncio.to_thread(registry.close)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        foreign_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            foreign_loop.run_until_complete(foreign_task)
+        foreign_loop.run_until_complete(asyncio.sleep(0))
+        foreign_loop.close()
+
+
+def test_sync_start_callback_returning_coroutine_is_awaited():
+    """A synchronous start callback's coroutine settles before tool execution."""
+    events = []
+
+    async def prepare():
+        """Record completion of the asynchronous callback work."""
+        events.append("callback")
+
+    def execution_started():
+        """Return unstarted coroutine work from the worker."""
+        return prepare()
+
+    def calculate():
+        """Record the admitted tool execution."""
+        events.append("tool")
+        return "done"
+
+    registry = ToolRegistry([calculate])
+    try:
+        output = asyncio.run(
+            registry.call_async("calculate", "{}", execution_started=execution_started)
+        )
+        assert result_value(output) == "done"
+        assert events == ["callback", "tool"]
+    finally:
+        registry.close()
+
+
+@pytest.mark.parametrize("started", [False, True])
+def test_cancelled_callback_worker_settles_owned_work(started):
+    """Cancelled callback workers close unstarted work or cancel started owned work."""
+    entered, release = Event(), Event()
+    effects = []
+
+    def calculate():
+        """Detect forbidden tool execution after cancellation."""
+        effects.append("tool")
+        return "done"
+
+    async def scenario():
+        """Release the callback only after dispatch has been cancelled."""
+        running = asyncio.Event()
+
+        async def work():
+            """Settle a cancellation if this owned work has started."""
+            try:
+                running.set()
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                effects.append("cancelled")
+
+        coroutine = work()
+        owned = OwnedToolTask(coroutine)
+        if started:
+            owned.start(asyncio.get_running_loop())
+            await running.wait()
+
+        def execution_started():
+            """Transfer owned work once the worker is released."""
+            entered.set()
+            assert release.wait(timeout=5), "test synchronization was not released"
+            return owned
+
+        registry = ToolRegistry([calculate])
+        task = asyncio.create_task(
+            registry.call_async("calculate", "{}", execution_started=execution_started)
+        )
+        try:
+            await asyncio.to_thread(entered.wait)
+            task.cancel()
+            await deliver_callbacks()
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert inspect.getcoroutinestate(coroutine) == inspect.CORO_CLOSED
+            assert effects == (["cancelled"] if started else [])
+        finally:
+            release.set()
+            await asyncio.gather(task, return_exceptions=True)
+            await asyncio.to_thread(registry.close)
+
+    asyncio.run(scenario())

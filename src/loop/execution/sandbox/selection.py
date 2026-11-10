@@ -5,14 +5,15 @@ from __future__ import annotations
 import os
 import platform
 import shlex
-import stat
 import tempfile
 import time
 from contextlib import ExitStack
+from importlib import import_module
 from pathlib import Path
 from threading import Event
+from types import ModuleType
+from typing import TYPE_CHECKING
 
-from ... import constants
 from .constants import (
     COMMAND_SANDBOX_SCRATCH_PREFIX,
     LANG_ENVIRONMENT_VARIABLE,
@@ -21,45 +22,30 @@ from .constants import (
     SYSTEM_LOCALE,
     TMPDIR_ENVIRONMENT_VARIABLE,
 )
-from .contracts import CommandProcessResult, SandboxBackend, SandboxOutcome, SandboxRequest
+from .contracts import (
+    CommandProcessResult,
+    QualificationProbeLayout,
+    SandboxBackend,
+    SandboxCapability,
+    SandboxOutcome,
+    SandboxRequest,
+)
+
+if TYPE_CHECKING:
+    from ...permissions.manager import PermissionManager
 
 
-def _macos_backend() -> SandboxBackend:
-    """Load the built-in macOS adapter only for a Darwin capability probe."""
-    from .macos import MacOSSeatbeltBackend
-
-    return MacOSSeatbeltBackend()
+_BACKEND_MODULES = {"Linux": ".linux.backend", "Darwin": ".macos.backend"}
 
 
-def _linux_probe_workspace_root() -> Path:
-    """Return an owned stable Linux probe root so repeat probes reuse one policy."""
-    parent = Path(tempfile.gettempdir()).resolve(strict=True)
-    parent_mode = parent.stat()
-    private_parent = (
-        parent_mode.st_uid == os.getuid()
-        and not parent_mode.st_mode & constants.GROUP_AND_OTHER_WRITE_MODE_MASK
-    )
-    sticky_shared_parent = (
-        parent_mode.st_uid == 0
-        and bool(parent_mode.st_mode & stat.S_ISVTX)
-        and bool(parent_mode.st_mode & stat.S_IWOTH)
-    )
-    if not stat.S_ISDIR(parent_mode.st_mode) or not (private_parent or sticky_shared_parent):
-        raise OSError("Temporary parent is not private or root-owned and sticky.")
+def selected_backend_module() -> ModuleType | None:
+    """Load only the reviewed native backend module for this host.
 
-    root = parent / f"loop-sandbox-probe-{os.getuid()}"
-    try:
-        root.mkdir(mode=constants.PRIVATE_DIRECTORY_MODE)
-    except FileExistsError:
-        pass
-    root_mode = root.lstat()
-    if (
-        not stat.S_ISDIR(root_mode.st_mode)
-        or root_mode.st_uid != os.getuid()
-        or stat.S_IMODE(root_mode.st_mode) != constants.PRIVATE_DIRECTORY_MODE
-    ):
-        raise OSError("Linux probe root is not an owned private directory.")
-    return root
+    Returns:
+        ModuleType | None: Matching backend module, or None for an unsupported host.
+    """
+    name = _BACKEND_MODULES.get(platform.system())
+    return import_module(name, __package__) if name is not None else None
 
 
 class UnavailableSandboxBackend:
@@ -71,9 +57,37 @@ class UnavailableSandboxBackend:
     """
 
     _reason: str | CommandProcessResult
+    capabilities = frozenset()
+    qualification_capabilities = frozenset()
 
     def __init__(self, reason: str | CommandProcessResult) -> None:
         self._reason = reason
+
+    def qualification_layout(self) -> QualificationProbeLayout:
+        """Return no probe parents when native execution is unavailable.
+
+        Returns:
+            QualificationProbeLayout: Default placement unused by this backend.
+        """
+        return QualificationProbeLayout(None, None)
+
+    def qualification_failure(
+        self, result: CommandProcessResult | None, reason: str
+    ) -> str | CommandProcessResult:
+        """Retain the original unavailable reason instead of reclassifying it.
+
+        Args:
+            result (CommandProcessResult | None): Unused native probe result.
+            reason (str): Unused failure explanation.
+
+        Returns:
+            str | CommandProcessResult: Original unavailable reason.
+        """
+        del result, reason
+        return self._reason
+
+    def close(self) -> None:
+        """Release no resources from an unavailable backend."""
 
     @property
     def trusted_file_owner_ids(self) -> tuple[int, ...]:
@@ -166,21 +180,45 @@ class UnavailableSandboxBackend:
         """
         return self._reason
 
+    def qualification_probe(self, request: SandboxRequest) -> CommandProcessResult:
+        """Reject a probe when no native sandbox is available.
+
+        Args:
+            request (SandboxRequest): Probe request that cannot run.
+
+        Returns:
+            CommandProcessResult: The original typed unavailability result.
+        """
+        return self.run(request)
+
+    def complete_qualification(self, request: SandboxRequest) -> None:
+        """Keep an unavailable backend without advertised capabilities.
+
+        Args:
+            request (SandboxRequest): Unused probe request.
+        """
+        del request
+
     def run(
         self,
         request: SandboxRequest,
         *,
         cancellation_event: Event | None = None,
+        policy_authority: PermissionManager | None = None,
+        approved_revision: int | None = None,
     ) -> CommandProcessResult:
         """Return a typed failure without launching a child.
 
         Args:
             request (SandboxRequest): Command that cannot be executed on this host.
             cancellation_event (Event | None): Optional run cancellation signal.
+            policy_authority (PermissionManager | None): Unused unavailable mediator authority.
+            approved_revision (int | None): Unused unavailable revision.
 
         Returns:
             CommandProcessResult: Original typed capability or integrity failure.
         """
+        del policy_authority, approved_revision
         if isinstance(self._reason, CommandProcessResult):
             return self._reason
         return CommandProcessResult(
@@ -191,49 +229,45 @@ class UnavailableSandboxBackend:
 
 
 def select_sandbox_backend() -> SandboxBackend:
-    """Select authenticated Linux installation or natively probed macOS confinement.
+    """Select and independently probe the native backend for this host.
+
+    Bind probe scratch explicitly and let each backend place its protected probe workspace.
 
     Returns:
         SandboxBackend: Available native backend or a fail-closed unavailable backend.
     """
-    host = platform.system()
-    if host == "Linux":
-        from .linux import LinuxNativeBackend
-
-        backend = LinuxNativeBackend()
-        failure = backend.capability_failure()
-        if failure is not None:
-            return UnavailableSandboxBackend(failure)
-    elif host == "Darwin":
-        backend = _macos_backend()
-    else:
+    backend_module = selected_backend_module()
+    if backend_module is None:
         return UnavailableSandboxBackend("No native command sandbox is qualified for this host.")
+    backend = backend_module.create_backend()
+    failure = backend.capability_failure()
+    if failure is not None:
+        return UnavailableSandboxBackend(failure)
+    result = None
     try:
         with ExitStack() as directories:
-            probe_workspace_root = _linux_probe_workspace_root() if host == "Linux" else None
+            layout = backend.qualification_layout()
             directory = directories.enter_context(
                 tempfile.TemporaryDirectory(
-                    prefix="loop-sandbox-probe-",
-                    dir=probe_workspace_root,
+                    prefix=f"{COMMAND_SANDBOX_SCRATCH_PREFIX}probe-",
+                    dir=layout.probe_parent,
                 )
             )
             root = Path(directory).resolve(strict=True)
             workspace = root / "workspace"
             workspace.mkdir()
-            if probe_workspace_root is None:
+            if layout.outside_parent is None:
                 outside = root / "outside"
                 outside.mkdir()
-                workspace_authority = workspace
             else:
                 outside = Path(
                     directories.enter_context(
                         tempfile.TemporaryDirectory(
-                            prefix="loop-sandbox-outside-",
-                            dir=probe_workspace_root.parent,
+                            prefix=f"{COMMAND_SANDBOX_SCRATCH_PREFIX}outside-",
+                            dir=layout.outside_parent,
                         )
                     )
                 ).resolve(strict=True)
-                workspace_authority = probe_workspace_root
             scratch_directory = directories.enter_context(
                 tempfile.TemporaryDirectory(prefix=backend.scratch_prefix)
             )
@@ -251,10 +285,13 @@ def select_sandbox_backend() -> SandboxBackend:
                     f"printf overwritten > {shlex.quote(str(canary))}"
                 ),
                 cwd=workspace,
-                workspace=workspace_authority,
+                workspace=workspace,
                 read_roots=(),
-                write_roots=(workspace_authority,),
+                write_roots=(workspace,),
                 network=False,
+                local_network=(
+                    SandboxCapability.LOCAL_NETWORK in backend.qualification_capabilities
+                ),
                 environment={
                     PATH_ENVIRONMENT_VARIABLE: MINIMAL_SYSTEM_PATH,
                     LANG_ENVIRONMENT_VARIABLE: SYSTEM_LOCALE,
@@ -263,8 +300,9 @@ def select_sandbox_backend() -> SandboxBackend:
                 policy_version=backend.policy_version,
                 deadline=time.monotonic() + 5,
                 workspace_id="native-probe",
+                scratch_root=scratch,
             )
-            result = backend.run(request)
+            result = backend.qualification_probe(request)
             enforced = (
                 result.outcome is SandboxOutcome.COMPLETED
                 and result.exit_code != 0
@@ -272,6 +310,8 @@ def select_sandbox_backend() -> SandboxBackend:
                 and not (workspace / "leaked").exists()
                 and canary.read_text(encoding="utf-8") == "keep"
             )
+            if enforced:
+                backend.complete_qualification(request)
     except (OSError, ValueError):
         reason = "Native sandbox capability probe could not be prepared."
     else:
@@ -282,12 +322,5 @@ def select_sandbox_backend() -> SandboxBackend:
             if "sandbox_apply" in result.detail
             else f"Native sandbox capability probe failed ({result.outcome.value})."
         )
-    if host == "Linux":
-        return UnavailableSandboxBackend(
-            CommandProcessResult(
-                SandboxOutcome.INVALID,
-                detail=reason,
-            )
-        )
     backend.close()
-    return UnavailableSandboxBackend(reason)
+    return UnavailableSandboxBackend(backend.qualification_failure(result, reason))

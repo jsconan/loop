@@ -5,6 +5,7 @@ from pathlib import Path
 from threading import Lock
 from weakref import finalize
 
+from ... import constants
 from ...models import Message
 from ...utils import content_digest, utc_now, validate_content_handle
 from ..models import (
@@ -32,7 +33,7 @@ class MemorySessionStore:
     _session_references: dict[str, set[str]]
 
     def __init__(self) -> None:
-        temporary = tempfile.TemporaryDirectory(prefix="loop-sessions-")
+        temporary = tempfile.TemporaryDirectory(prefix=f"{constants.APP_NAME}-sessions-")
         self._cleanup = finalize(self, temporary.cleanup)
         self._temporary_path = Path(temporary.name).resolve()
         self._bindings = {}

@@ -24,11 +24,17 @@ Run `tests/integration/macos/` from a terminal whose parent process permits Seat
 
 ## Linux native integration
 
-Provision the Linux sandbox explicitly through the main app before running installed execution checks. Ordinary integration tests do not install, refresh, or remove it. Use an installation matching the package being tested; incompatible installations refuse execution until refreshed. Without a working installation, the suite checks unavailable behavior and skips enforcement cases.
+Provision the Linux sandbox explicitly through the main app before running installed execution checks. Ordinary integration tests do not install, refresh, or remove it. Use an authenticated installation compatible with the package being tested. Without a working installation, the suite checks unavailable behavior and skips enforcement cases.
+
+Linux policy attestation requires the compiled policy bytes to match the kernel export. If the AppArmor parser emits a recognized compressed container, Loop retries with `--zstd-compress-level=0` under the original deadline. A parser that cannot produce attestable uncompressed policy leaves the sandbox unavailable; Loop does not weaken the byte comparison.
+
+Mediated HTTP(S) egress uses the installed receiver and an attempt-private proxy bridge. The payload's isolated network namespace exposes only its own loopback proxy listener; connected client sockets are passed to the trusted receiver over a private sequenced-packet channel. The receiver checks the active policy revision, resolves and filters destinations, and owns pinned upstream sockets. Heartbeat loss, policy activation, supervisor loss, attempt termination, and command deadlines close the bridge and covered transports. This is distinct from the general network grant, which remains subject to the private-network hard limit.
 
 Put the test virtual environment and `uv` on `PATH`, with pytest, pytest-cov and Ruff installed, to exercise the development-tool workflows. Some checks also require explicitly provisioned fake runtime data or a directory on the sandbox listener’s filesystem. See [native Linux test setup](../tests/README.md#native-linux-test-setup) for the environment variables and fixture requirements.
 
-Capacity and management lifecycle checks are opt-in and require a disposable Linux host. The capacity check fills the policy cache and requires a refresh afterward. The lifecycle check installs and removes the sandbox, requires a real terminal with administrator authentication, and must run separately. Do not raise limits, broaden permissions, or omit assertions to make native checks pass.
+Capacity and management lifecycle checks are opt-in and require a disposable Linux host. The capacity checks exercise repeated policy reclamation and concurrent live requests. The lifecycle check installs and removes the sandbox, requires a real terminal with administrator authentication, and must run separately. Do not raise limits, broaden permissions, or omit assertions to make native checks pass.
+
+The installed inner-seccomp case runs its useful child and outer-boundary controls on any qualified Linux host. Set `LOOP_NATIVE_INNER_ADVERSARIAL_TEST=disposable-linux-host` only on a disposable VM to also probe namespace and mount administration, nested Bubblewrap, profile and cgroup controls, and detached-child cleanup. The test copies the host's Bubblewrap executable into its owned synthetic workspace; it never changes the installed Loop helper.
 
 ## Source organization
 

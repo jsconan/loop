@@ -27,6 +27,7 @@ from loop import (
     Message,
     ModelSelectionError,
     OpenAIBackend,
+    OwnedToolTask,
     PendingToolCall,
     PermissionManager,
     Problem,
@@ -46,6 +47,7 @@ from loop import (
     ToolCall,
     ToolCallCompleted,
     ToolExecutionMetrics,
+    ToolRegistration,
     ToolRegistry,
     ToolResult,
     Usage,
@@ -53,12 +55,27 @@ from loop import (
     read_text_file,
 )
 from loop.agent import Agent, AgentRunner, AgentRunRecoveryRequired, AgentRunResult
-from loop.conversation.interaction import MailboxInteraction
+from loop.agent import runner as agent_runner_module
+from loop.conversation.interaction import ApprovalInteraction, MailboxInteraction
+from loop.execution import CommandExecutionService
+from loop.execution import jobs as command_jobs
+from loop.execution.sandbox import CommandProcessResult, SandboxOutcome
+from loop.execution.sandbox.linux.backend import LinuxNativeBackend
 from loop.session.models import RunCompletedEvent, RunStartedEvent
 from loop.telemetry import MemoryTelemetryAdapter, Telemetry, set_telemetry
-from loop.tooling import FileObservations
-from loop.utils import PathHolder, VirtualPath, content_digest, utc_now
+from loop.tooling import (
+    FileObservations,
+    Tool,
+    ToolContext,
+    ToolExecutionAdmissionRejected,
+    ToolRuntimeSettings,
+)
+from loop.tooling.models import ToolExecutionInterrupted, ToolExecutionNotStarted
+from loop.tools.system import control_command_terminal, run_command
+from loop.utils import PathHolder, VirtualPath, await_value_async, content_digest, utc_now
 from tests.scheduling import deliver_callbacks
+
+from ..execution.sandbox.helpers import logical_private_name
 
 
 def agent_runner(
@@ -155,6 +172,56 @@ def agent_runner(
     return runner, session_manager, interaction
 
 
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("superseded", [False, True])
+def test_yolo_recovery_preserves_unknown_tool_outcome_without_prompt(asynchronous, superseded):
+    """No-prompt recovery leaves a possibly executed tool unresolved for an explicit action."""
+    runner, sessions, interaction = agent_runner()
+    runner.permission_manager.yolo = True
+    call = ToolCall(call_id="uncertain", name="mutate", arguments="{}")
+    sessions.recovery_state = SessionRecoveryState(
+        action="resolve_uncertain_tools",
+        pending_calls=(PendingToolCall(call=call, status="outcome_unknown"),),
+        superseded=superseded,
+    )
+    if asynchronous:
+        result = asyncio.run(runner.recover_session_async())
+    else:
+        result = runner.recover_session()
+    assert result.pending is True
+    runner.agent.tools.call_with_timing.assert_not_called()
+    interaction.confirm.assert_not_called()
+    runner.permission_manager.confirmation_decision.assert_called_once_with(certain=False)
+    assert "may already have run" in interaction.warning.call_args.args[0]
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_yolo_retries_a_recoverable_model_request_at_most_once(asynchronous):
+    """Known no-effect model failures receive one automatic retry and then need recovery."""
+    error = BackendConnectionError("temporary", provider="test", operation="query")
+    runner, sessions, interaction = agent_runner(responses=[error, error])
+    sessions.begin_run()
+    runner.permission_manager.yolo = True
+    if asynchronous:
+        prompt = MagicMock(spec=ConsoleInteraction)
+        prompt.confirm_async = AsyncMock(return_value=True)
+        runner._interaction = prompt
+        runner.query_async = AsyncMock(side_effect=[error, error])
+        with pytest.raises(AgentRunRecoveryRequired):
+            asyncio.run(runner._query_with_recovery_async())
+        assert runner.query_async.await_count == 2
+        prompt.confirm_async.assert_awaited_once()
+        sessions.record_run_failure_async.assert_awaited_once()
+    else:
+        interaction.confirm.return_value = True
+        with pytest.raises(AgentRunRecoveryRequired):
+            runner._query_with_recovery()
+        assert runner.query.call_count == 2
+        interaction.confirm.assert_called_once()
+        sessions.record_run_failure.assert_called_once()
+    runner.permission_manager.confirmation_decision.assert_called_once_with(certain=False)
+
+
 def test_runner_confirm_async_requires_native_async_interaction():
     """Async agent confirmation never calls a synchronous prompt on the owner loop."""
     runner, _, interaction = agent_runner()
@@ -215,6 +282,1030 @@ def file_runner(tmp_path, backend, *, registry=None, sessions=None, run_control=
 def model_calls(*calls):
     """Emit one complete deterministic model response containing the requested calls."""
     return [*(ToolCallCompleted(call=call) for call in calls), ResponseCompleted(items=calls)]
+
+
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_foreign_owned_result_keeps_effectful_tool_in_recovery(tmp_path, monkeypatch, interrupted):
+    """An unclaimable result never becomes a completed receipt after a tool effect."""
+    effects = []
+
+    async def foreign():
+        """Remain available to the dispatcher that owns this handle."""
+        return "foreign result"
+
+    handle = OwnedToolTask(foreign())
+    handle.reserve()
+
+    async def interrupted_effect():
+        """Interrupt the runner after the effect, then return foreign-owned work."""
+        effects.append("entered")
+        try:
+            asyncio.get_running_loop().stop()
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            return handle
+
+    def unavailable_effect():
+        """Return foreign work after the effect when the runner is unavailable."""
+        effects.append("entered")
+        return handle
+
+    effect = interrupted_effect if interrupted else unavailable_effect
+    registry = ToolRegistry([effect])
+    if not interrupted:
+        monkeypatch.setattr(registry, "_sync_runner", Mock(side_effect=RuntimeError("unavailable")))
+    call = ToolCall(call_id="effect-call", name=effect.__name__, arguments="{}")
+    model = Mock()
+    model.get_response.return_value = model_calls(call)
+    runner = file_runner(tmp_path, model, registry=registry)
+    runner.session_manager.add_user_message("perform the action")
+    try:
+        result = runner.run()
+        assert result.stop_reason == "recovery_required"
+        assert runner.session_manager.recovery_pending
+        assert not any(isinstance(item, ToolResult) for item in runner.session_manager.messages)
+        assert effects == ["entered"]
+        assert model.get_response.call_count == 1
+        with asyncio.Runner() as owner:
+            task = handle.start(owner.get_loop())
+            assert owner.run(await_value_async(task)) == "foreign result"
+    finally:
+        registry.close()
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("nested", [False, True])
+def test_pending_foreign_work_keeps_entered_tool_in_recovery(tmp_path, async_mode, nested):
+    """A pending foreign task cannot become a completed receipt or automatic replay."""
+    effects = []
+
+    async def foreign():
+        """Perform an effect only when the original owner runs its loop."""
+        effects.append("foreign")
+        return "foreign result"
+
+    with asyncio.Runner() as owner:
+        handle = OwnedToolTask(foreign())
+        task = handle.start(owner.get_loop())
+        outer = owner.get_loop().create_future()
+        outer.set_result(task)
+
+        def effect():
+            """Perform an effect and return work attached to the other loop."""
+            effects.append("tool")
+            return outer if nested else handle
+
+        registry = ToolRegistry([effect])
+        call = ToolCall(call_id="effect-call", name="effect", arguments="{}")
+        model = Mock()
+        model.get_response.return_value = model_calls(call)
+
+        async def response(*args, **kwargs):
+            """Emit the same model request through the async boundary."""
+            for event in model_calls(call):
+                yield event
+
+        model.get_response_async.side_effect = response
+        runner = file_runner(tmp_path, model, registry=registry)
+        runner._compaction.compact_if_needed_async = AsyncMock()
+        runner.session_manager.add_user_message("perform the action")
+        try:
+            result = asyncio.run(runner.run_async()) if async_mode else runner.run()
+            assert result.stop_reason == "recovery_required"
+            assert runner.session_manager.recovery_pending
+            assert not any(isinstance(item, ToolResult) for item in runner.session_manager.messages)
+            assert effects == ["tool"]
+            assert not task.done()
+            assert owner.run(await_value_async(task)) == "foreign result"
+        finally:
+            registry.close()
+    assert effects == ["tool", "foreign"]
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_started_borrowed_coroutine_keeps_entered_tool_in_recovery(tmp_path, async_mode):
+    """A coroutine already owned by another task cannot become a completed receipt."""
+    effects = []
+
+    async def foreign():
+        """Wait for the original owner before producing its effect."""
+        await ready.wait()
+        effects.append("foreign")
+
+    with asyncio.Runner() as owner:
+        ready = asyncio.Event()
+        coroutine = foreign()
+        task = owner.get_loop().create_task(coroutine)
+        owner.run(asyncio.sleep(0))
+
+        def effect():
+            """Return work that belongs to the other task."""
+            effects.append("tool")
+            return coroutine
+
+        registry = ToolRegistry([effect])
+        call = ToolCall(call_id="effect-call", name="effect", arguments="{}")
+        model = Mock()
+        model.get_response.return_value = model_calls(call)
+
+        async def response(*args, **kwargs):
+            """Emit the same model request through the async boundary."""
+            for event in model_calls(call):
+                yield event
+
+        model.get_response_async.side_effect = response
+        runner = file_runner(tmp_path, model, registry=registry)
+        runner._compaction.compact_if_needed_async = AsyncMock()
+        runner.session_manager.add_user_message("perform the action")
+        try:
+            result = asyncio.run(runner.run_async()) if async_mode else runner.run()
+            assert result.stop_reason == "recovery_required"
+            assert runner.session_manager.recovery_pending
+            assert not any(isinstance(item, ToolResult) for item in runner.session_manager.messages)
+            assert effects == ["tool"]
+            assert not task.done()
+            ready.set()
+            owner.run(await_value_async(task))
+        finally:
+            registry.close()
+    assert effects == ["tool", "foreign"]
+
+
+def test_unhosted_borrowed_future_keeps_entered_tool_in_recovery(tmp_path, monkeypatch):
+    """A failed runner cannot publish a result while borrowed work remains unsettled."""
+    effects = []
+    with asyncio.Runner() as owner:
+        future = owner.get_loop().create_future()
+        future.add_done_callback(lambda _future: effects.append("foreign"))
+
+        def effect():
+            """Perform an effect and return an unresolved borrowed future."""
+            effects.append("tool")
+            return future
+
+        registry = ToolRegistry([effect])
+        monkeypatch.setattr(registry, "_sync_runner", Mock(side_effect=RuntimeError("unavailable")))
+        call = ToolCall(call_id="effect-call", name="effect", arguments="{}")
+        model = Mock()
+        model.get_response.return_value = model_calls(call)
+        runner = file_runner(tmp_path, model, registry=registry)
+        runner.session_manager.add_user_message("perform the action")
+        try:
+            result = runner.run()
+            assert result.stop_reason == "recovery_required"
+            assert runner.session_manager.recovery_pending
+            assert not any(isinstance(item, ToolResult) for item in runner.session_manager.messages)
+            assert effects == ["tool"]
+            assert not future.done()
+            future.set_result("foreign result")
+            assert owner.run(await_value_async(future)) == "foreign result"
+        finally:
+            registry.close()
+    assert effects == ["tool", "foreign"]
+
+
+@pytest.mark.parametrize("sync_tool", [False, True])
+def test_async_run_preserves_unknown_outcome_for_foreign_owned_work(tmp_path, sync_tool):
+    """Async dispatch retains recovery after an effect and an unclaimable result."""
+    effects = []
+
+    async def foreign():
+        """Remain available to the dispatcher that reserved this work."""
+        return "foreign"
+
+    handle = OwnedToolTask(foreign())
+    handle.reserve()
+
+    def sync_effect():
+        """Produce an effect before returning someone else's work."""
+        effects.append("entered")
+        return handle
+
+    async def async_effect():
+        """Produce an effect before returning someone else's work."""
+        effects.append("entered")
+        return handle
+
+    effect = sync_effect if sync_tool else async_effect
+    registry = ToolRegistry([effect])
+    call = ToolCall(call_id="effect-call", name=effect.__name__, arguments="{}")
+
+    async def response(*args, **kwargs):
+        """Emit the model request once."""
+        for event in model_calls(call):
+            yield event
+
+    model = Mock()
+    model.get_response_async.side_effect = response
+    runner = file_runner(tmp_path, model, registry=registry)
+    runner._compaction.compact_if_needed_async = AsyncMock()
+    runner.session_manager.add_user_message("perform the action")
+    try:
+        result = asyncio.run(runner.run_async())
+        assert result.stop_reason == "recovery_required"
+        assert runner.session_manager.recovery_pending
+        assert not any(isinstance(item, ToolResult) for item in runner.session_manager.messages)
+        assert effects == ["entered"]
+        assert model.get_response_async.call_count == 1
+        with asyncio.Runner() as owner:
+            assert owner.run(await_value_async(handle.start(owner.get_loop()))) == "foreign"
+    finally:
+        registry.close()
+
+
+def test_renamed_terminal_tool_executes_input_without_saving_it(tmp_path):
+    """Registered aliases retain argument privacy while the original bytes reach one dispatch."""
+    secret = "private-input-marker"
+    call = ToolCall(
+        call_id="terminal",
+        name="renamed_terminal",
+        arguments=json.dumps({"handle": "a" * 32, "action": "write", "content": secret}),
+    )
+    model = Mock()
+    model.get_response.side_effect = [model_calls(call), [ResponseCompleted(answer="done")]]
+    service = Mock()
+    service.control_command_terminal.return_value = {"terminal": True}
+    registry = ToolRegistry(
+        [ToolRegistration(control_command_terminal, name="renamed_terminal")],
+        execution_service=service,
+    )
+    assert registry.view().private_argument_names == frozenset({"renamed_terminal"})
+    runner = file_runner(tmp_path, model, registry=registry)
+    runner.session_manager.add_user_message("Send terminal input")
+
+    result = runner.run()
+
+    assert result.turns == 2
+    assert service.control_command_terminal.call_args.args[2] == "write"
+    assert service.control_command_terminal.call_args.args[3] == secret
+    assert secret not in runner.session_manager.session.serialize()
+    assert (
+        next(
+            item.arguments
+            for item in runner.session_manager.messages
+            if isinstance(item, ToolCall) and item.name == "renamed_terminal"
+        )
+        == "{}"
+    )
+    runner.interaction.tool_call.assert_called_once_with("renamed_terminal", "{}")
+
+
+def test_runner_uses_existing_executable_grant_in_one_tool_call(tmp_path, monkeypatch):
+    """A full grant cache does not force an extra model response or approval for a managed tool."""
+    tools = tmp_path.parent / "fixture-tools"
+    tools.mkdir()
+    executable = tools / "builder"
+    executable.write_text("tool", encoding="utf-8")
+    executable.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tools))
+    monkeypatch.setattr(
+        "loop.execution.facade.is_protected_external_read",
+        lambda path: logical_private_name(path, tmp_path.parent),
+    )
+    native = Mock()
+    native.system_read_roots = ()
+    native.installed_tool_roots.side_effect = lambda path: ((path.parent,), ())
+    native.managed_tool_root.return_value = True
+    native.run.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
+    service = CommandExecutionService(native, Mock())
+    lookup = ToolContext(None, "resolve_executable")
+    references = [
+        service.resolve_executable(lookup, "builder", str(tmp_path))["grant_reference"]
+        for _ in range(128)
+    ]
+    call = ToolCall(
+        call_id="command",
+        name="run_command",
+        arguments=json.dumps({"command": "builder", "executable_grant": references[0]}),
+    )
+    model = Mock()
+    model.get_response.side_effect = [model_calls(call), [ResponseCompleted(answer="done")]]
+    registry = ToolRegistry(
+        [run_command],
+        permission_manager=PermissionManager(tmp_path),
+        execution_service=service,
+    )
+    runner = file_runner(tmp_path, model, registry=registry)
+    runner.session_manager.add_user_message("Run the builder")
+
+    result = runner.run()
+
+    output = next(
+        json.loads(item.output)
+        for item in runner.session_manager.messages
+        if isinstance(item, ToolResult) and item.call_id == "command"
+    )
+    assert output["ok"] and output["result"]["boundary"] == "sandbox"
+    assert result.turns == model.get_response.call_count == 2
+    assert native.run.call_count == 1
+    runner.interaction.prompt.assert_not_called()
+
+
+@pytest.mark.parametrize("spelling", ["None", "nOnE", "null", "NULL"])
+def test_runner_normalizes_optional_capability_null_spellings_in_one_call(tmp_path, spelling):
+    """A malformed optional null does not require another model response or expand access."""
+    native = Mock()
+    native.system_read_roots = ()
+    native.run.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
+    host = Mock()
+    call = ToolCall(
+        call_id="command",
+        name="run_command",
+        arguments=json.dumps(
+            {
+                "command": "printf ready",
+                "read_only": True,
+                "read_roots": spelling,
+                "write_roots": spelling,
+                "executable_grant": spelling,
+                "egress_origins": spelling,
+            }
+        ),
+    )
+    model = Mock()
+    model.get_response.side_effect = [model_calls(call), [ResponseCompleted(answer="done")]]
+    registry = ToolRegistry(
+        [run_command],
+        permission_manager=PermissionManager(tmp_path),
+        execution_service=CommandExecutionService(native, host),
+    )
+    runner = file_runner(tmp_path, model, registry=registry)
+    runner.session_manager.add_user_message("Print ready")
+
+    result = runner.run()
+
+    output = next(
+        json.loads(item.output)
+        for item in runner.session_manager.messages
+        if isinstance(item, ToolResult) and item.call_id == "command"
+    )
+    assert output["ok"] and output["result"]["boundary"] == "sandbox"
+    assert result.turns == model.get_response.call_count == 2
+    assert len(result.metrics.tools) == native.run.call_count == 1
+    request = native.run.call_args.args[0]
+    assert request.read_roots == request.write_roots == request.egress_origins == ()
+    assert request.network is False
+    runner.interaction.prompt.assert_not_called()
+    host.run_host_command.assert_not_called()
+
+
+def test_runner_executes_reused_provider_id_in_distinct_responses(tmp_path, monkeypatch):
+    """Each response starts its own job even when the provider repeats an identifier."""
+    native = Mock()
+    native.system_read_roots = ()
+    native.run.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
+    service = CommandExecutionService(native, Mock())
+    sessions = SessionManager()
+    registry = ToolRegistry([run_command], execution_service=service, session_manager=sessions)
+    calls = [
+        ToolCall(
+            call_id="reused",
+            name="run_command",
+            arguments=json.dumps(
+                {
+                    "command": command,
+                    "background": True,
+                }
+            ),
+        )
+        for command in ("printf first", "printf second")
+    ]
+    model = Mock()
+    model.get_response.side_effect = [
+        model_calls(calls[0]),
+        model_calls(calls[1]),
+        [ResponseCompleted(answer="done")],
+    ]
+    runner = file_runner(tmp_path, model, registry=registry, sessions=sessions)
+    runner.permission_manager.bind_temporary_directory(sessions.temporary_directory)
+    runner.instructions_manager.set_runtime_environment(
+        RuntimeEnvironment(
+            working_directory=tmp_path, temporary_directory=sessions.temporary_directory
+        )
+    )
+
+    class Worker:
+        """Run each retained worker deterministically in the owning test thread."""
+
+        def __init__(self, target, daemon):
+            self.target = target
+
+        def start(self):
+            """Settle the synthetic worker immediately."""
+            self.target()
+
+        def join(self, timeout):
+            """Leave an already settled worker unchanged."""
+
+    monkeypatch.setattr(command_jobs.threading, "Thread", Worker)
+    runner.session_manager.add_user_message("Run both commands")
+    outcome = runner.run()
+    results = [
+        json.loads(item.output) for item in sessions.messages if isinstance(item, ToolResult)
+    ]
+    assert outcome.turns == 3
+    assert len(results) == 2 and all(result["ok"] for result in results)
+    assert results[0]["result"]["handle"] != results[1]["result"]["handle"]
+    assert [call.args[0].source for call in native.run.call_args_list] == [
+        "printf first",
+        "printf second",
+    ]
+
+
+@pytest.mark.parametrize("exit_code", [126, 127])
+def test_runner_reports_executable_failure_without_replaying_or_extra_tool_calls(
+    tmp_path, exit_code
+):
+    """A completed failure returns its uncertainty in the original tool result."""
+    native = Mock()
+    native.system_read_roots = ()
+    native.run.return_value = CommandProcessResult(
+        SandboxOutcome.COMPLETED,
+        exit_code=exit_code,
+        stderr="fixture command unavailable",
+    )
+    host = Mock()
+    call = ToolCall(
+        call_id="command",
+        name="run_command",
+        arguments=json.dumps({"command": "exit 127", "read_only": True}),
+    )
+    model = Mock()
+    model.get_response.side_effect = [model_calls(call), [ResponseCompleted(answer="done")]]
+    registry = ToolRegistry(
+        [run_command],
+        permission_manager=PermissionManager(tmp_path),
+        execution_service=CommandExecutionService(native, host),
+    )
+    runner = file_runner(tmp_path, model, registry=registry)
+    runner.session_manager.add_user_message("Run the project task")
+
+    result = runner.run()
+
+    output = next(
+        json.loads(item.output)
+        for item in runner.session_manager.messages
+        if isinstance(item, ToolResult) and item.call_id == "command"
+    )
+    assert output["problem"]["code"] == "process.nonzero_exit"
+    metadata = output["problem"]["metadata"]
+    assert metadata["exit_code"] == exit_code
+    assert metadata["sandbox_diagnostics"]["possible_effects"] is True
+    assert "may already have had effects" in metadata["executable_hint"]
+    assert "host_offer" not in metadata
+    assert result.turns == model.get_response.call_count == 2
+    assert len(result.metrics.tools) == native.run.call_count == 1
+    runner.interaction.prompt.assert_not_called()
+    host.run_host_command.assert_not_called()
+
+
+@pytest.mark.parametrize("command", ["builder", "cd child; builder"])
+def test_runner_discovers_managed_executable_without_extra_turns(tmp_path, monkeypatch, command):
+    """A managed executable on an absolute PATH needs one call before or after cd."""
+    tools = tmp_path.parent / "fixture-tools"
+    tools.mkdir()
+    executable = tools / "builder"
+    executable.write_text("tool", encoding="utf-8")
+    executable.chmod(0o755)
+    (tmp_path / "child").mkdir()
+    monkeypatch.setenv("PATH", str(tools))
+    monkeypatch.setattr(
+        "loop.execution.facade.is_protected_external_read",
+        lambda path: logical_private_name(path, tmp_path.parent),
+    )
+    native = Mock()
+    native.system_read_roots = ()
+    native.installed_tool_roots.side_effect = lambda path: ((path.parent,), ())
+    native.managed_tool_root.return_value = True
+    native.run.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
+    call = ToolCall(
+        call_id="command", name="run_command", arguments=json.dumps({"command": command})
+    )
+    model = Mock()
+    model.get_response.side_effect = [model_calls(call), [ResponseCompleted(answer="done")]]
+    registry = ToolRegistry(
+        [run_command],
+        permission_manager=PermissionManager(tmp_path),
+        execution_service=CommandExecutionService(native, Mock()),
+    )
+    runner = file_runner(tmp_path, model, registry=registry)
+    runner.session_manager.add_user_message("Run the project task")
+
+    result = runner.run()
+
+    output = next(
+        json.loads(item.output)
+        for item in runner.session_manager.messages
+        if isinstance(item, ToolResult) and item.call_id == "command"
+    )
+    assert output["ok"], output
+    assert result.turns == model.get_response.call_count == 2
+    assert len(result.metrics.tools) == native.run.call_count == 1
+    assert native.run.call_args.args[0].automatic_tool_reads == (tools,)
+    runner.interaction.prompt.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "selection",
+    [
+        "direct",
+        "identified-binary",
+        "identified-file",
+        "indirect",
+        "interpreter",
+        "argument",
+        "name",
+        "nested",
+        "identified",
+        "extra",
+        "first-chain",
+        "wrapped-chain",
+        "forwarded",
+        "forwarded-binary",
+        "forwarded-path",
+        "forwarded-path-chain",
+        "literal-forward",
+        "literal-fixed",
+        "literal-fixed-chain",
+        "literal-options",
+        "literal-prefix-chain",
+        "literal-chain",
+        "forwarded-chain",
+        "quoted",
+    ],
+)
+def test_runner_executes_scoped_executable_in_the_original_call(
+    shebang_root, monkeypatch, selection
+):
+    """Scoped aliases and off-PATH interpreters need one tool call and no extra model response."""
+    tmp_path = shebang_root
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    lookup = workspace / "lookup"
+    lookup.mkdir()
+    installation = tmp_path / "installation"
+    installation.mkdir()
+    extra = tmp_path / "extra"
+    extra.mkdir()
+    links = tmp_path / "links"
+    links.mkdir()
+    executable = installation / "actual"
+    executable.write_text("fixture executable", encoding="utf-8")
+    executable.chmod(0o755)
+    alias = links / "alias"
+    alias.symlink_to(installation, target_is_directory=True)
+    (lookup / "fixture-task").symlink_to(
+        executable if selection == "identified-file" else alias / executable.name
+    )
+    launcher = workspace / ("launcher with space" if selection == "quoted" else "launcher")
+    launcher.write_text(
+        "#!/bin/sh\nexec ./forwarder ./lookup/fixture-task\n"
+        if selection == "literal-fixed-chain"
+        else "#!/bin/sh\nexec ./lookup/fixture-task --fixed\n"
+        if selection == "literal-fixed"
+        else '#!/bin/sh\nexec ./forwarder ./lookup/fixture-task "$@"\n'
+        if selection == "literal-prefix-chain"
+        else '#!/bin/sh\nexec ./lookup/fixture-task --fixture "$@"\n'
+        if selection == "literal-options"
+        else '#!/bin/sh\nexec ./lookup/fixture-task "$@"\n'
+        if selection == "literal-forward"
+        else '#!/bin/sh\nexec ./forwarder "$@"\n'
+        if selection == "literal-chain"
+        else '#!/bin/sh\nexec "$@"\n'
+        if selection in {"forwarded-chain", "forwarded-path-chain"}
+        else '#!/bin/sh\nexec \t"$1"\n'
+        if selection == "forwarded"
+        else '#!/bin/sh\nexec "$1"\n'
+        if selection in {"forwarded-binary", "forwarded-path"}
+        else f"#!{lookup / 'fixture-task'}\n"
+        if selection
+        in {"interpreter", "identified", "extra", "first-chain", "wrapped-chain", "quoted"}
+        else "fixture-task",
+        encoding="utf-8",
+    )
+    launcher.chmod(0o755)
+    if selection in {
+        "forwarded-chain",
+        "forwarded-path-chain",
+        "literal-chain",
+        "literal-prefix-chain",
+        "literal-fixed-chain",
+    }:
+        forwarder = workspace / "forwarder"
+        forwarder.write_text(
+            '#!/bin/sh\nexec ./lookup/fixture-task "$@"\n'
+            if selection == "literal-chain"
+            else '#!/bin/sh\nexec "$@"\n',
+            encoding="utf-8",
+        )
+        forwarder.chmod(0o755)
+    if selection == "literal-fixed-chain":
+        unrelated = tmp_path / "unrelated"
+        unrelated.mkdir()
+        other = unrelated / "actual"
+        other.write_text("unrelated tool", encoding="utf-8")
+        other.chmod(0o755)
+        (lookup / "unrelated").symlink_to(other)
+    if selection in {"argument", "name", "nested", "forwarded"}:
+        task = workspace / "task"
+        interpreter = lookup / "fixture-task"
+        if selection == "nested":
+            nested = workspace / "nested"
+            nested.write_text(f"#!{interpreter}\n", encoding="utf-8")
+            nested.chmod(0o755)
+            interpreter = nested
+        task.write_text(f"#!{interpreter}\n", encoding="utf-8")
+        task.chmod(0o755)
+    empty = workspace / "empty-path"
+    empty.mkdir()
+    monkeypatch.setenv(
+        "PATH",
+        os.pathsep.join((str(workspace), str(lookup)))
+        if selection == "forwarded-path-chain"
+        else str(
+            empty
+            if selection
+            in {
+                "interpreter",
+                "argument",
+                "name",
+                "nested",
+                "identified",
+                "extra",
+                "first-chain",
+                "wrapped-chain",
+                "forwarded",
+                "forwarded-binary",
+                "forwarded-chain",
+                "literal-forward",
+                "literal-fixed",
+                "literal-fixed-chain",
+                "literal-options",
+                "literal-prefix-chain",
+                "literal-chain",
+                "quoted",
+            }
+            else lookup
+        ),
+    )
+    monkeypatch.setattr(
+        "loop.execution.facade.is_protected_external_read",
+        lambda path: logical_private_name(path, tmp_path.parent),
+    )
+    native = Mock()
+    native.system_read_roots = (
+        (Path("/bin"), Path("/usr/bin"))
+        if selection
+        in {
+            "forwarded",
+            "forwarded-binary",
+            "forwarded-path",
+            "forwarded-path-chain",
+            "forwarded-chain",
+            "literal-forward",
+            "literal-fixed",
+            "literal-fixed-chain",
+            "literal-options",
+            "literal-prefix-chain",
+            "literal-chain",
+        }
+        else ()
+    )
+    native.run.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
+    call = ToolCall(
+        call_id="command",
+        name="run_command",
+        arguments=json.dumps(
+            {
+                "command": (
+                    "./lookup/fixture-task"
+                    if selection in {"direct", "identified-binary", "identified-file"}
+                    else "'./launcher with space' && :"
+                    if selection == "quoted"
+                    else "./launcher && :"
+                    if selection == "first-chain"
+                    else "exec ./launcher; :"
+                    if selection == "wrapped-chain"
+                    else "./launcher task"
+                    if selection == "name"
+                    else "./launcher ./task"
+                    if selection in {"argument", "nested", "forwarded"}
+                    else "./launcher ./forwarder ./lookup/fixture-task"
+                    if selection == "forwarded-chain"
+                    else "./launcher ./lookup/fixture-task"
+                    if selection == "forwarded-binary"
+                    else "./launcher fixture-task"
+                    if selection == "forwarded-path"
+                    else "./launcher forwarder fixture-task"
+                    if selection == "forwarded-path-chain"
+                    else "./launcher ./lookup/unrelated"
+                    if selection == "literal-fixed-chain"
+                    else "./launcher ignored-argument"
+                    if selection == "literal-fixed"
+                    else "./launcher"
+                ),
+                "read_only": True,
+            }
+            | (
+                {}
+                if selection
+                in {
+                    "identified",
+                    "identified-binary",
+                    "identified-file",
+                    "first-chain",
+                    "wrapped-chain",
+                    "quoted",
+                    "forwarded",
+                    "forwarded-binary",
+                    "forwarded-path",
+                    "forwarded-path-chain",
+                    "forwarded-chain",
+                    "literal-forward",
+                    "literal-fixed",
+                    "literal-fixed-chain",
+                    "literal-options",
+                    "literal-prefix-chain",
+                    "literal-chain",
+                }
+                else {"read_roots": [str(extra if selection == "extra" else installation)]}
+            )
+        ),
+    )
+    model = Mock()
+    model.get_response.side_effect = [model_calls(call), [ResponseCompleted(answer="done")]]
+    registry = ToolRegistry(
+        [run_command],
+        permission_manager=PermissionManager(workspace),
+        execution_service=CommandExecutionService(native, Mock()),
+    )
+    runner = file_runner(workspace, model, registry=registry)
+    runner.interaction.prompt.return_value = "approve"
+    runner.session_manager.add_user_message("Run the project task")
+
+    result = runner.run()
+
+    output = next(
+        json.loads(item.output)
+        for item in runner.session_manager.messages
+        if isinstance(item, ToolResult) and item.call_id == "command"
+    )
+    assert output["ok"], output
+    assert result.turns == model.get_response.call_count == 2
+    assert len(result.metrics.tools) == native.run.call_count == 1
+    assert runner.interaction.prompt.call_count == 1
+    assert native.run.call_args.args[0].read_aliases == (
+        () if selection == "identified-file" else (alias,)
+    )
+    assert native.run.call_args.args[0].read_roots == (
+        (extra, installation) if selection == "extra" else (installation,)
+    )
+
+
+@pytest.mark.parametrize("selection", ["project", "direct", "script"])
+def test_runner_prepares_selected_runtime_without_an_extra_turn(
+    shebang_root, monkeypatch, selection
+):
+    """One tool call combines a selected runtime scope and execution."""
+    tmp_path = shebang_root
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    environment = workspace / ".venv"
+    commands = environment / "bin"
+    commands.mkdir(parents=True)
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    interpreter = runtime / "engine"
+    interpreter.write_text("fixture", encoding="utf-8")
+    interpreter.chmod(0o755)
+    (commands / "python").symlink_to(interpreter)
+    (environment / "pyvenv.cfg").write_text(
+        f"home = {runtime}\nimplementation = CPython\nversion_info = 3.14.2\n", encoding="utf-8"
+    )
+    (workspace / "pyproject.toml").write_text('[project]\nname = "fixture"\n', encoding="utf-8")
+    script = workspace / "fixture-task"
+    script.write_text(f"#!{commands / 'python'}\n", encoding="utf-8")
+    script.chmod(0o755)
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    executable = tools / "uv"
+    executable.write_text("fixture", encoding="utf-8")
+    executable.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tools))
+    monkeypatch.setattr(
+        "loop.execution.facade.is_protected_external_read",
+        lambda path: logical_private_name(path, tmp_path.parent),
+    )
+    native = Mock()
+    native.system_read_roots = ()
+    native.run.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
+    monkeypatch.setattr(
+        type(native),
+        "automatic_tool_read_roots",
+        lambda _self, _workspace, _roots, identities: (
+            (runtime,) if any(identity[1] == commands / "python" for identity in identities) else ()
+        ),
+        raising=False,
+    )
+    call = ToolCall(
+        call_id="command",
+        name="run_command",
+        arguments=json.dumps(
+            {
+                "command": (
+                    "uv run --no-sync pytest"
+                    if selection == "project"
+                    else "./.venv/bin/python -c pass"
+                    if selection == "direct"
+                    else "./fixture-task"
+                ),
+                "read_only": True,
+            }
+        ),
+    )
+    model = Mock()
+    model.get_response.side_effect = [model_calls(call), [ResponseCompleted(answer="done")]]
+    registry = ToolRegistry(
+        [run_command],
+        permission_manager=PermissionManager(workspace),
+        execution_service=CommandExecutionService(native, Mock()),
+    )
+    runner = file_runner(workspace, model, registry=registry)
+    runner.interaction.prompt.return_value = "approve"
+    runner.session_manager.add_user_message("Run the project task")
+
+    result = runner.run()
+
+    output = next(
+        json.loads(item.output)
+        for item in runner.session_manager.messages
+        if isinstance(item, ToolResult) and item.call_id == "command"
+    )
+    assert output["ok"], output
+    assert result.turns == model.get_response.call_count == 2
+    assert len(result.metrics.tools) == native.run.call_count == 1
+    assert runner.interaction.prompt.call_count == 1
+    assert native.run.call_args.args[0].read_roots == (runtime,)
+
+
+@pytest.mark.parametrize("selection", ["direct", "forwarded", "safe_options"])
+def test_runner_prepares_env_interpreter_in_the_original_call(tmp_path, monkeypatch, selection):
+    """An env interpreter or shell wrapper needs no model-facing discovery workaround."""
+    forwarded = selection != "direct"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    installation = tmp_path / "installation"
+    installation.mkdir()
+    executable = installation / "fixture-runtime"
+    executable.write_text("fixture", encoding="utf-8")
+    executable.chmod(0o755)
+    alias = tmp_path / "runtime-alias"
+    alias.symlink_to(installation, target_is_directory=True)
+    tools = workspace / "tools"
+    tools.mkdir()
+    (tools / "fixture-engine").symlink_to(alias / executable.name)
+    task = workspace / "task"
+    task.write_text("#!/usr/bin/env fixture-engine\n", encoding="utf-8")
+    task.chmod(0o755)
+    if forwarded:
+        (tools / "fixture-shell").symlink_to("/bin/sh")
+        launcher = workspace / "launcher"
+        header = (
+            "#!/usr/bin/env -S fixture-shell -e -u\n"
+            if selection == "safe_options"
+            else "#!/usr/bin/env fixture-shell\n"
+        )
+        launcher.write_text(f'{header}exec "$1"\n', encoding="utf-8")
+        launcher.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tools))
+    monkeypatch.setattr(
+        "loop.execution.facade.is_protected_external_read",
+        lambda path: logical_private_name(path, tmp_path.parent),
+    )
+    native = Mock()
+    native.system_read_roots = (Path("/bin"), Path("/usr/bin"))
+    native.run.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
+    call = ToolCall(
+        call_id="command",
+        name="run_command",
+        arguments=json.dumps({"command": "./launcher ./task" if forwarded else "./task"}),
+    )
+    model = Mock()
+    model.get_response.side_effect = [model_calls(call), [ResponseCompleted(answer="done")]]
+    registry = ToolRegistry(
+        [run_command],
+        permission_manager=PermissionManager(workspace),
+        execution_service=CommandExecutionService(native, Mock()),
+    )
+    runner = file_runner(workspace, model, registry=registry)
+    runner.interaction.prompt.return_value = "approve"
+    runner.session_manager.add_user_message("Run the task")
+
+    result = runner.run()
+
+    assert result.turns == model.get_response.call_count == 2
+    assert len(result.metrics.tools) == native.run.call_count == 1
+    assert runner.interaction.prompt.call_count == 1
+    assert native.run.call_args.args[0].read_roots == (installation,)
+
+
+def test_runner_waits_for_one_configured_command_without_an_extra_turn(tmp_path, monkeypatch):
+    """A longer configured budget completes in one call with a controlled clock."""
+    native = Mock()
+    native.system_read_roots = (Path("/bin"), Path("/usr/bin"))
+    clock = [100.0]
+
+    def complete_after_virtual_runtime(request):
+        """Complete one simulated command after advancing beyond the old default."""
+        assert request.deadline == 235
+        clock[0] += 65
+        return CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
+
+    native.run.side_effect = complete_after_virtual_runtime
+    call = ToolCall(
+        call_id="command",
+        name="run_command",
+        arguments=json.dumps({"command": "printf ready", "read_only": True}),
+    )
+    model = Mock()
+    model.get_response.side_effect = [model_calls(call), [ResponseCompleted(answer="done")]]
+    registry = ToolRegistry(
+        [run_command],
+        permission_manager=PermissionManager(tmp_path),
+        execution_service=CommandExecutionService(native, Mock()),
+        settings=ToolRuntimeSettings(command_timeout=75),
+    )
+    runner = file_runner(tmp_path, model, registry=registry)
+    runner.session_manager.add_user_message("Run the task")
+
+    monkeypatch.setattr(
+        "loop.execution.coordinator.time", SimpleNamespace(monotonic=lambda: clock[0])
+    )
+    result = runner.run()
+
+    assert result.turns == model.get_response.call_count == 2
+    assert len(result.metrics.tools) == native.run.call_count == 1
+    assert native.run.call_args.args[0].deadline == 235
+    assert clock[0] == 165
+    runner.interaction.prompt.assert_not_called()
+
+
+def test_runner_ignores_unidentified_runtime_metadata_in_the_original_call(tmp_path, monkeypatch):
+    """An unrelated tool completes without an extra model response or approval."""
+    tools = tmp_path / "bin"
+    tools.mkdir()
+    executable = tools / "fixture-processor"
+    executable.write_text("fixture executable", encoding="utf-8")
+    executable.chmod(0o755)
+    (tmp_path / "pyvenv.cfg").symlink_to(tmp_path / "unrelated")
+    home = tmp_path.parent / "fixture-home"
+    home.mkdir()
+    monkeypatch.setenv("PATH", str(tools))
+    monkeypatch.setattr(
+        "loop.execution.facade.is_protected_external_read",
+        lambda path: logical_private_name(path, tmp_path.parent),
+    )
+    monkeypatch.setattr(
+        "loop.execution.sandbox.linux.paths.is_protected_external_read",
+        lambda path: logical_private_name(path, tmp_path.parent),
+    )
+    monkeypatch.setattr(
+        "loop.execution.sandbox.linux.paths.pwd.getpwuid",
+        lambda _uid: SimpleNamespace(pw_dir=str(home)),
+    )
+    monkeypatch.setattr("loop.execution.sandbox.linux.backend.runtime_read_roots", lambda: ())
+    monkeypatch.setattr(LinuxNativeBackend, "file_creation_mask", 0o077)
+    native = LinuxNativeBackend(tmp_path / "management.json")
+    native.capability_failure = Mock(return_value=None)
+    native.run = Mock(return_value=CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0))
+    service = CommandExecutionService(native, Mock())
+    call = ToolCall(
+        call_id="command",
+        name="run_command",
+        arguments=json.dumps({"command": executable.name, "read_only": True}),
+    )
+    model = Mock()
+    model.get_response.side_effect = [model_calls(call), [ResponseCompleted(answer="done")]]
+    registry = ToolRegistry(
+        [run_command],
+        permission_manager=PermissionManager(tmp_path),
+        execution_service=service,
+    )
+    runner = file_runner(tmp_path, model, registry=registry)
+    runner.session_manager.add_user_message("Run the project processor")
+
+    result = runner.run()
+
+    output = next(
+        json.loads(item.output)
+        for item in runner.session_manager.messages
+        if isinstance(item, ToolResult) and item.call_id == "command"
+    )
+    assert output["ok"], output
+    assert output["result"]["boundary"] == "sandbox"
+    assert result.turns == model.get_response.call_count == 2
+    assert native.run.call_count == 1
+    runner.interaction.prompt.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -1141,6 +2232,29 @@ def test_runner_recovers_a_model_boundary_without_adding_user_input():
     sessions.add_response.assert_called_once_with(response)
 
 
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_invalid_run_recovery_confirmation_preserves_pending_state(asynchronous):
+    """A truthy non-boolean cannot authorize recovery or issue a model request."""
+    runner, sessions, interaction = agent_runner()
+    sessions.recovery_state = SessionRecoveryState(action="query_model")
+    interaction.confirm.return_value = object()
+    runner._confirm_async = AsyncMock(return_value=object())
+    runner._recover = Mock()
+    runner._recover_async = AsyncMock()
+
+    if asynchronous:
+        result = asyncio.run(runner.recover_session_async())
+        runner._confirm_async.assert_awaited_once()
+    else:
+        result = runner.recover_session()
+        interaction.confirm.assert_called_once()
+
+    assert result.pending is True
+    runner._recover.assert_not_called()
+    runner._recover_async.assert_not_awaited()
+    runner.backend.get_response.assert_not_called()
+
+
 def test_runner_recovers_unstarted_tools_before_requerying():
     """Definitely unstarted calls execute once with their stable call identifier."""
     final = Response(answer="done", reasoning="")
@@ -1174,6 +2288,221 @@ def test_runner_recovers_unstarted_tools_before_requerying():
     runner.agent.tools.call_with_timing.call_args.kwargs["execution_started"]()
     sessions.record_tool_execution_started.assert_called_once_with("call")
     assert sessions.add_tool_call.call_args.kwargs["succeeded"] is True
+
+
+def test_runner_records_synchronous_interrupted_tool_receipt():
+    """A known interrupted tool result is durably recorded before Ctrl+C propagates."""
+    runner, sessions, _ = agent_runner(responses=[])
+    call = ToolCall(call_id="call", name="effect", arguments="{}")
+    response = Response(answer="", reasoning="", tool_calls=(call,), items=(call,))
+    output = '{"ok":true,"result":"confirmed"}'
+    interruption = ToolExecutionInterrupted(output, 0.25)
+    interruption.add_note("Tool cleanup also stopped with KeyboardInterrupt.")
+    runner.agent.tools.call_with_timing.side_effect = interruption
+
+    with pytest.raises(KeyboardInterrupt) as caught:
+        runner.handle_tool_calls(response)
+
+    sessions.add_tool_call.assert_called_once()
+    recorded = sessions.add_tool_call.call_args.kwargs
+    assert recorded["call_id"] == "call"
+    assert recorded["output"] == output
+    assert recorded["succeeded"] is True
+    assert caught.value.metrics.name == "effect"
+    assert caught.value.metrics.duration_seconds == 0.25
+    assert caught.value.__notes__ == ["Tool cleanup also stopped with KeyboardInterrupt."]
+
+
+def test_cancelled_queued_tool_records_definitely_unstarted_result():
+    """A tool canceled before worker entry receives a durable non-replay receipt."""
+    runner, sessions, _ = agent_runner(responses=[])
+    call = ToolCall(call_id="call", name="effect", arguments="{}")
+    response = Response(answer="", reasoning="", tool_calls=(call,), items=(call,))
+    runner.agent.tools.call_with_timing_async = AsyncMock(side_effect=ToolExecutionNotStarted())
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(runner.handle_tool_calls_async(response))
+
+    sessions.add_tool_call.assert_called_once()
+    recorded = sessions.add_tool_call.call_args.kwargs
+    assert recorded["call_id"] == "call"
+    assert recorded["succeeded"] is False
+    assert "cancelled before execution" in recorded["output"]
+
+
+def test_cancelled_queued_retry_preserves_previous_unknown_outcome(tmp_path):
+    """Canceling an unstarted retry cannot erase the earlier uncertain invocation."""
+    runner, sessions, _ = agent_runner(responses=[])
+    permissions = PermissionManager(tmp_path)
+    runner._permission_manager = permissions
+    source = MagicMock(spec=ConsoleInteraction)
+    source.confirm_async = AsyncMock(return_value=True)
+    runner._interaction = ApprovalInteraction.for_permissions(source, permissions)
+    call = ToolCall(call_id="unknown", name="effect", arguments="{}")
+    sessions.recovery_state = SessionRecoveryState(
+        action="resolve_uncertain_tools",
+        pending_calls=(PendingToolCall(call=call, status="outcome_unknown"),),
+    )
+    runner.agent.tools.call_with_timing_async = AsyncMock(side_effect=ToolExecutionNotStarted())
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(runner.recover_session_async(confirmed=True))
+
+    sessions.add_tool_call.assert_not_called()
+    runner.agent.tools.call_with_timing_async.assert_awaited_once()
+
+
+def test_runner_preserves_interrupted_metrics_in_an_active_run():
+    """A completed interrupted tool retains metrics while the run stops."""
+    call = ToolCall(call_id="call", name="effect", arguments="{}")
+    response = Response(answer="", reasoning="", tool_calls=(call,), items=(call,))
+    runner, sessions, _ = agent_runner(responses=[response])
+    runner.agent.tools.call_with_timing.side_effect = ToolExecutionInterrupted(
+        '{"ok":true,"result":"confirmed"}', 0.25
+    )
+
+    with pytest.raises(KeyboardInterrupt) as caught:
+        runner.run()
+    assert caught.value.metrics.name == "effect"
+    assert sessions.add_tool_call.call_args.kwargs["succeeded"] is True
+    assert runner.query.call_count == 1
+
+
+def test_uninterrupted_tool_publication_propagates_keyboard_interrupt():
+    """A first interrupt during ordinary result publication is not replaced."""
+    runner, sessions, _ = agent_runner(responses=[])
+    call = ToolCall(call_id="call", name="effect", arguments="{}")
+    response = Response(answer="", reasoning="", tool_calls=(call,), items=(call,))
+    runner.agent.tools.call_with_timing.return_value = ('{"ok":true}', 0.25)
+    sessions.add_tool_call.side_effect = KeyboardInterrupt("publication interrupted")
+
+    with pytest.raises(KeyboardInterrupt, match="publication interrupted") as caught:
+        runner.handle_tool_calls(response)
+    assert not isinstance(caught.value, ToolExecutionInterrupted)
+    sessions.add_tool_call.assert_called_once()
+
+
+def test_repeated_interrupt_keeps_receipt_without_replaying_publication():
+    """A second interrupt preserves the receipt without retrying an uncertain save."""
+    runner, sessions, _ = agent_runner(responses=[])
+    call = ToolCall(call_id="call", name="effect", arguments="{}")
+    response = Response(answer="", reasoning="", tool_calls=(call,), items=(call,))
+    output = '{"ok":true,"result":"confirmed"}'
+    runner.agent.tools.call_with_timing.side_effect = ToolExecutionInterrupted(output, 0.25)
+    sessions.add_tool_call.side_effect = KeyboardInterrupt
+
+    with pytest.raises(ToolExecutionInterrupted) as caught:
+        runner.handle_tool_calls(response)
+
+    assert caught.value.output == output
+    assert caught.value.__notes__ == [
+        "Tool result publication may be incomplete; inspect recovery before retrying."
+    ]
+    sessions.add_tool_call.assert_called_once()
+
+
+def test_sync_interrupted_final_receipt_is_persisted_without_replay(tmp_path):
+    """A confirmed final result is saved before a synchronous interrupt escapes."""
+    effects = []
+
+    def interrupt():
+        """Interrupt the event loop while the tool is running."""
+        raise KeyboardInterrupt
+
+    async def child():
+        """Complete an effect while settling cancellation."""
+        try:
+            asyncio.get_running_loop().call_soon(interrupt)
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            effects.append("committed")
+            return "confirmed"
+
+    async def calculate() -> str:
+        """Return the owned child's complete tool outcome."""
+        return await OwnedToolTask(child(), final_result=True)
+
+    registry = ToolRegistry([calculate])
+    runner = file_runner(tmp_path, Mock(), registry=registry)
+    sessions = runner.session_manager
+    sessions.add_user_message("run the synthetic tool")
+    sessions.begin_run()
+    call = ToolCall(call_id="effect", name="calculate", arguments="{}")
+    response = Response(answer="", reasoning="", tool_calls=(call,), items=(call,))
+    sessions.add_response(response)
+
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            runner.handle_tool_calls(response)
+        results = [item for item in sessions.messages if isinstance(item, ToolResult)]
+        assert len(results) == 1
+        assert results[0].call_id == "effect"
+        assert json.loads(results[0].output)["result"] == "confirmed"
+        assert effects == ["committed"]
+        assert sessions.recovery_state.action == "query_model"
+        assert [pending.status for pending in sessions.recovery_state.pending_calls] == [
+            "result_available"
+        ]
+    finally:
+        registry.close()
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("unknown_count", [1, 2])
+def test_yolo_new_message_continues_without_replaying_unknown_tool(
+    tmp_path, async_mode, unknown_count
+):
+    """A new user instruction sees the unknown outcome and can issue a fresh tool call."""
+    sessions = SessionManager()
+    sessions.add_user_message("perform the old action")
+    sessions.begin_run()
+    old = tuple(
+        ToolCall(call_id=f"old-{index}", name="old_action", arguments="{}")
+        for index in range(unknown_count)
+    )
+    sessions.add_response(Response(answer="", reasoning="", tool_calls=old, items=old))
+    for call in old:
+        sessions.record_tool_execution_started(call.call_id)
+    sessions.add_user_message("inspect the result instead")
+    restored = SessionManager(session=Session.deserialize(sessions.session.serialize()))
+    registry = Mock(spec=ToolRegistry)
+    runner = file_runner(tmp_path, Mock(), registry=registry, sessions=restored)
+    registry = runner.agent.tools
+    registry.call_with_timing.return_value = ('{"ok":true}', 0.1)
+    registry.call_with_timing_async = AsyncMock(return_value=('{"ok":true}', 0.1))
+    runner.permission_manager.set_yolo(True)
+    fresh = ToolCall(call_id="new", name="inspect", arguments="{}")
+    response = Response(answer="", reasoning="", tool_calls=(fresh,), items=(fresh,))
+    final = Response(
+        answer="done", reasoning="", items=(Message(role="assistant", content="done"),)
+    )
+    responses = iter((response, final))
+
+    def query_after_warning(*_args, **_kwargs):
+        """Require the nonblocking user notice before any new model request."""
+        runner.interaction.warning.assert_called_once_with(
+            "A previous tool may already have run; its outcome is unknown. "
+            "A new action may repeat its effects. The old call will not be replayed."
+        )
+        return next(responses)
+
+    if async_mode:
+        runner.query_async = AsyncMock(side_effect=query_after_warning)
+        result = asyncio.run(runner.recover_session_async(confirmed=True))
+        registry.call_with_timing_async.assert_awaited_once()
+        assert registry.call_with_timing_async.await_args.args[0] == "inspect"
+    else:
+        runner.query = Mock(side_effect=query_after_warning)
+        result = runner.recover_session(confirmed=True)
+        registry.call_with_timing.assert_called_once()
+        assert registry.call_with_timing.call_args.args[0] == "inspect"
+    assert result.pending is False
+    outputs = [item.output for item in restored.messages if isinstance(item, ToolResult)]
+    assert len(outputs) == unknown_count + 1
+    assert all("external outcome is unknown" in output for output in outputs[:unknown_count])
+    assert all("may repeat its effects" in output for output in outputs[:unknown_count])
+    runner.interaction.confirm.assert_not_called()
+    assert restored.recovery_pending is False
 
 
 @pytest.mark.parametrize("async_mode", [False, True])
@@ -1273,6 +2602,48 @@ def test_runner_skips_completed_calls_in_a_partially_recovered_batch():
     sessions.record_tool_execution_started.assert_called_once_with("pending")
 
 
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("answer", ["truthy", "future"])
+def test_unknown_tool_is_not_replayed_for_invalid_confirmation(tmp_path, async_mode, answer):
+    """A malformed confirmation cannot authorize replay or resolve the unknown outcome."""
+    effects = []
+
+    def effect():
+        """Record an incorrectly retried tool."""
+        effects.append("replayed")
+
+    sessions = SessionManager()
+    sessions.add_user_message("perform the action")
+    sessions.begin_run()
+    call = ToolCall(call_id="unknown", name="effect", arguments="{}")
+    sessions.add_response(Response(answer="", reasoning="", tool_calls=(call,), items=(call,)))
+    sessions.record_tool_execution_started(call.call_id)
+    restored = SessionManager(session=Session.deserialize(sessions.session.serialize()))
+    registry = ToolRegistry([effect])
+    runner = file_runner(tmp_path, Mock(), registry=registry, sessions=restored)
+    foreign_loop = asyncio.new_event_loop()
+    future = foreign_loop.create_future()
+    response = future if answer == "future" else object()
+    runner.interaction.confirm.return_value = response
+    runner.interaction.confirm_async = AsyncMock(return_value=response)
+    runner.interaction.prompt_async = AsyncMock()
+    try:
+        if async_mode:
+            result = asyncio.run(runner.recover_session_async(confirmed=True))
+        else:
+            result = runner.recover_session(confirmed=True)
+        assert result.pending
+        assert result.result.stop_reason == "recovery_required"
+        assert restored.recovery_pending
+        assert not any(isinstance(item, ToolResult) for item in restored.messages)
+        assert effects == []
+        assert not future.done()
+    finally:
+        registry.close()
+        future.cancel()
+        foreign_loop.close()
+
+
 def test_runner_resolves_uncertain_tools_without_retry_by_default():
     """An uncertain side effect becomes an explicit model-visible error unless retry is approved."""
     final = Response(answer="reconciled", reasoning="")
@@ -1298,7 +2669,14 @@ def test_runner_retries_an_uncertain_tool_only_after_explicit_approval():
     final = Response(answer="done", reasoning="")
     runner, sessions, interaction = agent_runner(responses=[final])
     interaction.confirm.side_effect = [True, True]
-    runner.agent.tools.call_with_timing.return_value = ('{"ok": false}', 0.1)
+
+    def execute(*_args, **kwargs):
+        """Record execution and admission before returning the retried tool's result."""
+        kwargs["execution_started"]()
+        assert kwargs["execution_admission"]()
+        return '{"ok": false}', 0.1
+
+    runner.agent.tools.call_with_timing.side_effect = execute
     call = ToolCall(call_id="call", name="mutate", arguments="{}")
 
     sessions.recovery_state = SessionRecoveryState(
@@ -1308,9 +2686,599 @@ def test_runner_retries_an_uncertain_tool_only_after_explicit_approval():
     runner.recover_session()
 
     sessions.add_tool_call_event.assert_not_called()
-    callback = runner.agent.tools.call_with_timing.call_args.kwargs["execution_started"]
-    callback()
     sessions.record_tool_execution_started.assert_called_once_with("call")
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("change_at", ["confirmation", "dispatch", "persistence"])
+@pytest.mark.parametrize("disable_again", [False, True])
+def test_uncertain_retry_rejects_changed_yolo_generation(
+    tmp_path, monkeypatch, async_mode, change_at, disable_again
+):
+    """A changed automatic-decision generation cannot admit an uncertain tool retry."""
+    runner, sessions, _ = agent_runner(responses=[])
+    permissions = PermissionManager(tmp_path)
+    runner._permission_manager = permissions
+    source = MagicMock(spec=ConsoleInteraction)
+    source.confirm.return_value = True
+    source.confirm_async = AsyncMock(return_value=True)
+    runner._interaction = ApprovalInteraction.for_permissions(source, permissions)
+    call = ToolCall(call_id="unknown", name="effect", arguments="{}")
+    sessions.recovery_state = SessionRecoveryState(
+        action="resolve_uncertain_tools",
+        pending_calls=(PendingToolCall(call=call, status="outcome_unknown"),),
+    )
+    effects = []
+
+    def change():
+        """Change authority, optionally returning it to the original visible state."""
+        permissions.set_yolo(True)
+        if disable_again:
+            permissions.set_yolo(False)
+
+    if change_at == "persistence":
+        sessions.record_tool_execution_started.side_effect = lambda _call_id: change()
+
+    if change_at == "confirmation":
+        snapshot = permissions.recovery_retry_generation
+
+        def snapshot_then_change():
+            """Change authority after capturing the generation before confirmation."""
+            generation = snapshot()
+            change()
+            return generation
+
+        monkeypatch.setattr(permissions, "recovery_retry_generation", snapshot_then_change)
+
+    def dispatch(*_args, **kwargs):
+        """Change authority after approval and before the execution boundary."""
+        if change_at == "dispatch":
+            change()
+        kwargs["execution_started"]()
+        if not kwargs["execution_admission"]():
+            raise ToolExecutionAdmissionRejected
+        effects.append("executed")
+        return '{"ok":true}', 0.0
+
+    async def dispatch_async(*_args, **kwargs):
+        """Exercise the asynchronous execution boundary after approval."""
+        if change_at == "dispatch":
+            change()
+        await kwargs["execution_started"]()
+        if not kwargs["execution_admission"]():
+            raise ToolExecutionAdmissionRejected
+        effects.append("executed")
+        return '{"ok":true}', 0.0
+
+    runner.agent.tools.call_with_timing.side_effect = dispatch
+    runner.agent.tools.call_with_timing_async = AsyncMock(side_effect=dispatch_async)
+    if async_mode:
+        result = asyncio.run(runner.recover_session_async(confirmed=True))
+    else:
+        result = runner.recover_session(confirmed=True)
+
+    assert result.result.stop_reason == "recovery_required"
+    assert result.pending is True
+    assert effects == []
+    sessions.add_tool_call.assert_not_called()
+    runner.query.assert_not_called()
+    if change_at == "confirmation" and not disable_again:
+        source.confirm.assert_not_called()
+        source.confirm_async.assert_not_awaited()
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_uncertain_retry_policy_change_keeps_real_tool_unexecuted(
+    tmp_path, monkeypatch, async_mode
+):
+    """A policy change during durable admission leaves a real tool outcome unresolved."""
+    effects = []
+
+    def effect():
+        """Record the synthetic side effect."""
+        effects.append(True)
+
+    sessions = SessionManager()
+    sessions.add_user_message("perform the action")
+    sessions.begin_run()
+    call = ToolCall(call_id="unknown", name="effect", arguments="{}")
+    sessions.add_response(Response(answer="", reasoning="", tool_calls=(call,), items=(call,)))
+    sessions.record_tool_execution_started(call.call_id)
+    restored = SessionManager(session=Session.deserialize(sessions.session.serialize()))
+    runner = file_runner(tmp_path, Mock(), registry=ToolRegistry([effect]), sessions=restored)
+    runner.interaction.confirm.return_value = True
+    if async_mode:
+        interaction = MagicMock(spec=ConsoleInteraction)
+        interaction.confirm_async = AsyncMock(return_value=True)
+        runner._interaction = interaction
+        original_async = restored.record_tool_execution_started_async
+
+        async def record_async(call_id):
+            """Change policy while the async durable boundary is being recorded."""
+            await original_async(call_id)
+            runner.permission_manager.set_yolo(True)
+
+        monkeypatch.setattr(restored, "record_tool_execution_started_async", record_async)
+        result = asyncio.run(runner.recover_session_async(confirmed=True))
+    else:
+        original = restored.record_tool_execution_started
+
+        def record(call_id):
+            """Change policy while the durable boundary is being recorded."""
+            original(call_id)
+            runner.permission_manager.set_yolo(True)
+
+        monkeypatch.setattr(restored, "record_tool_execution_started", record)
+        result = runner.recover_session(confirmed=True)
+
+    assert result.pending and result.result.stop_reason == "recovery_required"
+    assert restored.recovery_pending
+    assert not any(isinstance(item, ToolResult) for item in restored.messages)
+    assert effects == []
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_uncertain_retry_rechecks_policy_at_real_tool_dispatch(tmp_path, monkeypatch, async_mode):
+    """A policy transition after durable start prevents the tool callable from running."""
+    effects = []
+
+    def effect():
+        """Record a synthetic side effect."""
+        effects.append(True)
+
+    sessions = SessionManager()
+    sessions.add_user_message("perform the action")
+    sessions.begin_run()
+    call = ToolCall(call_id="unknown", name="effect", arguments="{}")
+    sessions.add_response(Response(answer="", reasoning="", tool_calls=(call,), items=(call,)))
+    sessions.record_tool_execution_started(call.call_id)
+    restored = SessionManager(session=Session.deserialize(sessions.session.serialize()))
+    registry = ToolRegistry([effect])
+    runner = file_runner(tmp_path, Mock(), registry=registry, sessions=restored)
+    runner.interaction.confirm.return_value = True
+    if async_mode:
+        interaction = MagicMock(spec=ConsoleInteraction)
+        interaction.confirm_async = AsyncMock(return_value=True)
+        runner._interaction = interaction
+        original_async = Tool.execute_async
+
+        async def change_before_async_dispatch(tool, *args, **kwargs):
+            """Change policy after the durable callback but before tool dispatch."""
+            runner.permission_manager.set_yolo(True)
+            return await original_async(tool, *args, **kwargs)
+
+        monkeypatch.setattr(Tool, "execute_async", change_before_async_dispatch)
+        result = asyncio.run(runner.recover_session_async(confirmed=True))
+    else:
+        original = Tool.execute
+
+        def change_before_dispatch(tool, *args, **kwargs):
+            """Change policy after the durable callback but before tool dispatch."""
+            runner.permission_manager.set_yolo(True)
+            return original(tool, *args, **kwargs)
+
+        monkeypatch.setattr(Tool, "execute", change_before_dispatch)
+        result = runner.recover_session(confirmed=True)
+
+    assert result.pending and result.result.stop_reason == "recovery_required"
+    assert restored.recovery_pending
+    assert not any(isinstance(item, ToolResult) for item in restored.messages)
+    assert effects == []
+    registry.close()
+
+
+def test_uncertain_retry_rechecks_policy_in_async_tool_worker(tmp_path, monkeypatch):
+    """A worker held after durable start must recheck policy before its tool starts."""
+    effects = []
+    release = Event()
+
+    def effect():
+        """Record a synthetic side effect."""
+        effects.append(True)
+
+    sessions = SessionManager()
+    sessions.add_user_message("perform the action")
+    sessions.begin_run()
+    call = ToolCall(call_id="unknown", name="effect", arguments="{}")
+    sessions.add_response(Response(answer="", reasoning="", tool_calls=(call,), items=(call,)))
+    sessions.record_tool_execution_started(call.call_id)
+    restored = SessionManager(session=Session.deserialize(sessions.session.serialize()))
+    registry = ToolRegistry([effect])
+    runner = file_runner(tmp_path, Mock(), registry=registry, sessions=restored)
+    interaction = MagicMock(spec=ConsoleInteraction)
+    interaction.confirm_async = AsyncMock(return_value=True)
+    runner._interaction = interaction
+    original = Tool.execute_async
+
+    async def exercise():
+        """Hold the actual invocation worker while changing YOLO."""
+        ready = asyncio.Event()
+        owner = asyncio.get_running_loop()
+
+        async def delayed_tool(tool, *args, **kwargs):
+            """Pause the registry's admitted worker before its tool callable."""
+            dispatch = kwargs["sync_dispatch"]
+
+            async def delayed_dispatch(invoke):
+                """Run the normal worker with a deterministic pre-invocation barrier."""
+
+                def held():
+                    """Wait on the worker until the owner changes policy."""
+                    owner.call_soon_threadsafe(ready.set)
+                    if not release.wait(5):
+                        raise TimeoutError("Tool worker barrier was not released.")
+                    return invoke()
+
+                return await dispatch(held)
+
+            kwargs["sync_dispatch"] = delayed_dispatch
+            return await original(tool, *args, **kwargs)
+
+        monkeypatch.setattr(Tool, "execute_async", delayed_tool)
+        task = asyncio.create_task(runner.recover_session_async(confirmed=True))
+        try:
+            await asyncio.wait_for(ready.wait(), 5)
+            runner.permission_manager.set_yolo(True)
+        finally:
+            release.set()
+        return await task
+
+    result = asyncio.run(exercise())
+    assert result.pending and result.result.stop_reason == "recovery_required"
+    assert restored.recovery_pending
+    assert not any(isinstance(item, ToolResult) for item in restored.messages)
+    assert effects == []
+    registry.close()
+
+
+@pytest.mark.parametrize("failure", ["saturated", "closed"])
+@pytest.mark.parametrize("activate_yolo", [False, True])
+def test_uncertain_retry_without_worker_admission_preserves_unknown(
+    tmp_path, monkeypatch, failure, activate_yolo
+):
+    """Worker refusal after durable intent cannot settle an earlier unknown outcome."""
+    release = Event()
+    effects = []
+
+    def effect():
+        """Record a synthetic effect."""
+        effects.append(True)
+
+    def occupy():
+        """Retain a registry worker until the test releases it."""
+        assert release.wait(5), "worker was not released"
+
+    registry = ToolRegistry([effect, occupy])
+    sessions = SessionManager()
+    sessions.add_user_message("perform the original action")
+    sessions.begin_run()
+    call = ToolCall(call_id="unknown", name="effect", arguments="{}")
+    sessions.add_response(Response(answer="", reasoning="", tool_calls=(call,), items=(call,)))
+    sessions.record_tool_execution_started(call.call_id)
+    restored = SessionManager(session=Session.deserialize(sessions.session.serialize()))
+    backend = Mock()
+    runner = file_runner(tmp_path, backend, registry=registry, sessions=restored)
+    interaction = MagicMock(spec=ConsoleInteraction)
+    interaction.confirm_async = AsyncMock(return_value=True)
+    runner._interaction = interaction
+    original = restored.record_tool_execution_started_async
+
+    async def exercise():
+        """Fill or close the actual registry after intent is recorded."""
+        loop = asyncio.get_running_loop()
+        queued = asyncio.Event()
+        count = 0
+        tasks = []
+
+        def queued_one():
+            """Signal after each blocker has reached the worker submission boundary."""
+            nonlocal count
+            count += 1
+            if count == 8:
+                queued.set()
+
+        async def blocker_started():
+            """Observe submission after this callback returns to the registry."""
+            loop.call_soon(queued_one)
+
+        async def record_and_block(call_id):
+            """Arrange worker refusal after durable intent and before final admission."""
+            await original(call_id)
+            if failure == "closed":
+                registry.close()
+            else:
+                tasks.extend(
+                    asyncio.create_task(
+                        registry.call_with_timing_async(
+                            "occupy", "{}", execution_started=blocker_started
+                        )
+                    )
+                    for _ in range(8)
+                )
+                await asyncio.wait_for(queued.wait(), 5)
+            if activate_yolo:
+                runner.permission_manager.set_yolo(True)
+
+        monkeypatch.setattr(restored, "record_tool_execution_started_async", record_and_block)
+        try:
+            return await asyncio.wait_for(runner.recover_session_async(confirmed=True), 10)
+        finally:
+            release.set()
+            await asyncio.gather(*tasks)
+
+    try:
+        result = asyncio.run(exercise())
+        assert result.pending and result.result.stop_reason == "recovery_required"
+        assert restored.recovery_pending
+        assert not any(isinstance(item, ToolResult) for item in restored.messages)
+        assert json.loads(interaction.tool_result.call_args.args[0])["problem"]["code"] == (
+            "tool.dispatch_busy"
+        )
+        backend.get_response.assert_not_called()
+        assert effects == []
+    finally:
+        release.set()
+        registry.close()
+
+
+@pytest.mark.parametrize("activate_yolo", [False, True])
+def test_uncertain_coroutine_retry_with_closed_runner_preserves_unknown(
+    tmp_path, monkeypatch, caplog, activate_yolo
+):
+    """Coroutine scheduling failure after durable intent leaves the prior outcome unknown."""
+    effects = []
+
+    async def effect():
+        """Record a synthetic effect."""
+        effects.append(True)
+
+    registry = ToolRegistry([effect])
+    sessions = SessionManager()
+    sessions.add_user_message("perform the original action")
+    sessions.begin_run()
+    call = ToolCall(call_id="unknown", name="effect", arguments="{}")
+    sessions.add_response(Response(answer="", reasoning="", tool_calls=(call,), items=(call,)))
+    sessions.record_tool_execution_started(call.call_id)
+    restored = SessionManager(session=Session.deserialize(sessions.session.serialize()))
+    backend = Mock()
+    runner = file_runner(tmp_path, backend, registry=registry, sessions=restored)
+    runner.interaction.confirm.return_value = True
+    original = restored.record_tool_execution_started
+
+    def record_and_close(call_id):
+        """Close the initialized coroutine runner after execution intent is recorded."""
+        original(call_id)
+        registry.close()
+        if activate_yolo:
+            runner.permission_manager.set_yolo(True)
+
+    monkeypatch.setattr(restored, "record_tool_execution_started", record_and_close)
+    try:
+        result = runner.recover_session(confirmed=True)
+        assert result.pending and result.result.stop_reason == "recovery_required"
+        assert restored.recovery_pending
+        assert not any(isinstance(item, ToolResult) for item in restored.messages)
+        shown = json.loads(runner.interaction.tool_result.call_args.args[0])
+        assert shown["problem"]["code"] == "tool.execution_failed"
+        assert len(caplog.records) == 1
+        assert caplog.records[0].__dict__["error.type"] == "tool.execution_failed"
+        assert caplog.records[0].__dict__["exception.type"] == "builtins.RuntimeError"
+        backend.get_response.assert_not_called()
+        assert effects == []
+    finally:
+        registry.close()
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_admitted_uncertain_retry_publishes_the_new_result(tmp_path, async_mode):
+    """An explicitly approved and admitted retry executes once and proceeds normally."""
+    effects = []
+
+    def effect():
+        """Record a synthetic effect."""
+        effects.append(True)
+        return "completed"
+
+    registry = ToolRegistry([effect])
+    sessions = SessionManager()
+    sessions.add_user_message("perform the original action")
+    sessions.begin_run()
+    call = ToolCall(call_id="unknown", name="effect", arguments="{}")
+    sessions.add_response(Response(answer="", reasoning="", tool_calls=(call,), items=(call,)))
+    sessions.record_tool_execution_started(call.call_id)
+    restored = SessionManager(session=Session.deserialize(sessions.session.serialize()))
+    runner = file_runner(tmp_path, Mock(), registry=registry, sessions=restored)
+    runner.interaction.confirm.return_value = True
+    final = Response(
+        answer="done", reasoning="", items=(Message(role="assistant", content="done"),)
+    )
+    try:
+        if async_mode:
+            interaction = MagicMock(spec=ConsoleInteraction)
+            interaction.confirm_async = AsyncMock(return_value=True)
+            runner._interaction = interaction
+            runner.query_async = AsyncMock(return_value=final)
+            result = asyncio.run(runner.recover_session_async(confirmed=True))
+            runner.query_async.assert_awaited_once()
+        else:
+            runner.query = Mock(return_value=final)
+            result = runner.recover_session(confirmed=True)
+            runner.query.assert_called_once()
+        assert not result.pending and result.result.stop_reason == "completed"
+        assert result.result.turns == 1
+        assert effects == [True]
+        output = next(item.output for item in restored.messages if isinstance(item, ToolResult))
+        assert json.loads(output) == {"ok": True, "result": "completed"}
+    finally:
+        registry.close()
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_uncertain_retry_preserves_policy_check_failures(tmp_path, monkeypatch, async_mode):
+    """An unavailable policy check cannot settle or execute an unknown tool call."""
+    effects = []
+
+    def effect():
+        """Record a synthetic side effect."""
+        effects.append(True)
+
+    sessions = SessionManager()
+    sessions.add_user_message("perform the action")
+    sessions.begin_run()
+    call = ToolCall(call_id="unknown", name="effect", arguments="{}")
+    sessions.add_response(Response(answer="", reasoning="", tool_calls=(call,), items=(call,)))
+    sessions.record_tool_execution_started(call.call_id)
+    restored = SessionManager(session=Session.deserialize(sessions.session.serialize()))
+    registry = ToolRegistry([effect])
+    runner = file_runner(tmp_path, Mock(), registry=registry, sessions=restored)
+    runner.interaction.confirm.return_value = True
+    check = Mock(side_effect=[True, OSError("policy unavailable")])
+    monkeypatch.setattr(runner.permission_manager, "recovery_retry_current", check)
+    if async_mode:
+        interaction = MagicMock(spec=ConsoleInteraction)
+        interaction.confirm_async = AsyncMock(return_value=True)
+        runner._interaction = interaction
+    try:
+        with pytest.raises(OSError, match="policy unavailable"):
+            if async_mode:
+                asyncio.run(runner.recover_session_async(confirmed=True))
+            else:
+                runner.recover_session(confirmed=True)
+        assert restored.recovery_pending
+        assert not any(isinstance(item, ToolResult) for item in restored.messages)
+        assert effects == []
+    finally:
+        registry.close()
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize("activate_yolo", [False, True])
+@pytest.mark.parametrize("failure", ["unavailable", "invalid", "planning", "denied"])
+def test_unstarted_retry_leaves_earlier_unknown_outcome_pending(
+    tmp_path, monkeypatch, async_mode, activate_yolo, failure
+):
+    """A failed retry cannot replace an earlier unknown outcome or trigger a model query."""
+    effects = []
+
+    def effect(number: int) -> int:
+        """Record a synthetic effect."""
+        effects.append(number)
+        return number
+
+    def fail_plan(_arguments):
+        """Refuse synthetic planning before invocation."""
+        raise ValueError("synthetic planning failure")
+
+    registration = ToolRegistration(
+        effect, operation_planner=fail_plan if failure == "planning" else None
+    )
+    registry = ToolRegistry([registration])
+    trace = Mock()
+    monkeypatch.setattr(agent_runner_module, "telemetry_trace_event", trace)
+    sessions = SessionManager()
+    sessions.add_user_message("perform the original action")
+    sessions.begin_run()
+    call = ToolCall(
+        call_id="unknown",
+        name="unavailable" if failure == "unavailable" else "effect",
+        arguments="{}" if failure == "invalid" else '{"number": 1}',
+    )
+    sessions.add_response(Response(answer="", reasoning="", tool_calls=(call,), items=(call,)))
+    sessions.record_tool_execution_started(call.call_id)
+    restored = SessionManager(session=Session.deserialize(sessions.session.serialize()))
+    backend = Mock()
+    runner = file_runner(tmp_path, backend, registry=registry, sessions=restored)
+    runner.interaction.confirm.return_value = True
+    if async_mode:
+        interaction = MagicMock(spec=ConsoleInteraction)
+        interaction.confirm_async = AsyncMock(return_value=True)
+        runner._interaction = interaction
+    if activate_yolo:
+        runner.interaction.tool_call.side_effect = lambda *_args: (
+            runner.permission_manager.set_yolo(True)
+        )
+    if failure == "denied":
+        denial = SimpleNamespace(reason="synthetic policy denial")
+        monkeypatch.setattr(
+            runner.permission_manager, "check_boundaries", Mock(return_value=denial)
+        )
+        monkeypatch.setattr(
+            runner.permission_manager, "check_boundaries_async", AsyncMock(return_value=denial)
+        )
+    try:
+        if async_mode:
+            result = asyncio.run(runner.recover_session_async(confirmed=True))
+        else:
+            result = runner.recover_session(confirmed=True)
+        assert result.pending and result.result.stop_reason == "recovery_required"
+        assert restored.recovery_pending
+        assert not any(isinstance(item, ToolResult) for item in restored.messages)
+        assert effects == []
+        backend.get_response.assert_not_called()
+        shown = json.loads(runner.interaction.tool_result.call_args.args[0])
+        trace.assert_any_call(
+            "tool.response",
+            payload={
+                "call_id": "unknown",
+                "output": runner.interaction.tool_result.call_args.args[0],
+            },
+            duration_seconds=0,
+        )
+        assert (
+            shown["problem"]["code"]
+            == {
+                "unavailable": "tool.unknown",
+                "invalid": "tool.invalid_arguments",
+                "planning": "tool.planning_failed",
+                "denied": "tool.denied",
+            }[failure]
+        )
+        assert (
+            "earlier tool outcome is still unknown"
+            in runner.interaction.warning.call_args_list[0].args[0]
+        )
+    finally:
+        registry.close()
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_yolo_activation_during_unsuperseded_recovery_stays_pending(
+    tmp_path, monkeypatch, async_mode
+):
+    """A live YOLO change cannot resume an old request after an unknown outcome."""
+    sessions = SessionManager()
+    sessions.add_user_message("perform the original action")
+    sessions.begin_run()
+    call = ToolCall(call_id="unknown", name="effect", arguments="{}")
+    sessions.add_response(Response(answer="", reasoning="", tool_calls=(call,), items=(call,)))
+    sessions.record_tool_execution_started(call.call_id)
+    restored = SessionManager(session=Session.deserialize(sessions.session.serialize()))
+    backend = Mock()
+    runner = file_runner(tmp_path, backend, sessions=restored)
+    snapshot = runner.permission_manager.recovery_retry_generation
+
+    def enable_then_snapshot():
+        """Activate YOLO after the initial recovery check."""
+        runner.permission_manager.set_yolo(True)
+        return snapshot()
+
+    monkeypatch.setattr(
+        runner.permission_manager, "recovery_retry_generation", enable_then_snapshot
+    )
+    if async_mode:
+        interaction = MagicMock(spec=ConsoleInteraction)
+        interaction.confirm_async = AsyncMock(return_value=True)
+        runner._interaction = interaction
+        result = asyncio.run(runner.recover_session_async(confirmed=True))
+        interaction.confirm_async.assert_not_awaited()
+    else:
+        result = runner.recover_session(confirmed=True)
+        runner.interaction.confirm.assert_not_called()
+
+    assert result.pending and result.result.stop_reason == "recovery_required"
+    assert restored.recovery_pending
+    assert not any(isinstance(item, ToolResult) for item in restored.messages)
+    backend.get_response.assert_not_called()
 
 
 def test_runner_finalizes_a_completed_response_without_another_model_call():
@@ -1614,6 +3582,31 @@ def test_runner_async_recovery_waits_with_async_confirmation_and_control(tmp_pat
     interaction.confirm.assert_not_called()
     runner._run_control.wait_async.assert_awaited_once_with(2.5)
     assert runner.query_async.await_count == 2
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_invalid_backend_retry_confirmation_does_not_repeat_request(asynchronous):
+    """Malformed approval leaves the failed run pending without another model request."""
+    runner, sessions, interaction = agent_runner()
+    sessions.begin_run()
+    error = BackendConnectionError("temporary", provider="test", operation="query")
+    runner.query = Mock(side_effect=error)
+    runner.query_async = AsyncMock(side_effect=error)
+    interaction.confirm.return_value = object()
+    runner._confirm_async = AsyncMock(return_value=object())
+
+    with pytest.raises(AgentRunRecoveryRequired):
+        if asynchronous:
+            asyncio.run(runner._query_with_recovery_async())
+        else:
+            runner._query_with_recovery()
+
+    if asynchronous:
+        runner.query_async.assert_awaited_once()
+        sessions.record_run_failure_async.assert_awaited_once()
+    else:
+        runner.query.assert_called_once()
+        sessions.record_run_failure.assert_called_once()
 
 
 def test_runner_async_recovery_waits_without_a_run_control(tmp_path, monkeypatch):
@@ -1945,7 +3938,7 @@ def test_uncertain_tool_retry_prompt_carries_the_original_operation_id(async_mod
 
 @pytest.mark.parametrize(
     ("continue_run", "expected_reason", "expected_turns"),
-    [(False, "max_turns", 1), (True, "completed", 2)],
+    [(False, "max_turns", 1), (True, "completed", 2), (object(), "max_turns", 1)],
 )
 def test_runner_run_async_applies_turn_limit_confirmation(
     continue_run, expected_reason, expected_turns
@@ -1965,7 +3958,7 @@ def test_runner_run_async_applies_turn_limit_confirmation(
     assert result.stop_reason == expected_reason
     assert result.turns == expected_turns
     assert runner._confirm_async.await_count == 1
-    if continue_run:
+    if continue_run is True:
         interaction.warning.assert_not_called()
     else:
         interaction.warning.assert_called_once_with(
@@ -2819,6 +4812,61 @@ def test_controlled_async_run_cancels_stream_without_persisting_partial_response
             )
 
 
+async def wait_for_worker_event(event, worker):
+    """Wait for a checkpoint or report a worker that settled before reaching it."""
+    waiter = asyncio.create_task(event.wait())
+    try:
+        await asyncio.wait((waiter, worker), return_when=asyncio.FIRST_COMPLETED)
+        if worker.done():
+            await worker
+            raise AssertionError("Worker finished before the expected checkpoint.")
+    finally:
+        waiter.cancel()
+        await asyncio.gather(waiter, return_exceptions=True)
+
+
+@pytest.mark.parametrize("outcome", ["checkpoint", "failure", "finished", "cancelled"])
+def test_wait_for_worker_event_observes_early_settlement(outcome):
+    """Checkpoint waits report early worker failures and release their own waiter."""
+
+    async def scenario():
+        """Exercise each worker outcome without timers or external scheduling."""
+        event = asyncio.Event()
+
+        async def work():
+            """Reach the selected checkpoint or settle before it."""
+            if outcome == "failure":
+                raise RuntimeError("worker setup failed")
+            if outcome == "finished":
+                return
+            if outcome == "cancelled":
+                raise asyncio.CancelledError
+            event.set()
+            await asyncio.Event().wait()
+
+        worker = asyncio.create_task(work())
+        try:
+            if outcome == "failure":
+                with pytest.raises(RuntimeError, match="worker setup failed"):
+                    await wait_for_worker_event(event, worker)
+            elif outcome == "finished":
+                with pytest.raises(AssertionError, match="before the expected checkpoint"):
+                    await wait_for_worker_event(event, worker)
+            elif outcome == "cancelled":
+                with pytest.raises(asyncio.CancelledError):
+                    await wait_for_worker_event(event, worker)
+            else:
+                await wait_for_worker_event(event, worker)
+                assert event.is_set()
+                assert not worker.done()
+        finally:
+            worker.cancel()
+            await asyncio.gather(worker, return_exceptions=True)
+        assert not [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize(
     ("mode", "previous_batch"),
     [
@@ -2919,7 +4967,7 @@ def test_async_cancellation_persists_a_settled_sync_tool_receipt(
         else:
             task = asyncio.create_task(runner.run_async())
         try:
-            await started.wait()
+            await wait_for_worker_event(started, task)
             if mode == "interrupt":
                 assert control.interrupt()
             elif mode == "stop":
@@ -2928,7 +4976,7 @@ def test_async_cancellation_persists_a_settled_sync_tool_receipt(
                 task.cancel()
             await deliver_callbacks()
             release.set()
-            await publishing.wait()
+            await wait_for_worker_event(publishing, task)
             task.cancel()
             publish.set()
             if mode in {"external", "standalone"}:
@@ -3035,17 +5083,19 @@ def test_cancellation_settles_returned_owner_loop_work_before_the_run_ends(
 
     async def create_result():
         """Construct a task or future on the invocation's actual owning event loop."""
+        handle = None
         if kind.endswith("future"):
             result = asyncio.get_running_loop().create_future()
             if kind == "completed_future":
                 result.set_result(receipt)
         else:
-            result = asyncio.create_task(effect())
+            handle = OwnedToolTask(effect())
+            result = handle.start(asyncio.get_running_loop())
             await effect_started.wait()
             if kind == "completed_task":
                 await result
         owned_results.append(result)
-        return result
+        return handle if handle is not None else result
 
     def returned_work():
         """Return already-scheduled owner-loop work from a synchronous tool."""
@@ -3105,6 +5155,9 @@ def test_cancellation_settles_returned_owner_loop_work_before_the_run_ends(
                 await deliver_callbacks()
                 assert not owned_results[0].done()
                 finish_cleanup.set()
+            elif kind == "pending_future":
+                assert not owned_results[0].done()
+                owned_results[0].cancel()
             if mode == "external":
                 with pytest.raises(asyncio.CancelledError):
                     await task

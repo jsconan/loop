@@ -16,6 +16,18 @@ from loop.telemetry import (
 pytestmark = pytest.mark.integration
 
 
+@pytest.fixture(autouse=True)
+def untimed_queue(monkeypatch):
+    """Block on queue events instead of advancing a real telemetry interval."""
+    get = queue.Queue.get
+
+    def receive(target, block=True, timeout=None):
+        """Receive an event without an elapsed-time wait."""
+        return get(target, block=block)
+
+    monkeypatch.setattr(queue.Queue, "get", receive)
+
+
 class BlockingAdapter(MemoryTelemetryAdapter):
     """Block the first background write until a test releases it."""
 
@@ -27,7 +39,7 @@ class BlockingAdapter(MemoryTelemetryAdapter):
     def write_batch(self, records):
         """Wait before retaining the first offered batch."""
         self.started.set()
-        assert self.release.wait(timeout=5), "test synchronization was not released"
+        self.release.wait()
         super().write_batch(records)
 
 
@@ -49,13 +61,13 @@ def test_activity_overload_drops_only_activity_and_preserves_priority_records():
     adapter = BlockingAdapter()
     telemetry = Telemetry(adapter, queue_capacity=1, batch_size=1, flush_seconds=10)
     telemetry.activity("writing")
-    assert adapter.started.wait(1)
+    adapter.started.wait()
     telemetry.activity("queued")
     telemetry.activity("dropped")
     telemetry.audit("preserved", decision="allow")
     adapter.release.set()
     assert telemetry.dropped_activity == 1
-    assert telemetry.close(1)
+    assert telemetry.close(None)
     event_names = [record.event_name for record in adapter.records]
     assert event_names[0] == "writing"
     assert set(event_names[1:]) == {"preserved", "queued"}
@@ -68,7 +80,7 @@ def test_sqlite_lifecycle_runs_in_writer_thread_and_closes_cleanly(tmp_path, cap
     telemetry = Telemetry(adapter, workspace_id="workspace", batch_size=1, flush_seconds=1)
     with caplog.at_level(logging.ERROR, logger="loop.telemetry.telemetry"):
         telemetry.activity("persisted")
-        assert telemetry.close(1)
+        assert telemetry.close(None)
     assert "Telemetry operation failed" not in caplog.text
 
     connection = sqlite3.connect(path)
@@ -85,9 +97,9 @@ def test_shutdown_barrier_rejects_late_activity_and_coordinates_lifecycle_calls(
     adapter = BlockingAdapter()
     telemetry = Telemetry(adapter, batch_size=1, flush_seconds=10)
     telemetry.activity("accepted")
-    assert adapter.started.wait(1)
+    adapter.started.wait()
 
-    closing = threading.Thread(target=telemetry.close, args=(1,))
+    closing = threading.Thread(target=telemetry.close, args=(None,))
     closing.start()
     assert telemetry.close(0) is False
     assert telemetry.flush(0) is False
@@ -97,9 +109,9 @@ def test_shutdown_barrier_rejects_late_activity_and_coordinates_lifecycle_calls(
     telemetry.error("ignored.error", error_type="test.ignored", exception=RuntimeError())
 
     adapter.release.set()
-    closing.join(timeout=5)
+    closing.join()
     assert not closing.is_alive()
-    assert telemetry.close(1)
+    assert telemetry.close(None)
     assert [record.event_name for record in adapter.records] == ["accepted"]
 
 
@@ -108,25 +120,40 @@ def test_flush_timeout_close_retry_and_closed_emission_are_safe():
     adapter = BlockingAdapter()
     telemetry = Telemetry(adapter, queue_capacity=2, batch_size=1, flush_seconds=10)
     telemetry.activity("writing")
-    assert adapter.started.wait(1)
+    adapter.started.wait()
     telemetry.activity("queued")
     assert telemetry.flush(0) is False
     assert telemetry.close(0) is False
     adapter.release.set()
-    assert telemetry.close(1)
+    assert telemetry.close(None)
     count = len(adapter.records)
     telemetry.activity("ignored")
     assert len(adapter.records) == count
 
 
-def test_partial_batches_flush_on_interval_without_an_explicit_barrier():
+def test_partial_batches_flush_on_interval_without_an_explicit_barrier(monkeypatch):
     """The background interval persists low-volume batches before shutdown."""
+    get = queue.Queue.get
+    received = False
+    expired = False
+
+    def receive(target, *args, **kwargs):
+        """Deliver one event, then simulate its interval expiring immediately."""
+        nonlocal received, expired
+        if received and not expired:
+            expired = True
+            raise queue.Empty
+        item = get(target, *args, **kwargs)
+        received = True
+        return item
+
+    monkeypatch.setattr(queue.Queue, "get", receive)
     adapter = SignalingAdapter()
-    telemetry = Telemetry(adapter, batch_size=10, flush_seconds=0.01)
+    telemetry = Telemetry(adapter, batch_size=10, flush_seconds=10)
     telemetry.activity("interval")
-    assert adapter.written.wait(1)
+    adapter.written.wait()
     assert len(adapter.records) == 1
-    assert telemetry.close(1)
+    assert telemetry.close(None)
 
 
 def test_idle_writer_and_zero_timeout_shutdown_are_recoverable(monkeypatch):
@@ -145,8 +172,8 @@ def test_idle_writer_and_zero_timeout_shutdown_are_recoverable(monkeypatch):
         return original_get(target, *args, **kwargs)
 
     monkeypatch.setattr(queue.Queue, "get", return_immediate_empty_once)
-    telemetry = Telemetry(MemoryTelemetryAdapter(), flush_seconds=0.01)
-    assert idle_poll.wait(1)
+    telemetry = Telemetry(MemoryTelemetryAdapter(), flush_seconds=10)
+    idle_poll.wait()
     stopped = telemetry.close(0)
     if not stopped:
-        assert telemetry.close(1)
+        assert telemetry.close(None)

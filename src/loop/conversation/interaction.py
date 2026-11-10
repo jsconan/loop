@@ -4,16 +4,15 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Generator, Iterable, Mapping
 from contextlib import contextmanager
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from prompt_toolkit.completion import Completer
 
 from .. import constants
 from ..errors import Problem
-from ..interaction import AsyncInteractionInput, Interaction
-from ..interaction.models import ListMarker
+from ..interaction import AsyncInteractionInput, Interaction, ListMarker, require_async_interaction
 from ..models import RAW_TOOL_RESULT_PRESENTATION, RunMetrics, ToolResultPresentationSpec
-from ..utils import ChoiceItem, current_interaction_correlation
+from ..utils import ChoiceItem, choice_items, current_interaction_correlation
 from .models import (
     EVENT_CONFIRM,
     EVENT_OUTPUT,
@@ -22,6 +21,9 @@ from .models import (
     EVENT_TERMINAL_EXIT,
     InteractionCall,
 )
+
+if TYPE_CHECKING:
+    from ..permissions import PermissionManager
 
 
 class MailboxInteraction(Interaction, AsyncInteractionInput):
@@ -57,6 +59,15 @@ class MailboxInteraction(Interaction, AsyncInteractionInput):
         self._dispatch_async = dispatch_async
 
     @property
+    def supports_fresh_host_approval(self) -> bool:
+        """Report whether the underlying input supports fresh human host decisions.
+
+        Returns:
+            bool: True only when the underlying input explicitly supports the decision.
+        """
+        return getattr(self._source, "supports_fresh_host_approval", False) is True
+
+    @property
     def worker_calls_routed(self) -> bool:
         """Report whether this interaction currently relays worker calls to its owner.
 
@@ -64,6 +75,25 @@ class MailboxInteraction(Interaction, AsyncInteractionInput):
             bool: ``True`` while a controller dispatcher owns the UI interaction.
         """
         return self._dispatch is not None
+
+    def current_input(self) -> str | None:
+        """Return the source's unsubmitted editor text when it supports drafts.
+
+        Returns:
+            str | None: Current draft, or None when the source cannot inspect it.
+        """
+        current = getattr(self._source, "current_input", None)
+        return current() if callable(current) else None
+
+    def set_current_input(self, value: str) -> None:
+        """Restore editor text through an input source that supports drafts.
+
+        Args:
+            value (str): Text to place in the source editor.
+        """
+        setter = getattr(self._source, "set_current_input", None)
+        if callable(setter):
+            setter(value)
 
     def _call(
         self,
@@ -225,9 +255,10 @@ class MailboxInteraction(Interaction, AsyncInteractionInput):
             ValueError: If the prompt choices or completion options are invalid.
             CancelledError: If the input task is cancelled.
         """
+        source = require_async_interaction(self._source, "mailbox input")
         options = {} if exit_commands is constants.OMIT else {"exit_commands": exit_commands}
         return await self._call_async(
-            self._source.prompt_async,
+            source.prompt_async,
             message,
             completer=completer,
             choices=choices,
@@ -267,8 +298,9 @@ class MailboxInteraction(Interaction, AsyncInteractionInput):
         Raises:
             CancelledError: If the confirmation task is cancelled.
         """
+        source = require_async_interaction(self._source, "mailbox confirmation")
         return await self._call_async(
-            self._source.confirm_async,
+            source.confirm_async,
             message,
             default=default,
             kind=EVENT_CONFIRM,
@@ -500,3 +532,211 @@ class MailboxInteraction(Interaction, AsyncInteractionInput):
     def conversation_ended(self) -> None:
         """Display that the conversation has ended."""
         self._call(self._source.conversation_ended)
+
+
+class ApprovalInteraction(MailboxInteraction):
+    """Apply the permission decision mechanism to ordinary application confirmations.
+
+    Args:
+        source (Interaction): Underlying interactive or headless presentation.
+        permissions (PermissionManager): Current trusted confirmation policy.
+    """
+
+    permissions: PermissionManager
+
+    def __init__(self, source: Interaction, permissions: PermissionManager) -> None:
+        super().__init__(source)
+        self.permissions = permissions
+
+    @classmethod
+    def for_permissions(
+        cls,
+        source: Interaction,
+        permissions: PermissionManager,
+    ) -> ApprovalInteraction:
+        """Bind the supplied interaction to the current permission manager.
+
+        Args:
+            source (Interaction): Existing presentation or approval adapter.
+            permissions (PermissionManager): Authority for confirmation decisions.
+
+        Returns:
+            ApprovalInteraction: Adapter using the supplied authority without nested adapters.
+        """
+        while isinstance(source, cls):
+            if source.permissions is permissions and not isinstance(source._source, cls):
+                return source
+            source = source._source
+        return cls(source, permissions)
+
+    @property
+    def yolo(self) -> bool:
+        """Return whether trusted configuration currently enables YOLO.
+
+        Returns:
+            bool: Current no-prompt state.
+        """
+        return self.permissions.yolo
+
+    @property
+    def worker_calls_routed(self) -> bool:
+        """Preserve the source owner's worker relay capability.
+
+        Returns:
+            bool: Whether this wrapper or its source currently routes worker calls.
+        """
+        return super().worker_calls_routed or self._source.worker_calls_routed is True
+
+    def confirm(self, message: str, *, default: bool = False) -> bool:
+        """Resolve an ordinary confirmation through current policy or human input.
+
+        Args:
+            message (str): Confirmation question shown when YOLO is inactive.
+            default (bool): Human input default when YOLO is inactive.
+
+        Returns:
+            bool: Effective confirmation decision.
+        """
+        decision = self.permissions.confirmation_decision()
+        return decision if decision is not None else super().confirm(message, default=default)
+
+    @staticmethod
+    def _single_choice(
+        choices: Iterable[str | ChoiceItem] | Mapping[object, str],
+        *,
+        completer: Completer | None,
+        exit_commands: str | Iterable[str] | None | constants.Omit,
+        index: Iterable[str] | Mapping[object, str] | None,
+    ) -> tuple[bool, object, Iterable[str | ChoiceItem] | Mapping[object, str]]:
+        """Validate a console picker's implicit one-choice confirmation."""
+        entries = choices if isinstance(choices, Mapping) else tuple(choices)
+        if len(entries) != 1:
+            return False, None, entries
+        selected = choice_items(entries, index=index)[0]
+        exits = (
+            ("q",)
+            if exit_commands is constants.OMIT
+            else (exit_commands,)
+            if isinstance(exit_commands, str)
+            else tuple(exit_commands or ())
+        )
+        if selected.index.casefold() in {command.strip().casefold() for command in exits}:
+            raise ValueError("selection indexes cannot conflict with exit commands.")
+        if completer is not None:
+            raise ValueError("choices cannot be combined with a custom completer.")
+        return True, selected.value, entries
+
+    def prompt(
+        self,
+        message: str | None = None,
+        completer: Completer | None = None,
+        exit_commands: str | Iterable[str] | None | constants.Omit = constants.OMIT,
+        choices: Iterable[str | ChoiceItem] | Mapping[object, str] | None = None,
+        index: Iterable[str] | Mapping[object, str] | None = None,
+        default: object | None = None,
+        secret: bool = False,
+    ) -> object | False:
+        """Forward information input, or accept the console's sole choice under YOLO.
+
+        Args:
+            message (str | None): Prompt message.
+            completer (Completer | None): Optional completion provider.
+            exit_commands (str | Iterable[str] | None | constants.Omit): Exit terms or omission.
+            choices (Iterable[str | ChoiceItem] | Mapping[object, str] | None): Options to select.
+            index (Iterable[str] | Mapping[object, str] | None): Display indexes for options.
+            default (object | None): Empty-input value.
+            secret (bool): Whether to mask entered text.
+
+        Returns:
+            object | False: Selected value or exit result.
+        """
+        if self.yolo and choices is not None:
+            sole, value, choices = self._single_choice(
+                choices,
+                completer=completer,
+                exit_commands=exit_commands,
+                index=index,
+            )
+            if sole and self.permissions.confirmation_decision() is True:
+                return value
+        options = {}
+        if completer is not None:
+            options["completer"] = completer
+        if exit_commands is not constants.OMIT:
+            options["exit_commands"] = exit_commands
+        if choices is not None:
+            options["choices"] = choices
+        if index is not None:
+            options["index"] = index
+        if default is not None:
+            options["default"] = default
+        if secret:
+            options["secret"] = True
+        args = () if message is None else (message,)
+        return self._call(self._source.prompt, *args, kind=EVENT_PROMPT, **options)
+
+    async def prompt_async(
+        self,
+        message: str | None = None,
+        completer: Completer | None = None,
+        exit_commands: str | Iterable[str] | None | constants.Omit = constants.OMIT,
+        choices: Iterable[str | ChoiceItem] | Mapping[object, str] | None = None,
+        index: Iterable[str] | Mapping[object, str] | None = None,
+        default: object | None = None,
+        secret: bool = False,
+        initial: str | None = None,
+    ) -> object | False:
+        """Forward native async information input or accept the sole choice under YOLO.
+
+        Args:
+            message (str | None): Prompt message.
+            completer (Completer | None): Optional completion provider.
+            exit_commands (str | Iterable[str] | None | constants.Omit): Exit terms or omission.
+            choices (Iterable[str | ChoiceItem] | Mapping[object, str] | None): Options to select.
+            index (Iterable[str] | Mapping[object, str] | None): Display indexes for options.
+            default (object | None): Empty-input value.
+            secret (bool): Whether to mask entered text.
+            initial (str | None): Initial editor text.
+
+        Returns:
+            object | False: Selected value or exit result.
+
+        Raises:
+            ProblemException: If the source has no native asynchronous input.
+        """
+        if self.yolo and choices is not None:
+            sole, value, choices = self._single_choice(
+                choices,
+                completer=completer,
+                exit_commands=exit_commands,
+                index=index,
+            )
+            if sole and self.permissions.confirmation_decision() is True:
+                return value
+        require_async_interaction(self._source, "approval input")
+        return await super().prompt_async(
+            message,
+            completer=completer,
+            exit_commands=exit_commands,
+            choices=choices,
+            index=index,
+            default=default,
+            secret=secret,
+            initial=initial,
+        )
+
+    async def confirm_async(self, message: str, *, default: bool = False) -> bool:
+        """Resolve confirmation without blocking the asynchronous owner.
+
+        Args:
+            message (str): Confirmation question shown when YOLO is inactive.
+            default (bool): Human input default when YOLO is inactive.
+
+        Returns:
+            bool: Effective confirmation decision.
+        """
+        decision = self.permissions.confirmation_decision()
+        if decision is not None:
+            return decision
+        require_async_interaction(self._source, "approval confirmation")
+        return await super().confirm_async(message, default=default)

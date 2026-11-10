@@ -94,6 +94,23 @@ def test_tool_argument_redaction_is_transient() -> None:
     assert ToolCall.model_validate(expected).arguments_redacted is False
 
 
+def test_terminal_controls_remove_input_before_storage_or_display() -> None:
+    """A transient terminal control cannot expose input through its saved call copy."""
+    original = ToolCall(
+        call_id="terminal",
+        name="control_command_terminal",
+        arguments='{"handle":"owned","action":"write","content":"secret"}',
+    )
+    redacted = original.for_storage()
+    assert original.arguments.endswith('"secret"}')
+    assert redacted.arguments == "{}"
+    assert redacted.arguments_redacted
+    assert (
+        ToolCall(call_id="other", name="run_command", arguments="{}").for_storage().arguments
+        == "{}"
+    )
+
+
 def test_conversation_items_expose_optional_response_metadata() -> None:
     """Every conversation item can retain response-level usage without changing local inputs."""
     metadata = ResponseMetadata(

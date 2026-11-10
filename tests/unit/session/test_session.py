@@ -1,8 +1,8 @@
 """Tests for session state, serialization, and persistence contracts."""
 
 import json
+import uuid
 from datetime import UTC, datetime, timedelta, timezone
-from uuid import UUID
 
 import pytest
 
@@ -65,12 +65,12 @@ def test_session_info_describes_a_persisted_session():
     assert info == SessionInfo("session-id", "Useful title", updated_at, 2)
 
 
-def test_session_generates_a_stable_uuidv7_identifier():
-    """Fresh sessions receive an identifier before persistence begins."""
+def test_session_generates_a_stable_uuid_identifier():
+    """Fresh sessions use the runtime's UUID7 generator or its UUID4 fallback."""
     session = Session()
 
     assert session.id is not None
-    assert UUID(session.id).version == 7
+    assert uuid.UUID(session.id).version == (7 if hasattr(uuid, "uuid7") else 4)
 
 
 def test_session_deserialization_rejects_an_empty_identifier():
@@ -182,6 +182,19 @@ def test_session_groups_model_metadata_as_one_assignment():
     assert session.assignment == ModelAssignment(model="model", context_window=8192)
 
 
+def test_session_tool_call_index_identifies_the_latest_occurrence():
+    """A provider identifier reused in a later response denotes a distinct history item."""
+    first = ToolCall(call_id="reused", name="run_command", arguments="{}")
+    second = ToolCall(call_id="reused", name="run_command", arguments="{}")
+    session = Session()
+    assert session.tool_call_index("reused") is None
+    session.add_message(first)
+    assert session.tool_call_index("reused") == 0
+    session.add_message(ToolResult(call_id="reused", output="done"))
+    session.add_message(second)
+    assert session.tool_call_index("reused") == 2
+
+
 def test_session_places_response_tool_calls_when_they_are_executed():
     """Multiple model tool calls replay beside their sequential local results."""
     first = ToolCall(call_id="first", name="one", arguments="{}")
@@ -207,6 +220,20 @@ def test_session_places_response_tool_calls_when_they_are_executed():
         session.add_tool_call_event("first")
     with pytest.raises(ValueError, match="Unknown"):
         session.add_tool_call_event("missing")
+
+
+def test_terminal_input_is_not_persisted_in_session_response() -> None:
+    """Session snapshots and replay retain terminal call identity without its input."""
+    call = ToolCall(
+        call_id="secret-call",
+        name="control_command_terminal",
+        arguments='{"action":"write","content":"private-secret"}',
+    )
+    session = Session()
+    session.add_message(Response(answer="", reasoning="", tool_calls=(call,), items=(call,)))
+    assert session.messages[-1].arguments == "{}"
+    assert "private-secret" not in session.serialize()
+    assert call.arguments.endswith('"private-secret"}')
 
 
 @pytest.mark.parametrize(
@@ -627,14 +654,25 @@ def test_session_externalizes_shipped_v11_inline_references():
 
 
 def test_session_migrates_v13_snapshots_without_changing_existing_history():
-    """Version 13 sessions retain canonical history while adopting the current schema."""
-    original = Session(messages=[Message(role="user", content="question")])
+    """Version 13 migration preserves recorded command output without reconstructing it."""
+    recorded = json.dumps(
+        {"ok": True, "result": {"stdout": {"content": "<external>/old path", "truncated": False}}}
+    )
+    original = Session(
+        messages=[
+            Message(role="user", content="question"),
+            ToolCall(call_id="old-command", name="run_command", arguments='{"command":"pwd"}'),
+            ToolResult(call_id="old-command", output=recorded),
+        ]
+    )
     payload = json.loads(original.serialize())
     payload["version"] = 13
 
     restored = Session.deserialize(json.dumps(payload))
 
     assert restored.messages == original.messages
+    assert restored.messages[-1].output == recorded
+    assert "decoding_loss" not in json.loads(restored.messages[-1].output)["result"]["stdout"]
     assert json.loads(restored.serialize())["version"] == 16
 
 

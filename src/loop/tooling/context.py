@@ -17,9 +17,25 @@ if TYPE_CHECKING:
     from ..execution import CommandExecutionService
     from ..instructions import InstructionsManager
     from ..permissions import OperationPlan, Operations, PermissionManager
+    from ..session import SessionManager
 
 AdditionalAuthorizer = Callable[[dict[str, object]], "OperationPlan"]
 AdditionalAuthorizerAsync = Callable[[dict[str, object]], Awaitable["OperationPlan"]]
+
+
+def _confirmation_decision(value: object, tool_name: str) -> bool:
+    """Reject malformed interaction results without treating them as user decisions."""
+    if value is True or value is False:
+        return value
+    raise ProblemException(
+        Problem(
+            code="tool.invalid_confirmation",
+            title="Invalid confirmation",
+            detail="The interaction did not return a boolean confirmation decision.",
+            severity="warning",
+            operation=tool_name,
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -34,8 +50,8 @@ class ToolContext:
         operations (Operations): Authorized operations for this invocation.
         prerequisite_operations (Operations): Authorized inspection operations that
             produced the executable plan.
-        call_id (str | None): Stable model call identifier suitable as an idempotency key, or
-            ``None`` for direct user-command invocations.
+        call_id (str | None): Provider identifier for this model call, or ``None`` for direct
+            user-command invocations. Identifiers can recur in later responses.
         additional_authorizer (AdditionalAuthorizer | None): Registry-owned callback that plans
             and authorizes effects discovered during execution, or ``None`` when unavailable.
         additional_authorizer_async (AdditionalAuthorizerAsync | None): Native asynchronous
@@ -45,6 +61,8 @@ class ToolContext:
             approval, or None outside registry dispatch.
         execution_service (CommandExecutionService | None): Registry-injected facade for tools
             with native execution authorization, or ``None`` otherwise.
+        session_manager (SessionManager | None): Selected session whose native ownership lease
+            must outlive a detached command, or ``None`` for standalone dispatch.
         file_versions (dict[str, str | None]): Versions successfully written by this call, or
             ``None`` for paths successfully removed.
             Defaults to an independent empty dictionary.
@@ -68,6 +86,7 @@ class ToolContext:
     settings: ToolRuntimeSettings = field(default_factory=ToolRuntimeSettings)
     permission_manager: PermissionManager | None = None
     execution_service: CommandExecutionService | None = None
+    session_manager: SessionManager | None = None
     file_versions: dict[str, str | None] = field(default_factory=dict)
     read_versions: dict[str, str | None] = field(default_factory=dict)
     cancellation_event: Event | None = None
@@ -160,8 +179,8 @@ class ToolContext:
             bool: Whether the user approved the action.
 
         Raises:
-            ProblemException: If interaction is unavailable or an async tool attempts blocking
-                confirmation.
+            ProblemException: If interaction is unavailable, returns an invalid decision, or an
+                async tool attempts blocking confirmation.
         """
         if self.execution_mode == "async":
             raise ProblemException(
@@ -185,7 +204,9 @@ class ToolContext:
                     operation=self.tool_name,
                 )
             )
-        return self.interaction.confirm(message, default=default)
+        return _confirmation_decision(
+            self.interaction.confirm(message, default=default), self.tool_name
+        )
 
     async def confirm_async(self, message: str, *, default: bool = False) -> bool:
         """Ask the user for confirmation through native asynchronous input.
@@ -198,11 +219,14 @@ class ToolContext:
             bool: Whether the user approved the action.
 
         Raises:
-            ProblemException: If interaction is unavailable or lacks native async input.
+            ProblemException: If interaction is unavailable, lacks native async input, or returns
+                an invalid decision.
             asyncio.CancelledError: If the interaction is cancelled.
         """
         interaction = require_async_interaction(self.interaction, "tool confirmation")
-        return await interaction.confirm_async(message, default=default)
+        return _confirmation_decision(
+            await interaction.confirm_async(message, default=default), self.tool_name
+        )
 
     def authorize_additional(self, arguments: dict[str, object]) -> OperationPlan:
         """Plan and authorize effects discovered during this tool invocation.

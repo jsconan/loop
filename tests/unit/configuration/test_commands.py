@@ -1,19 +1,635 @@
 """Tests for interactive application-configuration commands."""
 
 import asyncio
+import json
+import os
 from threading import Event, get_ident
 from unittest.mock import AsyncMock, Mock, call
 
 import pytest
 from prompt_toolkit.document import Document
 
-from loop import Interaction
-from loop.commands import CommandManager
+from loop import Interaction, PermissionManager
+from loop.commands import CommandArgumentError, CommandContext, CommandManager
 from loop.completion import CommandCompletionAdapter, CompletionManager
 from loop.configuration import ConfigurationCommands, ConfigurationManager
 from loop.interaction import ConsoleInteraction
 from loop.models import CommandCapability
+from loop.permissions.managed import ManagedPolicyStore
 from tests.scheduling import deliver_callbacks
+
+
+def test_yolo_command_defaults_to_session_and_displays_activation_and_status(tmp_path):
+    """The human config command explains authority before enabling and reports both lifetimes."""
+    configuration = ConfigurationManager(tmp_path / "config" / "config.toml")
+    configuration.initialize()
+    configuration.load({})
+    interaction = Mock(spec=ConsoleInteraction)
+    events = []
+    interaction.warning.side_effect = lambda message: events.append(("warning", message))
+    apply = Mock(side_effect=lambda path, settings: events.append(("apply", path)) or "applied now")
+    manager = CommandManager(
+        providers=(ConfigurationCommands(configuration, apply),), interaction=interaction
+    )
+    config = next(item for item in manager.active_commands if item.name == "config")
+    assert "private data" in config.description
+
+    assert manager.handle_user_command("/config set app.yolo true")
+    assert configuration.effective.app.yolo is True
+    assert configuration.source_for("app.yolo") == "session"
+    assert configuration.saved_yolo is False
+    assert events[0][0] == "warning"
+    assert "private data" in events[0][1]
+    assert events[1] == ("apply", "app.yolo")
+    interaction.prompt.assert_not_called()
+    assert "YOLO active: True" in interaction.info.call_args.args[0]
+
+    assert manager.handle_user_command("/config set app.yolo true scope=user")
+    assert configuration.saved_yolo is True
+    assert manager.handle_user_command("/config set app.yolo false")
+    assert configuration.effective.app.yolo is False
+    assert "will become active on restart" in interaction.info.call_args.args[0]
+    assert manager.handle_user_command("/config set app.yolo true scope=session")
+    assert manager.handle_user_command("/config set app.yolo false scope=user")
+    assert configuration.effective.app.yolo is True
+    assert "Disable with scope=session" in interaction.info.call_args.args[0]
+    assert manager.handle_user_command("/config get app.yolo")
+    assert "saved user value: False" in interaction.info.call_args.args[0]
+    assert manager.handle_user_command("/config set app.yolo false scope=workspace")
+    assert "supports session and user" in interaction.report.call_args.args[0].detail
+
+
+@pytest.mark.parametrize("scope", ["session", "user"])
+def test_yolo_command_checks_managed_policy_before_changing_configuration(tmp_path, scope):
+    """Administrator denial cannot change active or persisted YOLO configuration."""
+    configuration = ConfigurationManager(tmp_path / "config" / "config.toml")
+    configuration.initialize()
+    configuration.load({})
+    before = configuration.path.read_bytes()
+    interaction = Mock(spec=ConsoleInteraction)
+    apply = Mock()
+    validate = Mock(side_effect=ValueError("Administrator policy prohibits YOLO activation."))
+    provider = ConfigurationCommands(configuration, apply, validate_yolo=validate)
+    manager = CommandManager(providers=(provider,), interaction=interaction)
+    assert manager.handle_user_command(f"/config set app.yolo true scope={scope}")
+    assert configuration.effective.app.yolo is False
+    assert configuration.saved_yolo is False
+    assert configuration.path.read_bytes() == before
+    assert "prohibits YOLO" in interaction.report.call_args.args[0].detail
+    apply.assert_not_called()
+    validate.assert_called_once()
+
+
+@pytest.mark.parametrize("scope", ["session", "user"])
+def test_yolo_activation_failure_does_not_publish_or_overwrite_concurrent_config(tmp_path, scope):
+    """A later managed denial rolls back runtime without publishing the pending setting."""
+    configuration = ConfigurationManager(tmp_path / "config" / "config.toml")
+    configuration.initialize()
+    configuration.load({})
+    concurrent = ConfigurationManager(configuration.path)
+    concurrent.load({})
+    interaction = Mock(spec=ConsoleInteraction)
+    applied = []
+
+    def apply(path, settings):
+        """Change an unrelated saved setting while runtime activation is being applied."""
+        applied.append(settings.app.yolo)
+        if settings.app.yolo:
+            concurrent.set("app.debug", True, scope="user")
+        return "applied now"
+
+    validate = Mock(side_effect=[None, ValueError("Administrator policy became stale.")])
+    provider = ConfigurationCommands(configuration, apply, validate_yolo=validate)
+    manager = CommandManager(providers=(provider,), interaction=interaction)
+    assert manager.handle_user_command(f"/config set app.yolo true scope={scope}")
+    assert applied == [True, False]
+    assert "policy became stale" in interaction.report.call_args.args[0].detail
+    concurrent.reload({})
+    assert concurrent.saved_yolo is False
+    assert concurrent.effective.app.debug is True
+    assert configuration.effective.app.yolo is False
+
+
+@pytest.mark.parametrize("policy_fails", [False, True])
+def test_cancelled_yolo_activation_settles_its_commit_or_rollback(tmp_path, policy_fails):
+    """Cancellation waits for publication or rollback when managed validation changes."""
+    configuration = ConfigurationManager(tmp_path / "config" / "config.toml")
+    configuration.initialize()
+    configuration.load({})
+    started = asyncio.Event()
+    release = asyncio.Event()
+    applied = []
+
+    async def apply_async(_path, settings):
+        """Block only the first activation so cancellation can arrive during application."""
+        applied.append(settings.app.yolo)
+        if settings.app.yolo:
+            started.set()
+            await release.wait()
+        return "applied now"
+
+    validate = Mock(side_effect=[None, ValueError("policy changed")] if policy_fails else None)
+    provider = ConfigurationCommands(
+        configuration, Mock(), apply_async=apply_async, validate_yolo=validate
+    )
+    manager = CommandManager(providers=(provider,), interaction=Mock(spec=ConsoleInteraction))
+
+    async def dispatch():
+        """Cancel after runtime work begins and allow the transaction to settle."""
+        pending = asyncio.create_task(manager.call_async("config", "set app.yolo true scope=user"))
+        await started.wait()
+        pending.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError) as captured:
+            await pending
+        if policy_fails:
+            assert isinstance(captured.value.__cause__, ValueError)
+
+    asyncio.run(dispatch())
+    assert configuration.saved_yolo is (not policy_fails)
+    assert applied == ([True, False] if policy_fails else [True])
+    manager.close()
+
+
+def test_independently_cancelled_yolo_application_rolls_back(tmp_path):
+    """A cancelled runtime callback cannot leave a committed or active activation."""
+    configuration = ConfigurationManager(tmp_path / "config" / "config.toml")
+    configuration.initialize()
+    configuration.load({})
+    applied = []
+
+    async def apply_async(_path, settings):
+        """Cancel the activation independently and accept the explicit rollback."""
+        applied.append(settings.app.yolo)
+        if settings.app.yolo:
+            raise asyncio.CancelledError("runtime cancelled")
+        return "applied now"
+
+    provider = ConfigurationCommands(
+        configuration, Mock(), apply_async=apply_async, validate_yolo=Mock()
+    )
+    manager = CommandManager(providers=(provider,), interaction=Mock(spec=ConsoleInteraction))
+
+    async def dispatch():
+        """Observe the callback cancellation after the compensating runtime action."""
+        with pytest.raises(asyncio.CancelledError, match="runtime cancelled"):
+            await manager.call_async("config", "set app.yolo true scope=user")
+
+    asyncio.run(dispatch())
+    assert applied == [True, False]
+    assert configuration.saved_yolo is False
+    assert configuration.effective.app.yolo is False
+    manager.close()
+
+
+@pytest.mark.parametrize("fail_save", [False, True])
+def test_yolo_publication_gates_automatic_decisions_and_restores_failed_save(
+    tmp_path, monkeypatch, fail_save
+):
+    """An uncommitted runtime activation cannot approve work and a failed save restores state."""
+    configuration = ConfigurationManager(tmp_path / "config" / "config.toml")
+    configuration.initialize()
+    configuration.load({})
+    before = configuration.path.read_bytes()
+    permissions = PermissionManager(tmp_path)
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def apply_async(_path, settings):
+        """Apply the requested mode, then hold activation before publishing it."""
+        permissions.set_yolo(settings.app.yolo)
+        if settings.app.yolo:
+            started.set()
+            await release.wait()
+        return "applied now"
+
+    if fail_save:
+        monkeypatch.setattr(configuration, "_save_scope", Mock(side_effect=OSError("save failed")))
+    provider = ConfigurationCommands(
+        configuration,
+        Mock(),
+        apply_async=apply_async,
+        validate_yolo=permissions.validate_yolo_activation,
+        yolo_active=lambda: permissions.yolo,
+        yolo_gate=permissions.suspend_yolo_decisions,
+    )
+    manager = CommandManager(providers=(provider,), interaction=Mock(spec=ConsoleInteraction))
+
+    async def dispatch():
+        """Check the live permission boundary while the activation is not yet committed."""
+        pending = asyncio.create_task(manager.call_async("config", "set app.yolo true scope=user"))
+        await started.wait()
+        assert permissions.yolo is False
+        assert permissions.confirmation_decision() is None
+        release.set()
+        if fail_save:
+            with pytest.raises(OSError, match="save failed"):
+                await pending
+        else:
+            await pending
+
+    asyncio.run(dispatch())
+    assert permissions.yolo is not fail_save
+    assert configuration.effective.app.yolo is not fail_save
+    assert configuration.saved_yolo is not fail_save
+    if fail_save:
+        assert configuration.path.read_bytes() == before
+    manager.close()
+    permissions.close()
+
+
+@pytest.mark.parametrize("scope", ["session", "user"])
+def test_reapplying_yolo_preserves_decisions_during_publication(tmp_path, scope):
+    """An already committed activation remains available while its update is pending."""
+    configuration = ConfigurationManager(tmp_path / "config" / "config.toml")
+    configuration.initialize()
+    configuration.load({})
+    configuration.set_session("app.yolo", True)
+    permissions = PermissionManager(tmp_path, yolo=True)
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def apply_async(_path, settings):
+        """Hold publication after the runtime sees the already-active setting."""
+        permissions.set_yolo(settings.app.yolo)
+        started.set()
+        await release.wait()
+        return "applied now"
+
+    provider = ConfigurationCommands(
+        configuration,
+        Mock(),
+        apply_async=apply_async,
+        validate_yolo=permissions.validate_yolo_activation,
+        yolo_active=lambda: permissions.yolo,
+        yolo_gate=permissions.suspend_yolo_decisions,
+    )
+    manager = CommandManager(providers=(provider,), interaction=Mock(spec=ConsoleInteraction))
+
+    async def dispatch():
+        """Authorize while the config command has not yet completed."""
+        pending = asyncio.create_task(
+            manager.call_async("config", f"set app.yolo true scope={scope}")
+        )
+        await started.wait()
+        assert permissions.yolo is True
+        assert permissions.confirmation_decision() is True
+        release.set()
+        await pending
+
+    asyncio.run(dispatch())
+    assert permissions.yolo is True
+    assert configuration.effective.app.yolo is True
+    manager.close()
+    permissions.close()
+
+
+@pytest.mark.parametrize("revoke", [False, True])
+def test_failed_yolo_update_does_not_restore_revoked_authority(tmp_path, monkeypatch, revoke):
+    """A failed update restores active authority only if managed policy never revoked it."""
+    directory = tmp_path / "system" / "loop"
+    directory.mkdir(parents=True)
+    directory.parent.chmod(0o755)
+    directory.chmod(0o755)
+    identity = "a" * 32
+    expectation = directory.parent / "loop.managed.expect.json"
+    expectation.write_text(json.dumps({"version": 1, "identity": identity, "minimum_revision": 1}))
+    policy = directory / "managed-policy.json"
+    document = {"version": 1, "identity": identity, "revision": 1, "forbid_yolo": False}
+    policy.write_text(json.dumps(document))
+    expectation.chmod(0o644)
+    policy.chmod(0o644)
+    store = ManagedPolicyStore(directory, trust_anchor=tmp_path, owner_uid=os.getuid())
+    configuration = ConfigurationManager(tmp_path / "config" / "config.toml")
+    configuration.initialize()
+    configuration.load({})
+    configuration.set_session("app.yolo", True)
+    permissions = PermissionManager(tmp_path, managed_policy_store=store, yolo=True)
+    started, release = asyncio.Event(), asyncio.Event()
+    applied = []
+
+    async def apply_async(_path, settings):
+        """Hold the runtime update before the user configuration save."""
+        applied.append(settings.app.yolo)
+        permissions.set_yolo(settings.app.yolo)
+        if len(applied) == 1:
+            started.set()
+            await release.wait()
+        return "applied now"
+
+    monkeypatch.setattr(configuration, "_save_scope", Mock(side_effect=OSError("save failed")))
+    provider = ConfigurationCommands(
+        configuration,
+        Mock(),
+        apply_async=apply_async,
+        validate_yolo=permissions.validate_yolo_activation,
+        yolo_active=lambda: permissions.yolo,
+        yolo_gate=permissions.suspend_yolo_decisions,
+    )
+    manager = CommandManager(providers=(provider,), interaction=Mock(spec=ConsoleInteraction))
+
+    async def dispatch():
+        """Change managed authority while the original publication is pending."""
+        pending = asyncio.create_task(manager.call_async("config", "set app.yolo true scope=user"))
+        await started.wait()
+        if revoke:
+            document.update(revision=2, forbid_yolo=True)
+            policy.write_text(json.dumps(document))
+            permissions.reload()
+            assert permissions.yolo is False
+            document.update(revision=3, forbid_yolo=False)
+            policy.write_text(json.dumps(document))
+            permissions.reload()
+            assert permissions.yolo is False
+        release.set()
+        with pytest.raises(OSError, match="save failed"):
+            await pending
+
+    asyncio.run(dispatch())
+    assert permissions.yolo is not revoke
+    assert permissions.confirmation_decision() is (None if revoke else True)
+    assert configuration.saved_yolo is False
+    manager.close()
+    permissions.close()
+
+
+def test_yolo_rollback_without_permission_gate_preserves_original_error(tmp_path):
+    """An independent configuration adapter retains both errors when no gate is supplied."""
+    configuration = ConfigurationManager(tmp_path / "config" / "config.toml")
+    configuration.initialize()
+    configuration.load({})
+    apply = Mock(side_effect=[ValueError("activation failed"), OSError("rollback failed")])
+    provider = ConfigurationCommands(configuration, apply, validate_yolo=Mock())
+    context = CommandContext("config", Mock(spec=ConsoleInteraction))
+    with pytest.raises(CommandArgumentError, match="activation failed") as captured:
+        asyncio.run(provider.config_async(context, "set", "app.yolo", "true", "session"))
+    assert any("rollback failed" in note for note in captured.value.__cause__.__notes__)
+    assert configuration.effective.app.yolo is False
+    assert configuration.saved_yolo is False
+
+
+@pytest.mark.parametrize("initially_active", [False, True])
+def test_yolo_rollback_failure_disables_automatic_approval(tmp_path, monkeypatch, initially_active):
+    """Unconfirmed egress revocation cannot expose YOLO after a failed configuration write."""
+    configuration = ConfigurationManager(tmp_path / "config" / "config.toml")
+    configuration.initialize()
+    configuration.load({})
+    permissions = PermissionManager(tmp_path, yolo=initially_active)
+    lease = Mock()
+    lease.pause.return_value = False
+    lease.revoke_revision.return_value = False
+    applied = []
+
+    async def apply_async(_path, settings):
+        """Bind an unresponsive mediator after pre-application and before the failed save."""
+        applied.append(settings.app.yolo)
+        permissions.set_yolo(settings.app.yolo)
+        if len(applied) == 1:
+            permissions.bind_egress(permissions.egress_policy_revision(), lease)
+        return "applied now"
+
+    monkeypatch.setattr(configuration, "_save_scope", Mock(side_effect=OSError("save failed")))
+    provider = ConfigurationCommands(
+        configuration,
+        Mock(),
+        apply_async=apply_async,
+        validate_yolo=permissions.validate_yolo_activation,
+        yolo_active=lambda: permissions.yolo,
+        yolo_gate=permissions.suspend_yolo_decisions,
+    )
+    manager = CommandManager(providers=(provider,), interaction=Mock(spec=ConsoleInteraction))
+
+    async def dispatch():
+        """Keep the original save failure and the unconfirmed rollback diagnostic."""
+        with pytest.raises(OSError, match="save failed") as captured:
+            await manager.call_async("config", "set app.yolo true scope=user")
+        assert any(
+            "egress admission pause is uncertain" in note for note in captured.value.__notes__
+        )
+
+    asyncio.run(dispatch())
+    assert permissions.yolo is False
+    assert permissions.confirmation_decision() is None
+    assert configuration.saved_yolo is False
+    lease.revoke_revision.assert_called()
+    with pytest.raises(OSError, match="egress closure could not be confirmed"):
+        permissions.close()
+    manager.close()
+
+
+@pytest.mark.parametrize("cancel_first", [False, True])
+def test_concurrent_yolo_commands_apply_in_order(tmp_path, cancel_first):
+    """A later session disable takes effect after the pending user activation settles."""
+    configuration = ConfigurationManager(tmp_path / "config" / "config.toml")
+    configuration.initialize()
+    configuration.load({})
+    started, release, second_started = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    applied = []
+
+    async def apply_async(_path, settings):
+        """Hold the first activation while another command enters dispatch."""
+        applied.append(settings.app.yolo)
+        if settings.app.yolo:
+            started.set()
+            await release.wait()
+        return "applied now"
+
+    provider = ConfigurationCommands(
+        configuration, Mock(), apply_async=apply_async, validate_yolo=Mock()
+    )
+    manager = CommandManager(providers=(provider,), interaction=Mock(spec=ConsoleInteraction))
+
+    async def disable():
+        """Signal entry before contending for the mutation transaction."""
+        second_started.set()
+        await manager.call_async("config", "set app.yolo false scope=session")
+
+    async def dispatch():
+        """Interleave an activation and later disable, optionally cancelling the first."""
+        first = asyncio.create_task(manager.call_async("config", "set app.yolo true scope=user"))
+        await started.wait()
+        second = asyncio.create_task(disable())
+        await second_started.wait()
+        assert not second.done()
+        if cancel_first:
+            first.cancel()
+        release.set()
+        if cancel_first:
+            with pytest.raises(asyncio.CancelledError):
+                await first
+        else:
+            await first
+        await second
+
+    asyncio.run(dispatch())
+    assert applied == [True, False]
+    assert configuration.saved_yolo is True
+    assert configuration.effective.app.yolo is False
+    manager.close()
+
+
+def test_cancelled_yolo_waiter_does_not_retain_the_mutation_lock(tmp_path):
+    """Cancelling a competing command cannot strand or steal another transaction's lock."""
+    configuration = ConfigurationManager(tmp_path / "config" / "config.toml")
+    configuration.initialize()
+    configuration.load({})
+    started, release, waiting = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def apply_async(_path, settings):
+        """Hold the first activation while the competing command is cancelled."""
+        if settings.app.yolo:
+            started.set()
+            await release.wait()
+        return "applied now"
+
+    provider = ConfigurationCommands(
+        configuration, Mock(), apply_async=apply_async, validate_yolo=Mock()
+    )
+    manager = CommandManager(providers=(provider,), interaction=Mock(spec=ConsoleInteraction))
+
+    async def competing():
+        """Signal entry before waiting for the shared mutation transaction."""
+        waiting.set()
+        await manager.call_async("config", "set app.yolo false scope=session")
+
+    async def dispatch():
+        """Cancel the waiter, finish the owner, and then start another mutation."""
+        first = asyncio.create_task(manager.call_async("config", "set app.yolo true scope=user"))
+        await started.wait()
+        second = asyncio.create_task(competing())
+        await waiting.wait()
+        second.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await second
+        release.set()
+        await first
+        await manager.call_async("config", "set app.yolo false scope=session")
+
+    asyncio.run(dispatch())
+    assert configuration.saved_yolo is True
+    assert configuration.effective.app.yolo is False
+    manager.close()
+
+
+def test_user_yolo_preapply_preserves_masking_session_override(tmp_path):
+    """Saving a user activation cannot override an active false session setting."""
+    configuration = ConfigurationManager(tmp_path / "config" / "config.toml")
+    configuration.initialize()
+    configuration.load({})
+    configuration.set_session("app.yolo", False)
+    apply = Mock(return_value="applied now")
+    provider = ConfigurationCommands(configuration, apply, validate_yolo=Mock())
+    manager = CommandManager(providers=(provider,), interaction=Mock(spec=ConsoleInteraction))
+    assert manager.handle_user_command("/config set app.yolo true scope=user")
+    assert configuration.saved_yolo is True
+    assert configuration.effective.app.yolo is False
+    assert apply.call_args.args[1].app.yolo is False
+
+
+def test_yolo_reload_cannot_activate_a_forbidden_saved_value(tmp_path):
+    """An externally saved activation remains ineffective when managed policy rejects it."""
+    configuration = ConfigurationManager(tmp_path / "config" / "config.toml")
+    configuration.initialize()
+    configuration.load({})
+    writer = ConfigurationManager(configuration.path)
+    writer.load({})
+    writer.set("app.yolo", True, scope="user")
+    interaction = Mock(spec=ConsoleInteraction)
+    apply = Mock(side_effect=ValueError("Administrator policy prohibits YOLO activation."))
+    provider = ConfigurationCommands(configuration, apply, yolo_active=lambda: False)
+    manager = CommandManager(providers=(provider,), interaction=interaction)
+    assert manager.handle_user_command("/config reload")
+    assert "prohibits YOLO" in interaction.report.call_args.args[0].detail
+    assert manager.handle_user_command("/config get app.yolo")
+    assert "YOLO active: False; source: inactive" in interaction.info.call_args.args[0]
+
+
+@pytest.mark.parametrize("async_dispatch", [False, True])
+def test_yolo_reload_warns_before_enabling_without_an_extra_confirmation(tmp_path, async_dispatch):
+    """A newly effective trusted value displays the disclaimer before runtime activation."""
+    configuration = ConfigurationManager(tmp_path / "config" / "config.toml")
+    configuration.initialize()
+    configuration.load({})
+    writer = ConfigurationManager(configuration.path)
+    writer.load({})
+    writer.set("app.yolo", True, scope="user")
+    interaction = Mock(spec=ConsoleInteraction)
+    events = []
+    interaction.warning.side_effect = lambda message: events.append(("warning", message))
+    apply = Mock(side_effect=lambda path, settings: events.append(("apply", path)) or "applied now")
+    manager = CommandManager(
+        providers=(ConfigurationCommands(configuration, apply),), interaction=interaction
+    )
+    if async_dispatch:
+        asyncio.run(manager.call_async("config", "reload"))
+    else:
+        manager.call("config", "reload")
+    assert events[0][0] == "warning"
+    assert "private data" in events[0][1]
+    assert "directly on the host" in events[0][1]
+    assert events[1] == ("apply", "app.yolo")
+    interaction.prompt.assert_not_called()
+    interaction.confirm.assert_not_called()
+    manager.close()
+
+
+@pytest.mark.parametrize("transition", ["unchanged", "disable", "masked"])
+def test_yolo_reload_does_not_warn_without_activation(tmp_path, transition):
+    """Unchanged, disabled, and session-masked settings do not produce activation warnings."""
+    configuration = ConfigurationManager(tmp_path / "config" / "config.toml")
+    configuration.initialize()
+    if transition == "disable":
+        configuration.set("app.yolo", True, scope="user")
+    configuration.load({})
+    if transition == "masked":
+        configuration.set_session("app.yolo", False)
+    writer = ConfigurationManager(configuration.path)
+    writer.load({})
+    if transition != "unchanged":
+        writer.set("app.yolo", transition == "masked", scope="user")
+    interaction = Mock(spec=ConsoleInteraction)
+    manager = CommandManager(
+        providers=(ConfigurationCommands(configuration, Mock(return_value="applied now")),),
+        interaction=interaction,
+    )
+    manager.call("config", "reload")
+    assert configuration.effective.app.yolo is False
+    interaction.warning.assert_not_called()
+    manager.close()
+
+
+def test_yolo_status_reports_managed_suppression(tmp_path):
+    """Display effective mode when a loaded setting is administratively blocked."""
+    configuration = ConfigurationManager(tmp_path / "config" / "config.toml")
+    configuration.initialize()
+    configuration.load({})
+    configuration.set_session("app.yolo", True)
+    interaction = Mock(spec=ConsoleInteraction)
+    provider = ConfigurationCommands(configuration, Mock(), yolo_active=lambda: False)
+    manager = CommandManager(providers=(provider,), interaction=interaction)
+    assert manager.handle_user_command("/config get app.yolo")
+    assert "YOLO active: False; source: inactive" in interaction.info.call_args.args[0]
+
+
+def test_yolo_deactivation_reports_active_run_authority(tmp_path):
+    """Disabling no-prompt mode during a run explains that admitted jobs may continue."""
+    configuration = ConfigurationManager(tmp_path / "config.toml")
+    configuration.load({})
+    interaction = Mock(spec=ConsoleInteraction)
+    manager = CommandManager(
+        providers=(ConfigurationCommands(configuration, Mock(return_value="applied now")),),
+        interaction=interaction,
+    )
+    manager.set_capability_provider(
+        lambda: frozenset(
+            {
+                CommandCapability.CONTEXT_READ,
+                CommandCapability.CONTEXT_UPDATE,
+                CommandCapability.RUN_ACTIVE,
+            }
+        )
+    )
+    assert manager.handle_user_command("/config set app.yolo true scope=session")
+    assert manager.handle_user_command("/config set app.yolo false scope=session")
+    assert any("running jobs" in call.args[0] for call in interaction.warning.call_args_list)
 
 
 def test_safe_config_changes_apply_during_runs_and_hide_unsafe_values(tmp_path):
@@ -37,9 +653,9 @@ def test_safe_config_changes_apply_during_runs_and_hide_unsafe_values(tmp_path):
     config_command = next(item for item in manager.active_commands if item.name == "config")
 
     assert config_command.name == "config"
-    assert manager.handle_user_command("/config set loop.max_agent_turns 50 scope=session")
-    assert configuration.effective.loop.max_agent_turns == 50
-    provider._apply.assert_called_once_with("loop.max_agent_turns", configuration.effective)
+    assert manager.handle_user_command("/config set app.max_agent_turns 50 scope=session")
+    assert configuration.effective.app.max_agent_turns == 50
+    provider._apply.assert_called_once_with("app.max_agent_turns", configuration.effective)
 
     completion = CompletionManager(
         (
@@ -51,9 +667,9 @@ def test_safe_config_changes_apply_during_runs_and_hide_unsafe_values(tmp_path):
         )
     )
     action_values = list(completion.get_completions(Document("/config "), None))
-    setting_values = list(completion.get_completions(Document("/config set loop."), None))
+    setting_values = list(completion.get_completions(Document("/config set app."), None))
     assert {item.text for item in action_values} == {"get", "set"}
-    assert "loop.max_agent_turns" in {item.text for item in setting_values}
+    assert "app.max_agent_turns" in {item.text for item in setting_values}
     assert not any(item.text.startswith("backend.") for item in setting_values)
     assert "tools.command_timeout" in {
         item.text for item in completion.get_completions(Document("/config set tools."), Mock())
@@ -85,7 +701,7 @@ def test_config_run_restrictions_preserve_scope_prompt_and_reject_unsafe_operati
     )
 
     interaction.prompt.return_value = "session"
-    assert manager.handle_user_command("/config set loop.debug true")
+    assert manager.handle_user_command("/config set app.debug true")
     interaction.prompt.assert_called_once_with(
         "Choose configuration scope:",
         choices={
@@ -96,14 +712,14 @@ def test_config_run_restrictions_preserve_scope_prompt_and_reject_unsafe_operati
         },
         index={"user": "u", "workspace": "w", "session": "s", "cancel": "c"},
     )
-    assert configuration.effective.loop.debug is True
-    assert manager.handle_user_command("/config set loop.model test scope=session")
+    assert configuration.effective.app.debug is True
+    assert manager.handle_user_command("/config set app.model test scope=session")
     assert "cannot be changed while the agent is working" in (
         interaction.report.call_args.args[0].detail
     )
-    assert manager.handle_user_command("/config set loop.unknown value scope=session")
+    assert manager.handle_user_command("/config set app.unknown value scope=session")
     assert "Unknown configuration field" in interaction.report.call_args.args[0].detail
-    assert manager.handle_user_command("/config reset loop.debug scope=session")
+    assert manager.handle_user_command("/config reset app.debug scope=session")
     assert "cannot run while the agent is working" in (interaction.report.call_args.args[0].detail)
     assert manager.handle_user_command("/config reload")
     assert "cannot run while the agent is working" in (interaction.report.call_args.args[0].detail)
@@ -125,12 +741,12 @@ def test_sync_command_manager_keeps_sync_configuration_prompts(tmp_path):
         interaction=interaction,
     )
 
-    manager.call("config", "set loop.debug true")
-    manager.call("config", "reset loop.debug scope=session")
+    manager.call("config", "set app.debug true")
+    manager.call("config", "reset app.debug scope=session")
 
-    assert configuration.effective.loop.debug is False
+    assert configuration.effective.app.debug is False
     interaction.prompt.assert_called_once()
-    interaction.confirm.assert_called_once_with("Reset loop.debug for session?", default=False)
+    interaction.confirm.assert_called_once_with("Reset app.debug for session?", default=False)
     manager.close()
 
 
@@ -165,9 +781,7 @@ def test_async_config_command_offloads_persistence_and_applies_on_owner(tmp_path
     async def dispatch():
         """Release synchronous persistence from a scheduled owner-loop callback."""
         owner_thread = get_ident()
-        pending = asyncio.create_task(
-            manager.call_async("config", "set loop.debug true scope=user")
-        )
+        pending = asyncio.create_task(manager.call_async("config", "set app.debug true scope=user"))
         try:
             assert await asyncio.to_thread(started.wait, 5)
             assert not pending.done()
@@ -180,7 +794,7 @@ def test_async_config_command_offloads_persistence_and_applies_on_owner(tmp_path
     asyncio.run(dispatch())
 
     assert set_threads[0] != apply_threads[0]
-    assert configuration.effective.loop.debug is True
+    assert configuration.effective.app.debug is True
 
 
 def test_config_dispatch_uses_the_callback_for_its_execution_mode(tmp_path):
@@ -195,20 +809,20 @@ def test_config_dispatch_uses_the_callback_for_its_execution_mode(tmp_path):
         interaction=interaction,
     )
 
-    manager.call("config", "set loop.debug true scope=session")
+    manager.call("config", "set app.debug true scope=session")
 
-    apply.assert_called_once_with("loop.debug", configuration.effective)
+    apply.assert_called_once_with("app.debug", configuration.effective)
     apply_async.assert_not_awaited()
 
     async def dispatch():
         """Run a configuration update through the asynchronous command API."""
-        await manager.call_async("config", "set loop.debug false scope=session")
+        await manager.call_async("config", "set app.debug false scope=session")
 
     asyncio.run(dispatch())
 
-    apply_async.assert_awaited_once_with("loop.debug", configuration.effective)
+    apply_async.assert_awaited_once_with("app.debug", configuration.effective)
     apply.assert_called_once()
-    assert configuration.effective.loop.debug is False
+    assert configuration.effective.app.debug is False
     manager.close()
 
 
@@ -217,10 +831,10 @@ def test_async_config_reload_uses_the_async_batch_applicator(tmp_path):
     configuration = ConfigurationManager(tmp_path / "config.toml")
     configuration.initialize()
     configuration.load()
-    configuration.path.write_text("[loop]\ndebug = true\n", encoding="utf-8")
+    configuration.path.write_text("[app]\ndebug = true\n", encoding="utf-8")
     interaction = Mock(spec=ConsoleInteraction)
     apply_many = Mock()
-    apply_many_async = AsyncMock(return_value={"loop.debug": "applied now"})
+    apply_many_async = AsyncMock(return_value={"app.debug": "applied now"})
     manager = CommandManager(
         providers=(
             ConfigurationCommands(
@@ -240,8 +854,8 @@ def test_async_config_reload_uses_the_async_batch_applicator(tmp_path):
     asyncio.run(dispatch())
 
     apply_many.assert_not_called()
-    apply_many_async.assert_awaited_once_with(("loop.debug",), configuration.effective)
-    interaction.info.assert_called_once_with("Configuration reloaded: applied now: loop.debug.")
+    apply_many_async.assert_awaited_once_with(("app.debug",), configuration.effective)
+    interaction.info.assert_called_once_with("Configuration reloaded: applied now: app.debug.")
     manager.close()
 
 
@@ -258,7 +872,7 @@ def test_async_config_cancellation_settles_async_runtime_effect(tmp_path):
         """Hold runtime application until the test cancels the configuration command."""
         started.set()
         await release.wait()
-        applied.append((path, settings.loop.debug))
+        applied.append((path, settings.app.debug))
         return "applied now"
 
     manager = CommandManager(
@@ -269,7 +883,7 @@ def test_async_config_cancellation_settles_async_runtime_effect(tmp_path):
     async def dispatch():
         """Cancel a session update while its async runtime callback is pending."""
         pending = asyncio.create_task(
-            manager.call_async("config", "set loop.debug true scope=session")
+            manager.call_async("config", "set app.debug true scope=session")
         )
         await started.wait()
         pending.cancel()
@@ -279,8 +893,8 @@ def test_async_config_cancellation_settles_async_runtime_effect(tmp_path):
 
     asyncio.run(dispatch())
 
-    assert applied == [("loop.debug", True)]
-    assert configuration.effective.loop.debug is True
+    assert applied == [("app.debug", True)]
+    assert configuration.effective.app.debug is True
     manager.close()
 
 
@@ -306,7 +920,7 @@ def test_async_config_cancellation_preserves_failure_from_runtime_effect(tmp_pat
     async def dispatch():
         """Cancel the command before releasing its failing runtime callback."""
         pending = asyncio.create_task(
-            manager.call_async("config", "set loop.debug true scope=session")
+            manager.call_async("config", "set app.debug true scope=session")
         )
         await started.wait()
         pending.cancel()
@@ -337,7 +951,7 @@ def test_async_config_propagates_runtime_effect_failure_without_cancellation(tmp
     async def dispatch():
         """Dispatch the setting and observe its uncancelled runtime failure."""
         with pytest.raises(RuntimeError, match="runtime update failed"):
-            await manager.call_async("config", "set loop.debug true scope=session")
+            await manager.call_async("config", "set app.debug true scope=session")
 
     asyncio.run(dispatch())
     manager.close()
@@ -373,9 +987,7 @@ def test_async_config_cancellation_settles_persistence_and_owner_effect(tmp_path
     async def dispatch():
         """Cancel twice while persistence runs, then release it to settle."""
         owner_thread = get_ident()
-        pending = asyncio.create_task(
-            manager.call_async("config", "set loop.debug true scope=user")
-        )
+        pending = asyncio.create_task(manager.call_async("config", "set app.debug true scope=user"))
         assert await asyncio.to_thread(started.wait, 5)
         pending.cancel()
         await deliver_callbacks()
@@ -389,7 +1001,7 @@ def test_async_config_cancellation_settles_persistence_and_owner_effect(tmp_path
 
     asyncio.run(dispatch())
 
-    assert configuration.effective.loop.debug is True
+    assert configuration.effective.app.debug is True
 
 
 def test_async_config_cancellation_preserves_cancel_when_persistence_fails(tmp_path, monkeypatch):
@@ -414,9 +1026,7 @@ def test_async_config_cancellation_preserves_cancel_when_persistence_fails(tmp_p
 
     async def dispatch():
         """Cancel during persistence, then check the worker failure note."""
-        pending = asyncio.create_task(
-            manager.call_async("config", "set loop.debug true scope=user")
-        )
+        pending = asyncio.create_task(manager.call_async("config", "set app.debug true scope=user"))
         assert await asyncio.to_thread(started.wait, 5)
         pending.cancel()
         await deliver_callbacks()
@@ -436,7 +1046,7 @@ def test_async_reset_all_offloads_persistence_and_applies_on_owner(tmp_path, mon
     configuration = ConfigurationManager(tmp_path / "config.toml")
     configuration.initialize()
     configuration.load()
-    configuration.set("loop.debug", True, scope="user")
+    configuration.set("app.debug", True, scope="user")
     interaction = Mock(spec=ConsoleInteraction)
     interaction.confirm_async.return_value = True
     reset_threads = []
@@ -469,7 +1079,7 @@ def test_async_reset_all_offloads_persistence_and_applies_on_owner(tmp_path, mon
 
     asyncio.run(dispatch())
 
-    assert configuration.effective.loop.debug is False
+    assert configuration.effective.app.debug is False
 
 
 def test_config_reads_remain_available_during_agent_runs(tmp_path):
@@ -491,8 +1101,8 @@ def test_config_reads_remain_available_during_agent_runs(tmp_path):
         )
     )
 
-    assert manager.handle_user_command("/config get loop.debug")
-    assert [item.path for item in interaction.table.call_args.args[0]] == ["loop.debug"]
+    assert manager.handle_user_command("/config get app.debug")
+    assert [item.path for item in interaction.table.call_args.args[0]] == ["app.debug"]
 
 
 def test_config_set_applies_a_session_override(tmp_path):
@@ -507,12 +1117,12 @@ def test_config_set_applies_a_session_override(tmp_path):
         providers=(ConfigurationCommands(configuration, apply),), interaction=interaction
     )
 
-    manager.call("config", "set loop.debug true scope=session")
+    manager.call("config", "set app.debug true scope=session")
 
-    assert configuration.effective.loop.debug is True
-    assert configuration.source_for("loop.debug") == "session"
-    apply.assert_called_once_with("loop.debug", configuration.effective)
-    interaction.info.assert_called_once_with("Updated loop.debug for session: applied now")
+    assert configuration.effective.app.debug is True
+    assert configuration.source_for("app.debug") == "session"
+    apply.assert_called_once_with("app.debug", configuration.effective)
+    interaction.info.assert_called_once_with("Updated app.debug for session: applied now")
 
 
 def test_config_get_rejects_secret_entries(tmp_path):
@@ -541,10 +1151,10 @@ def test_config_get_displays_non_secret_entries(tmp_path):
         providers=(ConfigurationCommands(configuration, Mock()),), interaction=interaction
     )
 
-    manager.call("config", "get loop.debug")
+    manager.call("config", "get app.debug")
 
     entries = interaction.table.call_args.args[0]
-    assert [entry.path for entry in entries] == ["loop.debug"]
+    assert [entry.path for entry in entries] == ["app.debug"]
 
 
 def test_config_without_arguments_displays_only_non_secret_entries(tmp_path):
@@ -575,9 +1185,9 @@ def test_config_set_applies_a_file_override(tmp_path):
         providers=(ConfigurationCommands(configuration, apply),), interaction=interaction
     )
 
-    manager.call("config", "set loop.stream false scope=workspace")
+    manager.call("config", "set app.stream false scope=workspace")
 
-    assert configuration.effective.loop.stream is False
+    assert configuration.effective.app.stream is False
     assert (tmp_path / ".loop" / "config.toml").exists()
     assert apply.called
 
@@ -589,9 +1199,9 @@ def test_config_reload_applies_effective_user_and_workspace_changes(tmp_path):
     configuration = ConfigurationManager(user_path, workspace_path)
     configuration.initialize()
     configuration.load()
-    user_path.write_text("[loop]\nstream = false\n", encoding="utf-8")
+    user_path.write_text("[app]\nstream = false\n", encoding="utf-8")
     workspace_path.parent.mkdir()
-    workspace_path.write_text("[loop]\ndebug = true\n", encoding="utf-8")
+    workspace_path.write_text("[app]\ndebug = true\n", encoding="utf-8")
     apply = Mock(return_value="applied now")
     interaction = Mock(spec=ConsoleInteraction)
     manager = CommandManager(
@@ -600,14 +1210,14 @@ def test_config_reload_applies_effective_user_and_workspace_changes(tmp_path):
 
     manager.call("config", "reload")
 
-    assert configuration.effective.loop.debug is True
-    assert configuration.effective.loop.stream is False
+    assert configuration.effective.app.debug is True
+    assert configuration.effective.app.stream is False
     assert apply.call_args_list == [
-        call("loop.stream", configuration.effective),
-        call("loop.debug", configuration.effective),
+        call("app.stream", configuration.effective),
+        call("app.debug", configuration.effective),
     ]
     interaction.info.assert_called_once_with(
-        "Configuration reloaded: applied now: loop.stream, loop.debug."
+        "Configuration reloaded: applied now: app.stream, app.debug."
     )
 
 
@@ -616,9 +1226,9 @@ def test_config_reload_delegates_multiple_changes_to_the_batch_applicator(tmp_pa
     configuration = ConfigurationManager(tmp_path / "config.toml")
     configuration.initialize()
     configuration.load()
-    configuration.path.write_text("[loop]\ndebug = true\n", encoding="utf-8")
+    configuration.path.write_text("[app]\ndebug = true\n", encoding="utf-8")
     apply = Mock()
-    apply_many = Mock(return_value={"loop.debug": "applied now"})
+    apply_many = Mock(return_value={"app.debug": "applied now"})
     interaction = Mock(spec=ConsoleInteraction)
     manager = CommandManager(
         providers=(ConfigurationCommands(configuration, apply, apply_many),),
@@ -628,7 +1238,7 @@ def test_config_reload_delegates_multiple_changes_to_the_batch_applicator(tmp_pa
     manager.call("config", "reload")
 
     apply.assert_not_called()
-    apply_many.assert_called_once_with(("loop.debug",), configuration.effective)
+    apply_many.assert_called_once_with(("app.debug",), configuration.effective)
 
 
 def test_config_reload_reports_no_effective_change(tmp_path):
@@ -658,14 +1268,14 @@ def test_config_reload_rejects_arguments_and_invalid_disk_content(tmp_path):
         providers=(ConfigurationCommands(configuration, Mock()),), interaction=interaction
     )
 
-    manager.call("config", "reload loop.debug")
-    configuration.path.write_text('[loop]\ndebug = "invalid"\n', encoding="utf-8")
+    manager.call("config", "reload app.debug")
+    configuration.path.write_text('[app]\ndebug = "invalid"\n', encoding="utf-8")
     manager.call("config", "reload")
 
     assert interaction.report.call_count == 2
     assert "does not accept arguments" in interaction.report.call_args_list[0].args[0].detail
-    assert "loop.debug" in interaction.report.call_args_list[1].args[0].detail
-    assert configuration.effective.loop.debug is False
+    assert "app.debug" in interaction.report.call_args_list[1].args[0].detail
+    assert configuration.effective.app.debug is False
 
 
 def test_config_secret_prompts_before_selecting_scope_and_applies_value(tmp_path):
@@ -709,7 +1319,7 @@ def test_config_set_rejects_secret_entries_and_secret_rejects_plain_entries(tmp_
     )
 
     manager.call("config", "set backend.api_key exposed scope=session")
-    manager.call("config", "secret loop.debug scope=session")
+    manager.call("config", "secret app.debug scope=session")
     manager.call("config", "secret backend.api_key exposed scope=session")
     manager.call("config", "set unknown.path ignored scope=session")
     manager.call("config", "secret")
@@ -746,38 +1356,61 @@ def test_config_reset_and_invalid_direct_forms_report_argument_errors(tmp_path):
         providers=(ConfigurationCommands(configuration, Mock(return_value="applied now")),),
         interaction=interaction,
     )
-    manager.call("config", "set loop.debug true scope=session")
+    manager.call("config", "set app.debug true scope=session")
 
     interaction.confirm.side_effect = [True, True, True, True]
-    manager.call("config", "reset loop.debug scope=session")
+    manager.call("config", "reset app.debug scope=session")
     manager.call("config", "reset unknown.path scope=session")
-    manager.call("config", "reset loop.debug scope=session")
-    manager.call("config", "reset loop.debug scope=session")
-    manager.call("config", "set loop.debug")
+    manager.call("config", "reset app.debug scope=session")
+    manager.call("config", "reset app.debug scope=session")
+    manager.call("config", "set app.debug")
     manager.call("config", "set")
     manager.call("config", "get unknown.path")
     manager.call("config", "get")
 
-    assert configuration.effective.loop.debug is False
+    assert configuration.effective.app.debug is False
     assert interaction.report.call_count == 5
 
 
-def test_config_reset_with_explicit_scope_requires_confirmation(tmp_path):
-    """An explicit reset scope is confirmed before changing configuration."""
+@pytest.mark.parametrize("response", [False, object()])
+@pytest.mark.parametrize("path", ["app.debug", ""])
+def test_config_reset_with_explicit_scope_requires_confirmation(tmp_path, response, path):
+    """Only explicit approval permits resetting a setting or an entire scope."""
     configuration = ConfigurationManager(tmp_path / ".loop" / "config.toml")
     configuration.load()
-    configuration.set_session("loop.debug", True)
+    configuration.set_session("app.debug", True)
     interaction = Mock(spec=ConsoleInteraction)
-    interaction.confirm.return_value = False
+    interaction.confirm.return_value = response
     manager = CommandManager(
         providers=(ConfigurationCommands(configuration, Mock(return_value="applied now")),),
         interaction=interaction,
     )
 
-    manager.call("config", "reset loop.debug scope=session")
+    manager.call("config", f"reset {path} scope=session")
 
-    assert configuration.effective.loop.debug is True
-    interaction.confirm.assert_called_once_with("Reset loop.debug for session?", default=False)
+    assert configuration.effective.app.debug is True
+    target = path or "all configuration entries"
+    interaction.confirm.assert_called_once_with(f"Reset {target} for session?", default=False)
+
+
+def test_async_config_reset_rejects_invalid_confirmation(tmp_path):
+    """The native async interaction cannot approve reset with a truthy non-boolean."""
+    configuration = ConfigurationManager(tmp_path / ".loop" / "config.toml")
+    configuration.load()
+    configuration.set_session("app.debug", True)
+    interaction = Mock(spec=ConsoleInteraction)
+    interaction.confirm_async = AsyncMock(return_value=object())
+    manager = CommandManager(
+        providers=(ConfigurationCommands(configuration, Mock()),), interaction=interaction
+    )
+
+    asyncio.run(manager.call_async("config", "reset app.debug scope=session"))
+
+    assert configuration.effective.app.debug is True
+    interaction.confirm_async.assert_awaited_once_with(
+        "Reset app.debug for session?", default=False
+    )
+    manager.close()
 
 
 def test_config_workspace_reset_reveals_user_value(tmp_path):
@@ -787,8 +1420,8 @@ def test_config_workspace_reset_reveals_user_value(tmp_path):
     )
     configuration.initialize()
     configuration.load()
-    configuration.set("loop.debug", True, scope="user")
-    configuration.set("loop.debug", False, scope="workspace")
+    configuration.set("app.debug", True, scope="user")
+    configuration.set("app.debug", False, scope="workspace")
     interaction = Mock(spec=ConsoleInteraction)
     interaction.confirm.return_value = True
     manager = CommandManager(
@@ -796,10 +1429,10 @@ def test_config_workspace_reset_reveals_user_value(tmp_path):
         interaction=interaction,
     )
 
-    manager.call("config", "reset loop.debug scope=workspace")
+    manager.call("config", "reset app.debug scope=workspace")
 
-    assert configuration.effective.loop.debug is True
-    assert configuration.source_for("loop.debug") == "user"
+    assert configuration.effective.app.debug is True
+    assert configuration.source_for("app.debug") == "user"
     assert not (tmp_path / "project" / ".loop" / "config.toml").exists()
 
 
@@ -808,17 +1441,18 @@ def test_config_reset_all_and_validation_failures_leave_state_consistent(tmp_pat
     configuration = ConfigurationManager(tmp_path / ".loop" / "config.toml")
     configuration.load()
     interaction = Mock(spec=ConsoleInteraction)
+    interaction.confirm.return_value = True
     manager = CommandManager(
         providers=(ConfigurationCommands(configuration, Mock(return_value="applied now")),),
         interaction=interaction,
     )
 
-    manager.call("config", "set loop.debug true scope=session")
-    manager.call("config", "set loop.max_agent_turns -1 scope=session")
+    manager.call("config", "set app.debug true scope=session")
+    manager.call("config", "set app.max_agent_turns -1 scope=session")
     manager.call("config", "reset scope=session")
-    manager.call("config", "reset loop.debug scope=session")
+    manager.call("config", "reset app.debug scope=session")
 
-    assert configuration.effective.loop.debug is False
+    assert configuration.effective.app.debug is False
     assert interaction.report.call_count == 1
 
 
@@ -826,7 +1460,7 @@ def test_config_scope_picker_cancels_reset_all(tmp_path):
     """The cancel choice leaves all session overrides untouched."""
     configuration = ConfigurationManager(tmp_path / ".loop" / "config.toml")
     configuration.load()
-    configuration.set_session("loop.debug", True)
+    configuration.set_session("app.debug", True)
     interaction = Mock(spec=ConsoleInteraction)
     manager = CommandManager(
         providers=(ConfigurationCommands(configuration, Mock(return_value="applied now")),),
@@ -835,7 +1469,7 @@ def test_config_scope_picker_cancels_reset_all(tmp_path):
 
     manager.call("config", "reset")
 
-    assert configuration.effective.loop.debug is True
+    assert configuration.effective.app.debug is True
     interaction.prompt.assert_called_once()
 
 
@@ -869,12 +1503,12 @@ def test_config_omitted_scope_prompts_and_supports_workspace_or_cancel(tmp_path)
         providers=(ConfigurationCommands(configuration, apply),), interaction=interaction
     )
 
-    manager.call("config", "set loop.debug true")
-    manager.call("config", "set loop.stream false")
-    manager.call("config", "reset loop.debug")
+    manager.call("config", "set app.debug true")
+    manager.call("config", "set app.stream false")
+    manager.call("config", "reset app.debug")
 
-    assert configuration.source_for("loop.debug") == "session"
-    assert configuration.effective.loop.stream is True
+    assert configuration.source_for("app.debug") == "session"
+    assert configuration.effective.app.stream is True
 
 
 def test_config_completion_excludes_secret_paths_from_get_and_set(tmp_path):
@@ -887,9 +1521,9 @@ def test_config_completion_excludes_secret_paths_from_get_and_set(tmp_path):
         (CommandCompletionAdapter(lambda: commands.commands, providers=(provider,)),)
     )
 
-    values = list(completion.get_completions(Document("/config get loop.d"), Mock()))
+    values = list(completion.get_completions(Document("/config get app.d"), Mock()))
 
-    assert [value.text for value in values] == ["loop.debug"]
+    assert [value.text for value in values] == ["app.debug"]
     values = list(completion.get_completions(Document("/config set backend.a"), Mock()))
 
     assert not values
@@ -921,10 +1555,10 @@ def test_config_completion_suggests_scope_values_after_edit_arguments(tmp_path):
     )
 
     values = list(
-        completion.get_completions(Document("/config set loop.debug false scope="), Mock())
+        completion.get_completions(Document("/config set app.debug false scope="), Mock())
     )
     positional_values = list(
-        completion.get_completions(Document("/config set loop.debug false "), Mock())
+        completion.get_completions(Document("/config set app.debug false "), Mock())
     )
 
     assert [value.text for value in values] == [
@@ -964,7 +1598,7 @@ def test_config_reset_completion_suggests_scope_after_a_path(tmp_path):
         (CommandCompletionAdapter(lambda: commands.commands, providers=(provider,)),)
     )
 
-    values = list(completion.get_completions(Document("/config reset loop.debug scope="), Mock()))
+    values = list(completion.get_completions(Document("/config reset app.debug scope="), Mock()))
 
     assert [value.text for value in values] == [
         "scope=session",
@@ -991,14 +1625,14 @@ def test_config_completion_lists_arguments_for_selected_operation(tmp_path):
     reload_arguments = list(completion.get_completions(Document("/config reload "), Mock()))
 
     assert {value.text for value in actions} == {"get", "set", "secret", "reset", "reload"}
-    assert {value.text for value in get_arguments} >= {"loop.debug"}
+    assert {value.text for value in get_arguments} >= {"app.debug"}
     assert "path=" not in {value.text for value in get_arguments}
     assert "backend.api_key" not in {value.text for value in get_arguments}
     assert "path=" not in {value.text for value in set_arguments}
     assert {value.text for value in set_arguments} >= {
         "value=",
         "scope=",
-        "loop.debug",
+        "app.debug",
     }
     assert "backend.api_key" not in {value.text for value in set_arguments}
     assert {value.text for value in secret_arguments} >= {"scope=", "backend.api_key"}

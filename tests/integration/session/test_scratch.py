@@ -2,9 +2,11 @@
 
 import json
 import os
+import pwd
 import sqlite3
 import subprocess
 import sys
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from threading import Event
@@ -13,9 +15,40 @@ from unittest.mock import Mock
 import pytest
 
 from loop import Interaction, SessionExecutionConflictError, SessionManager, SQLiteSessionStore
-from loop.utils.path import private_directory_lock
+from loop.utils.path import ensure_private_directory, private_directory_lock
 
 pytestmark = pytest.mark.integration
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Requires Linux O_PATH directory traversal")
+def test_session_storage_traverses_search_only_ancestors(tmp_path, monkeypatch):
+    """Session storage works without listing ancestors and still rejects symlink substitutions."""
+    if os.geteuid() == 0:
+        pytest.skip("Search-only access requires an unprivileged test account")
+    ancestor = tmp_path / "search-only"
+    ancestor.mkdir(mode=0o700)
+    scratch = ancestor / "scratch"
+    scratch.mkdir(mode=0o700)
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o700)
+    alias = ancestor / "alias"
+    alias.symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr(tempfile, "tempdir", str(scratch))
+    ancestor.chmod(0o111)
+    try:
+        with pytest.raises(PermissionError):
+            os.open(ancestor, os.O_RDONLY | os.O_DIRECTORY)
+        ensure_private_directory(scratch, create=False)
+        with pytest.raises(ValueError, match="private real directory"):
+            ensure_private_directory(alias / "escaped")
+        assert not (outside / "escaped").exists()
+        manager = SessionManager()
+        with manager.execution():
+            report = manager.temporary_directory.get() / "report"
+            report.write_text("session-ok", encoding="utf-8")
+            assert report.read_text(encoding="utf-8") == "session-ok"
+    finally:
+        ancestor.chmod(0o700)
 
 
 def test_saved_working_files_survive_process_exit_and_resume(tmp_path):
@@ -51,7 +84,6 @@ print(json.dumps({
             capture_output=True,
             text=True,
             check=True,
-            timeout=15,
         )
         assert result.stderr == ""
         return json.loads(result.stdout)
@@ -67,10 +99,9 @@ def test_native_ownership_serializes_one_session_and_releases_after_owner_death(
     """Cooperating processes exclude shared-session execution while independent sessions overlap."""
     database = tmp_path / "sessions.db"
     source = """
-import json, signal, sys
+import json, sys
 from unittest.mock import Mock
 from loop import Interaction, Session, SessionManager, SQLiteSessionStore, SessionExecutionConflictError
-signal.alarm(15)
 try:
     manager = SessionManager(
         interaction=Mock(spec=Interaction), session=Session(id=sys.argv[2]),
@@ -101,7 +132,6 @@ except SessionExecutionConflictError:
                 capture_output=True,
                 text=True,
                 check=True,
-                timeout=15,
             )
             assert result.stderr == ""
             return json.loads(result.stdout)
@@ -109,13 +139,13 @@ except SessionExecutionConflictError:
         assert attempt("shared") == {"owned": False}
         assert attempt("independent")["owned"] is True
         owner.kill()
-        stdout, stderr = owner.communicate(timeout=5)
+        stdout, stderr = owner.communicate()
         assert stdout == stderr == ""
         assert attempt("shared") == initial
     finally:
         if owner.poll() is None:
             owner.kill()
-        owner.communicate(timeout=5)
+        owner.communicate()
 
 
 @pytest.mark.parametrize("crash", [False, True])
@@ -125,10 +155,9 @@ def test_concurrent_load_preserves_live_confirmation_and_recovers_abandoned_requ
     """A rejected process cannot revoke live approval; owner death permits one recovery."""
     database = tmp_path / "sessions.db"
     source = """
-import asyncio, json, signal, sys
+import asyncio, json, sys
 from unittest.mock import Mock
 from loop import Interaction, SessionManager, SQLiteSessionStore
-signal.alarm(15)
 manager = SessionManager(interaction=Mock(spec=Interaction),
     session_store=SQLiteSessionStore(sys.argv[1], workspace_id="workspace"))
 with manager.execution():
@@ -166,15 +195,14 @@ else:
             capture_output=True,
             text=True,
             check=True,
-            timeout=10,
         )
         assert contender.stdout == "owned\n" and contender.stderr == ""
         assert store.load(session_id).serialize() == snapshot
         if crash:
             owner.kill()
-            stdout, stderr = owner.communicate(timeout=5)
+            stdout, stderr = owner.communicate()
         else:
-            stdout, stderr = owner.communicate("answer\n", timeout=5)
+            stdout, stderr = owner.communicate("answer\n")
             assert owner.returncode == 0
         assert stdout == stderr == ""
         restored = SessionManager(
@@ -193,7 +221,7 @@ else:
     finally:
         if owner.poll() is None:
             owner.kill()
-        owner.communicate(timeout=5)
+        owner.communicate()
 
 
 @pytest.mark.parametrize("mode", ["sync", "async"])
@@ -207,7 +235,7 @@ def test_idle_export_confirmation_excludes_concurrent_recovery(tmp_path, mode, o
     destination.parent.mkdir(mode=0o700)
     destination.write_text("original export")
     source = r"""
-import asyncio,json,logging,shlex,signal,sys
+import asyncio,json,logging,shlex,sys
 from contextlib import nullcontext
 from logging.handlers import BufferingHandler
 from pathlib import Path
@@ -216,7 +244,6 @@ from unittest.mock import MagicMock,patch
 from loop import (ConsoleInteraction,Loop,PermissionManager,SessionController,SessionManager,
                   SQLiteSessionStore,ToolRegistry)
 from loop.session import LocalSessionNameGenerator
-signal.alarm(20)
 diagnostics=BufferingHandler(1000)
 logging.getLogger("loop.operational").addHandler(diagnostics)
 inputs=asyncio.Queue()
@@ -313,15 +340,14 @@ else:
             capture_output=True,
             text=True,
             check=True,
-            timeout=10,
         )
         assert contender.stdout == "owned\n" and contender.stderr == ""
         assert store.load(session_id).serialize() == snapshot
         if outcome == "crash":
             owner.kill()
-            stdout, stderr = owner.communicate(timeout=5)
+            stdout, stderr = owner.communicate()
         else:
-            stdout, stderr = owner.communicate(outcome + "\n", timeout=10)
+            stdout, stderr = owner.communicate(outcome + "\n")
             assert owner.returncode == 0, stderr
         assert stdout == ("settlement failed\n" if outcome == "failure" else "")
         assert stderr == ""
@@ -350,7 +376,7 @@ else:
     finally:
         if owner.poll() is None:
             owner.kill()
-        owner.communicate(timeout=5)
+        owner.communicate()
 
 
 @pytest.mark.parametrize("selection", [False, True])
@@ -361,11 +387,10 @@ def test_requester_cancellation_retains_ownership_through_revocation(
     """A cancelled owner closes its prompt and retains native exclusion until revocation commits."""
     database = tmp_path / "sessions.db"
     source = """
-import asyncio,json,signal,sys
+import asyncio,json,sys
 from contextlib import nullcontext
 from unittest.mock import MagicMock,patch
 from loop import ConsoleInteraction,SessionController,SessionManager,SQLiteSessionStore
-signal.alarm(20)
 async def main():
     ui=MagicMock(spec=ConsoleInteraction)
     manager=SessionManager(interaction=ui,
@@ -434,7 +459,7 @@ asyncio.run(main())
             SessionManager(
                 interaction=Mock(spec=Interaction), session=session_id, session_store=store
             )
-        stdout, stderr = owner.communicate("commit\n", timeout=10)
+        stdout, stderr = owner.communicate("commit\n")
         assert owner.returncode == 0, stderr
         assert stdout == "done\n" and stderr == ""
         restored = SessionManager(
@@ -448,7 +473,7 @@ asyncio.run(main())
     finally:
         if owner.poll() is None:
             owner.kill()
-        owner.communicate(timeout=5)
+        owner.communicate()
 
 
 def test_busy_database_admission_does_not_block_an_independent_store(tmp_path, monkeypatch):
@@ -481,12 +506,14 @@ def test_busy_database_admission_does_not_block_an_independent_store(tmp_path, m
         writer.execute("BEGIN IMMEDIATE")
         monkeypatch.setattr(sqlite3, "connect", traced_connect)
         pending = executor.submit(admit, manager)
+        pending.add_done_callback(lambda _future: waiting.set())
         try:
-            assert waiting.wait(timeout=5)
-            executor.submit(admit, independent).result(timeout=2)
+            waiting.wait()
+            assert not pending.done(), pending.result() if pending.done() else None
+            executor.submit(admit, independent).result()
         finally:
             writer.rollback()
-        assert pending.result(timeout=5) == original
+        assert pending.result() == original
     with manager.execution() as directory:
         assert directory == original
 
@@ -508,36 +535,51 @@ def test_ownership_descriptor_closes_on_exec(tmp_path):
             close_fds=False,
             capture_output=True,
             text=True,
-            timeout=5,
         )
         assert result.returncode == 0
         assert result.stdout == result.stderr == ""
 
 
-def test_native_commands_file_tools_and_sqlite_survive_independent_resume(tmp_path):
+def test_native_commands_file_tools_and_sqlite_survive_independent_resume(
+    tmp_path, native_directory
+):
     """A new harness process reads and edits command-created bytes and retains SQLite state."""
+    if sys.platform == "linux":
+        # Reuse the native home-workspace policy after the earlier case has removed its data.
+        home = pwd.getpwuid(os.getuid()).pw_dir
+        tmp_path = native_directory(home, name=f"loop-native-public-{os.getuid()}")
     database = tmp_path / "Library/Application Support/Loop é ;$'" / "sessions.db"
-    workspace = tmp_path / "work"
+    workspace = tmp_path / ("loop-native-test-workspace" if sys.platform == "linux" else "work")
     workspace.mkdir(mode=0o700)
     source = r"""
-import json, shlex, sys, tempfile
+import json, os, shlex, sys, tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from loop import (ApprovalChoice, Interaction, PermissionManager, Session, SessionManager,
-                  SQLiteSessionStore, ToolRegistry)
+                  SQLiteSessionStore, ToolRegistry, constants)
 from loop.execution import CommandExecutionService
 from loop.execution.sandbox import UnavailableSandboxBackend, select_sandbox_backend
 from loop.instructions import InstructionsManager, RuntimeEnvironment
 from loop.tools.files import read_text_file, edit_text_file, write_text_file
 from loop.tools.system import run_command
+from loop.tools.web import read_cached_content
 from loop.session.exporter import export_session
-from loop.utils import cached_path
+from loop.utils import VirtualPath, cached_path
 from zipfile import ZipFile
 monitor = Mock()
 monitor.denial.return_value = None
 if sys.platform == "linux":
     # Fresh probe scratch must match the installed receiver's native system temporary root.
     tempfile.tempdir = "/tmp"
+elif sys.platform == "darwin":
+    from loop.execution import coordinator, facade
+    from loop.execution.sandbox import selection
+    from loop.execution.sandbox.macos import backend as macos_backend
+    from loop.utils import process
+    clock = SimpleNamespace(monotonic=lambda: 100.0, sleep=lambda _: os.sched_yield(),
+        strftime=lambda _format, _value: '2000-01-01 00:00:00+0000', localtime=lambda: None)
+    coordinator.time = facade.time = selection.time = macos_backend.time = process.time = clock
 with patch("loop.execution.sandbox.macos.backend.SeatbeltDiagnosticService.monitor", return_value=monitor), \
      patch("loop.execution.sandbox.macos.backend._denial_from_log", return_value=None):
     backend = select_sandbox_backend()
@@ -557,7 +599,8 @@ with patch("loop.execution.sandbox.macos.backend.SeatbeltDiagnosticService.monit
         Path(sys.argv[2]), manager.temporary_directory))
     host = Mock()
     host.run_host_command.side_effect = AssertionError("unapproved host retry")
-    registry = ToolRegistry([run_command, read_text_file, edit_text_file, write_text_file],
+    registry = ToolRegistry([run_command, read_text_file, edit_text_file, write_text_file,
+        read_cached_content],
         permission_manager=permissions, execution_service=CommandExecutionService(backend, host))
     def sqlite_command(query, *, select=False):
         '''Use the installed Linux runtime's Python SQLite module or the macOS system CLI.'''
@@ -598,8 +641,96 @@ with patch("loop.execution.sandbox.macos.backend.SeatbeltDiagnosticService.monit
             diagnostics = dispatch("run_command", command='i=0; while [ "$i" -lt 2048 ]; '
                 'do printf "%s\n" "$TMPDIR"; i=$((i+1)); done', read_only=True)
             cached = cached_path(diagnostics["stdout"]["handle"])[0].read_text()
-            visible = instructions.virtual_paths.display(str(manager.temporary_directory.get()))
-            assert visible in cached
+            expected = ("/loop-private-scratch" if sys.platform == "linux"
+                        else str(manager.temporary_directory.get()))
+            assert cached == (expected + "\n") * 2048
+            prefix_length = constants.MAX_TOOL_CONTENT_BYTES // 2
+            tail = "€z"
+            printer = constants.SHELL_PRINT_BUILTIN
+            filename = "physical-path.txt"
+            dispatch(write_text_file.__name__, path=f"{VirtualPath.WORKSPACE}/{filename}",
+                content="physical workspace")
+            printed_path = dispatch(run_command.__name__, command=
+                f'{printer} "%s" "{VirtualPath.WORKSPACE}/{filename}"', read_only=True)["stdout"]["content"]
+            assert dispatch(read_text_file.__name__, path=printed_path)["content"] == "physical workspace"
+            dispatch(edit_text_file.__name__, path=printed_path, old_content="physical",
+                new_content="verified")
+            assert dispatch(read_text_file.__name__, path=printed_path)["content"] == "verified workspace"
+            page_command = (f'{printer} "%*s" {prefix_length} ""; '
+                            f'{printer} "%s" {shlex.quote(tail)}')
+            page = dispatch(run_command.__name__, command=page_command, read_only=True)["stdout"]
+            assert page["content"] == " " * prefix_length and page["truncated"]
+            arguments = {"handle": page["handle"], "cursor": page["next_cursor"], "max_bytes": 1}
+            continuation = dispatch(read_cached_content.__name__, **arguments)
+            assert continuation["content"] == tail[0]
+            assert continuation["requested_max_bytes"] == 1
+            assert continuation["effective_max_bytes"] == len(tail[0].encode("utf-8"))
+            arguments["cursor"] = continuation["next_cursor"]
+            assert dispatch(read_cached_content.__name__, **arguments)["content"] == tail[1:]
+            escaped_stream = '"' * (constants.MAX_TOOL_CONTENT_BYTES // 2)
+            length = len(escaped_stream)
+            literal = shlex.quote(escaped_stream)
+            command = (f'{printer} "%s" {literal}; '
+                f'{printer} "%s" {literal} >&2')
+            dispatch(run_command.__name__, command=command, read_only=True)
+            delivered_command = json.loads(manager.messages[-1].output)
+            assert delivered_command["ok"] and delivered_command["result"]["exit_code"] == 0
+            snapshot = json.loads(cached_path(delivered_command["handle"])[0].read_text())
+            assert snapshot["result"]["stdout"]["content"] == escaped_stream
+            assert snapshot["result"]["stderr"]["content"] == escaped_stream
+            trimmed = False
+            for name in ("stdout", "stderr"):
+                stream = delivered_command["result"][name]
+                assert stream["capture_complete"] and stream["captured_bytes"] == len(escaped_stream)
+                if stream["included_bytes"] < stream["captured_bytes"]:
+                    trimmed = True
+                    remainder = dispatch(read_cached_content.__name__, handle=stream["handle"],
+                        cursor=stream["next_cursor"])["content"]
+                    assert stream["content"] + remainder == escaped_stream
+                else:
+                    assert stream["content"] == escaped_stream
+            assert trimmed
+            short_path = f"{VirtualPath.TEMPORARY}/short-line.txt"
+            short_content = tail + " ordinary line\n"
+            dispatch("write_text_file", path=short_path, content=short_content)
+            short_page = dispatch("read_text_file", path=short_path, max_bytes=2)
+            assert short_page["content"] == short_content
+            assert short_page["requested_max_bytes"] == 2
+            assert short_page["effective_max_bytes"] == len(short_content.encode())
+            long_path = f"{VirtualPath.TEMPORARY}/long-line.txt"
+            long_content = "a" * constants.MAX_TOOL_CONTENT_BYTES + tail + "\n"
+            dispatch("write_text_file", path=long_path, content=long_content)
+            first = dispatch("read_text_file", path=long_path, max_bytes=2)
+            assert first["requested_max_bytes"] == 2
+            assert first["effective_max_bytes"] == constants.MAX_TOOL_CONTENT_BYTES
+            assert "next_start_line" not in first
+            second = dispatch("read_text_file", path=long_path,
+                start_byte=first["next_start_byte"], max_bytes=len((tail + "\n").encode()))
+            assert first["content"] + second["content"] == long_content
+            assert first["version"] == second["version"]
+            unicode_path = f"{VirtualPath.TEMPORARY}/unicode-line.txt"
+            width = len(tail[0].encode())
+            unicode_content = tail[0] * (constants.MAX_TOOL_CONTENT_BYTES // width) + tail + "\n"
+            dispatch("write_text_file", path=unicode_path, content=unicode_content)
+            unicode_first = dispatch("read_text_file", path=unicode_path, max_bytes=2)
+            assert unicode_first["effective_max_bytes"] == constants.MAX_TOOL_CONTENT_BYTES
+            assert unicode_first["included_bytes"] == constants.MAX_TOOL_CONTENT_BYTES // width * width
+            unicode_second = dispatch("read_text_file", path=unicode_path,
+                start_byte=unicode_first["next_start_byte"], max_bytes=len((tail + "\n").encode()))
+            assert unicode_first["content"] + unicode_second["content"] == unicode_content
+            assert unicode_first["version"] == unicode_second["version"]
+            escaped_path = f"{VirtualPath.TEMPORARY}/escaped-line.txt"
+            escaped_content = '"' * constants.MAX_TOOL_CONTENT_BYTES
+            dispatch("write_text_file", path=escaped_path, content=escaped_content)
+            dispatch("read_text_file", path=escaped_path)
+            delivered = json.loads(manager.messages[-1].output)
+            assert delivered["ok"] and delivered["result"]["truncation_reason"] == "result_limit"
+            assert delivered["read_versions"][escaped_path] == delivered["result"]["version"]
+            snapshot = json.loads(cached_path(delivered["handle"])[0].read_text())
+            assert snapshot["result"]["content"] == escaped_content
+            suffix = dispatch("read_text_file", path=escaped_path,
+                start_byte=delivered["result"]["next_start_byte"])
+            assert delivered["result"]["content"] + suffix["content"] == escaped_content
         else:
             assert dispatch("read_text_file", path="$TMPDIR/report.txt")["content"] == "draft"
             dispatch("edit_text_file", path="$TMPDIR/report.txt", old_content="draft",
@@ -613,17 +744,21 @@ with patch("loop.execution.sandbox.macos.backend.SeatbeltDiagnosticService.monit
         outputs = [json.loads(item.output) for item in persisted.messages
                    if getattr(item, "output", None)]
         assert visible in json.dumps(outputs, ensure_ascii=False)
+        expected = ("/loop-private-scratch" if sys.platform == "linux" else native)
+        assert expected in json.dumps(outputs, ensure_ascii=False)
         for kind, filename in (("markdown", "transcript.md"), ("archive", "transcript.zip")):
             destination = Path(sys.argv[2]) / filename
             export_session(persisted, manager.store, destination, format=kind, overwrite=True)
             if kind == "markdown":
                 assert visible in destination.read_text()
+                assert expected in destination.read_text()
             else:
                 with ZipFile(destination) as archive:
                     archived = Session.deserialize(archive.read("session.json").decode())
                 archived_outputs = [json.loads(item.output) for item in archived.messages
                                     if getattr(item, "output", None)]
                 assert visible in json.dumps(archived_outputs, ensure_ascii=False)
+                assert expected in json.dumps(archived_outputs, ensure_ascii=False)
         print(json.dumps({"id": manager.session.id, "content": content, "state": state,
                           "directory": str(manager.temporary_directory.get())}))
     finally:
@@ -638,7 +773,6 @@ with patch("loop.execution.sandbox.macos.backend.SeatbeltDiagnosticService.monit
             capture_output=True,
             text=True,
             check=False,
-            timeout=30,
         )
         assert result.returncode == 0, result.stderr
         assert result.stderr == ""

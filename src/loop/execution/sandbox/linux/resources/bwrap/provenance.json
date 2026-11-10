@@ -1,0 +1,25 @@
+{
+  "binaries": {
+    "amd64": {
+      "elf_sha256": "5d1f77a455d3a5cc1a45bdbf2e23b89cbd7b33e640dd9ae3b5ce2573d133889e",
+      "elf_size": 80424,
+      "index_sha512": "1180e265fc90a5ca3caa782baf3f555baad1bc878bb3787020498698ff68e4c0915e2f702ff73573c7333e71f7271a3169df13717a3b64e76b361f465872e44d",
+      "package_path": "pool/main/b/bubblewrap/bubblewrap_0.12.0-1_amd64.deb",
+      "package_sha512": "f4e2c7e8944e22ea0d49ad88fdba695a78dd5793524fdbf8cccdf8f0984c0b3e13c27812e92664d2f0a71cd09c4121e470468c962da1c644e9566e2082aaae6a"
+    },
+    "arm64": {
+      "elf_sha256": "e2a3e04708d2b6d7dbb536671375643c717bf799e3bdb83ee524a00c1a82a0f7",
+      "elf_size": 133624,
+      "index_sha512": "1d3d92d823a4a8b26c820a5e22e22b77443c2052d5c19831923592e0d64c874d525f6207efd1b6d3a21d17cf389989b49d8a94d72081fc59e93f8b9a99602964",
+      "package_path": "pool/main/b/bubblewrap/bubblewrap_0.12.0-1_arm64.deb",
+      "package_sha512": "7c596ffafa7e409b75f5e3238647b49683a22d3e897088847aed2603f1ea21cf1dde6fb208bd99730097ff3b843143d682d219538f4073a6c7078cc5bcb6d9d1"
+    }
+  },
+  "release": "stonking",
+  "signers": [
+    "F6ECB3762474EDA9D21B7022871920D1991BC93C"
+  ],
+  "source_index_sha512": "043db4970d9c62625dbfce086b79d27abf24766f65a5ea382a625728e336bd2a2d8af3ea34eb5b114ea30fbf62233e89bb9f6ab95a118cd483a136c10292e03a",
+  "upstream_source_sha256": "9760d007363e3abba7c747489910f9f82d9fca53ba3bd3282e396fa3c97a3314",
+  "version": "0.12.0-1"
+}

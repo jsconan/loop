@@ -8,12 +8,14 @@ import stat
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 
 from loop.execution.sandbox.linux import host as linux_host
 from loop.execution.sandbox.linux import installation as linux_installation
+
+from .helpers import mountinfo_path
 
 
 @pytest.mark.parametrize("wrong_record", [False, True])
@@ -209,14 +211,14 @@ def installation(tmp_path, monkeypatch):
 def runtime_staging(installation, monkeypatch):
     """Supply isolated private deployment paths and an authoritative empty mount inventory."""
     directory, lock = installation
-    previous = Path.read_text
+    previous = Path.read_bytes
     monkeypatch.setattr(
         Path,
-        "read_text",
-        lambda path, **kwargs: (
-            "1 0 0:1 / / rw - tmpfs tmpfs rw\n"
+        "read_bytes",
+        lambda path: (
+            b"1 0 0:1 / / rw - tmpfs tmpfs rw\n"
             if str(path) == "/proc/self/mountinfo"
-            else previous(path, **kwargs)
+            else previous(path)
         ),
     )
     return directory, lock, {"pkg/module.py": b"module", "entry.py": b"entry"}
@@ -337,25 +339,47 @@ def test_runtime_staging_refuses_existing_drift_before_deploying_missing_files(
         (directory / "pkg").mkdir()
         monkeypatch.setattr(Path, "lstat", metadata)
     else:
-        previous = Path.read_text
+        previous = Path.read_bytes
         monkeypatch.setattr(
             Path,
-            "read_text",
-            lambda path, **kw: (
+            "read_bytes",
+            lambda path: (
                 (
-                    ""
+                    b""
                     if change == "empty_mount"
-                    else "invalid\n"
+                    else b"invalid\n"
                     if change == "short_mount"
-                    else f"2 1 0:1 / {directory}/pkg rw - tmpfs tmpfs rw\n"
+                    else f"2 1 0:1 / {mountinfo_path(directory)}/pkg rw - tmpfs tmpfs rw\n".encode()
                 )
                 if str(path) == "/proc/self/mountinfo"
-                else previous(path, **kw)
+                else previous(path)
             ),
         )
     with pytest.raises(ValueError, match="authority|inventory|ancestry|canonical"):
         linux_installation.stage_generation_files(directory, contents, {"entry.py"}, lock)
     assert not (directory / "pkg/module.py").exists()
+
+
+def test_runtime_staging_rejects_escaped_mount_under_spaced_root(runtime_staging, monkeypatch):
+    """A kernel-escaped submount is not overlooked when staging under a spaced directory."""
+    directory, lock, contents = runtime_staging
+    directory = directory / "installation root"
+    directory.mkdir()
+    encoded = mountinfo_path(directory)
+    previous = Path.read_bytes
+    monkeypatch.setattr(
+        Path,
+        "read_bytes",
+        lambda path: (
+            f"2 1 0:1 / {encoded}/pkg rw - tmpfs tmpfs rw\n".encode()
+            if str(path) == "/proc/self/mountinfo"
+            else previous(path)
+        ),
+    )
+
+    with pytest.raises(ValueError, match="Mounted or ambiguous generation staging inventory"):
+        linux_installation.stage_generation_files(directory, contents, {"entry.py"}, lock)
+    assert list(directory.iterdir()) == []
 
 
 def test_runtime_staging_retains_completed_partial_files_for_exact_retry(
@@ -635,7 +659,7 @@ def test_provision_receipt_validates_before_publication(artifacts, monkeypatch, 
 
 
 @pytest.fixture
-def publication(installation, monkeypatch):
+def publication(installation, monkeypatch, logical_admission_sources):
     """Prepare protected staged inputs and a disposable runtime unit directory."""
     from loop.execution.sandbox.linux.admission import GenerationAdmission
 
@@ -683,6 +707,54 @@ def test_generation_publication_exact_reuse_and_partial_completion(publication):
     assert resumed["socket_unit"] == result["socket_unit"]
     assert not list(runtime.glob(".loop-unit-*"))
     assert config.reservation.path.exists()
+
+
+@pytest.mark.parametrize("change", [None, "path", "digest"])
+def test_boot_unit_recovery_requires_exact_saved_slice(publication, monkeypatch, change):
+    """Missing volatile units are recreated only from the original fixed slice authority."""
+    from contextlib import nullcontext
+
+    config, lock, runtime = publication
+
+    def publish(directory, name, data):
+        """Model atomic kernel publication in the isolated unit directory."""
+        path = directory / name
+        path.write_bytes(data)
+        path.chmod(0o444)
+
+    monkeypatch.setattr(linux_installation, "publish_volatile_file", publish)
+    units = linux_installation.provision_generation_units(config, lock)
+    saved = units["slice_unit"]
+    saved.path.unlink()
+    if change == "path":
+        saved = replace(saved, path=runtime.parent / saved.path.name)
+        saved.path.unlink()
+    elif change == "digest":
+        saved = replace(saved, digest="0" * 64)
+    config = replace(config, slice_unit=saved)
+
+    def recover():
+        """Recreate unit fragments under the already-held administration gate."""
+        return linux_installation._provision_generation_units(
+            config, lock, nullcontext(), boot_recovery=True
+        )
+
+    if change is None:
+        recovered = recover()
+        assert recovered["slice_unit"].path == runtime / saved.path.name
+        assert recovered["slice_unit"].digest == saved.digest
+    else:
+        with pytest.raises(ValueError, match="Saved generation slice"):
+            recover()
+
+
+def test_generation_publication_checks_logical_receiver_syntax(publication):
+    """The fixture maps its owned prefix while preserving fixed-path validation."""
+    config, _, _ = publication
+    assert config.receiver.is_file()
+    for receiver in (config.receiver.parent / "bad name", Path("/outside bad/receiver")):
+        with pytest.raises(ValueError, match="Invalid fixed generation admission authority"):
+            replace(config, receiver=receiver).unit_sources()
 
 
 @pytest.mark.parametrize(
@@ -793,14 +865,23 @@ def test_generation_publication_failure_retains_complete_partial_authority(
 
 
 @pytest.fixture
-def drain(installation, monkeypatch):
-    """Model fixed manager and kernel boundaries without native enforcement claims."""
+def drain(installation, monkeypatch, logical_admission_sources):
+    """Model fixed manager and kernel boundaries with a logical receiver identity."""
     from types import SimpleNamespace
 
     from loop.execution.sandbox.linux.admission import GenerationAdmission
 
     directory, lock = installation
     root = directory.parent
+    retirement_sources = linux_installation._retirement_sources
+
+    def sources_for_logical_receiver(config, service):
+        """Retain the real current and saved digest checks for the fixture's logical path."""
+        return retirement_sources(
+            replace(config, receiver=logical_admission_sources(config.receiver)), service
+        )
+
+    monkeypatch.setattr(linux_installation, "_retirement_sources", sources_for_logical_receiver)
     receiver = root / "receiver"
     receiver.write_bytes(b"receiver")
     receiver.chmod(0o555)
@@ -846,6 +927,7 @@ def drain(installation, monkeypatch):
         mount="12 1 0:20 / /sys/fs/cgroup rw - cgroup2 cgroup rw\n",
         ids="mnt_id:\t12\n",
         entered=False,
+        slice_started=False,
     )
     monkeypatch.setattr(linux_installation.time, "monotonic", lambda: 10)
 
@@ -860,8 +942,12 @@ def drain(installation, monkeypatch):
         output = ""
         if "stop" in argv:
             state.closed = True
+        elif "start" in argv:
+            state.slice_started = True
         elif "list-jobs" in argv:
             output = "1 pending start waiting\n" if state.change == "pending" else ""
+        elif "list-units" in argv:
+            output = ""
         else:
             name = argv[-1]
             slice_unit = name.endswith(".slice")
@@ -892,6 +978,8 @@ def drain(installation, monkeypatch):
                 fields["ControlGroup"] = ""
             if state.change == "inactiveslice" and slice_unit:
                 fields["ActiveState"] = "inactive"
+            if state.change == "idle" and slice_unit and not state.slice_started:
+                fields.update(ActiveState="inactive", SubState="dead", ControlGroup="")
             output = "".join(f"{k}={v}\n" for k, v in fields.items())
             if state.change == "duplicate":
                 output += "Id=" + name + "\n"
@@ -932,6 +1020,14 @@ def drain(installation, monkeypatch):
         linux_installation.os, "close", lambda fd: None if fd == 9999 else real_close(fd)
     )
     monkeypatch.setattr(linux_installation.os, "read", lambda fd, size: state.events)
+    real_bytes = Path.read_bytes
+    monkeypatch.setattr(
+        Path,
+        "read_bytes",
+        lambda path: (
+            state.mount.encode() if str(path) == "/proc/self/mountinfo" else real_bytes(path)
+        ),
+    )
     real_text = Path.read_text
     monkeypatch.setattr(
         Path,
@@ -939,8 +1035,6 @@ def drain(installation, monkeypatch):
         lambda path, **kw: (
             state.ids
             if str(path).startswith("/proc/self/fdinfo/")
-            else state.mount
-            if str(path) == "/proc/self/mountinfo"
             else "threaded\n"
             if str(path).endswith("/cgroup.type") and state.change == "threaded"
             else "domain\n"
@@ -1012,6 +1106,96 @@ def enter_drain(state, deadline=20):
     """Exercise the public scoped drain interface and observe whether it yields."""
     with linux_installation.drained_generation(state.config, state.files, state.lock, deadline):
         state.entered = True
+
+
+def test_drain_restores_idle_absent_tracking_before_retirement(drain, monkeypatch):
+    """A fully bound idle generation restores its missing cgroup before draining."""
+    drain.change = "idle"
+    idle = Mock()
+    monkeypatch.setattr(linux_installation, "_recursive_idle", idle)
+    enter_drain(drain)
+    group = linux_installation.CGROUP_ROOT / drain.config.slice_unit.path.name
+    assert idle.call_args_list == [call(group, absent=True), call(group, absent=False)]
+    assert drain.slice_started and drain.entered
+
+
+def test_drain_refuses_unverified_absent_tracking(drain, monkeypatch):
+    """A failed whole-root cgroup absence proof never activates tracking."""
+    drain.change = "idle"
+    monkeypatch.setattr(
+        linux_installation, "_recursive_idle", Mock(side_effect=ValueError("unverified cgroup"))
+    )
+    with pytest.raises(ValueError, match="unverified cgroup"):
+        enter_drain(drain)
+    assert not drain.slice_started and not drain.entered
+
+
+@pytest.mark.parametrize("change", ["jobs", "instances", "substate"])
+def test_drain_rechecks_restored_tracking_before_retirement(drain, monkeypatch, change):
+    """A queued job, receiver or inactive substate prevents retirement after recovery."""
+    drain.change = "idle"
+    monkeypatch.setattr(linux_installation, "_recursive_idle", Mock())
+    original_manager = linux_installation._manager
+    original_state = linux_installation._unit_state
+
+    def manager(tool, args, deadline):
+        """Expose one conflicting manager record only after the tracking start."""
+        if drain.slice_started and args[0] == {"jobs": "list-jobs", "instances": "list-units"}.get(
+            change
+        ):
+            return "unexpected\n"
+        return original_manager(tool, args, deadline)
+
+    def unit_state(tool, unit, deadline, **kwargs):
+        """Expose an invalid active slice substate only after tracking starts."""
+        state = original_state(tool, unit, deadline, **kwargs)
+        if drain.slice_started and change == "substate" and unit == drain.config.slice_unit:
+            return {**state, "SubState": "failed"}
+        return state
+
+    monkeypatch.setattr(linux_installation, "_manager", manager)
+    monkeypatch.setattr(linux_installation, "_unit_state", unit_state)
+    with pytest.raises(ValueError, match="Pending|Ambiguous|tracking"):
+        enter_drain(drain)
+    assert drain.slice_started and not drain.entered
+
+
+def changed_service(state):
+    """Bind a changed service body without changing the original unit identity."""
+    bound = state.files["service_unit"]
+    source = state.config.unit_sources()[bound.path.name]
+    source = source.replace("ExitType=main\n", "ExitType=cgroup\n")
+    bound.path.chmod(0o600)
+    bound.path.write_text(source)
+    bound.path.chmod(0o444)
+    state.files["service_unit"] = linux_host.bind_host_file(bound.path)
+
+
+def test_drain_refuses_changed_service_before_closure(drain):
+    """A changed service body cannot close admission as the current fixed template."""
+    changed_service(drain)
+    with pytest.raises(ValueError, match="Saved service template differs"):
+        enter_drain(drain)
+    assert not drain.entered and drain.config.reservation.path.exists()
+
+
+def test_drain_rejects_invalid_logical_receiver_before_closure(drain):
+    """Logical fixture mapping retains fixed receiver syntax checks before admission closes."""
+    drain.config = replace(drain.config, receiver=drain.config.receiver.parent / "bad name")
+
+    with pytest.raises(ValueError, match="Invalid fixed generation admission authority"):
+        enter_drain(drain)
+    assert not drain.entered and not drain.closed
+    assert drain.config.reservation.path.exists()
+
+
+def test_drain_refuses_unknown_saved_template(drain):
+    """An unknown saved service digest retains capacity before closing admission."""
+    bound = drain.files["service_unit"]
+    drain.files["service_unit"] = replace(bound, digest="0" * 64)
+    with pytest.raises(ValueError, match="Saved service template differs from fixed source"):
+        enter_drain(drain)
+    assert not drain.closed and drain.config.reservation.path.exists()
 
 
 def test_drain_closes_only_listener_and_holds_lock(drain, monkeypatch):
@@ -1541,11 +1725,29 @@ def test_policy_removal_never_resolves_kernel_magic_link(policy_removal, monkeyp
 
 
 @pytest.fixture
-def attachment_removal(policy_removal, monkeypatch):
-    """Model a private helper and kernel-owned global attachment after namespace removal."""
+def attachment_removal(policy_removal, monkeypatch, logical_admission_sources):
+    """Model a bound helper and attachment with a logical fixed installation identity."""
     import shutil
 
     state = policy_removal
+    authority = linux_installation._attachment_authority
+
+    def logical_authority(config, lock, helper, compiled, source, compiler_lock):
+        """Validate the same attachment inputs using only a mapped fixture-owned prefix."""
+        real_path = helper.path
+        mapped_path = logical_admission_sources(real_path)
+        if isinstance(source, bytes):
+            source = source.replace(str(real_path).encode(), str(mapped_path).encode())
+        return authority(
+            replace(config, receiver=logical_admission_sources(config.receiver)),
+            lock,
+            replace(helper, path=mapped_path),
+            compiled,
+            source,
+            compiler_lock,
+        )
+
+    monkeypatch.setattr(linux_installation, "_attachment_authority", logical_authority)
     shutil.rmtree(state.backing / "apparmor/policy/namespaces/generation")
     state.helper_path = state.config.receiver.parent / "helper"
     state.helper_path.write_bytes(b"private helper")
@@ -2303,7 +2505,7 @@ def test_activation_refuses_active_instances_before_kernel_idle_check(activation
         "ControlGroup": "/loopgen_generation.slice/" + name,
         "Slice": "loopgen_generation.slice",
         "Delegate": "no",
-        "ExitType": "cgroup",
+        "ExitType": "main",
         "ActiveState": "active",
     }
 
@@ -2445,6 +2647,7 @@ def reclamation(attachment_removal, monkeypatch):
     state.cleanup_change = ""
     state.stopped = False
     state.instance_count = 1
+    state.exit_type = "main"
     tool_path = state.backing / "systemctl"
     tool_path.write_bytes(b"fixture systemctl")
     tool_path.chmod(0o555)
@@ -2453,7 +2656,7 @@ def reclamation(attachment_removal, monkeypatch):
     monkeypatch.setattr(
         linux_installation,
         "bind_host_file",
-        lambda path: (
+        lambda path, **_kwargs: (
             tool if path == Path("/usr/bin/systemctl") else linux_host.bind_host_file(path)
         ),
     )
@@ -2486,7 +2689,7 @@ def reclamation(attachment_removal, monkeypatch):
                 "ControlGroup": "",
                 "Slice": "loopgen_generation.slice",
                 "Delegate": "no",
-                "ExitType": "cgroup",
+                "ExitType": state.exit_type,
                 "ActiveState": "failed",
             }
             if change == "instance_drift":
@@ -2564,6 +2767,14 @@ def test_reclamation_releases_capacity_only_after_exact_owned_cleanup(reclamatio
         state.config.reservation.path.parent, state.lock, "next"
     )
     assert linux_installation.generation_limits(replacement, "next") == (29, 14680064)
+
+
+def test_reclamation_refuses_changed_service(reclamation):
+    """A changed saved service body cannot pass the fixed retirement authority check."""
+    changed_service(reclamation)
+    with pytest.raises(ValueError, match="Saved service template differs"):
+        reclaim(reclamation)
+    assert reclamation.config.reservation.path.exists()
 
 
 def test_reclamation_deletes_support_files_before_helper_and_receiver(reclamation, monkeypatch):
@@ -3800,6 +4011,28 @@ def test_known_removed_template_drain_requires_known_socket(removed_template):
     assert state.config.reservation.path.exists()
 
 
+@pytest.mark.parametrize("missing", ["receiver", "service"])
+def test_known_removed_template_drain_requires_original_bindings(removed_template, missing):
+    """A removed unit needs its saved binding and its known removed receiver authority."""
+    state = removed_template
+    receiver = state.receiver if missing == "service" else None
+    if missing == "service":
+        state.files.pop("service_unit")
+    with (
+        pytest.raises(ValueError, match="Known removed (slice|template)"),
+        linux_installation.drained_generation(
+            state.config,
+            state.files,
+            state.lock,
+            20,
+            removed_receiver=receiver,
+            recovery=linux_installation.RetirementState.TEMPLATE_REMOVED,
+        ),
+    ):
+        pytest.fail("missing authority yielded")
+    assert state.config.reservation.path.exists()
+
+
 @pytest.mark.parametrize("late", ["before_removal", "final", "instance"])
 def test_known_removed_template_reappearance_retains_capacity(removed_template, monkeypatch, late):
     """A recreated template or service history before removal or final release retains capacity."""
@@ -4097,7 +4330,7 @@ def test_reclamation_refuses_unsafe_fixed_inventory_before_deletion(
     elif change == "symlink":
         (state.root / "unknown").symlink_to("helper")
     elif change == "mount":
-        state.mount += f"14 1 0:20 / {state.root}/cache rw - tmpfs tmpfs rw\n"
+        state.mount += f"14 1 0:20 / {mountinfo_path(state.root)}/cache rw - tmpfs tmpfs rw\n"
     else:
         (state.config.reservation.path.parent / "other").write_bytes(b"other")
     with pytest.raises(ValueError, match="authority|remains|withdrawn|inventory|Aliased|type"):
@@ -4621,7 +4854,9 @@ def absent_tracking_cleanup(bound_owner, monkeypatch):
             "ControlGroup": "",
         },
     )
-    monkeypatch.setattr(linux_installation, "_retired_instances", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        linux_installation, "attest_idle_generation_instances", lambda *args, **kwargs: []
+    )
     monkeypatch.setattr(linux_installation, "_recursive_idle", lambda *args, **kwargs: None)
     return fixture
 
@@ -5064,7 +5299,7 @@ def test_observed_retirement_refuses_changed_native_prefix(bound_owner, change):
         message = "namespace inventory differs"
     elif change == "missing_attachment":
         shutil.rmtree(state.attachment_entry)
-        message = "attachment removed while namespace"
+        message = "generation namespace is not empty"
     elif change == "helper_drift":
         state.helper_path.chmod(0o644)
         state.helper_path.write_bytes(b"changed")
@@ -5096,6 +5331,178 @@ def test_observed_retirement_refuses_changed_native_prefix(bound_owner, change):
     with pytest.raises(ValueError, match=message):
         owner.retire(fixture.record, 20)
     assert fixture.record.path.exists()
+
+
+@pytest.fixture
+def externally_cleaned_owner(bound_owner, monkeypatch):
+    """Model an authenticated generation whose policy was removed outside Loop."""
+    fixture = bound_owner
+    state = fixture.state
+    namespace = state.backing / "apparmor/policy/namespaces/generation"
+    shutil.rmtree(state.attachment_entry)
+    for name in ("profiles", "namespaces"):
+        directory = namespace / name
+        for child in directory.iterdir():
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+    (namespace / "raw_data").mkdir()
+    original_rmdir = Path.rmdir
+
+    def remove(path):
+        """Model the kernel removing an empty namespace's virtual metadata directories."""
+        if path == namespace:
+            shutil.rmtree(path)
+        else:
+            original_rmdir(path)
+
+    monkeypatch.setattr(Path, "rmdir", remove)
+    continuation = Mock()
+    monkeypatch.setattr(linux_installation, "retire_generation", continuation)
+    return fixture, namespace, continuation
+
+
+@pytest.mark.parametrize("already_withdrawn", [False, True])
+@pytest.mark.parametrize("retained_raw", [False, True])
+def test_observed_retirement_recovers_exact_empty_external_cleanup(
+    externally_cleaned_owner, already_withdrawn, retained_raw
+):
+    """After drain, an empty original namespace and withdrawn helper continue checked removal."""
+    fixture, namespace, continuation = externally_cleaned_owner
+    if already_withdrawn:
+        fixture.state.helper_path.chmod(0o444)
+    if retained_raw:
+        retained = namespace / "raw_data/0"
+        retained.mkdir()
+        (retained / "raw_data").write_bytes(fixture.owner.policies[""]["bootstrap"])
+    fixture.owner.retire(fixture.record, 20)
+    assert not namespace.exists()
+    assert stat.S_IMODE(fixture.state.helper_path.stat().st_mode) == 0o444
+    assert continuation.call_args.kwargs["recovery"] is (
+        linux_installation.RetirementState.ATTACHMENT_REMOVED
+    )
+    assert fixture.record.path.exists()
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        "namespace_identity",
+        "attachment",
+        "namespaces",
+        "profiles",
+        "raw_data",
+        "raw_overflow",
+        "helper_identity",
+        "helper_metadata",
+        "helper_digest",
+        "helper_mode",
+        "helper_ctime",
+        "unsafe_helper",
+        "deadline",
+        "attachment_reappeared",
+        "namespace_replaced",
+        "live",
+    ],
+)
+def test_external_policy_cleanup_preserves_ambiguous_authority(
+    externally_cleaned_owner, monkeypatch, change
+):
+    """Unknown, live, changed or interrupted state cannot remove an authenticated namespace."""
+    fixture, namespace, continuation = externally_cleaned_owner
+    state = fixture.state
+    owner = fixture.owner
+    if change == "namespace_identity":
+        owner = replace(owner, namespace=(0, 0))
+    elif change in {"namespaces", "profiles", "raw_data"}:
+        (namespace / change / "foreign").mkdir()
+        if change == "raw_data":
+            (namespace / change / "foreign/raw_data").write_bytes(b"unknown")
+    elif change == "raw_overflow":
+        for index in range(linux_installation.MAX_NATIVE_INSTALLATION_ENTRIES + 1):
+            retained = namespace / "raw_data" / str(index)
+            retained.mkdir()
+            (retained / "raw_data").write_bytes(owner.policies[""]["bootstrap"])
+    elif change in {"attachment", "attachment_reappeared"}:
+        responses = [None, state.attachment_entry]
+        if change == "attachment_reappeared":
+            responses.insert(1, None)
+        monkeypatch.setattr(linux_installation, "_attachment_entry", Mock(side_effect=responses))
+    elif change.startswith("helper_"):
+        helper = owner.helper
+        identity = list(helper.identity)
+        digest = helper.digest
+        if change == "helper_identity":
+            identity[1] += 1
+        elif change == "helper_metadata":
+            identity[4] += 1
+        elif change == "helper_digest":
+            digest = "0" * 64
+        elif change == "helper_mode":
+            identity[6] += 1
+        else:
+            identity[2] = identity[2] & ~0o777 | 0o444
+            identity[6] -= 1
+        changed = replace(helper, identity=tuple(identity), digest=digest)
+        original = linux_installation.bind_host_file
+        monkeypatch.setattr(
+            linux_installation,
+            "bind_host_file",
+            lambda path, **kwargs: changed if path == helper.path else original(path, **kwargs),
+        )
+    elif change == "unsafe_helper":
+        state.helper_path.chmod(0o500)
+        owner = replace(owner, helper=linux_host.bind_host_file(state.helper_path))
+    elif change == "deadline":
+        monkeypatch.setattr(
+            linux_installation.time,
+            "monotonic",
+            lambda: 15 if stat.S_IMODE(state.helper_path.stat().st_mode) == 0o444 else 10,
+        )
+    elif change == "namespace_replaced":
+        original = Path.lstat
+
+        def lstat(path):
+            """Expose namespace identity drift only after helper withdrawal."""
+            value = original(path)
+            if (
+                path.name == namespace.name
+                and path.parent.name == "namespaces"
+                and stat.S_IMODE(state.helper_path.stat().st_mode) == 0o444
+            ):
+                return SimpleNamespace(st_dev=value.st_dev, st_ino=value.st_ino + 1)
+            return value
+
+        monkeypatch.setattr(Path, "lstat", lstat)
+    else:
+        monkeypatch.setattr(
+            linux_installation, "drained_generation", Mock(side_effect=OSError("live"))
+        )
+    with pytest.raises(
+        TimeoutError if change == "deadline" else OSError if change == "live" else ValueError
+    ):
+        owner.retire(fixture.record, 20)
+    assert namespace.exists() and fixture.record.path.exists()
+    continuation.assert_not_called()
+
+
+def test_external_policy_cleanup_refuses_missing_artifact(bound_owner):
+    """A namespace cannot be recovered when original files were already removed out of order."""
+    fixture = bound_owner
+    shutil.rmtree(fixture.state.attachment_entry)
+    ordered = sorted(
+        fixture.owner.artifacts,
+        key=lambda name: (
+            fixture.owner.artifacts[name].path
+            in {fixture.owner.helper.path, fixture.owner.config.receiver},
+            fixture.owner.artifacts[name].path == fixture.owner.config.receiver,
+            str(fixture.owner.artifacts[name].path),
+        ),
+    )
+    fixture.owner.artifacts[ordered[0]].path.unlink()
+    with pytest.raises(ValueError, match="Artifact or attachment removed while namespace"):
+        fixture.owner.retire(fixture.record, 20)
 
 
 @pytest.mark.parametrize(
@@ -5559,7 +5966,18 @@ def test_retirement_continuation_cannot_resume_missing_artifacts_or_tracking(ret
 
 @pytest.mark.parametrize(
     "change",
-    [None, "name", "empty", "mode", "bootstrap", "capacity", "bytes", "duplicate", "flags"],
+    [
+        None,
+        "scoped",
+        "name",
+        "empty",
+        "mode",
+        "bootstrap",
+        "capacity",
+        "bytes",
+        "duplicate",
+        "flags",
+    ],
 )
 def test_generation_policy_cache_authenticates_add_only_payloads(retirement, monkeypatch, change):
     """Bound cache inspection refuses unknown, ambiguous or over-budget enforcing exports."""
@@ -5568,6 +5986,8 @@ def test_generation_policy_cache_authenticates_add_only_payloads(retirement, mon
     entry = profiles / "payload"
     entry.mkdir()
     name = "payload_" + "a" * 64
+    if change == "scoped":
+        name += "_" + "b" * 48
     (entry / "name").write_text(("foreign" if change == "name" else name) + "\n")
     (entry / "raw_data").write_bytes(b"" if change == "empty" else b"payload")
     (entry / "mode").write_bytes(b"complain" if change == "mode" else b"enforce")
@@ -5589,7 +6009,7 @@ def test_generation_policy_cache_authenticates_add_only_payloads(retirement, mon
         duplicate.mkdir()
         for child in entry.iterdir():
             (duplicate / child.name).write_bytes(child.read_bytes())
-    if change in {None, "flags"}:
+    if change in {None, "scoped", "flags"}:
         result = linux_installation.generation_policy_cache(
             state.config,
             state.namespace_identity,
@@ -5627,3 +6047,106 @@ def test_generation_policy_cache_authenticates_add_only_payloads(retirement, mon
                 state.helper,
                 state.attachment_bytes,
             )
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        None,
+        "namespace_missing",
+        "bootstrap_missing",
+        "attachment_missing",
+        "children",
+        "payload_without_bootstrap",
+        "duplicate",
+        "mode",
+        "bytes",
+        "nested_policy",
+        "expired",
+    ],
+)
+def test_boot_policy_recovers_only_original_authority(retirement, monkeypatch, change):
+    """Boot loading adds only missing exact policy and rejects conflicting kernel state."""
+    from contextlib import nullcontext
+
+    state = retirement
+    base = state.backing / "apparmor/policy"
+    namespace = base / "namespaces/generation"
+    shutil.rmtree(namespace / "namespaces/inner")
+    policies = {"": dict(state.policies[""])}
+    bootstrap = namespace / "profiles/0"
+    if change == "namespace_missing":
+        shutil.rmtree(namespace)
+    elif change in {"bootstrap_missing", "payload_without_bootstrap"}:
+        shutil.rmtree(bootstrap)
+        if change == "payload_without_bootstrap":
+            (namespace / "profiles/unknown").mkdir()
+            (namespace / "profiles/unknown/name").write_text("other\n")
+    elif change == "attachment_missing":
+        shutil.rmtree(state.attachment_entry)
+    elif change == "children":
+        (namespace / "namespaces/foreign").mkdir()
+    elif change == "duplicate":
+        duplicate = namespace / "profiles/duplicate"
+        duplicate.mkdir()
+        for child in bootstrap.iterdir():
+            (duplicate / child.name).write_bytes(child.read_bytes())
+    elif change == "mode":
+        (bootstrap / "mode").write_text("complain\n")
+    elif change == "bytes":
+        (bootstrap / "raw_data").write_bytes(b"changed")
+    elif change == "nested_policy":
+        policies["inner"] = {"bootstrap": b"other"}
+    original_mkdir = Path.mkdir
+
+    def mkdir(path, *args, **kwargs):
+        """Model kernel namespace creation with its fixed export directories."""
+        if path == state.namespace:
+            namespace.mkdir()
+            (namespace / "namespaces").mkdir()
+            (namespace / "profiles").mkdir()
+        else:
+            original_mkdir(path, *args, **kwargs)
+
+    def load(path, policy, device, data, deadline):
+        """Model kernel loading through the existing authenticated native boundary."""
+        if path == state.namespace / ".load":
+            entry = namespace / "profiles/loaded"
+            entry.mkdir()
+            (entry / "name").write_text("bootstrap\n")
+            (entry / "mode").write_text("enforce\n")
+            (entry / "raw_data").write_bytes(data)
+        else:
+            state.attachment_entry.mkdir()
+            for name, value in {
+                "name": b"loopgen_generation\n",
+                "mode": b"enforce\n",
+                "attach": str(state.helper_path).encode() + b"\n",
+                "raw_data": data,
+            }.items():
+                (state.attachment_entry / name).write_bytes(value)
+
+    monkeypatch.setattr(Path, "mkdir", mkdir)
+    monkeypatch.setattr(linux_installation, "_load_policy_data", load)
+    if change == "expired":
+        monkeypatch.setattr(linux_installation.time, "monotonic", lambda: 20)
+
+    def operation():
+        """Attempt recovery from the selected kernel state."""
+        return linux_installation._recover_generation_policy(
+            state.config,
+            state.lock,
+            state.helper,
+            policies,
+            state.attachment_bytes,
+            state.attachment_source,
+            state.compiler_lock,
+            20,
+            nullcontext(),
+        )
+
+    if change in {None, "namespace_missing", "bootstrap_missing", "attachment_missing"}:
+        assert operation() == (namespace.stat().st_dev, namespace.stat().st_ino)
+    else:
+        with pytest.raises(TimeoutError if change == "expired" else ValueError):
+            operation()

@@ -410,7 +410,7 @@ class ConversationRecoveryCommands:
     """Expose continue and retry controls for pending durable run recovery.
 
     Args:
-        control (ConversationRecoveryControl): Loop state and recovery operation.
+        control (ConversationRecoveryControl): Application state and recovery operation.
     """
 
     _control: ConversationRecoveryControl

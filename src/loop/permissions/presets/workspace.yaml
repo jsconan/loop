@@ -1,5 +1,5 @@
 version: 1
-kind: loop.permission-preset
+kind: app.permission-preset
 metadata:
   id: workspace
   revision: "1"

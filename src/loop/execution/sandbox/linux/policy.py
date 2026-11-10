@@ -15,9 +15,9 @@ from ....constants import GIT_DIRECTORY, NATIVE_UNIT_PREFIX
 from ....permissions.protection import PRIVATE_READ_COMPONENTS, is_protected_external_read
 from ....utils.hashing import sha256_digest
 from ..constants import TMPDIR_ENVIRONMENT_VARIABLE
-from .constants import NATIVE_SCRATCH_PATH
+from .constants import NATIVE_CONVENTIONAL_TMP_PATH, NATIVE_SCRATCH_PATH, NATIVE_TRACKING_PATH
 from .host import RUNTIME_READ_FILES
-from .paths import payload_aliases, payload_path
+from .paths import conventional_tmp_available, payload_path
 
 if TYPE_CHECKING:
     from ..contracts import SandboxRequest
@@ -88,24 +88,29 @@ def payload_policy(
         raise ValueError("Policy scratch is not bound to the request.")
     if not cache_lock.is_absolute() or ".." in cache_lock.parts or not cache_lock.name:
         raise ValueError("Policy cache lock must be absolute.")
+    conventional = conventional_tmp_available(request, scratch, runtime_roots=runtime_roots)
     reads = tuple(
         dict.fromkeys(
-            payload_path(path, scratch)
-            for path in (
-                request.workspace,
-                NATIVE_SCRATCH_PATH,
-                *request.read_roots,
-                *request.read_aliases,
-                *(target for _, _, target in request.aliases),
+            (
+                payload_path(request.workspace, scratch),
+                payload_path(NATIVE_SCRATCH_PATH, scratch),
+                *((payload_path(NATIVE_CONVENTIONAL_TMP_PATH, scratch),) if conventional else ()),
+                *sorted(
+                    payload_path(path, scratch)
+                    for path in (
+                        *request.read_roots,
+                        *request.read_aliases,
+                    )
+                ),
             )
         )
     )
     writes = tuple(
         dict.fromkeys(
-            payload_path(path, scratch)
-            for path in (
-                *request.write_roots,
-                NATIVE_SCRATCH_PATH,
+            (
+                *sorted(payload_path(path, scratch) for path in request.write_roots),
+                payload_path(NATIVE_SCRATCH_PATH, scratch),
+                *((payload_path(NATIVE_CONVENTIONAL_TMP_PATH, scratch),) if conventional else ()),
             )
         )
     )
@@ -126,11 +131,6 @@ def payload_policy(
         *(f'  allow r "{_literal(str(path))}",' for path in RUNTIME_READ_FILES),
         *(f'  allow rmix "{_tree(root)}",' for root in reads),
         *(f'  allow rmix "{_literal(str(path))}",' for path in sorted(executable_files)),
-        *(
-            f'  allow r "{_literal(str(alias.parent))}",'
-            for _, alias, _ in payload_aliases(request)
-        ),
-        *(f'  allow r "{_literal(str(alias))}",' for _, alias, _ in payload_aliases(request)),
         *(f'  allow rwlkmix "{_tree(root)}",' for root in writes),
         *(f'  allow rwlkmix "{_literal(str(root).rstrip("/"))}/{{,**/}}*",' for root in writes),
         "  allow network,",
@@ -144,6 +144,7 @@ def payload_policy(
         "  deny mount,",
         "  deny umount,",
         "  deny /sys/kernel/security/{,**} rwkl,",
+        f'  deny "{_tree(NATIVE_TRACKING_PATH)}" rwklmx,',
         f'  deny "{_literal(str(cache_lock))}" rwkl,',
     ]
     workspace = _literal(str(payload_path(request.workspace, scratch)).rstrip("/"))
@@ -160,7 +161,8 @@ def payload_policy(
         dict.fromkeys(
             root
             for root in (*runtime_roots, *reads, *writes)
-            if root != NATIVE_SCRATCH_PATH or request.session_scratch and not request.scratch_data
+            if (root != NATIVE_SCRATCH_PATH or request.session_scratch and not request.scratch_data)
+            and (root != NATIVE_CONVENTIONAL_TMP_PATH or not conventional)
         )
     )
     for name in PRIVATE_READ_COMPONENTS:

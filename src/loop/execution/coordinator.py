@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-import re
+import json
 import subprocess
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Protocol
@@ -13,7 +14,15 @@ from uuid import uuid4
 
 from .. import constants
 from ..interaction import Interaction
-from ..permissions import HostCommandRule, PermissionManager
+from ..permissions import (
+    Action,
+    ApprovalChoice,
+    Decision,
+    Operation,
+    PermissionManager,
+    ProcessBoundary,
+    ProcessTarget,
+)
 from ..telemetry import telemetry_audit
 from ..utils import (
     ProcessCaptureStatus,
@@ -22,79 +31,32 @@ from ..utils import (
     sha256_digest,
     supervise_process,
 )
+from ..utils.process import is_finite_deadline
 from .sandbox import CommandProcessResult, SandboxBackend, SandboxOutcome, SandboxRequest
 
-_DENIED_OPERATION = re.compile(r"\b(file-(?:read|write)[\w-]*|network-[\w-]+)\s+(\S+)")
-_NETWORK_ACTION = re.compile(
-    r"\b(?:connect|bind|listen|send(?:to)?|recv(?:from)?|socket)\b", re.IGNORECASE
-)
-_PERMISSION_FAILURE_MARKERS = ("permission denied", "operation not permitted", "access denied")
 
-
-def _denied_path_in_error_output(request: SandboxRequest, target: str, output: str) -> bool:
-    """Match a denied path against absolute, relative, or symlinked error spellings."""
-    resolved_target = Path(target).resolve(strict=False)
-    for line in output.splitlines():
-        if not any(marker in line.casefold() for marker in _PERMISSION_FAILURE_MARKERS):
-            continue
-        if target in line:
-            return True
-        for spelling in re.findall(r"[A-Za-z0-9_./@+-]+", line)[
-            : constants.MAX_COMMAND_PATH_LENGTH + 1
-        ]:
-            candidate = Path(spelling)
-            if not candidate.is_absolute():
-                candidate = request.cwd / candidate
-            try:
-                if (
-                    str(candidate.resolve(strict=False)).casefold()
-                    == str(resolved_target).casefold()
-                ):
-                    return True
-            except (OSError, RuntimeError):
-                continue
-    return False
-
-
-def _denial_supports_host_offer(request: SandboxRequest, result: CommandProcessResult) -> bool:
-    """Require a child failure related to the observed denied operation."""
-    match = _DENIED_OPERATION.search(result.observed_denial)
-    if match is None:
-        return False
-    operation, target = match.groups()
-    output = f"{result.stdout}\n{result.stderr}"
-    permission_failure = any(marker in output.casefold() for marker in _PERMISSION_FAILURE_MARKERS)
-    if operation.startswith("network-"):
-        if target.startswith("/"):
-            lines = output.splitlines()
-            return any(
-                _NETWORK_ACTION.search(line)
-                and target in line
-                and any(
-                    any(marker in candidate.casefold() for marker in _PERMISSION_FAILURE_MARKERS)
-                    for candidate in lines[index : index + 4]
-                )
-                for index, line in enumerate(lines)
-            )
-        port = target.rpartition(":")[2]
-        if not port.isdecimal():
-            return False
-        port_pattern = re.compile(rf"(?::|\bport\s+){re.escape(port)}\b", re.IGNORECASE)
-        return any(
-            any(marker in line.casefold() for marker in _PERMISSION_FAILURE_MARKERS)
-            and port_pattern.search(line)
-            and _NETWORK_ACTION.search(line)
-            for line in output.splitlines()
-        )
-    if (
-        not permission_failure
-        or not target.startswith("/")
-        or not _denied_path_in_error_output(request, target, output)
+def _check_command_deadlines(request: SandboxRequest, timeout: float | None) -> None:
+    """Reject invalid request deadlines or optional execution budgets before authorization."""
+    if not is_finite_deadline(request.deadline) or (
+        timeout is not None and (not is_finite_deadline(timeout) or timeout <= 0)
     ):
-        return False
-    if operation.startswith("file-write") and request.workspace not in request.write_roots:
-        return not Path(target).is_relative_to(request.workspace)
-    return True
+        raise ValueError("Command deadline must be finite and execution timeout positive.")
+
+
+def _renew_command_deadline(
+    request: SandboxRequest, timeout: float | None, *, preparation_seconds: float = 0
+) -> SandboxRequest:
+    """Renew an approved request's budget without admitting an overflowed deadline."""
+    if timeout is None:
+        return request
+    deadline = time.monotonic() + preparation_seconds + timeout
+    if not is_finite_deadline(deadline):
+        raise ValueError("Renewed command deadline must be finite.")
+    return replace(
+        request,
+        deadline=deadline,
+        runtime_timeout=timeout if preparation_seconds else request.runtime_timeout,
+    )
 
 
 class HostCommandExecutor(Protocol):
@@ -134,13 +96,18 @@ class LocalHostCommandExecutor:
 
         Returns:
             CommandProcessResult: Bounded process output and exit or timeout outcome.
+
+        Raises:
+            ValueError: The command deadline is not finite.
         """
+        if not is_finite_deadline(request.deadline):
+            raise ValueError("Command deadline must be finite.")
         if time.monotonic() >= request.deadline:
             return CommandProcessResult(SandboxOutcome.TIMED_OUT)
         if cancellation_event is not None and cancellation_event.is_set():
             return CommandProcessResult(SandboxOutcome.CANCELLED)
         process = subprocess.Popen(
-            ["/bin/sh", "-c", request.source],
+            [constants.SHELL_COMMAND_PATH, constants.SHELL_COMMAND_OPTION, request.source],
             cwd=request.cwd,
             env=dict(request.environment),
             stdin=subprocess.DEVNULL,
@@ -159,10 +126,20 @@ class LocalHostCommandExecutor:
             reader=read_bounded_stream,
             thread_factory=threading.Thread,
             cancel_event=cancellation_event,
+            preserve_newlines=True,
         )
         if capture.status is ProcessCaptureStatus.UNAVAILABLE:
+            incomplete = capture.stdout_discarded is None or capture.stderr_discarded is None
             return CommandProcessResult(
-                SandboxOutcome.UNAVAILABLE, detail="Host child pipes unavailable."
+                SandboxOutcome.UNAVAILABLE,
+                stdout=capture.stdout,
+                stderr=capture.stderr,
+                stdout_discarded=capture.stdout_discarded,
+                stderr_discarded=capture.stderr_discarded,
+                detail="Host output capture failed."
+                if incomplete
+                else "Host child pipes unavailable.",
+                possible_effects=True,
             )
         return CommandProcessResult(
             SandboxOutcome(capture.status.value),
@@ -222,15 +199,18 @@ class HostCommandOffer:
     Args:
         token (str): Unpredictable identifier for this offer.
         request (SandboxRequest): Exact command context offered for retry.
-        failure (CommandProcessResult): Sandbox failure or completed attempt with an observed
-            denial behind the offer.
+        failure (CommandProcessResult | None): Sandbox failure behind the offer, or None for an
+            explicitly requested host command.
         warning (str): Full user-facing host execution warning.
+        tool_id (str): Original execution tool identity used for policy checks. Defaults to
+            ``run_command`` for callers constructing an offer directly.
     """
 
     token: str
     request: SandboxRequest
-    failure: CommandProcessResult
+    failure: CommandProcessResult | None
     warning: str
+    tool_id: str = "run_command"
 
 
 @dataclass(frozen=True)
@@ -239,8 +219,7 @@ class CommandAttempt:
 
     Args:
         result (CommandProcessResult | None): Sandboxed attempt, or None when permission was denied.
-        offer (HostCommandOffer | None): Host retry offer after a boundary failure or an
-            observed denial during a nonzero shell attempt.
+        offer (HostCommandOffer | None): Host retry offer after a no-effects boundary failure.
     """
 
     result: CommandProcessResult | None
@@ -255,7 +234,8 @@ class CommandExecutionCoordinator:
         host_executor (HostCommandExecutor): Host supervisor used after explicit approval.
         permissions (PermissionManager): Dedicated sandbox command permission authority.
         interaction (Interaction | None): Actual user prompt surface, or None in headless mode.
-        auto_approval (bool): Whether prompts are being bypassed by an automatic mode.
+        auto_approval (bool): Whether ordinary prompts use automatic input. This does not
+            authorize host execution; trusted YOLO is a distinct permission-manager decision.
     """
 
     _backend: SandboxBackend
@@ -287,29 +267,58 @@ class CommandExecutionCoordinator:
         tool_id: str,
         *,
         prelaunch_failure: CommandProcessResult | None = None,
+        reason: str | None = None,
         execution_timeout: float | None = None,
         cancellation_event: threading.Event | None = None,
+        admission_cancellation_event: threading.Event | None = None,
+        on_admitted: Callable[[], None] | None = None,
+        output_observer: Callable[[str, str], None] | None = None,
+        terminal_input: Callable[[], bytes | None] | None = None,
     ) -> CommandAttempt:
-        """Run an authorized request or offer retry for a typed prelaunch failure.
+        """Run an authorized request or offer retry for a no-effects boundary failure.
 
         Args:
             request (SandboxRequest): Exact approved command, policy, and path identities.
             tool_id (str): Registered execution tool identity used for permission evaluation.
             prelaunch_failure (CommandProcessResult | None): Typed startup capability failure to
                 return without invoking the backend, after authorization and path validation.
-            execution_timeout (float | None): Execution budget in seconds to start after approval.
-                Defaults to preserving the caller's absolute deadline.
+            reason (str | None): Explanation for additional sandbox authority.
+            execution_timeout (float | None): Runtime seconds starting at native launch, with a
+                separate 60-second preparation ceiling after approval. None preserves the
+                caller's absolute deadline.
             cancellation_event (threading.Event | None): Optional run cancellation signal.
+            admission_cancellation_event (threading.Event | None): Original run stop signal
+                checked until a detached job is admitted; later signals do not cancel that job.
+            on_admitted (Callable[[], None] | None): Callback after approval and final prelaunch
+                validation, before the native backend owns the attempt.
+            output_observer (Callable[[str, str], None] | None): Bounded native output sink.
+            terminal_input (Callable[[], bytes | None] | None): Transient control frames for an
+                approved receiver-owned terminal.
 
         Returns:
             CommandAttempt: Sandboxed result and optional unexecuted host offer.
+
+        Raises:
+            ValueError: The request deadline or renewed execution deadline is not finite.
         """
+        _check_command_deadlines(request, execution_timeout)
+        if admission_cancellation_event is not None and admission_cancellation_event.is_set():
+            return CommandAttempt(CommandProcessResult(SandboxOutcome.CANCELLED), None)
+        reason_argument = {"reason": reason} if reason is not None else {}
+        approved_revision: list[int] = []
         if not self._permissions.authorize_sandboxed_command(
-            request, tool_id=tool_id, interaction=self._interaction
+            request,
+            tool_id=tool_id,
+            interaction=self._interaction,
+            approved_revision=approved_revision,
+            **reason_argument,
         ):
             return CommandAttempt(None, None)
-        if execution_timeout is not None:
-            request = replace(request, deadline=time.monotonic() + execution_timeout)
+        request = _renew_command_deadline(
+            request,
+            execution_timeout,
+            preparation_seconds=constants.COMMAND_PREPARATION_SECONDS,
+        )
         if not request.paths_are_current():
             result = CommandProcessResult(
                 SandboxOutcome.STALE,
@@ -319,44 +328,67 @@ class CommandExecutionCoordinator:
             result = CommandProcessResult(
                 SandboxOutcome.TIMED_OUT, detail="Command deadline expired before launch."
             )
-        elif cancellation_event is not None and cancellation_event.is_set():
+        elif (
+            cancellation_event is not None
+            and cancellation_event.is_set()
+            or admission_cancellation_event is not None
+            and admission_cancellation_event.is_set()
+        ):
             result = CommandProcessResult(SandboxOutcome.CANCELLED)
         elif prelaunch_failure is not None:
             result = prelaunch_failure
-        else:
-            result = (
-                self._backend.run(request, cancellation_event=cancellation_event)
-                if cancellation_event is not None
-                else self._backend.run(request)
+        elif len(approved_revision) != 1:
+            result = CommandProcessResult(
+                SandboxOutcome.INVALID, detail="Approved policy revision is unavailable."
             )
+        elif not self._permissions.sandbox_policy_revision_current(approved_revision[0]):
+            result = CommandProcessResult(
+                SandboxOutcome.STALE, detail="Permission policy changed before launch."
+            )
+        else:
+            if on_admitted is not None:
+                on_admitted()
+            output_argument = (
+                {"output_observer": output_observer} if output_observer is not None else {}
+            )
+            if terminal_input is not None:
+                output_argument["terminal_input"] = terminal_input
+            if request.egress_origins:
+                result = self._backend.run(
+                    request,
+                    policy_authority=self._permissions,
+                    approved_revision=approved_revision[0],
+                    **({"cancellation_event": cancellation_event} if cancellation_event else {}),
+                    **output_argument,
+                )
+            else:
+                result = self._backend.run(
+                    request,
+                    **({"cancellation_event": cancellation_event} if cancellation_event else {}),
+                    **output_argument,
+                )
         telemetry_audit(
             "sandbox.completed",
             workspace_id=request.workspace_id,
             attempt_id=request.attempt_id,
             outcome=result.outcome.value,
         )
-        uncertain = (
-            result.outcome is SandboxOutcome.COMPLETED
-            and result.exit_code not in (0, 72, 126, 127)
-            and _denial_supports_host_offer(request, result)
-        )
         if (
             result.outcome not in {SandboxOutcome.UNAVAILABLE, SandboxOutcome.DENIED}
-            and not uncertain
+            or result.possible_effects
+            or request.egress_origins
         ):
             return CommandAttempt(result, None)
-        offer = HostCommandOffer(
-            str(uuid4()),
-            request,
-            result,
-            self._permissions.host_retry_prompt(
-                request.source,
-                result.outcome.value,
-                result.exit_code,
-                result.possible_effects,
-                result.failure_context,
-            ),
+        warning = self._permissions.host_retry_prompt(
+            request.source,
+            result.outcome.value,
+            result.exit_code,
+            result.possible_effects,
+            result.failure_context,
         )
+        if request.execution_source != request.source:
+            warning += f"\nExecuted command: {json.dumps(request.execution_source)}"
+        offer = HostCommandOffer(str(uuid4()), request, result, warning, tool_id)
         self._offers[offer.token] = offer
         telemetry_audit(
             "host_command.offered",
@@ -364,9 +396,57 @@ class CommandExecutionCoordinator:
             attempt_id=request.attempt_id,
             command_hash=sha256_digest(request.source),
             offer_id=offer.token,
-            failure="observed_denial" if uncertain else result.outcome.value,
+            failure=result.outcome.value,
         )
+        self._record_host_boundary("host_command.offered", offer, outcome=result.outcome.value)
         return CommandAttempt(result, offer)
+
+    def request_host_command(
+        self,
+        request: SandboxRequest,
+        tool_id: str,
+        reason: str,
+        *,
+        execution_timeout: float | None = None,
+        cancellation_event: threading.Event | None = None,
+    ) -> CommandProcessResult | None:
+        """Request one explicit host run with fresh consent or an exact trusted grant.
+
+        Args:
+            request (SandboxRequest): Exact command and bound process context.
+            tool_id (str): Registered tool identity used for host policy evaluation.
+            reason (str): Model-supplied explanation for needing unrestricted execution.
+            execution_timeout (float | None): Optional execution budget after approval.
+            cancellation_event (threading.Event | None): Optional cancellation signal.
+
+        Returns:
+            CommandProcessResult | None: Host result, or None if authorization fails.
+
+        Raises:
+            ValueError: If the explanation or deadline is invalid.
+        """
+        _check_command_deadlines(request, execution_timeout)
+        if not reason.strip():
+            raise ValueError("An unrestricted host request requires a reason.")
+        warning = (
+            f"Command: {json.dumps(request.source)}\n"
+            f"Executed command: {json.dumps(request.execution_source)}\n"
+            f"Working directory: {json.dumps(str(request.cwd))}\n"
+            f"Reason: {json.dumps(reason)}\n"
+            "The sandbox restrictions do not apply. The command runs with the host user's "
+            "authority, subject to independent OS and outer-environment restrictions. It can "
+            "read private files, change files outside the workspace, and use the network. "
+            "Previous attempts may already have had effects; running again may repeat them."
+        )
+        offer = HostCommandOffer(str(uuid4()), request, None, warning, tool_id)
+        self._offers[offer.token] = offer
+        self._record_host_boundary("host_command.offered", offer)
+        return self.retry_host_command(
+            offer,
+            request,
+            execution_timeout=execution_timeout,
+            cancellation_event=cancellation_event,
+        )
 
     def retry_host_command(
         self,
@@ -387,7 +467,11 @@ class CommandExecutionCoordinator:
 
         Returns:
             CommandProcessResult | None: Host result after approval, or None when no launch occurs.
+
+        Raises:
+            ValueError: The request deadline or renewed execution deadline is not finite.
         """
+        _check_command_deadlines(current_request, execution_timeout)
         issued = self._offers.pop(offer.token, None)
         if (
             issued != offer
@@ -401,53 +485,202 @@ class CommandExecutionCoordinator:
                 attempt_id=offer.request.attempt_id,
                 offer_id=offer.token,
             )
+            self._record_host_boundary("host_command.stale", offer)
             return None
         if cancellation_event is not None and cancellation_event.is_set():
+            self._record_host_boundary("host_command.cancelled", offer)
             return None
-        if self._auto_approval or self._interaction is None:
+        host_operations = tuple(
+            Operation(
+                tool_id=offer.tool_id,
+                action=Action.PROCESS_EXECUTE,
+                target=ProcessTarget(
+                    argv=(constants.SHELL_COMMAND_PATH, constants.SHELL_COMMAND_OPTION, source),
+                    cwd=str(current_request.cwd),
+                    boundary=ProcessBoundary.HOST,
+                ),
+            )
+            for source in dict.fromkeys((current_request.source, current_request.execution_source))
+        )
+        host_policy, policy_revision = self._permissions.evaluate_with_revision(host_operations)
+        if offer.failure is not None and self._permissions.yolo:
             telemetry_audit(
                 "host_command.denied",
                 workspace_id=offer.request.workspace_id,
                 attempt_id=offer.request.attempt_id,
                 offer_id=offer.token,
+                source="yolo_requires_separate_explicit_request",
+            )
+            self._record_host_boundary(
+                "host_command.denied", offer, source="yolo_requires_separate_explicit_request"
             )
             return None
+        if host_policy.decision is Decision.DENY:
+            telemetry_audit(
+                "host_command.denied",
+                workspace_id=offer.request.workspace_id,
+                attempt_id=offer.request.attempt_id,
+                offer_id=offer.token,
+                source="policy",
+            )
+            self._record_host_boundary("host_command.denied", offer, source="policy")
+            return None
+        explicit_asks = {
+            source
+            for source in host_policy.sources
+            if host_policy.decision is Decision.ASK
+            and source.startswith(("rule:", "managed:human:"))
+        }
+        managed_human = any(source.startswith("managed:human:") for source in explicit_asks)
         reusable = (
-            offer.failure.outcome in {SandboxOutcome.UNAVAILABLE, SandboxOutcome.DENIED}
+            offer.failure is not None
+            and offer.failure.outcome in {SandboxOutcome.UNAVAILABLE, SandboxOutcome.DENIED}
             and not offer.failure.possible_effects
+            and not explicit_asks
         )
         rule = self._permissions.matching_host_command_rule(current_request) if reusable else None
-        if rule is None:
+        trusted = (
+            self._permissions.matching_trusted_host_command_rule(
+                current_request.source,
+                current_request.cwd,
+                offer.tool_id,
+                workspace=current_request.workspace,
+                environment=current_request.shell_environment(),
+            )
+            if offer.failure is None
+            and current_request.source == current_request.execution_source
+            and not managed_human
+            else None
+        )
+        grantable = (
+            offer.failure is None
+            and offer.tool_id == "request_host_command"
+            and current_request.source == current_request.execution_source
+            and not managed_human
+        )
+        if trusted is not None:
+            answer = "trusted"
+            if self._interaction is not None:
+                self._interaction.info(offer.warning)
+        elif rule is not None:
+            answer = "rule"
+        elif self._permissions.yolo:
+            answer = "yolo"
+            if self._interaction is not None:
+                self._interaction.warning(offer.warning)
+        elif (
+            self._auto_approval
+            or self._interaction is None
+            or getattr(self._interaction, "supports_fresh_host_approval", False) is not True
+        ):
+            telemetry_audit(
+                "host_command.denied",
+                workspace_id=offer.request.workspace_id,
+                attempt_id=offer.request.attempt_id,
+                offer_id=offer.token,
+                source="fresh_input_unavailable",
+            )
+            self._record_host_boundary(
+                "host_command.denied", offer, source="fresh_input_unavailable"
+            )
+            return None
+        else:
             self._interaction.info(offer.warning)
-            choices, index = self._permissions.host_retry_choices(reusable)
+            choices, index = self._permissions.host_retry_choices(reusable, grantable)
             answer = self._interaction.prompt(
                 "Run this exact command without the OS sandbox?",
                 exit_commands=None,
                 choices=choices,
                 index=index,
             )
-        else:
-            answer = "rule"
         if cancellation_event is not None and cancellation_event.is_set():
+            self._record_host_boundary("host_command.cancelled", offer)
             return None
-        if answer not in ({"approve", "session", "rule"} if reusable else {"approve"}):
+        allowed_answers = {"approve", "session", "rule"} if reusable else {"approve", "trusted"}
+        if self._permissions.yolo and offer.failure is None:
+            allowed_answers.add("yolo")
+        if grantable:
+            allowed_answers.update({"trust_session", "trust_workspace", "trust_user"})
+        if answer not in allowed_answers:
             telemetry_audit(
                 "host_command.denied",
                 workspace_id=offer.request.workspace_id,
                 attempt_id=offer.request.attempt_id,
                 offer_id=offer.token,
             )
+            self._record_host_boundary("host_command.denied", offer, source="interactive")
             return None
-        if execution_timeout is not None:
-            current_request = replace(
-                current_request, deadline=time.monotonic() + execution_timeout
+        current_request = _renew_command_deadline(current_request, execution_timeout)
+        authority_current = (
+            current_request.paths_are_current()
+            and time.monotonic() < current_request.deadline
+            and (
+                rule is None
+                or self._permissions.matching_host_command_rule(current_request) == rule
             )
+            and (
+                trusted is None
+                or self._permissions.matching_trusted_host_command_rule(
+                    current_request.source,
+                    current_request.cwd,
+                    offer.tool_id,
+                    workspace=current_request.workspace,
+                    environment=current_request.shell_environment(),
+                )
+                == trusted
+            )
+        )
+        current_policy, current_revision = self._permissions.evaluate_with_revision(host_operations)
         if (
-            not current_request.paths_are_current()
-            or time.monotonic() >= current_request.deadline
+            not authority_current
+            or current_policy.decision is Decision.DENY
+            or current_revision != policy_revision
+        ):
+            telemetry_audit(
+                "host_command.stale",
+                workspace_id=offer.request.workspace_id,
+                attempt_id=offer.request.attempt_id,
+                offer_id=offer.token,
+            )
+            self._record_host_boundary("host_command.stale", offer)
+            return None
+        if answer == "session":
+            rule = self._permissions.remember_host_command_rule_if_current(
+                current_request, policy_revision
+            )
+            if rule is None:
+                telemetry_audit(
+                    "host_command.stale",
+                    workspace_id=offer.request.workspace_id,
+                    attempt_id=offer.request.attempt_id,
+                    offer_id=offer.token,
+                )
+                self._record_host_boundary("host_command.stale", offer)
+                return None
+        elif answer.startswith("trust_"):
+            scope = ApprovalChoice(answer.removeprefix("trust_"))
+            installation = self._permissions.remember_trusted_host_command_rule_if_current(
+                current_request, scope, policy_revision
+            )
+            if installation is None:
+                self._record_host_boundary("host_command.stale", offer)
+                return None
+            trusted, policy_revision = installation
+        final_policy, final_revision = self._permissions.evaluate_with_revision(host_operations)
+        if (
+            final_policy.decision is Decision.DENY
+            or final_revision != policy_revision
+            or not current_request.paths_are_current()
             or (
-                rule is not None
-                and self._permissions.matching_host_command_rule(current_request) != rule
+                trusted is not None
+                and self._permissions.matching_trusted_host_command_rule(
+                    current_request.source,
+                    current_request.cwd,
+                    offer.tool_id,
+                    workspace=current_request.workspace,
+                    environment=current_request.shell_environment(),
+                )
+                != trusted
             )
         ):
             telemetry_audit(
@@ -456,16 +689,21 @@ class CommandExecutionCoordinator:
                 attempt_id=offer.request.attempt_id,
                 offer_id=offer.token,
             )
+            self._record_host_boundary("host_command.stale", offer)
             return None
-        if answer == "session":
-            rule = self._permissions.remember_host_command_rule(current_request)
         telemetry_audit(
             "host_command.approved",
             workspace_id=offer.request.workspace_id,
             attempt_id=offer.request.attempt_id,
             offer_id=offer.token,
-            source="rule" if answer == "rule" else "interactive",
-            rule_id=rule.id if isinstance(rule, HostCommandRule) else None,
+            source=answer if answer in {"rule", "trusted", "yolo"} else "interactive",
+            rule_id=(trusted or rule).id if trusted is not None or rule is not None else None,
+        )
+        self._record_host_boundary(
+            "host_command.approved",
+            offer,
+            source=answer if answer in {"rule", "trusted", "yolo"} else "interactive",
+            rule_id=(trusted or rule).id if trusted is not None or rule is not None else None,
         )
         try:
             host_request = HostCommandRequest.from_sandbox(current_request)
@@ -484,6 +722,7 @@ class CommandExecutionCoordinator:
                 attempt_id=offer.request.attempt_id,
                 offer_id=offer.token,
             )
+            self._record_host_boundary("host_command.execution_failed", offer)
             raise
         telemetry_audit(
             "host_command.executed",
@@ -491,19 +730,34 @@ class CommandExecutionCoordinator:
             attempt_id=offer.request.attempt_id,
             offer_id=offer.token,
         )
+        self._record_host_boundary(
+            "host_command.executed",
+            offer,
+            outcome=result.outcome.value if isinstance(result, CommandProcessResult) else None,
+        )
         return result
 
-    @staticmethod
-    def _host_identity(request: SandboxRequest) -> tuple[object, ...]:
-        """Bind the authority-bearing details of the offered host execution."""
-        return (
-            request.source,
-            request.execution_source,
-            request.aliases,
-            request.read_aliases,
-            request.executable_identities,
-            request.cwd,
-            request.workspace,
-            request.workspace_id,
-            request.environment,
+    def _record_host_boundary(
+        self,
+        event_name: str,
+        offer: HostCommandOffer,
+        *,
+        source: str | None = None,
+        rule_id: str | None = None,
+        outcome: str | None = None,
+    ) -> None:
+        """Write a minimized durable record for one host offer or execution boundary."""
+        self._permissions.record_host_boundary(
+            event_name,
+            offer.request.execution_source,
+            attempt_id=offer.request.attempt_id,
+            offer_id=offer.token,
+            source=source,
+            rule_id=rule_id,
+            outcome=outcome,
         )
+
+    @staticmethod
+    def _host_identity(request: SandboxRequest) -> SandboxRequest:
+        """Bind the complete reviewed context except its renewable deadline and attempt ID."""
+        return replace(request, deadline=0.0, attempt_id="", runtime_timeout=None)

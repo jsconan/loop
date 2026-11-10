@@ -10,6 +10,8 @@ import socket
 import stat
 import struct
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -79,8 +81,9 @@ class GenerationAdmission:
         """Render fixed socket, ordinary service template and protected generation slice.
 
         No client data reaches ExecStart or root setup. The receiver runs with host privileges
-        removed before reading any frame. ExitType=cgroup keeps detached descendants tracked
-        after their parent exits. No dependency on listener stop kills accepted services.
+        removed before reading any frame. On receiver exit, systemd sends SIGKILL to remaining
+        cgroup members; capacity remains reserved until the cgroup is empty. No listener
+        dependency kills accepted services.
         The launcher uses NoNewPrivileges without a systemd seccomp filter: systemd's
         privilege-drop setup for such filters can remove SETUID before setpriv executes.
         Memory pressure watching is disabled to prevent a writable pressure-file submount.
@@ -110,10 +113,12 @@ class GenerationAdmission:
             raise ValueError("Generation slice fragment differs from fixed authority.")
 
         return {
-            prefix
-            + SYSTEMD_SLICE_UNIT_SUFFIX: "[Unit]\nDescription=Loop protected generation\n[Slice]\n",
+            prefix + SYSTEMD_SLICE_UNIT_SUFFIX: (
+                f"[Unit]\nDescription={constants.APP_DISPLAY_NAME} protected generation\n[Slice]\n"
+            ),
             prefix + SYSTEMD_SOCKET_UNIT_SUFFIX: (
-                "[Unit]\nDescription=Loop ordinary command admission\n[Socket]\n"
+                f"[Unit]\nDescription={constants.APP_DISPLAY_NAME} ordinary command admission\n"
+                "[Socket]\n"
                 f"ListenStream={SYSTEM_RUNTIME_DIRECTORY}/{prefix}{SYSTEMD_SOCKET_UNIT_SUFFIX}\n"
                 "Accept=yes\n"
                 f"SocketUser={self.uid}\nSocketGroup={self.gid}\n"
@@ -122,8 +127,9 @@ class GenerationAdmission:
                 f"MaxConnections={_SOCKET_MAX_CONNECTIONS}\nRemoveOnStop=yes\n"
             ),
             prefix + SYSTEMD_SERVICE_TEMPLATE_SUFFIX: (
-                "[Unit]\nDescription=Loop protected command receiver\n[Service]\n"
-                "Type=exec\nExitType=cgroup\n"
+                f"[Unit]\nDescription={constants.APP_DISPLAY_NAME} protected command receiver\n"
+                "[Service]\n"
+                "Type=exec\nExitType=main\n"
                 f"ExecStart={SETPRIV_PATH} --reuid={self.uid} --regid={self.gid} "
                 "--clear-groups --bounding-set=-all --inh-caps=-all --ambient-caps=-all "
                 f"--no-new-privs {SYSTEM_PYTHON_PATH} -I -B {self.receiver}\n"
@@ -131,6 +137,7 @@ class GenerationAdmission:
                 f"Slice={prefix}{SYSTEMD_SLICE_UNIT_SUFFIX}\n"
                 "StandardInput=socket\nStandardOutput=socket\nStandardError=journal\n"
                 "ProtectControlGroups=yes\nDelegate=no\nKillMode=control-group\n"
+                "KillSignal=SIGKILL\nSendSIGKILL=yes\n"
                 "MemoryPressureWatch=off\n"
                 "NoNewPrivileges=yes\n"
                 "CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_SETPCAP\n"
@@ -256,13 +263,14 @@ def admission_group(config: GenerationAdmission) -> Path:
     return _tracking(config)[1]
 
 
+@contextmanager
 def receive_request(
     config: GenerationAdmission,
     files: dict[str, HostFile],
     deadline: float,
     *,
     descriptor: int = 0,
-) -> bytes:
+) -> Iterator[tuple[bytes, socket.socket]]:
     """Authenticate fixed activated admission and receive exactly one bounded opaque frame.
 
     Call only from the installed trusted ordinary receiver, before parsing request fields or
@@ -283,8 +291,9 @@ def receive_request(
         deadline (float): Absolute monotonic budget, capped to five seconds for all admission.
         descriptor (int): Activated connected socket descriptor; standard input by default.
 
-    Returns:
-        bytes: One opaque request of at most 64 KiB, received as the fixed ordinary peer.
+    Yields:
+        tuple[bytes, socket.socket]: The bounded request and its authenticated socket, retained
+            until the caller leaves the scope.
 
     Raises:
         ValueError: Identity, tracking, installed/loaded authority, peer or frame is invalid.
@@ -347,7 +356,11 @@ def receive_request(
                 "Slice": prefix + SYSTEMD_SLICE_UNIT_SUFFIX,
                 SYSTEMD_CONTROL_GROUP_PROPERTY: "/" + str(group.relative_to(CGROUP_ROOT)),
                 "NoNewPrivileges": "yes",
-                "ExitType": "cgroup",
+                "Type": "exec",
+                "ExitType": "main",
+                "KillMode": "control-group",
+                "KillSignal": "9",
+                "SendSIGKILL": "yes",
                 "MemoryPressureWatch": "off",
                 "CapabilityBoundingSet": "cap_setgid cap_setuid cap_setpcap",
             },
@@ -401,12 +414,12 @@ def receive_request(
         if trailing and trailing != NATIVE_CANCEL_FRAME:
             raise ValueError("Trailing admission frame bytes.")
 
-    if _tracking(config) != (service, group):
-        raise ValueError("Generation membership changed during admission.")
+        if _tracking(config) != (service, group):
+            raise ValueError("Generation membership changed during admission.")
 
-    for bound in (*files.values(), config.slice_unit, config.reservation, *native_inputs):
-        with bound.open_verified(deadline=deadline):
-            pass
+        for bound in (*files.values(), config.slice_unit, config.reservation, *native_inputs):
+            with bound.open_verified(deadline=deadline):
+                pass
 
-    _remaining(deadline)
-    return payload
+        _remaining(deadline)
+        yield payload, connection

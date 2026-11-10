@@ -1,4 +1,4 @@
-"""Expose Loop's local structured observability boundary."""
+"""Expose the application's local structured observability boundary."""
 
 __all__ = [
     "JSONLTelemetryAdapter",

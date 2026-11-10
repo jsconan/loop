@@ -7,7 +7,7 @@ import io
 import json
 import os
 import stat
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,8 +15,85 @@ from unittest.mock import Mock
 
 import pytest
 
+from loop import constants as app_constants
 from loop.execution.sandbox.linux import host as linux_host
 from loop.utils.process import ProcessCapture, ProcessCaptureStatus
+
+
+def test_native_lock_seeds_follow_application_display_name():
+    """Protected lock contents use the configured application identity."""
+    assert linux_host.NATIVE_LOCK_SEEDS == {
+        "management.lock": f"{app_constants.APP_DISPLAY_NAME} native management\n".encode("ascii"),
+        "compiler.lock": f"{app_constants.APP_DISPLAY_NAME} native compiler\n".encode("ascii"),
+    }
+
+
+@pytest.mark.parametrize(
+    "directory,name,data",
+    [
+        (Path("relative"), "unit", b"data"),
+        (Path("/tmp"), "../unit", b"data"),
+        (Path("/tmp"), "", b"data"),
+        (Path("/tmp"), ".", b"data"),
+        (Path("/tmp"), "unit", b""),
+    ],
+)
+def test_volatile_publication_refuses_invalid_inputs(directory, name, data):
+    """Malformed runtime publication cannot create a filesystem object."""
+    with pytest.raises(ValueError, match="Invalid volatile"):
+        linux_host.publish_volatile_file(directory, name, data)
+
+
+def test_volatile_publication_requires_unnamed_file_support(tmp_path, monkeypatch):
+    """A platform without unnamed-file support refuses without creating a temporary."""
+    monkeypatch.delattr(os, "O_TMPFILE", raising=False)
+    with pytest.raises(OSError) as error:
+        linux_host.publish_volatile_file(tmp_path, "unit", b"data")
+    assert error.value.errno == errno.ENOTSUP
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("failure", [None, "short", "link"])
+def test_volatile_publication_links_only_complete_readonly_bytes(tmp_path, monkeypatch, failure):
+    """Only a complete read-only inode is atomically linked to the requested destination."""
+    temporary = tmp_path / "mock-unnamed"
+    real_open, real_write = os.open, os.write
+    monkeypatch.setattr(os, "O_TMPFILE", 0x40000000, raising=False)
+
+    def open_file(path, flags, mode=0o777, *, dir_fd=None):
+        """Model an unnamed descriptor without depending on the host filesystem."""
+        if path == "." and dir_fd is not None:
+            return real_open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    def write_file(descriptor, data):
+        """Inject only the requested short-write failure."""
+        return 0 if failure == "short" else real_write(descriptor, data)
+
+    def link_file(descriptor, empty, parent, name, flags):
+        """Simulate kernel publication, including a refusal to replace an existing file."""
+        assert empty == b"" and name == b"unit" and flags == 0x1000
+        assert stat.S_IMODE(os.fstat(descriptor).st_mode) == 0o444
+        if failure == "link":
+            return -1
+        os.link(temporary, tmp_path / os.fsdecode(name))
+        temporary.unlink()
+        return 0
+
+    link = Mock(side_effect=link_file)
+    monkeypatch.setattr(os, "open", open_file)
+    monkeypatch.setattr(os, "write", write_file)
+    monkeypatch.setattr(ctypes, "CDLL", lambda *args, **kwargs: SimpleNamespace(linkat=link))
+    monkeypatch.setattr(ctypes, "get_errno", lambda: errno.EEXIST)
+    if failure:
+        with pytest.raises(OSError) as error:
+            linux_host.publish_volatile_file(tmp_path, "unit", b"data")
+        assert error.value.errno == (errno.EIO if failure == "short" else errno.EEXIST)
+        assert not (tmp_path / "unit").exists()
+    else:
+        linux_host.publish_volatile_file(tmp_path, "unit", b"data")
+        assert (tmp_path / "unit").read_bytes() == b"data"
+        assert stat.S_IMODE((tmp_path / "unit").stat().st_mode) == 0o444
 
 
 @pytest.fixture
@@ -189,6 +266,18 @@ def test_protected_path_rejects_unbound_spellings(path):
     """Relative paths and traversal cannot supply host authority."""
     with pytest.raises(ValueError, match="Invalid native host path"):
         linux_host.protected_path(path)
+
+
+def test_protected_path_limits_hardlink_exception_to_explicit_root_owned_files(host):
+    """A selected system tool may have package hardlinks without relaxing default trust anchors."""
+    path = Path("/usr/bin/tail")
+    host.details.st_nlink = 2
+    with pytest.raises(ValueError, match="Unsafe native host file"):
+        linux_host.protected_path(path)
+    assert linux_host.protected_path(path, allow_root_owned_hardlinks=True) == path
+    host.details.st_uid = 1000
+    with pytest.raises(ValueError, match="Unsafe native host authority"):
+        linux_host.protected_path(path, allow_root_owned_hardlinks=True)
 
 
 @pytest.mark.parametrize("unsafe", ["owner", "write", "link_owner"])
@@ -516,10 +605,11 @@ def test_bind_host_file_refuses_drift_during_preparation(binding, monkeypatch, w
         calls = []
 
         def changed(path, **options):
-            """Replace bytes after the initial pathname binding observation."""
-            calls.append(path)
-            if len(calls) == 3:
-                path.write_bytes(b"different")
+            """Replace the bound file after its initial follow-symlink observations."""
+            if path == binding and options.get("follow_symlinks", True):
+                calls.append(path)
+                if len(calls) == 3:
+                    path.write_bytes(b"different")
             return real_stat(path, **options)
 
         monkeypatch.setattr(Path, "stat", changed)
@@ -556,6 +646,246 @@ def test_discover_tool_refuses_nonexecutable_authority(binding, monkeypatch):
     monkeypatch.setattr(Path, "lstat", lambda path: SimpleNamespace(st_uid=0, st_mode=0o100600))
     with pytest.raises(ValueError, match="not executable"):
         linux_host.discover_tool("bwrap")
+
+
+def test_discover_tool_prefers_protected_local_bubblewrap(monkeypatch):
+    """A fixed local helper can coexist with an older distribution executable."""
+    selected = Path("/usr/local/bin/bwrap")
+    monkeypatch.setattr(Path, "exists", lambda path: path in {selected, Path("/usr/bin/bwrap")})
+    binding = Mock(return_value=SimpleNamespace(path=selected, identity=(0, 0, 0o100755)))
+    monkeypatch.setattr(linux_host, "bind_host_file", binding)
+    assert linux_host.discover_tool("bwrap").path == selected
+    binding.assert_called_once_with(selected, deadline=None)
+
+
+@pytest.mark.parametrize("version", ["bubblewrap 0.12.0\n", "bubblewrap 0.13.1\n"])
+def test_fixed_bubblewrap_version_is_bound_and_bounded(monkeypatch, version):
+    """A pinned helper with a fixed upstream version passes a bounded version inspection."""
+    helper = SimpleNamespace(open_verified=Mock(return_value=nullcontext(11)))
+    process = Mock()
+    monkeypatch.setattr(linux_host.time, "monotonic", lambda: 10)
+    monkeypatch.setattr(linux_host.subprocess, "Popen", Mock(return_value=process))
+    supervise = Mock(return_value=ProcessCapture(ProcessCaptureStatus.COMPLETED, 0, version))
+    monkeypatch.setattr(linux_host, "supervise_process", supervise)
+
+    linux_host.require_fixed_bubblewrap(helper, deadline=20)
+
+    helper.open_verified.assert_called_once_with(deadline=15)
+    assert linux_host.subprocess.Popen.call_args.args[0] == ["/proc/self/fd/11", "--version"]
+    assert linux_host.subprocess.Popen.call_args.kwargs["pass_fds"] == (11,)
+    assert supervise.call_args.kwargs["stdout_limit"] == 128
+    assert supervise.call_args.kwargs["stderr_limit"] == 128
+
+
+@pytest.mark.parametrize("version", ["bubblewrap 0.9.0\n", "bubblewrap 0.11.2\n", "unexpected"])
+def test_unfixed_or_ambiguous_bubblewrap_is_refused(monkeypatch, version):
+    """Older and unrecognized helper output cannot assert fixed setup semantics."""
+    helper = SimpleNamespace(open_verified=Mock(return_value=nullcontext(11)))
+    monkeypatch.setattr(linux_host.time, "monotonic", lambda: 10)
+    monkeypatch.setattr(linux_host.subprocess, "Popen", Mock())
+    monkeypatch.setattr(
+        linux_host,
+        "supervise_process",
+        Mock(return_value=ProcessCapture(ProcessCaptureStatus.COMPLETED, 0, version)),
+    )
+    with pytest.raises(ValueError, match="0.12.0 or newer"):
+        linux_host.require_fixed_bubblewrap(helper)
+
+
+@pytest.mark.parametrize(
+    ("capture", "error"),
+    [
+        (ProcessCapture(ProcessCaptureStatus.TIMED_OUT), TimeoutError),
+        (ProcessCapture(ProcessCaptureStatus.UNAVAILABLE), OSError),
+        (ProcessCapture(ProcessCaptureStatus.COMPLETED, 1), OSError),
+        (ProcessCapture(ProcessCaptureStatus.COMPLETED, 0, stderr="diagnostic"), OSError),
+        (ProcessCapture(ProcessCaptureStatus.COMPLETED, 0, stdout_discarded=1), OSError),
+        (ProcessCapture(ProcessCaptureStatus.COMPLETED, 0, stderr_discarded=1), OSError),
+    ],
+)
+def test_fixed_bubblewrap_requires_clean_bounded_completion(monkeypatch, capture, error):
+    """A failed or truncated version query never authorizes native setup."""
+    helper = SimpleNamespace(open_verified=Mock(return_value=nullcontext(11)))
+    monkeypatch.setattr(linux_host.time, "monotonic", lambda: 10)
+    monkeypatch.setattr(linux_host.subprocess, "Popen", Mock())
+    monkeypatch.setattr(linux_host, "supervise_process", Mock(return_value=capture))
+    with pytest.raises(error):
+        linux_host.require_fixed_bubblewrap(helper)
+
+
+def test_fixed_bubblewrap_deadline_refuses_before_launch(monkeypatch):
+    """An expired command budget cannot start an extra helper process."""
+    helper = SimpleNamespace(open_verified=Mock())
+    monkeypatch.setattr(linux_host.time, "monotonic", lambda: 10)
+    launch = Mock()
+    monkeypatch.setattr(linux_host.subprocess, "Popen", launch)
+    with pytest.raises(TimeoutError, match="deadline expired"):
+        linux_host.require_fixed_bubblewrap(helper, deadline=10)
+    helper.open_verified.assert_not_called()
+    launch.assert_not_called()
+
+
+@pytest.fixture
+def managed_helper(monkeypatch):
+    """Model one reviewed Ubuntu 24.04 ELF without launching a native process."""
+    binary = bytearray(64)
+    binary[:6] = b"\x7fELF\x02\x01"
+    binary[18:20] = (183).to_bytes(2, "little")
+    data = bytes(binary)
+    digest = hashlib.sha256(data).hexdigest()
+    monkeypatch.setattr(linux_host, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(linux_host.platform, "machine", lambda: "aarch64")
+    monkeypatch.setattr(
+        linux_host.platform,
+        "freedesktop_os_release",
+        lambda: {"ID": "ubuntu", "VERSION_ID": "24.04"},
+    )
+    monkeypatch.setattr(linux_host, "_MANAGED_BUBBLEWRAP", {"aarch64": ("arm64", 183, 64, digest)})
+    monkeypatch.setattr(linux_host.os, "MFD_CLOEXEC", 1, raising=False)
+    monkeypatch.setattr(linux_host.os, "MFD_ALLOW_SEALING", 2, raising=False)
+    staged = Mock(return_value=42)
+    written = Mock(return_value=len(data))
+    sealed = Mock()
+    version = Mock()
+    monkeypatch.setattr(linux_host.os, "memfd_create", staged, raising=False)
+    monkeypatch.setattr(linux_host.os, "write", written)
+    monkeypatch.setattr(linux_host.os, "fchmod", Mock())
+    monkeypatch.setattr(linux_host.os, "close", Mock())
+    monkeypatch.setattr(linux_host.fcntl, "fcntl", sealed)
+    monkeypatch.setattr(linux_host, "_require_bubblewrap_version", version)
+    return SimpleNamespace(
+        data=data, staged=staged, written=written, sealed=sealed, version=version
+    )
+
+
+def test_managed_bubblewrap_is_verified_before_execution(managed_helper):
+    """Reviewed bytes, ELF machine, sealed descriptor and fixed version precede use."""
+    linux_host.require_managed_bubblewrap_bytes(managed_helper.data)
+    assert linux_host.is_managed_bubblewrap(hashlib.sha256(managed_helper.data).hexdigest())
+    managed_helper.staged.assert_called_once()
+    managed_helper.sealed.assert_called_once_with(42, 1033, 15)
+    managed_helper.version.assert_called_once()
+    linux_host.require_reviewed_bubblewrap_bytes(managed_helper.data)
+    assert managed_helper.version.call_count == 2
+
+
+@pytest.mark.parametrize("case", ["platform", "distribution", "release", "machine"])
+def test_managed_bubblewrap_refuses_unqualified_hosts(managed_helper, monkeypatch, case):
+    """Managed helper identities are restricted to reviewed Ubuntu 24.04 machines."""
+    if case == "platform":
+        monkeypatch.setattr(linux_host, "sys", SimpleNamespace(platform="darwin"))
+    elif case == "distribution":
+        monkeypatch.setattr(linux_host.platform, "freedesktop_os_release", lambda: {"ID": "other"})
+    elif case == "release":
+        monkeypatch.setattr(
+            linux_host.platform,
+            "freedesktop_os_release",
+            lambda: {"ID": "ubuntu", "VERSION_ID": "26.10"},
+        )
+    else:
+        monkeypatch.setattr(linux_host.platform, "machine", lambda: "riscv64")
+    assert not linux_host.is_managed_bubblewrap(hashlib.sha256(managed_helper.data).hexdigest())
+    with pytest.raises(OSError, match="qualified"):
+        linux_host.require_managed_bubblewrap_bytes(managed_helper.data)
+    managed_helper.staged.assert_not_called()
+
+
+@pytest.mark.parametrize("case", ["size", "digest", "magic", "machine"])
+def test_managed_bubblewrap_refuses_changed_artifacts(managed_helper, monkeypatch, case):
+    """Size, SHA256, ELF class and machine must all match the reviewed artifact."""
+    data = bytearray(managed_helper.data)
+    if case == "size":
+        data.pop()
+    elif case == "digest":
+        data[-1] = 1
+    elif case == "magic":
+        data[0] = 0
+    else:
+        data[18] = 0
+    if case in {"magic", "machine"}:
+        monkeypatch.setattr(
+            linux_host,
+            "_MANAGED_BUBBLEWRAP",
+            {"aarch64": ("arm64", 183, 64, hashlib.sha256(data).hexdigest())},
+        )
+    with pytest.raises(ValueError, match="integrity or architecture"):
+        linux_host.require_managed_bubblewrap_bytes(bytes(data))
+    managed_helper.staged.assert_not_called()
+
+
+@pytest.mark.parametrize("case", ["write", "seal", "version"])
+def test_managed_bubblewrap_refuses_incomplete_compatibility(managed_helper, case):
+    """Partial staging, failed sealing and invalid version stop before setup."""
+    if case == "write":
+        managed_helper.written.return_value = 0
+    elif case == "seal":
+        managed_helper.sealed.side_effect = OSError("seal failed")
+    else:
+        managed_helper.version.side_effect = ValueError("version changed")
+    with pytest.raises((OSError, ValueError), match="staging|seal failed|version changed"):
+        linux_host.require_managed_bubblewrap_bytes(managed_helper.data)
+    linux_host.os.close.assert_called_once_with(42)
+
+
+def test_reviewed_external_helper_requires_pinned_system_bytes(managed_helper, monkeypatch):
+    """Nonmanaged catalogs must still match a protected fixed system helper."""
+    helper = Mock(digest=hashlib.sha256(b"external").hexdigest())
+    binding = Mock(return_value=helper)
+    fixed = Mock()
+    monkeypatch.setattr(linux_host, "discover_tool", binding)
+    monkeypatch.setattr(linux_host, "require_fixed_bubblewrap", fixed)
+    linux_host.require_reviewed_bubblewrap_bytes(b"external")
+    fixed.assert_called_once_with(helper)
+    with pytest.raises(ValueError, match="helper changed"):
+        linux_host.require_reviewed_bubblewrap_bytes(b"changed")
+
+
+def test_partial_helper_recovers_only_trusted_staged_bytes(managed_helper, monkeypatch, tmp_path):
+    """Checked partial cleanup reuses protected helper bytes without archive access."""
+    assert linux_host.partial_bubblewrap_bytes(tmp_path) == b""
+    path = tmp_path / "helper"
+    path.write_bytes(managed_helper.data)
+    bound = SimpleNamespace(
+        digest=hashlib.sha256(managed_helper.data).hexdigest(),
+        identity=(0, 0, 0o100555, 1, len(managed_helper.data)),
+        open_verified=Mock(return_value=nullcontext(11)),
+    )
+    monkeypatch.setattr(linux_host, "bind_host_file", Mock(return_value=bound))
+    monkeypatch.setattr(linux_host.os, "pread", Mock(return_value=managed_helper.data))
+    reviewed = Mock()
+    monkeypatch.setattr(linux_host, "require_reviewed_bubblewrap_bytes", reviewed)
+    assert linux_host.partial_bubblewrap_bytes(tmp_path) == managed_helper.data
+    reviewed.assert_called_once_with(managed_helper.data)
+    linux_host.os.pread.return_value = b"changed"
+    with pytest.raises(ValueError, match="changed during read"):
+        linux_host.partial_bubblewrap_bytes(tmp_path)
+
+
+def test_older_managed_generation_stays_usable_after_manifest_update(
+    managed_helper, monkeypatch, tmp_path
+):
+    """Previously reviewed protected bytes remain recognized after a later release."""
+    path = tmp_path / "helper"
+    path.write_bytes(b"older fixed helper")
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    monkeypatch.setattr(
+        linux_host, "_OLDER_MANAGED_BUBBLEWRAP_DIGESTS", {"aarch64": frozenset({digest})}
+    )
+    assert linux_host.is_managed_bubblewrap(digest)
+    bound = SimpleNamespace(
+        digest=digest,
+        identity=(0, 0, 0o100555, 1, len(path.read_bytes())),
+        open_verified=Mock(return_value=nullcontext(11)),
+    )
+    monkeypatch.setattr(linux_host, "bind_host_file", Mock(return_value=bound))
+    monkeypatch.setattr(linux_host.os, "pread", Mock(return_value=path.read_bytes()))
+    fixed = Mock()
+    reviewed = Mock()
+    monkeypatch.setattr(linux_host, "require_fixed_bubblewrap", fixed)
+    monkeypatch.setattr(linux_host, "require_reviewed_bubblewrap_bytes", reviewed)
+    assert linux_host.partial_bubblewrap_bytes(tmp_path) == b"older fixed helper"
+    fixed.assert_called_once_with(bound)
+    reviewed.assert_not_called()
 
 
 @pytest.mark.parametrize("outcome", ["native", "foreign_first", "unloadable", "missing_api"])
@@ -837,6 +1167,8 @@ def policy_compiler(monkeypatch):
         source=b"profile payload {}\n",
         times=iter([10, 10, 10]),
         output=b"\x00\xff\r\n\r\n\n",
+        outputs=[],
+        inputs=[],
         errors=b"",
         input=None,
         process=None,
@@ -845,9 +1177,9 @@ def policy_compiler(monkeypatch):
     def launch(argv, **options):
         """Capture source and fixed launch controls without starting a process."""
         state.input = options["stdin"].read()
-        state.process = SimpleNamespace(
-            stdout=io.BytesIO(state.output), stderr=io.BytesIO(state.errors)
-        )
+        state.inputs.append(state.input)
+        output = state.outputs.pop(0) if state.outputs else state.output
+        state.process = SimpleNamespace(stdout=io.BytesIO(output), stderr=io.BytesIO(state.errors))
         return state.process
 
     def supervise(process, deadline, **limits):
@@ -882,6 +1214,7 @@ def compile_source(state):
 def test_compile_policy_source_preserves_binary_and_bounds_every_launch(policy_compiler):
     """Binary CR/LF bytes survive transport and fixed controls prevent implicit policy loading."""
     assert compile_source(policy_compiler) == policy_compiler.output
+    policy_compiler.launch.assert_called_once()
     assert policy_compiler.input == policy_compiler.source
     argv = policy_compiler.launch.call_args.args[0]
     assert argv == [
@@ -910,6 +1243,54 @@ def test_compile_policy_source_preserves_binary_and_bounds_every_launch(policy_c
     }
     for bound in (policy_compiler.parser, policy_compiler.limiter, policy_compiler.abi):
         assert bound.open_verified.call_count == 2
+
+
+@pytest.mark.parametrize("level", [0, 1, 3, 10, 20, 255])
+def test_compile_policy_source_recompiles_compressed_container_without_compression(
+    policy_compiler, level
+):
+    """Compressed containers with any level byte are recompiled within the original budget."""
+    compressed = b"\x01" + bytes([level]) + b"\x00" * 6 + b"\x28\xb5\x2f\xfdpayload"
+    policy_compiler.outputs = [compressed, b"exact-policy"]
+    policy_compiler.times = iter([10, 10, 10, 10])
+
+    assert compile_source(policy_compiler) == b"exact-policy"
+    assert policy_compiler.inputs == [policy_compiler.source, policy_compiler.source]
+    first, second = policy_compiler.launch.call_args_list
+    assert "--zstd-compress-level=0" not in first.args[0]
+    assert "--zstd-compress-level=0" in second.args[0]
+    assert all(call.args[1] == 15 for call in policy_compiler.supervise.call_args_list)
+    for authority in (policy_compiler.parser, policy_compiler.limiter, policy_compiler.abi):
+        assert authority.open_verified.call_count == 3
+
+
+def test_compile_policy_source_refuses_compression_after_retry(policy_compiler):
+    """A parser that changes level instead of disabling compression cannot supply policy bytes."""
+    compressed = b"\x01\x03\x00\x00\x00\x00\x00\x00\x28\xb5\x2f\xfdpayload"
+    still_compressed = b"\x01\x14\x00\x00\x00\x00\x00\x00\x28\xb5\x2f\xfdpayload"
+    policy_compiler.outputs = [compressed, still_compressed]
+    policy_compiler.times = iter([10, 10, 10, 10])
+
+    with pytest.raises(OSError, match="compressed policy"):
+        compile_source(policy_compiler)
+
+
+def test_compile_policy_source_preserves_a_nonmatching_container(policy_compiler):
+    """Uncompressed bytes resembling a container do not trigger another compiler launch."""
+    policy_compiler.output = b"\x01\x03\x01\x00\x00\x00\x00\x00\x28\xb5\x2f\xfdpayload"
+
+    assert compile_source(policy_compiler) == policy_compiler.output
+    policy_compiler.launch.assert_called_once()
+
+
+def test_compile_policy_source_honors_deadline_before_uncompressed_retry(policy_compiler):
+    """The fallback cannot extend the original compilation deadline."""
+    policy_compiler.output = b"\x01\x03\x00\x00\x00\x00\x00\x00\x28\xb5\x2f\xfdpayload"
+    policy_compiler.times = iter([10, 10, 10, 15])
+
+    with pytest.raises(TimeoutError, match="deadline expired"):
+        compile_source(policy_compiler)
+    policy_compiler.launch.assert_called_once()
 
 
 @pytest.mark.parametrize(

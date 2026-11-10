@@ -105,6 +105,8 @@ __all__ = [
     "OpenAIBackend",
     "Operation",
     "OperationPlan",
+    "OwnedToolTask",
+    "OwnedToolTaskCancelled",
     "PendingToolCall",
     "PermissionArtifactError",
     "PermissionConfiguration",
@@ -232,6 +234,7 @@ __all__ = [
     "read_cached_content",
     "read_text_file",
     "register_shutdown_signals",
+    "request_host_command",
     "resolve_executable",
     "run_command",
     "search_text",
@@ -459,6 +462,8 @@ from .session import (
     validate_session_source,
 )
 from .tooling import (
+    OwnedToolTask,
+    OwnedToolTaskCancelled,
     Tool,
     ToolContext,
     ToolPreflight,
@@ -481,6 +486,7 @@ from .tools import (
     manage_skills,
     read_cached_content,
     read_text_file,
+    request_host_command,
     resolve_executable,
     run_command,
     search_text,

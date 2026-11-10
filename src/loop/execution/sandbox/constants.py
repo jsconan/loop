@@ -1,10 +1,16 @@
 """Define shared command sandbox names and defaults."""
 
+from ... import constants
 from ...utils.virtual_path import VirtualPath
 
-COMMAND_SANDBOX_SCRATCH_PREFIX = "loop-sandbox-"
+COMMAND_SANDBOX_SCRATCH_PREFIX = f"{constants.APP_NAME}-sandbox-"
+PYTHON_BIN_DIRECTORY_NAME = "bin"
+PYTHON_ENVIRONMENT_CONFIG_NAME = "pyvenv.cfg"
+CPYTHON_EXECUTABLE_NAME = "python"
+PYTHON_LIBRARY_DIRECTORY_NAME = "lib"
 
 LANG_ENVIRONMENT_VARIABLE = "LANG"
+HOME_ENVIRONMENT_VARIABLE = "HOME"
 LC_ALL_ENVIRONMENT_VARIABLE = "LC_ALL"
 PATH_ENVIRONMENT_VARIABLE = "PATH"
 TEMP_ENVIRONMENT_VARIABLE = "TEMP"

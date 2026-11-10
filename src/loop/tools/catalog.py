@@ -14,7 +14,15 @@ from .files import (
     write_text_file,
 )
 from .skills import activate_skill, manage_skills
-from .system import resolve_executable, run_command
+from .system import (
+    cancel_command_job,
+    control_command_terminal,
+    inspect_command_jobs,
+    read_command_job,
+    request_host_command,
+    resolve_executable,
+    run_command,
+)
 from .web import fetch_content, read_cached_content
 
 BUILTIN_TOOLS = (
@@ -29,6 +37,11 @@ BUILTIN_TOOLS = (
     manage_skills,
     resolve_executable,
     run_command,
+    inspect_command_jobs,
+    read_command_job,
+    cancel_command_job,
+    control_command_terminal,
+    request_host_command,
     fetch_content,
     read_cached_content,
 )

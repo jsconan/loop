@@ -2,9 +2,10 @@
 
 import json
 import runpy
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, Mock
+from unittest.mock import ANY, MagicMock, Mock
 
 import pytest
 
@@ -41,6 +42,7 @@ def receiver(tmp_path, monkeypatch, wire_restorer):
         ),
     )
     admitted = Mock(return_value=b"opaque private request")
+    admitted.side_effect = lambda *args: nullcontext((admitted.return_value, Mock()))
     monkeypatch.setattr(linux_runtime, "receive_installed_request", admitted)
     restored = Mock(return_value=CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=17))
     monkeypatch.setattr(
@@ -48,7 +50,7 @@ def receiver(tmp_path, monkeypatch, wire_restorer):
         "from_wire",
         Mock(
             return_value=SimpleNamespace(
-                attempt_id="1248c892-42dc-4b68-a3fb-30d2a70a93a7", deadline=20
+                attempt_id="1248c892-42dc-4b68-a3fb-30d2a70a93a7", deadline=20, cleanup_proof=False
             )
         ),
     )
@@ -68,13 +70,40 @@ def test_receiver_forwards_typed_result_after_protected_admission(receiver, monk
     )
     module.main()
     admitted.assert_called_once_with(entry.parent / "management.json", 15)
-    restored.assert_called_once_with(entry.parent / "management.json", b"opaque private request")
+    restored.assert_called_once_with(
+        entry.parent / "management.json", b"opaque private request", ANY
+    )
     factory.assert_called_once_with(1, module.socket.AF_UNIX, module.socket.SOCK_STREAM)
     connection.settimeout.assert_called_once_with(15)
     data = connection.sendall.call_args.args[0]
     assert json.loads(data)["result"]["exit_code"] == 17
     assert len(json.loads(data)["result"]["stdout"]) == 1000000
     connection.__exit__.assert_called_once()
+
+
+def test_receiver_negotiates_only_concrete_cleanup_proof(receiver, monkeypatch):
+    """A supervised response attests absence; a cleanup timeout remains explicitly unknown."""
+    _entry, _admitted, restored = receiver
+    request = SandboxRequest.from_wire.return_value
+    request.cleanup_proof = True
+    connection = MagicMock()
+    connection.__enter__.return_value = connection
+    monkeypatch.setattr(module.socket, "fromfd", Mock(return_value=connection))
+    restored.return_value = CommandProcessResult(
+        SandboxOutcome.CANCELLED, possible_effects=True, cleanup_verified=True
+    )
+
+    module.main()
+
+    data = connection.sendall.call_args.args[0]
+    assert CommandProcessResult.from_wire(data, request.attempt_id).cleanup_verified is True
+    connection.reset_mock()
+    restored.side_effect = TimeoutError("descendants remain")
+
+    module.main()
+
+    data = connection.sendall.call_args.args[0]
+    assert CommandProcessResult.from_wire(data, request.attempt_id).cleanup_verified is None
 
 
 def test_receiver_expired_delivery_refuses_before_socket_send(receiver, monkeypatch):
@@ -141,7 +170,9 @@ def test_receiver_invalid_request_never_reports_readiness(receiver, capsys):
     with pytest.raises(ValueError, match="request snapshot changed"):
         module.main()
     admitted.assert_called_once()
-    restored.assert_called_once_with(entry.parent / "management.json", b"opaque private request")
+    restored.assert_called_once_with(
+        entry.parent / "management.json", b"opaque private request", ANY
+    )
     assert capsys.readouterr().out == ""
 
 
@@ -204,7 +235,9 @@ def test_receiver_delivers_preparation_expiry_with_original_identity(receiver, m
     from loop.execution.sandbox.contracts import SandboxRequestExpired
 
     _, _, executed = receiver
-    request = SimpleNamespace(attempt_id="1248c892-42dc-4b68-a3fb-30d2a70a93a7", deadline=20)
+    request = SimpleNamespace(
+        attempt_id="1248c892-42dc-4b68-a3fb-30d2a70a93a7", deadline=20, cleanup_proof=False
+    )
     if phase == "restoration":
         SandboxRequest.from_wire.side_effect = SandboxRequestExpired(request)
     else:

@@ -78,6 +78,16 @@ def test_transport_preserves_frame_halfclose_and_bounded_response(transport):
         b"LOOP\x01" + struct.pack("!I", len(payload)) + payload
     )
     connection.shutdown.assert_called_once_with(socket.SHUT_WR)
+
+
+def test_transport_starts_observation_only_after_listener_authentication(transport):
+    """Optional observation receives the authenticated connected socket and generation."""
+    config, files, connection, *_ = transport
+    observer = Mock()
+    result = linux_transport.exchange_request(config, files, b"request", 20, observer=observer)
+    assert result == b'{"result": "UNAVAILABLE"}\n'
+    observer.start.assert_called_once_with(connection, "test")
+    connection.sendall.assert_called_once()
     assert [call.args for call in connection.settimeout.call_args_list] == [
         (10,),
         (10,),
@@ -86,6 +96,69 @@ def test_transport_preserves_frame_halfclose_and_bounded_response(transport):
         (15,),
     ]
     assert connection.recv.call_count == 3
+
+
+def test_transport_delivers_split_native_output_frames_before_one_final_result(transport):
+    """The authenticated receiver's bounded live frames preserve observation order."""
+    config, files, connection, *_ = transport
+    stdout = b"O1" + (2).to_bytes(4, "big") + b"ok"
+    stderr = b"O2" + (3).to_bytes(4, "big") + b"err"
+    connection.recv.side_effect = [stdout[:3], stdout[3:] + stderr + b'{"result":1}', b""]
+    seen = []
+
+    result = linux_transport.exchange_request(
+        config,
+        files,
+        b"request",
+        20,
+        output_observer=lambda stream, chunk: seen.append((stream, chunk)),
+    )
+
+    assert result == b'{"result":1}'
+    assert seen == [("stdout", "ok"), ("stderr", "err")]
+
+
+def test_transport_sends_terminal_input_only_after_receiver_ready(transport):
+    """The authenticated ready byte gates one bounded control frame on the original socket."""
+    config, files, connection, *_ = transport
+    connection.recv.side_effect = [b"T", TimeoutError(), b'{"result":1}', b""]
+    frames = iter((b"I\x00\x02ok", None))
+
+    result = linux_transport.exchange_request(
+        config, files, b"request", 20, terminal_input=lambda: next(frames)
+    )
+
+    assert result == b'{"result":1}'
+    assert connection.sendall.call_count == 2
+    assert connection.sendall.call_args_list[1].args == (b"I\x00\x02ok",)
+    connection.shutdown.assert_not_called()
+
+
+def test_transport_rejects_unexpected_terminal_ready_marker(transport):
+    """An unsolicited or duplicate terminal-ready byte cannot alter response framing."""
+    config, files, connection, *_ = transport
+    connection.recv.side_effect = [b"TT", b""]
+    with pytest.raises(ValueError, match="Invalid native control"):
+        linux_transport.exchange_request(config, files, b"request", 20, terminal_input=lambda: None)
+
+
+@pytest.mark.parametrize(
+    "frame",
+    [
+        b"O3" + (1).to_bytes(4, "big") + b"x",
+        b"O1" + (0).to_bytes(4, "big"),
+        b"O1" + (32769).to_bytes(4, "big"),
+        b"O1" + (1).to_bytes(4, "big") + b"\xff",
+        b"O1" + (2).to_bytes(4, "big") + b"x",
+    ],
+)
+def test_transport_rejects_invalid_or_incomplete_native_output_frames(transport, frame):
+    """Malformed stream records cannot be mistaken for an authenticated final result."""
+    config, files, connection, *_ = transport
+    connection.recv.side_effect = [frame, b""]
+
+    with pytest.raises(ValueError, match="native output|no response"):
+        linux_transport.exchange_request(config, files, b"request", 20, output_observer=Mock())
 
 
 def test_transport_waits_for_cleanup_ack_after_sending_cancellation(transport):
@@ -122,7 +195,7 @@ def test_transport_waits_for_cleanup_ack_after_sending_cancellation(transport):
     connection.shutdown.assert_not_called()
 
 
-def test_transport_keeps_legacy_timeout_behavior_without_a_cancel_event(transport):
+def test_transport_reports_timeout_without_a_cancel_event(transport):
     """A timeout from a non-cancellable transport remains an ordinary typed timeout."""
     config, files, connection, *_ = transport
     connection.recv.side_effect = TimeoutError("transport wait expired")
@@ -348,3 +421,314 @@ def test_transport_timeout_capture_uses_fixed_delivery_interval(transport, monke
     assert CommandProcessResult.from_wire(result, attempt) == expected
     assert connection.settimeout.call_args.args == (4.0,)
     connection.sendall.assert_called_once()
+
+
+def test_mediated_transport_keeps_control_open_and_demultiplexes_acknowledgements(transport):
+    """Route authenticated readiness, lease, pause, resume, and revision frames before JSON."""
+    config, files, connection, *_ = transport
+    revision = (7).to_bytes(8, "big")
+    connection.recv.side_effect = [
+        b"E",
+        b"h" + revision[:3],
+        revision[3:] + b"p" + revision + b"u" + revision,
+        b"A" + revision + b"1" + b'{"result":',
+        b' "COMPLETED"}',
+        b"",
+    ]
+    lease = Mock()
+    lease.healthy.return_value = True
+
+    result = linux_transport.exchange_request(config, files, b"request", 20, egress_lease=lease)
+
+    assert result == b'{"result": "COMPLETED"}'
+    lease.ready.assert_called_once_with(connection)
+    lease.heartbeat_ack.assert_called_once_with(7)
+    lease.pause_ack.assert_called_once_with(7)
+    lease.resume_ack.assert_called_once_with(7)
+    lease.revision_ack.assert_called_once_with(7, True)
+    lease.close.assert_called_once()
+    connection.shutdown.assert_not_called()
+
+
+@pytest.mark.parametrize("control", [b"X", b"h", b"A" + b"\0" * 8 + b"x"])
+def test_mediated_transport_rejects_invalid_control_and_closes_lease(transport, control):
+    """Reject unknown and malformed control frames before accepting a native result."""
+    config, files, connection, *_ = transport
+    connection.recv.side_effect = [b"E" + control, b""]
+    lease = Mock()
+    lease.healthy.return_value = True
+
+    with pytest.raises(ValueError, match="control|no response|acknowledgement"):
+        linux_transport.exchange_request(config, files, b"request", 20, egress_lease=lease)
+    lease.close.assert_called_once()
+
+
+@pytest.mark.parametrize("partial", [b"p", b"u", b"A"])
+def test_mediated_transport_never_accepts_a_partial_control_ack(transport, partial):
+    """Incomplete pause, resume, or revision acknowledgements cannot yield a result."""
+    config, files, connection, *_ = transport
+    connection.recv.side_effect = [b"E" + partial, b""]
+    lease = Mock()
+    lease.healthy.return_value = True
+    with pytest.raises(ValueError, match="no response"):
+        linux_transport.exchange_request(config, files, b"request", 20, egress_lease=lease)
+    lease.close.assert_called_once()
+
+
+def test_mediated_transport_rejects_expired_health_ack(transport):
+    """A timed-out read cannot hide a missing mediator heartbeat acknowledgement."""
+    config, files, connection, *_ = transport
+    connection.recv.side_effect = [b"E", TimeoutError()]
+    lease = Mock()
+    lease.healthy.return_value = False
+    with pytest.raises(OSError, match="health acknowledgement timed out"):
+        linux_transport.exchange_request(config, files, b"request", 20, egress_lease=lease)
+    lease.close.assert_called_once()
+
+
+@pytest.fixture
+def mediated_lease(monkeypatch):
+    """Provide a lease with a deterministic writable channel and inert heartbeat thread."""
+    authority = Mock()
+    authority.egress_policy_revision.return_value = 7
+    connection = Mock()
+    connection.send.side_effect = lambda frame: len(frame)
+    monkeypatch.setattr(linux_transport.select, "select", lambda *_: ([], [connection], []))
+    worker = Mock()
+    monkeypatch.setattr(linux_transport.threading, "Thread", Mock(return_value=worker))
+    clock = [10.0]
+    monkeypatch.setattr(linux_transport.time, "monotonic", lambda: clock[0])
+    lease = linux_transport.EgressLease(authority, 7)
+    return lease, authority, connection, clock, worker
+
+
+def test_egress_lease_binds_acknowledges_and_revokes_exact_revision(mediated_lease):
+    """Bind before initial H, keep its approved revision, and settle only exact closure."""
+    lease, authority, connection, clock, worker = mediated_lease
+
+    def send(frame):
+        """Echo receiver control acknowledgements without waiting on a real socket."""
+        frame = bytes(frame)
+        if frame.startswith(b"P"):
+            lease.pause_ack(7)
+        elif frame.startswith(b"U"):
+            lease.resume_ack(7)
+        return len(frame)
+
+    connection.send.side_effect = send
+    lease._acknowledged.wait = Mock(side_effect=lambda _: lease.revision_ack(8, True) or True)
+    assert not lease.healthy()
+    lease.ready(connection)
+    authority.bind_egress.assert_called_once_with(7, lease)
+    worker.start.assert_called_once()
+    lease.heartbeat_ack(7)
+    assert lease.healthy()
+    assert lease.pause()
+    assert lease.resume()
+    assert lease.revoke_revision(8)
+    lease.revision_ack(8, False)
+    assert lease.revoke_revision(8)
+    assert not lease.revoke_revision(9)
+    authority.unbind_egress.assert_not_called()
+    assert lease.pause() and lease.resume()
+    lease.heartbeat_ack(6)
+    assert lease.healthy()
+    lease.close()
+    authority.unbind_egress.assert_called_once_with(lease)
+    worker.join.assert_called_once()
+    assert [call.args[0][0:1] for call in connection.send.call_args_list] == [
+        b"H",
+        b"P",
+        b"U",
+        b"R",
+    ]
+    clock[0] = 15
+
+
+def test_egress_lease_refuses_stale_ack_and_expired_heartbeat(mediated_lease):
+    """Only an exact heartbeat refreshes the two-second health deadline."""
+    lease, _authority, connection, clock, _worker = mediated_lease
+    lease.ready(connection)
+    with pytest.raises(ValueError, match="heartbeat acknowledgement differs"):
+        lease.heartbeat_ack(8)
+    lease.heartbeat_ack(7)
+    clock[0] = 12.1
+    assert not lease.healthy()
+    assert not lease.revoke_revision(7)
+    lease.close()
+
+
+def test_egress_control_acknowledgements_ignore_stale_revisions(mediated_lease):
+    """Stale and unsolicited acknowledgements never settle a new control transition."""
+    lease, _authority, connection, _clock, _worker = mediated_lease
+    lease.ready(connection)
+    lease.revision_ack(8, True)
+    lease.pause_ack(8)
+    lease.resume_ack(8)
+    assert not lease._acknowledged.is_set()
+    assert not lease._paused_ack.is_set()
+    assert not lease._resumed_ack.is_set()
+    lease.close()
+
+
+@pytest.mark.parametrize("phase", ["pause", "resume"])
+def test_egress_lease_missing_ack_after_successful_send_fails_closed(mediated_lease, phase):
+    """An independent barrier timeout closes the original authority channel."""
+    lease, _authority, connection, _clock, _worker = mediated_lease
+    lease.ready(connection)
+    acknowledged = lease._paused_ack if phase == "pause" else lease._resumed_ack
+    acknowledged.wait = Mock(return_value=False)
+    assert not getattr(lease, phase)()
+    connection.shutdown.assert_called_once_with(socket.SHUT_RDWR)
+    lease.close()
+
+
+def test_egress_lease_revocation_send_error_cannot_confirm_closure(mediated_lease):
+    """A broken R frame leaves the outcome uncertain and closes the transport."""
+    lease, _authority, connection, _clock, _worker = mediated_lease
+    lease.ready(connection)
+    connection.send.side_effect = OSError("broken control")
+    assert not lease.revoke_revision(8)
+    connection.shutdown.assert_called_once_with(socket.SHUT_RDWR)
+    lease.close()
+
+
+@pytest.mark.parametrize("late_phase", ["ack", "send"])
+def test_egress_lease_rejects_acknowledgement_after_exact_deadline(mediated_lease, late_phase):
+    """An event already set after two seconds cannot make a late revision successful."""
+    lease, _authority, connection, clock, _worker = mediated_lease
+    lease.ready(connection)
+    if late_phase == "ack":
+
+        def late_ack(_timeout):
+            """Deliver a closure frame after its deadline but before wait returns."""
+            clock[0] = 12.01
+            lease.revision_ack(8, True)
+            return True
+
+        lease._acknowledged.wait = Mock(side_effect=late_ack)
+    else:
+
+        def slow_send(frame):
+            """Complete the R send only after its independent deadline."""
+            clock[0] = 12.01
+            return len(frame)
+
+        connection.send.side_effect = slow_send
+    assert not lease.revoke_revision(8)
+    connection.shutdown.assert_called_once_with(socket.SHUT_RDWR)
+    lease.close()
+
+
+@pytest.mark.parametrize("case", ["current", "busy", "expired", "changed", "stopped", "send-error"])
+def test_egress_lease_watch_checks_policy_without_stalling_health(mediated_lease, case):
+    """The heartbeat sender keeps bounded freshness or terminates stale authority."""
+    lease, authority, connection, clock, _worker = mediated_lease
+    lease.ready(connection)
+    lease._stopped.wait = Mock(side_effect=[False, True])
+    authority.try_egress_policy_revision.return_value = 7
+    if case in {"busy", "expired"}:
+        authority.try_egress_policy_revision.return_value = None
+    if case == "expired":
+        clock[0] = 12.1
+    if case == "changed":
+        authority.try_egress_policy_revision.return_value = 8
+    if case == "stopped":
+        lease._stopped.is_set = Mock(return_value=True)
+    if case == "send-error":
+        connection.send.side_effect = OSError("closed")
+        connection.shutdown.side_effect = OSError("already closed")
+    lease._watch()
+    if case in {"expired", "changed", "send-error"}:
+        connection.shutdown.assert_called_once_with(socket.SHUT_RDWR)
+    if case in {"current", "busy"}:
+        assert [bytes(call.args[0])[:1] for call in connection.send.call_args_list] == [b"H", b"H"]
+    lease.close()
+
+
+@pytest.mark.parametrize("failure", ["unbound", "short-send"])
+def test_egress_lease_requires_a_writable_bound_control_socket(mediated_lease, failure):
+    """A missing or closed authenticated socket cannot carry a heartbeat frame."""
+    lease, _authority, connection, _clock, _worker = mediated_lease
+    if failure == "short-send":
+        lease.ready(connection)
+        connection.send.side_effect = None
+        connection.send.return_value = 0
+    with pytest.raises(OSError, match="unavailable|closed"):
+        lease._send(b"H" + (7).to_bytes(8, "big"))
+    lease.close()
+
+
+def test_egress_lease_can_fail_before_receiving_a_control_socket(mediated_lease):
+    """An unbound failed attempt stops without touching another connection."""
+    lease, _authority, connection, _clock, _worker = mediated_lease
+    lease._fail()
+    assert lease._stopped.is_set()
+    connection.shutdown.assert_not_called()
+
+
+def test_egress_lease_never_sends_initial_heartbeat_after_prebind_revocation(mediated_lease):
+    """A concurrent revision during bind cannot reactivate the stale approved grant."""
+    lease, authority, connection, _clock, _worker = mediated_lease
+
+    def send(frame):
+        """Confirm only the revocation frame emitted by the race."""
+        frame = bytes(frame)
+        return len(frame)
+
+    connection.send.side_effect = send
+    lease._acknowledged.wait = Mock(side_effect=lambda _: lease.revision_ack(8, True) or True)
+    authority.bind_egress.side_effect = lambda _revision, bound: bound.revoke_revision(8)
+    with pytest.raises(OSError, match="revoked before activation"):
+        lease.ready(connection)
+    assert [call.args[0][0:1] for call in connection.send.call_args_list] == [b"R"]
+    lease.close()
+
+
+@pytest.mark.parametrize("phase", ["pause", "resume"])
+def test_egress_lease_missing_control_ack_closes_authority(mediated_lease, monkeypatch, phase):
+    """A healthy heartbeat cannot extend an independent missing barrier acknowledgement."""
+    lease, _authority, connection, _clock, _worker = mediated_lease
+    lease.ready(connection)
+    monkeypatch.setattr(linux_transport, "_EGRESS_CONTROL_SECONDS", 0)
+    assert not getattr(lease, phase)()
+    connection.shutdown.assert_called_with(socket.SHUT_RDWR)
+    lease.close()
+
+
+def test_egress_revision_ack_deadline_is_independent_of_healthy_heartbeats(mediated_lease):
+    """Withhold only R acknowledgement while H stays healthy; closure remains unconfirmed."""
+    lease, authority, connection, _clock, _worker = mediated_lease
+    lease.ready(connection)
+    authority.try_egress_policy_revision.return_value = 7
+    lease._stopped.wait = Mock(side_effect=[False, True])
+
+    def withhold_ack(deadline):
+        """Drive one valid health exchange without acknowledging revision closure."""
+        assert deadline == 2.0
+        lease._watch()
+        lease.heartbeat_ack(7)
+        assert lease.healthy()
+        return False
+
+    lease._acknowledged.wait = Mock(side_effect=withhold_ack)
+    assert not lease.revoke_revision(8)
+    assert not lease.revoke_revision(8)
+    assert [bytes(call.args[0])[:1] for call in connection.send.call_args_list] == [
+        b"H",
+        b"R",
+        b"H",
+    ]
+    connection.shutdown.assert_called_with(socket.SHUT_RDWR)
+    lease.close()
+
+
+def test_egress_lease_binding_failure_never_sends_a_heartbeat(mediated_lease):
+    """A changed manager policy before activation keeps the mediator gate closed."""
+    lease, authority, connection, _clock, worker = mediated_lease
+    authority.bind_egress.side_effect = OSError("policy changed")
+    with pytest.raises(OSError, match="policy changed"):
+        lease.ready(connection)
+    connection.send.assert_not_called()
+    worker.start.assert_not_called()
+    lease.close()

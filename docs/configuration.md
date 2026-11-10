@@ -2,11 +2,11 @@
 
 ## Config files and scope
 
-The CLI stores a complete, commented user configuration in the platform-native Loop configuration directory. An optional `.loop/config.toml` contains workspace-specific overrides. Both files are private to your account; do not commit secrets from the local override.
+The CLI stores a complete, commented user configuration in the platform-native application configuration directory. An optional `.loop/config.toml` contains workspace-specific overrides. Both files are private to your account; do not commit secrets from the local override.
 
-Settings resolve in this order, from lowest to highest priority: built-in defaults, user configuration, workspace overrides, environment variables, and session overrides. Configuration commands use user scope by default; pass `scope=workspace` or `scope=session` to save a narrower override.
+Most settings resolve in this order, from lowest to highest priority: built-in defaults, user configuration, workspace overrides, environment variables, and session overrides. Configuration commands ask for a scope when one is omitted. `app.yolo` accepts a trusted user setting or a session setting; `/config set app.yolo` defaults to session scope. Workspace files cannot control YOLO, and unrelated environment variables such as `APP` and `APP__YOLO` are ignored.
 
-Loop uses one active workspace per process. Sessions and permission policies belong to that workspace. Telemetry, the audit database, and the application log are shared across workspaces.
+The application uses one active workspace per process. Sessions and permission policies belong to that workspace. Telemetry, the audit database, and the `app.log` file are shared across workspaces.
 
 Set `LOOP_CONFIG_HOME`, `LOOP_DATA_HOME`, or `LOOP_STATE_HOME` to override the corresponding platform-native directory. Run `/app dirs` to see the resolved locations.
 
@@ -22,6 +22,8 @@ Forget and rekey require confirmation. Loop imports legacy sessions, policies, l
 ## See all settings
 
 The generated file contains every setting and its built-in value. The example below shows commonly used settings. Settings that can be unset, such as `context_window`, `file_input_mode`, `model`, `temperature`, and `reasoning_effort`, appear as commented `<unset>` entries because TOML has no null value.
+
+Existing version 1 files with a `[loop]` settings table remain readable as `[app]`; Loop writes the current table name when that file is next saved. A file containing both tables is rejected because their precedence is ambiguous.
 
 ```toml
 # user config.toml
@@ -48,12 +50,13 @@ hyperparameter_policy = "fallback"
 [conversation]
 input_mode = "queue" # "queue" | "steer"
 
-[loop]
+[app]
 agent_name = "Loop"
 # temperature = <unset>
 # reasoning_effort = <unset>
 stream = true
 debug = false
+yolo = false
 compaction_threshold = 0.8
 prompt_on_recoverable_error = true
 max_agent_turns = 25
@@ -62,7 +65,7 @@ max_agent_turns = 25
 # See "Web requests" below to override it.
 
 [tools]
-command_timeout = 60.0
+command_timeout = 3600.0
 
 [logging]
 level = "INFO"
@@ -85,17 +88,24 @@ Use `/config` to browse, inspect, change, or reset effective settings. Completio
 
 ```text
 /config
-/config get loop.temperature
-/config set loop.temperature 0.7 scope=session
-/config set loop.stream false scope=workspace
+/config get app.temperature
+/config set app.temperature 0.7 scope=session
+/config set app.stream false scope=workspace
+/config set app.yolo true
+/config get app.yolo
+/config set app.yolo false scope=session
 /config secret backend.api_key
-/config reset loop.temperature scope=workspace
+/config reset app.temperature scope=workspace
 /config reset  # prompts for scope and confirmation
 ```
 
 Reset behavior depends on the scope. At workspace scope, reset removes the override so the user setting applies. At user or session scope, reset restores the built-in default.
 
 Session settings apply only to the current Loop process and take precedence over environment and file values. A file value remains saved when an environment variable overrides it, so the saved value applies again when the variable is absent. Backend and supported interactive-loop settings apply immediately. Logging, telemetry, and agent identity changes require a restart. API-key input and configuration output are masked.
+
+`app.yolo` is off by default. Enabling it skips Loop confirmation prompts for eligible operations: the agent can request private data, change or delete files, use networks, and explicitly run commands on the host. Host execution has the host user's authority and can alter or bypass the sandbox. Hard policy denies, invalid identities, and unavailable enforcement still stop requests; the native sandbox remains active for ordinary sandboxed commands. Loop displays this warning before a human `/config set app.yolo true` takes effect. To keep YOLO active after restart, explicitly run `/config set app.yolo true scope=user`. A session setting takes precedence over the saved value. A child process launched inside a native sandbox inherits that sandbox even when its own YOLO setting is enabled. `/config get app.yolo` shows the effective state, source, and saved user value. A session `false` masks a saved user `true` only until restart; set `scope=user` to `false` to keep it off. A user `false` does not erase an active session `true`; disable that session too. Startup announces whether a trusted saved activation is active or suppressed by managed policy. Persistent activation requires an owner-private, real user configuration directory and file. An untrusted or ambiguous saved activation fails closed.
+
+YOLO grants each eligible request once and does not save an approval rule. A failed sandbox command is not automatically retried on the host. Recovery that could repeat a previous effect or needs a missing choice stays unresolved for an explicit action. Disabling YOLO affects new decisions; a process already running may retain its admitted authority, so stop the active run when immediate withdrawal is needed. An installed [protected administrator policy](permissions.md#optional-administrator-policy) can prohibit YOLO activation, deny operations, require sandbox execution, prohibit host execution, or require a fresh human decision; YOLO cannot override those restrictions. Managed enforcement is unavailable on an unmanaged installation.
 
 While an agent run is active, `conversation.input_mode = "queue"` admits plain text as a follow-up that runs after the current operation settles. Set it to `"steer"` to admit plain text at steering priority and stop the run at its next safe boundary. Explicit `/queue` and `/steer` commands override this setting.
 
@@ -148,10 +158,10 @@ The `loop` command accepts environment overrides for automation:
 | Reasoning effort            | `LOOP_REASONING_EFFORT`                 | unset                          |
 | Hyperparameter policy       | `OPENAI_HYPERPARAMETER_POLICY`          | `fallback`                     |
 | Web user agent              | `USER_AGENT`                            | browser-like user agent        |
-| Command timeout             | `LOOP_COMMAND_TIMEOUT`                  | `60.0`                         |
-| Loop agent name             | `LOOP_AGENT_NAME`                       | `Loop`                         |
+| Command timeout             | `LOOP_COMMAND_TIMEOUT`                  | `3600.0`                       |
+| Agent name                  | `LOOP_AGENT_NAME`                       | `Loop`                         |
 | Active input mode           | `LOOP_CONVERSATION_INPUT_MODE`          | `queue`                        |
-| Loop model                  | `LOOP_MODEL`                            | unset                          |
+| Model                       | `LOOP_MODEL`                            | unset                          |
 | Stream responses            | `LOOP_STREAM`                           | `true`                         |
 | Debug responses             | `LOOP_DEBUG`                            | `false`                        |
 | Compaction threshold        | `LOOP_COMPACTION_THRESHOLD`             | `0.8`                          |

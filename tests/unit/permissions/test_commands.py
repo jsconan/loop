@@ -1,5 +1,6 @@
 """Tests for complete operation-policy user commands."""
 
+import shlex
 import time
 from unittest.mock import Mock
 
@@ -28,6 +29,7 @@ from loop import (
 from loop.execution.sandbox import SandboxRequest
 from loop.interaction import ConsoleInteraction
 from loop.permissions import PermissionCommands
+from loop.workspace import Workspace, WorkspaceRepository
 
 
 def test_permissions_sandbox_rules_can_be_listed_and_removed(tmp_path):
@@ -88,6 +90,144 @@ def test_permissions_host_rules_can_be_listed_and_revoked(tmp_path):
     assert "No matching" in interaction.info.call_args.args[0]
     command.call("permissions", "host unknown")
     interaction.report.assert_called()
+
+
+def test_permissions_trusted_host_grant_is_confirmed_listed_and_revoked(tmp_path):
+    """Only the trusted human command installs an exact session no-prompt host grant."""
+    interaction = Mock(spec=ConsoleInteraction)
+    interaction.supports_fresh_host_approval = True
+    interaction.prompt.return_value = "deny"
+    permissions = PermissionManager(tmp_path)
+    command = command_manager(permissions, interaction)
+
+    command.call("permissions", "host trust 'printf host'")
+    assert not permissions.trusted_host_command_rules()
+    interaction.prompt.return_value = "trust"
+    command.call("permissions", "host trust 'printf host'")
+    rule = permissions.trusted_host_command_rules()[0]
+    assert "host user's authority" in interaction.info.call_args_list[-2].args[0]
+    command.call("permissions", "host trusted")
+    assert rule.id in interaction.info.call_args.args[0]
+    command.call("permissions", f"host untrust {rule.id}")
+    assert not permissions.trusted_host_command_rules()
+    command.call("permissions", f"host untrust {rule.id}")
+    assert "No matching" in interaction.info.call_args.args[0]
+    permissions.close()
+
+
+def test_yolo_human_host_trust_command_needs_no_second_confirmation(tmp_path):
+    """An explicit trusted human grant command remains usable without a second Loop prompt."""
+    interaction = Mock(spec=ConsoleInteraction)
+    interaction.supports_fresh_host_approval = True
+    permissions = PermissionManager(tmp_path, yolo=True)
+    command = command_manager(permissions, interaction)
+
+    command.call("permissions", "host trust 'printf host'")
+
+    assert len(permissions.trusted_host_command_rules()) == 1
+    interaction.prompt.assert_not_called()
+    permissions.close()
+
+
+@pytest.mark.parametrize("scope", ["workspace", "user"])
+def test_explicit_policy_reset_command_uses_no_confirmation(tmp_path, scope):
+    """A human policy reset archives the selected scope without a second prompt."""
+    interaction = Mock(spec=ConsoleInteraction)
+    user_path = tmp_path / "user-policy.yaml"
+    permissions = PermissionManager(tmp_path, user_configuration_path=user_path, yolo=True)
+    command = command_manager(permissions, interaction)
+    if scope == "workspace":
+        permissions.set_default(Action.FILESYSTEM_READ, Decision.DENY)
+
+    command.call("permissions", f"reset {scope}")
+
+    assert "prior policy archive:" in interaction.info.call_args.args[0]
+    assert (permissions.configuration_path if scope == "workspace" else user_path).exists()
+    interaction.prompt.assert_not_called()
+    permissions.close()
+
+
+def test_user_reset_command_recovers_invalid_policy_with_an_archive(tmp_path):
+    """The trusted command can recover captured invalid user policy without a prompt."""
+    interaction = Mock(spec=ConsoleInteraction)
+    user_path = tmp_path / "user-policy.yaml"
+    user_path.write_text("version: invalid\n", encoding="utf-8")
+    permissions = PermissionManager(
+        tmp_path, user_configuration_path=user_path, interaction=interaction
+    )
+    command = command_manager(permissions, interaction)
+
+    command.call("permissions", "reset user")
+
+    assert "prior policy archive:" in interaction.info.call_args.args[0]
+    assert next(tmp_path.glob("user-policy.yaml.*.bak")).read_text(encoding="utf-8") == (
+        "version: invalid\n"
+    )
+    interaction.prompt.assert_not_called()
+    permissions.close()
+
+
+def test_bare_reset_clears_only_session_policy(tmp_path):
+    """Bare reset clears session overrides without changing the persisted workspace policy."""
+    interaction = Mock(spec=ConsoleInteraction)
+    permissions = PermissionManager(tmp_path)
+    command = command_manager(permissions, interaction)
+    permissions.set_default(Action.FILESYSTEM_DELETE, Decision.DENY)
+    permissions.set_default(Action.FILESYSTEM_READ, Decision.DENY, scope=PolicyScope.SESSION)
+    workspace_bytes = permissions.configuration_path.read_bytes()
+
+    command.call("permissions", "reset")
+
+    assert not permissions.session_overrides.defaults
+    assert permissions.configuration_path.read_bytes() == workspace_bytes
+    interaction.info.assert_called_with("Cleared every session permission override.")
+    permissions.close()
+
+
+def test_permissions_trusted_host_grant_refuses_automatic_input(tmp_path):
+    """Automatic command input cannot create future no-prompt host authority."""
+    interaction = Mock(spec=ConsoleInteraction)
+    interaction.supports_fresh_host_approval = False
+    permissions = PermissionManager(tmp_path)
+    command = command_manager(permissions, interaction)
+
+    command.call("permissions", "host trust 'printf host'")
+
+    assert not permissions.trusted_host_command_rules()
+    interaction.prompt.assert_not_called()
+    interaction.report.assert_called_once()
+    assert "fresh human host input" in interaction.report.call_args.args[0].detail
+    permissions.close()
+
+
+@pytest.mark.parametrize("scope", (ApprovalChoice.WORKSPACE, ApprovalChoice.USER))
+def test_permissions_host_trust_command_manages_durable_scopes(tmp_path, scope):
+    """The trusted command exposes and revokes each durable host grant scope."""
+    interaction = Mock(spec=ConsoleInteraction)
+    interaction.supports_fresh_host_approval = True
+    interaction.prompt.return_value = "trust"
+    catalog = tmp_path.parent / f"{tmp_path.name}-policy-data" / "workspaces.sqlite"
+    workspace = WorkspaceRepository(catalog).initialize(Workspace.discover(tmp_path))
+    permissions = PermissionManager(
+        tmp_path,
+        configuration_path=catalog.parent / "workspaces" / workspace.id / "permissions.yaml",
+        user_configuration_path=catalog.parent / "user-permissions.yaml",
+        workspace_id=workspace.id,
+        namespace_catalog_path=catalog,
+        user_namespace_identity=str(catalog.parent),
+    )
+    permissions.initialize_policy_namespace("workspace", workspace.id, authorized=True)
+    permissions.initialize_policy_namespace("user", str(catalog.parent), authorized=True)
+    command = command_manager(permissions, interaction)
+
+    command.call("permissions", f"host trust {scope.value} 'printf host'")
+    rule = permissions.trusted_host_command_rules()[0]
+    assert rule.scope is scope
+    command.call("permissions", "host trusted")
+    assert f"{scope.value} {rule.id}" in interaction.info.call_args.args[0]
+    command.call("permissions", f"host untrust {scope.value} {rule.id}")
+    assert permissions.trusted_host_command_rules() == ()
+    permissions.close()
 
 
 def test_permissions_sandbox_cli_preserves_other_persisted_scope(tmp_path):
@@ -189,7 +329,7 @@ def test_permission_policy_changes_apply_immediately_during_runs(tmp_path):
     )
     actions = {item.text for item in complete(completer, "/permissions ")}
     assert "reload" not in actions
-    assert "session" not in actions
+    assert "reset" not in actions
     assert {"default", "limit", "rule", "show"} <= actions
     preset_actions = {item.text for item in complete(completer, "/permissions preset ")}
     assert preset_actions == {"list", "show", "diff"}
@@ -218,7 +358,8 @@ def test_permission_commands_reject_prompting_changes_during_runs(tmp_path):
         "/permissions rule add session allow",
         "/permissions rule add",
         "/permissions reload",
-        "/permissions session reset",
+        "/permissions reset",
+        "/permissions reset workspace",
         "/permissions preset replace session basic",
     ):
         assert manager.handle_user_command(command)
@@ -308,6 +449,7 @@ def test_permission_change_during_approval_prompt_overrides_stale_approval(tmp_p
 def test_permissions_command_manages_defaults_limits_and_complete_rule_lifetimes(tmp_path):
     """Commands persist every policy dimension and manage process-local rules separately."""
     interaction = Mock(spec=ConsoleInteraction)
+    interaction.confirm.return_value = True
     permissions = PermissionManager(tmp_path)
     manager = command_manager(permissions, interaction)
 
@@ -369,13 +511,14 @@ def test_permissions_rule_add_defaults_omitted_matchers_to_wildcards(tmp_path):
     interaction.report.assert_not_called()
 
 
-def test_permissions_rule_add_confirms_broad_matchers_before_mutation(tmp_path):
+@pytest.mark.parametrize("declined", [False, object()])
+def test_permissions_rule_add_confirms_broad_matchers_before_mutation(tmp_path, declined):
     """Broad rules require explicit approval and declined creation leaves policy unchanged."""
     interaction = Mock(spec=ConsoleInteraction)
     permissions = PermissionManager(tmp_path)
     manager = command_manager(permissions, interaction)
 
-    interaction.confirm.return_value = False
+    interaction.confirm.return_value = declined
     manager.call("permissions", "rule add session allow run_command process.execute")
 
     assert not permissions.session_rules
@@ -425,6 +568,7 @@ def test_permissions_rule_without_mutation_lists_scoped_rules(tmp_path):
 def test_permissions_show_and_explain_report_the_complete_effective_policy(tmp_path):
     """Policy output distinguishes defaults, limits, persistent rules, and session rules."""
     interaction = Mock(spec=ConsoleInteraction)
+    interaction.confirm.return_value = True
     permissions = PermissionManager(tmp_path)
     manager = command_manager(permissions, interaction)
     manager.call("permissions", "rule add workspace allow read_text_file filesystem.read '*'")
@@ -441,6 +585,8 @@ def test_permissions_show_and_explain_report_the_complete_effective_policy(tmp_p
 
     manager.call("permissions", "help")
     assert "limit" in interaction.info.call_args.args[0]
+    assert "  /permissions reset\n" in interaction.info.call_args.args[0]
+    assert "  /permissions reset user\n" in interaction.info.call_args.args[0]
 
     manager.call("permissions", "explain read_text_file filesystem.read file.txt")
     explained = interaction.info.call_args.args[0]
@@ -472,7 +618,7 @@ def test_permissions_reload_reports_invalid_policy_without_replacing_active_poli
     interaction.prompt.return_value = "continue"
     permissions = PermissionManager(tmp_path, interaction=interaction)
     permissions.set_default(Action.FILESYSTEM_DELETE, Decision.DENY)
-    (tmp_path / ".loop" / "permissions.yaml").write_text("version: 2\n", "utf-8")
+    (tmp_path / ".loop" / "permissions.yaml").write_text("version: 3\n", "utf-8")
     manager = command_manager(permissions, interaction)
 
     manager.call("permissions", "reload")
@@ -493,7 +639,7 @@ def test_sync_permissions_command_bridges_recovery_to_legacy_input(tmp_path):
     interaction.prompt.return_value = "continue"
     permissions = PermissionManager(tmp_path, interaction=interaction)
     permissions.set_default(Action.FILESYSTEM_DELETE, Decision.DENY)
-    permissions.configuration_path.write_text("version: 2\n", "utf-8")
+    permissions.configuration_path.write_text("version: 3\n", "utf-8")
     manager = command_manager(permissions, interaction)
 
     manager.call("permissions", "reload")
@@ -518,13 +664,15 @@ def test_permissions_commands_manage_and_display_session_boundaries(tmp_path):
     assert "allow_host_processes: True" in shown
     assert "network_origins: https://my-host.local" in shown
     assert PermissionManager(tmp_path).configuration.limits == permissions.configuration.limits
+    manager.call("permissions", "show managed")
+    assert "Managed enforcement: unavailable" in interaction.info.call_args.args[0]
 
     manager.call("permissions", "limit reset session host-process")
     manager.call("permissions", "default reset session process.execute")
     manager.call("permissions", "default reset session process.execute")
     assert "already inherited" in interaction.warning.call_args.args[0]
-    manager.call("permissions", "session reset")
-    manager.call("permissions", "session reset")
+    manager.call("permissions", "reset")
+    manager.call("permissions", "reset session")
     assert "already empty" in interaction.warning.call_args.args[0]
     assert not permissions.session_overrides.defaults
     assert not permissions.session_rules
@@ -552,7 +700,70 @@ def test_permissions_limit_without_mutation_lists_scoped_values(tmp_path):
     interaction.report.assert_not_called()
 
 
-def test_permissions_preset_commands_preview_and_confirm_scoped_policy_replacement(tmp_path):
+def test_permissions_local_network_limit_is_a_trusted_boolean_command(tmp_path):
+    """A trusted session command can revoke and restore attempt-local networking."""
+    interaction = Mock(spec=ConsoleInteraction)
+    permissions = PermissionManager(tmp_path)
+    manager = command_manager(permissions, interaction)
+    manager.call("permissions", "limit set session local-network deny")
+    assert permissions.effective_configuration.limits.deny_local_networks is True
+    manager.call("permissions", "limit reset session local-network")
+    assert permissions.effective_configuration.limits.deny_local_networks is False
+
+
+def test_permissions_classifies_collection_limits_through_trusted_command(tmp_path):
+    """A human command changes classification and shows the value, scope, and source."""
+    interaction = Mock(spec=ConsoleInteraction)
+    permissions = PermissionManager(tmp_path)
+    manager = command_manager(permissions, interaction)
+
+    manager.call("permissions", "limit classify workspace read-root hard")
+    manager.call("permissions", "limit classify session write-root approval")
+    manager.call("permissions", "limit list")
+
+    output = interaction.info.call_args.args[0]
+    assert "read-root: workspace, app-temp (classification=hard, source=user)" in output
+    assert "write-root: inherited (classification=approval, source=session)" in output
+    assert permissions.configuration.limit_classifications.readable_roots.value == "hard"
+    assert (
+        permissions.effective_configuration.limit_classifications.writable_roots.value == "approval"
+    )
+
+    manager.call("permissions", "limit classify workspace private-network approval")
+    interaction.report.assert_called()
+
+
+def test_permissions_initialize_binds_exact_workspace_and_user_identity(tmp_path):
+    """The human policy command provisions only the explicit empty namespace identity."""
+    catalog = tmp_path.parent / f"{tmp_path.name}-policy-data" / "workspaces.sqlite"
+    workspace = WorkspaceRepository(catalog).initialize(Workspace.discover(tmp_path))
+    interaction = Mock(spec=ConsoleInteraction)
+    permissions = PermissionManager(
+        tmp_path,
+        configuration_path=catalog.parent / "workspaces" / workspace.id / "permissions.yaml",
+        user_configuration_path=tmp_path.parent / f"{tmp_path.name}-user-permissions.yaml",
+        workspace_id=workspace.id,
+        namespace_catalog_path=catalog,
+        user_namespace_identity=str(catalog.parent),
+    )
+    manager = command_manager(permissions, interaction)
+
+    manager.call("permissions", "initialize workspace wrong")
+    interaction.report.assert_called()
+    assert "workspace namespace recovery required" in permissions.describe()
+
+    manager.call("permissions", f"initialize workspace {workspace.id}")
+    manager.call("permissions", f"initialize user {shlex.quote(str(catalog.parent))}")
+
+    assert permissions.configuration.namespace_generation is not None
+    assert "recovery required" not in permissions.describe()
+    assert "Initialized the user permission policy." in interaction.info.call_args.args[0]
+
+
+@pytest.mark.parametrize("declined", [False, object()])
+def test_permissions_preset_commands_preview_and_confirm_scoped_policy_replacement(
+    tmp_path, declined
+):
     """Preset commands replace confirmed selected-scope defaults and rules only."""
     interaction = Mock(spec=ConsoleInteraction)
     permissions = PermissionManager(tmp_path)
@@ -571,7 +782,7 @@ def test_permissions_preset_commands_preview_and_confirm_scoped_policy_replaceme
     manager.call("permissions", "preset diff workspace workspace")
     assert "Unchanged: enforcement limits" in interaction.info.call_args.args[0]
 
-    interaction.confirm.return_value = False
+    interaction.confirm.return_value = declined
     manager.call("permissions", "preset replace workspace workspace")
     assert [rule.id for rule in permissions.persistent_rules] == ["workspace-rule"]
     assert "not approved" in interaction.warning.call_args.args[0]
@@ -690,6 +901,11 @@ def test_permissions_command_rejects_every_malformed_branch(tmp_path):
         "preset unknown",
         "preset show missing extra",
         "preset diff invalid workspace",
+        "reset invalid",
+        "reset session extra",
+        "session reset",
+        "workspace reset",
+        "user reset",
     )
     for arguments in invalid:
         manager.call("permissions", arguments)
@@ -730,11 +946,13 @@ def test_registered_permissions_grammar_completes_described_policy_domains_and_r
             ),
         )
     )
+    assert "managed" in {item.text for item in complete(completer, "/permissions show ")}
 
     commands = complete(completer, "/permissions ")
     assert {item.text for item in commands} == {
         "show",
         "reload",
+        "initialize",
         "explain",
         "default",
         "rule",
@@ -742,13 +960,45 @@ def test_registered_permissions_grammar_completes_described_policy_domains_and_r
         "host",
         "limit",
         "preset",
-        "session",
+        "reset",
         "help",
     }
     assert all(item.display_meta_text for item in commands)
+    assert {item.text for item in complete(completer, "/permissions reset ")} == {
+        "workspace",
+        "user",
+        "session",
+    }
+    assert complete(completer, "/permissions initialize workspace ") == []
     assert [item.text for item in complete(completer, "/permissions sandbox ")] == [
         "list",
         "remove",
+    ]
+    assert {item.text for item in complete(completer, "/permissions host ")} == {
+        "list",
+        "remove",
+        "trusted",
+        "trust",
+        "untrust",
+    }
+    assert {item.text for item in complete(completer, "/permissions host trust ")} == {
+        "'command here'",
+        "session",
+        "workspace",
+        "user",
+    }
+    assert [item.text for item in complete(completer, "/permissions host trust user ")] == [
+        "'command here'"
+    ]
+    trusted = permissions.trust_host_command("printf completion")
+    assert {item.text for item in complete(completer, "/permissions host untrust ")} == {
+        trusted.id,
+        "session",
+        "workspace",
+        "user",
+    }
+    assert [item.text for item in complete(completer, "/permissions host untrust session ")] == [
+        trusted.id
     ]
     assert [item.text for item in complete(completer, "/permissions rule add session al")] == [
         "allow"
@@ -777,15 +1027,27 @@ def test_registered_permissions_grammar_completes_described_policy_domains_and_r
     limits = complete(completer, "/permissions limit set session host-process ")
     assert [item.text for item in limits] == ["allow", "deny"]
     assert all(item.display_meta_text for item in limits)
+    classifications = complete(completer, "/permissions limit classify workspace ")
+    assert {item.text for item in classifications} == {
+        "read-root",
+        "write-root",
+        "network-origin",
+    }
+    assert {
+        item.text for item in complete(completer, "/permissions limit classify session read-root ")
+    } == {
+        "hard",
+        "approval",
+    }
     presets = complete(completer, "/permissions preset ")
     assert {item.text for item in presets} == {"list", "show", "diff", "replace"}
     presets = complete(completer, "/permissions preset replace session w")
     assert [item.text for item in presets] == ["workspace"]
     roots = complete(completer, "/permissions limit remove workspace read-root ")
-    assert [item.text for item in roots] == ["loop-temp", "workspace"]
+    assert [item.text for item in roots] == ["app-temp", "workspace"]
     root_tokens = complete(completer, "/permissions limit add workspace read-root ")
     assert [item.text for item in root_tokens] == [
-        "loop-temp",
+        "app-temp",
         "system-temp",
         "workspace",
     ]
@@ -793,3 +1055,43 @@ def test_registered_permissions_grammar_completes_described_policy_domains_and_r
     permissions.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
     reset_limits = complete(completer, "/permissions limit reset session host")
     assert [item.text for item in reset_limits] == ["host-process"]
+
+
+def test_permission_initialize_completion_offers_exact_quoted_identity_only_when_idle(tmp_path):
+    """Durable initialization completes its exact identity without exposing an active-run action."""
+    catalog = tmp_path.parent / f"{tmp_path.name} policy data" / "workspaces.sqlite"
+    workspace = WorkspaceRepository(catalog).initialize(Workspace.discover(tmp_path))
+    permissions = PermissionManager(
+        tmp_path,
+        configuration_path=catalog.parent / "workspaces" / workspace.id / "permissions.yaml",
+        user_configuration_path=tmp_path.parent / "user permissions.yaml",
+        workspace_id=workspace.id,
+        namespace_catalog_path=catalog,
+        user_namespace_identity=str(catalog.parent),
+    )
+    manager = CommandManager()
+    manager.register_provider(PermissionCommands(permissions))
+    completer = CompletionManager((manager.completion_adapter,))
+
+    assert {item.text for item in complete(completer, "/permissions initialize ")} == {
+        "workspace",
+        "user",
+    }
+    workspace_identity = complete(completer, "/permissions initialize workspace ")
+    assert [item.text for item in workspace_identity] == [workspace.id]
+    user_identity = complete(completer, "/permissions initialize user ")
+    assert len(user_identity) == 1
+    assert shlex.split(user_identity[0].text) == [str(catalog.parent)]
+    assert user_identity[0].display_meta_text
+
+    manager.set_capability_provider(
+        lambda: frozenset(
+            {
+                CommandCapability.CONTEXT_READ,
+                CommandCapability.CONTEXT_UPDATE,
+                CommandCapability.RUN_ACTIVE,
+            }
+        )
+    )
+    assert "initialize" not in {item.text for item in complete(completer, "/permissions ")}
+    assert complete(completer, "/permissions initialize user ") == []

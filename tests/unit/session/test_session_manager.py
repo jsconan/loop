@@ -2259,6 +2259,46 @@ def test_async_authorization_observation_is_persisted_as_a_permission_event():
     assert stored.events[-1].result == result
 
 
+def test_async_authorization_precedes_a_later_interaction_in_the_timeline():
+    """A scheduled authorization records before a subsequently scheduled interaction."""
+    store = MemorySessionStore()
+
+    async def run_blocking_async(function, *args):
+        """Execute in-memory persistence without leaving the event loop."""
+        return function(*args)
+
+    manager = SessionManager(session_store=store, async_blocking_runner=run_blocking_async)
+    result = AuthorizationResult(
+        operations=(),
+        policy=PolicyDecision(decision=Decision.DENY, reason="denied", sources=()),
+        decision=Decision.DENY,
+        prompted=False,
+        reason="denied",
+        source="policy",
+    )
+
+    async def record_events():
+        """Schedule both events in their intended timeline order."""
+        authorization = asyncio.create_task(manager.record_authorization_async(result))
+        interaction = asyncio.create_task(
+            manager.record_interaction_requested_async(
+                "confirmation-request",
+                kind="confirm",
+                session_id=None,
+                run_id=None,
+                operation_id=None,
+            )
+        )
+        await asyncio.gather(authorization, interaction)
+
+    asyncio.run(record_events())
+
+    events = store.load(manager.session.id).events
+    assert [type(event) for event in events] == [PermissionEvent, InteractionRequestedEvent]
+    assert events[0].result == result
+    assert events[1].request_id == "confirmation-request"
+
+
 def test_async_session_commit_finishes_persistence_before_propagating_cancellation():
     """Cancellation waits for the owned write and publishes its committed result."""
     store = MemorySessionStore()
@@ -4064,15 +4104,17 @@ def test_retirement_cleanup_refuses_a_substituted_symlink(monkeypatch, tmp_path)
 
     def substitute(path):
         """Replace only the retired pathname immediately before the safe cleanup boundary."""
+        assert path == original
         path.rename(path.with_name("retained"))
         path.symlink_to(outside, target_is_directory=True)
         cleanup(path)
 
     with monkeypatch.context() as change:
-        change.setattr(session_manager_module.shutil, "rmtree", substitute)
+        change.setattr(session_manager_module, "shutil", SimpleNamespace(rmtree=substitute))
         with pytest.raises(OSError) as failure:
             manager.discard_working_directory()
-    assert failure.value.filename == original
+    assert failure.value.args == ("Cannot call rmtree on a symbolic link",)
+    assert failure.value.filename in (None, original)
     assert original.is_symlink()
     assert (outside / "preserved").read_text() == "safe"
     assert manager.temporary_directory.get() != original

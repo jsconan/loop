@@ -7,7 +7,6 @@ from math import isfinite
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
-from pydantic_settings import BaseSettings
 
 from .. import constants
 from ..models import (
@@ -73,8 +72,8 @@ class BackendSettings(BaseModel):
             raise ValueError("Repetition minimum count must be at least two when enabled.")
 
 
-class LoopSettings(BaseModel):
-    """Configure interactive-loop behavior."""
+class AppSettings(BaseModel):
+    """Configure application behavior."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -88,6 +87,12 @@ class LoopSettings(BaseModel):
     )
     debug: bool = Field(
         default=False,
+        json_schema_extra={"required_capabilities": [CommandCapability.CONTEXT_UPDATE.value]},
+    )
+    yolo: bool = Field(
+        default=False,
+        description="Approve eligible requests without confirmation; "
+        "host commands can bypass the sandbox.",
         json_schema_extra={"required_capabilities": [CommandCapability.CONTEXT_UPDATE.value]},
     )
     compaction_threshold: float = Field(
@@ -143,6 +148,7 @@ class ToolSettings(BaseModel):
     command_timeout: float = Field(
         default=constants.DEFAULT_COMMAND_TIMEOUT,
         gt=0,
+        allow_inf_nan=False,
         json_schema_extra={"required_capabilities": [CommandCapability.CONTEXT_UPDATE.value]},
     )
 
@@ -173,7 +179,7 @@ class TelemetrySettings(BaseModel):
     )
 
 
-class ApplicationSettings(BaseSettings):
+class ApplicationSettings(BaseModel):
     """Represent the immutable effective application configuration."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
@@ -181,7 +187,7 @@ class ApplicationSettings(BaseSettings):
     config_version: int = CONFIGURATION_VERSION
     backend: BackendSettings = BackendSettings()
     conversation: ConversationSettings = ConversationSettings()
-    loop: LoopSettings = LoopSettings()
+    app: AppSettings = AppSettings()
     web: WebSettings = WebSettings()
     tools: ToolSettings = ToolSettings()
     logging: LoggingSettings = LoggingSettings()

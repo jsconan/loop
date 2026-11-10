@@ -15,7 +15,7 @@ def parse_mentions(
     Args:
         text (str): Submitted user text.
         candidates (Mapping[str, Sequence[str]]): Exact values accepted for each marker. Bounded
-            values may escape their closing delimiter and backslashes. Only legacy bare mentions
+            values may escape their closing delimiter and backslashes. Only bare mentions
             require a known candidate.
         optional_link_marker (str | None): Marker namespace that should gracefully resolve ordinary
             Markdown link destinations. Defaults to ignoring ordinary links.

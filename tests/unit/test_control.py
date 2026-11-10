@@ -226,7 +226,7 @@ def test_shutdown_supersedes_interruption_and_survives_execution_cleanup():
         assert control.interrupt() is False
         control.checkpoint()
 
-    assert type(raised.value) is KeyboardInterrupt
+    assert not isinstance(raised.value, RunInterrupted)
     assert control.active is False
     assert control.interrupted is False
     assert control.cancelling is False

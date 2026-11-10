@@ -40,10 +40,10 @@ class AgentInstructions:
 
     @classmethod
     def default(cls) -> AgentInstructions:
-        """Load Loop's bundled agent instructions.
+        """Load the bundled agent instructions.
 
         Returns:
-            AgentInstructions: Versioned instructions packaged with Loop.
+            AgentInstructions: Versioned instructions packaged with the application.
         """
         package, resource_path = DEFAULT_AGENT_INSTRUCTIONS_SOURCE.split("/", maxsplit=1)
         resource = files(package).joinpath(resource_path)
@@ -116,8 +116,8 @@ class Agent:
 
     Args:
         identity (AgentIdentity | str): Agent identity or a non-empty shorthand name.
-        instructions (AgentInstructions): Intrinsic model-facing behavior. Defaults to Loop's
-            bundled instructions.
+        instructions (AgentInstructions): Intrinsic model-facing behavior. Defaults to the
+            application's bundled instructions.
         tools (ToolRegistry | ToolRegistryView): Live view of the tools exposed to the model, or
             the owning registry from which to create that view. Defaults to an empty registry.
         hyperparameters (GenerationHyperparameters): Per-request model controls used by this

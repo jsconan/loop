@@ -1,7 +1,7 @@
 """Tests for tool invocation context."""
 
 import asyncio
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -17,6 +17,44 @@ def test_confirm_delegates_to_the_interaction():
 
     assert context.confirm("Continue?", default=True) is True
     interaction.confirm.assert_called_once_with("Continue?", default=True)
+
+
+@pytest.mark.parametrize("response", [True, False, 1, "yes"])
+def test_confirmation_requires_an_actual_boolean_approval(response):
+    """Only the actual boolean True can authorize a synchronous or async tool."""
+    interaction = Mock(spec=Interaction)
+    interaction.confirm.return_value = response
+    interaction.confirm_async = AsyncMock(return_value=response)
+    interaction.prompt_async = AsyncMock()
+    context = ToolContext(interaction, "guarded")
+
+    if response is True or response is False:
+        assert context.confirm("Continue?") is response
+        assert asyncio.run(context.confirm_async("Continue?")) is response
+    else:
+        with pytest.raises(ProblemException, match="boolean confirmation"):
+            context.confirm("Continue?")
+        with pytest.raises(ProblemException, match="boolean confirmation"):
+            asyncio.run(context.confirm_async("Continue?"))
+
+
+def test_async_confirmation_does_not_approve_a_nested_future():
+    """A pending borrowed response is neither approved nor canceled."""
+
+    async def scenario():
+        """Return a pending future from the async interaction adapter."""
+        future = asyncio.get_running_loop().create_future()
+        interaction = Mock(spec=Interaction)
+        interaction.confirm_async = AsyncMock(return_value=future)
+        interaction.prompt_async = AsyncMock()
+        try:
+            with pytest.raises(ProblemException, match="boolean confirmation"):
+                await ToolContext(interaction, "guarded").confirm_async("Continue?")
+            assert not future.done()
+        finally:
+            future.cancel()
+
+    asyncio.run(scenario())
 
 
 def test_file_receipts_record_exact_versions_absence_and_cached_capabilities(tmp_path):

@@ -37,6 +37,7 @@ from .constants import (
     CGROUP_PROCS_FILENAME,
     CGROUP_ROOT,
     MANAGEMENT_RECORD_NAME,
+    NATIVE_PROFILE_GROUP_HASH_CHARS,
     PROC_UID_MAP_PATH,
     SYSTEM_COMMAND_PATH,
     SYSTEM_RUNTIME_DIRECTORY,
@@ -62,6 +63,7 @@ from .host import (
     compile_policy_source,
     installation_files,
     protected_path,
+    publish_volatile_file,
     read_policy_bytes,
 )
 from .mountinfo import MINIMUM_MOUNTINFO_FIELDS, read_descriptor_mount_ids, read_mountinfo
@@ -82,6 +84,18 @@ _MAX_CGROUP_EVENTS_BYTES = 4096
 _MAX_GLOBAL_POLICY_INVENTORY_ENTRIES = 4096
 _MAX_POLICY_ATTACHMENT_BYTES = 4096
 _MAX_RESERVATION_RECORD_BYTES = 256
+
+
+def _retirement_sources(config: "GenerationAdmission", service: HostFile | None) -> dict[str, str]:
+    """Authenticate the saved service digest against the current fixed source."""
+    name = NATIVE_UNIT_PREFIX + config.generation + SYSTEMD_SERVICE_TEMPLATE_SUFFIX
+    sources = config.unit_sources()
+    if service is not None and (
+        service.path.name != name
+        or hashlib.sha256(sources[name].encode()).hexdigest() != service.digest
+    ):
+        raise ValueError("Saved service template differs from fixed source.")
+    return sources
 
 
 class RetirementState(IntEnum):
@@ -172,8 +186,11 @@ class GenerationLifecycle:
                     raise ValueError("Partial namespace inventory differs from the fixed policy.")
             else:
                 policies = {"": policies[""]}
-            if missing or attachment is None:
+            if missing:
                 raise ValueError("Artifact or attachment removed while namespace remains.")
+            if attachment is None:
+                _recover_empty_external_policy(self, record, deadline)
+                return self._retire_observed(record, deadline)
             recovery = RetirementState.COMPLETE
         else:
             if namespace.is_symlink():
@@ -266,7 +283,7 @@ class GenerationLifecycle:
                     self.files["socket_unit"],
                 ):
                     _unit_state(tool, bound, deadline, removed=True)
-                _retired_instances(
+                attest_idle_generation_instances(
                     tool, self.config, self.files["service_unit"], deadline, removed=True
                 )
                 inert = set()
@@ -340,6 +357,66 @@ class GenerationLifecycle:
             empty_directories=empty_directories or None,
             cached_payloads=recovery is RetirementState.COMPLETE,
         )
+
+
+def _recover_empty_external_policy(
+    installed: GenerationLifecycle, record: HostFile, deadline: float
+) -> None:
+    """Retire an exact empty namespace left by external policy cleanup after draining jobs."""
+    deadline = min(deadline, time.monotonic() + NATIVE_MANAGEMENT_TIMEOUT_SECONDS)
+    with (
+        drained_generation(installed.config, installed.files, installed.lock, deadline),
+        record.open_verified(deadline=deadline),
+        installed.compiler_lock.open_verified(deadline=deadline) as compiler,
+    ):
+        fcntl.flock(compiler, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        policy, device = _policy_root()
+        namespace = policy / "namespaces" / installed.config.generation
+        _policy_directory(namespace, policy, device)
+        info = namespace.lstat()
+        if (info.st_dev, info.st_ino) != installed.namespace:
+            raise ValueError("Generation namespace identity changed.")
+        if _attachment_entry(policy, device, NATIVE_UNIT_PREFIX + installed.config.generation):
+            raise ValueError("Generation attachment reappeared during external cleanup recovery.")
+        for name in ("namespaces", "profiles"):
+            directory = namespace / name
+            _policy_directory(directory, policy, device)
+            if next(directory.iterdir(), None) is not None:
+                raise ValueError("Externally cleaned generation namespace is not empty.")
+        raw_data = namespace / "raw_data"
+        _policy_directory(raw_data, policy, device)
+        expected = set(installed.policies[""].values())
+        for count, entry in enumerate(raw_data.iterdir(), 1):
+            _policy_directory(entry, policy, device)
+            if count > MAX_NATIVE_INSTALLATION_ENTRIES or (
+                read_policy_bytes(entry / "raw_data", MAX_COMPILED_BYTES) not in expected
+            ):
+                raise ValueError("Externally cleaned generation has unknown raw policy.")
+        helper = bind_host_file(installed.helper.path, deadline=deadline)
+        if helper != installed.helper and (
+            helper.identity[:2] != installed.helper.identity[:2]
+            or helper.identity[3:6] != installed.helper.identity[3:6]
+            or helper.digest != installed.helper.digest
+            or stat.S_IMODE(helper.identity[2]) != constants.READ_ONLY_FILE_MODE
+            or helper.identity[6] < installed.helper.identity[6]
+        ):
+            raise ValueError("Externally cleaned generation helper differs from authority.")
+        with helper.open_verified(deadline=deadline) as descriptor:
+            mode = stat.S_IMODE(os.fstat(descriptor).st_mode)
+            if mode == constants.READ_ONLY_EXECUTABLE_FILE_MODE:
+                os.fchmod(descriptor, constants.READ_ONLY_FILE_MODE)
+                os.fsync(descriptor)
+            elif mode != constants.READ_ONLY_FILE_MODE:
+                raise ValueError("Externally cleaned generation helper has unsafe mode.")
+        if time.monotonic() >= deadline:
+            raise TimeoutError("External policy cleanup recovery deadline expired.")
+        _recursive_idle(CGROUP_ROOT / installed.config.slice_unit.path.name)
+        if (namespace.lstat().st_dev, namespace.lstat().st_ino) != installed.namespace or (
+            _attachment_entry(policy, device, NATIVE_UNIT_PREFIX + installed.config.generation)
+            is not None
+        ):
+            raise ValueError("External policy cleanup authority changed during recovery.")
+        namespace.rmdir()
 
 
 _GENERATION_PROFILES = MAX_PROFILES - _INSTALLATION_RESERVED_PROFILE_COUNT
@@ -560,7 +637,9 @@ def stage_generation_files(
         for name, data in contents.items():
             path = directory / name
             if name not in existing:
-                descriptor, temporary = tempfile.mkstemp(prefix=".loop-file-", dir=path.parent)
+                descriptor, temporary = tempfile.mkstemp(
+                    prefix=f".{constants.APP_NAME}-file-", dir=path.parent
+                )
                 staging = Path(temporary)
                 try:
                     with os.fdopen(descriptor, "wb") as stream:
@@ -726,7 +805,9 @@ def provision_generation_units(
     return _provision_generation_units(config, lock, _administration(lock))
 
 
-def _provision_generation_units(config: "GenerationAdmission", lock: HostFile, scope):
+def _provision_generation_units(
+    config: "GenerationAdmission", lock: HostFile, scope, *, boot_recovery: bool = False
+):
     """Publish fixed fragments within the caller's continuously held administration scope."""
     sources = config.unit_sources()
     prefix = NATIVE_UNIT_PREFIX + config.generation
@@ -740,12 +821,22 @@ def _provision_generation_units(config: "GenerationAdmission", lock: HostFile, s
             raise ValueError("Generation receiver must be canonical and immutable executable.")
         if stat.S_IMODE(config.slice_unit.identity[2]) != constants.READ_ONLY_FILE_MODE:
             raise ValueError("Staged generation slice must be immutable.")
-        staged = pins.enter_context(config.slice_unit.open_verified())
-        if (
-            os.pread(staged, MAX_NATIVE_UNIT_BYTES + 1, 0)
-            != sources[prefix + SYSTEMD_SLICE_UNIT_SUFFIX].encode()
-        ):
-            raise ValueError("Staged generation slice differs from fixed source.")
+        slice_source = sources[prefix + SYSTEMD_SLICE_UNIT_SUFFIX].encode()
+        missing_slice = (
+            boot_recovery
+            and not config.slice_unit.path.exists()
+            and not config.slice_unit.path.is_symlink()
+        )
+        if missing_slice:
+            if (
+                config.slice_unit.path != _UNIT_DIRECTORY / (prefix + SYSTEMD_SLICE_UNIT_SUFFIX)
+                or config.slice_unit.digest != hashlib.sha256(slice_source).hexdigest()
+            ):
+                raise ValueError("Saved generation slice differs from fixed source.")
+        else:
+            staged = pins.enter_context(config.slice_unit.open_verified())
+            if os.pread(staged, MAX_NATIVE_UNIT_BYTES + 1, 0) != slice_source:
+                raise ValueError("Staged generation slice differs from fixed source.")
         for bound in (receiver, config.reservation):
             pins.enter_context(bound.open_verified())
         directory = protected_path(_UNIT_DIRECTORY, directory=True)
@@ -780,22 +871,31 @@ def _provision_generation_units(config: "GenerationAdmission", lock: HostFile, s
             name = prefix + suffix
             path = directory / name
             if name not in existing:
-                descriptor, temporary = tempfile.mkstemp(
-                    prefix=".loop-unit-" + config.generation + "-", dir=directory
-                )
-                staging = Path(temporary)
-                try:
-                    with os.fdopen(descriptor, "wb") as stream:
-                        stream.write(sources[name].encode())
-                        stream.flush()
-                        os.fchmod(stream.fileno(), constants.READ_ONLY_FILE_MODE)
-                        os.fsync(stream.fileno())
-                    os.link(staging, path, follow_symlinks=False)
-                finally:
-                    staging.unlink()
+                if boot_recovery:
+                    publish_volatile_file(directory, name, sources[name].encode())
+                else:
+                    descriptor, temporary = tempfile.mkstemp(
+                        prefix=f".{constants.APP_NAME}-unit-{config.generation}-",
+                        dir=directory,
+                    )
+                    staging = Path(temporary)
+                    try:
+                        with os.fdopen(descriptor, "wb") as stream:
+                            stream.write(sources[name].encode())
+                            stream.flush()
+                            os.fchmod(stream.fileno(), constants.READ_ONLY_FILE_MODE)
+                            os.fsync(stream.fileno())
+                        os.link(staging, path, follow_symlinks=False)
+                    finally:
+                        staging.unlink()
             os.fsync(directory_fd)
             result[role] = bind_host_file(path)
-        for bound in (lock, config.slice_unit, config.reservation, *result.values()):
+        for bound in (
+            lock,
+            *((config.slice_unit,) if not missing_slice else ()),
+            config.reservation,
+            *result.values(),
+        ):
             with bound.open_verified():
                 pass
         return result
@@ -1081,14 +1181,8 @@ def _drained_generation(
         raise ValueError(
             "Known removed slice requires explicit stopped tracking and receiver binding."
         )
-    sources = config.unit_sources()
-    if template_removed and (
-        files.get("service_unit") is None
-        or files["service_unit"].path.name
-        != NATIVE_UNIT_PREFIX + config.generation + SYSTEMD_SERVICE_TEMPLATE_SUFFIX
-        or files["service_unit"].digest
-        != hashlib.sha256(sources[files["service_unit"].path.name].encode()).hexdigest()
-    ):
+    sources = _retirement_sources(config, files.get("service_unit"))
+    if template_removed and files.get("service_unit") is None:
         raise ValueError("Known removed template differs from fixed source.")
     if socket_removed and (
         files.get("socket_unit") is None
@@ -1166,6 +1260,29 @@ def _drained_generation(
             raise ValueError("Generation listener remains after closure.")
         unit_state = _unit_state(tool, config.slice_unit, deadline, removed=slice_removed)
         group = CGROUP_ROOT / config.slice_unit.path.name
+        if _manager(
+            tool,
+            ["list-jobs", "--no-legend", "--", NATIVE_UNIT_PREFIX + config.generation + "*"],
+            deadline,
+        ).strip():
+            raise ValueError("Pending generation activation; confinement retained.")
+        if (
+            recovery is RetirementState.COMPLETE
+            and unit_state[SYSTEMD_ACTIVE_STATE_PROPERTY] == "inactive"
+            and unit_state[SYSTEMD_SUB_STATE_PROPERTY] == "dead"
+            and not unit_state[SYSTEMD_CONTROL_GROUP_PROPERTY]
+        ):
+            attest_idle_generation_instances(tool, config, files["service_unit"], deadline)
+            _recursive_idle(group, absent=True)
+            _manager(tool, ["start", "--", config.slice_unit.path.name], deadline)
+            unit_state = _unit_state(tool, config.slice_unit, deadline)
+            if _manager(
+                tool,
+                ["list-jobs", "--no-legend", "--", NATIVE_UNIT_PREFIX + config.generation + "*"],
+                deadline,
+            ).strip():
+                raise ValueError("Pending generation activation; confinement retained.")
+            attest_idle_generation_instances(tool, config, files["service_unit"], deadline)
         if tracking_removed or tracking_absent:
             if (
                 unit_state[SYSTEMD_CONTROL_GROUP_PROPERTY]
@@ -1176,14 +1293,9 @@ def _drained_generation(
         elif (
             unit_state[SYSTEMD_CONTROL_GROUP_PROPERTY] != "/" + group.name
             or unit_state[SYSTEMD_ACTIVE_STATE_PROPERTY] != "active"
+            or unit_state[SYSTEMD_SUB_STATE_PROPERTY] != "active"
         ):
             raise ValueError("Generation tracking is missing or inactive; confinement retained.")
-        if _manager(
-            tool,
-            ["list-jobs", "--no-legend", "--", NATIVE_UNIT_PREFIX + config.generation + "*"],
-            deadline,
-        ).strip():
-            raise ValueError("Pending generation activation; confinement retained.")
         _recursive_idle(group, absent=tracking_removed or tracking_absent)
         for bound in (lock, config.reservation, config.slice_unit, tool, *files.values()):
             if bound != removed_receiver and not (
@@ -1207,7 +1319,9 @@ def _drained_generation(
         if socket_removed:
             _unit_state(tool, socket, deadline, removed=True)
         if template_removed:
-            _retired_instances(tool, config, files["service_unit"], deadline, removed=True)
+            attest_idle_generation_instances(
+                tool, config, files["service_unit"], deadline, removed=True
+            )
         if tracking_absent:
             _retired_records_absent(
                 tool,
@@ -1425,7 +1539,7 @@ def generation_policy_cache(
     launch still compares its compiled bytes with the kernel entry. Unknown names, nested,
     non-enforcing, empty or oversized exports refuse. Removal callers must already hold closed
     admission and prove recursive drain; independently unconfined profile users are outside
-    Loop's lifetime guarantee. Revalidate the complete observed tree and global attachment.
+    the application's lifetime guarantee. Revalidate the complete observed tree and attachment.
 
     Args:
         config (GenerationAdmission): Original generation and capacity authority.
@@ -1458,7 +1572,14 @@ def generation_policy_cache(
             len(root) >= capacity + 1
             or name in root
             or not data
-            or (name not in policies[""] and re.fullmatch(r"payload_[a-f0-9]{64}", name) is None)
+            or (
+                name not in policies[""]
+                and re.fullmatch(
+                    rf"payload_[a-f0-9]{{64}}(?:_[a-f0-9]{{{NATIVE_PROFILE_GROUP_HASH_CHARS}}})?",
+                    name,
+                )
+                is None
+            )
             or read_policy_bytes(entry / "mode", MAX_NATIVE_POLICY_MODE_BYTES).strip() != b"enforce"
         ):
             raise ValueError("Invalid managed payload cache inventory.")
@@ -1572,7 +1693,7 @@ def remove_generation_attachment(
 
     Require the generation namespace already absent in the authenticated initial-host policy
     hierarchy. Under the qualified drain lock, authenticate the single enforcing global profile
-    named loopgen_<generation>, its literal helper attachment and exact compiled bytes. Strictly
+    named for the generation, its literal helper attachment and exact compiled bytes. Strictly
     enumerate exactly that profile and recompile its fixed literal source under the distinct
     installation-wide payload compiler lock, requiring byte equality
     with both administrator authority and the loaded export. An opaque kernel attachment display
@@ -1692,6 +1813,27 @@ def _remove_generation_attachment(
             raise TimeoutError("Attachment removal completion expired; capacity retained.")
 
 
+def _load_policy_data(path: Path, policy: Path, device: int, data: bytes, deadline: float) -> None:
+    """Load exact compiled bytes through an authenticated kernel policy endpoint."""
+    _policy_directory(path.parent, policy, device)
+    descriptor = os.open(path, os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        info = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != 0
+            or info.st_mode & UNSAFE_HOST_PATH_MODE_BITS
+            or info.st_dev != device
+        ):
+            raise ValueError("Unsafe generation kernel load endpoint.")
+        if time.monotonic() >= deadline:
+            raise TimeoutError("Generation policy loading deadline expired.")
+        if os.write(descriptor, data) != len(data):
+            raise OSError("Incomplete generation kernel load; authority retained.")
+    finally:
+        os.close(descriptor)
+
+
 def load_generation_policy(
     config: "GenerationAdmission",
     lock: HostFile,
@@ -1784,23 +1926,7 @@ def load_generation_policy(
             loads.extend((directory / ".load", data) for data in profiles.values())
         loads.append((policy / ".load", attachment))
         for path, data in loads:
-            _policy_directory(path.parent, policy, device)
-            descriptor = os.open(path, os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
-            try:
-                info = os.fstat(descriptor)
-                if (
-                    not stat.S_ISREG(info.st_mode)
-                    or info.st_uid != 0
-                    or info.st_mode & UNSAFE_HOST_PATH_MODE_BITS
-                    or info.st_dev != device
-                ):
-                    raise ValueError("Unsafe generation kernel load endpoint.")
-                if time.monotonic() >= deadline:
-                    raise TimeoutError("Generation policy loading deadline expired.")
-                if os.write(descriptor, data) != len(data):
-                    raise OSError("Incomplete generation kernel load; authority retained.")
-            finally:
-                os.close(descriptor)
+            _load_policy_data(path, policy, device, data, deadline)
         _policy_tree(config.generation, identity, compiled)
         _attest_attachment(policy, device, name, helper, attachment)
         for bound in (helper, config.slice_unit, config.reservation, compiler_lock):
@@ -1808,6 +1934,67 @@ def load_generation_policy(
         if time.monotonic() >= deadline:
             raise TimeoutError("Generation policy loading completion expired.")
         return identity, compiled, attachment
+
+
+def _recover_generation_policy(
+    config, lock, helper, policies, compiled, source, compiler_lock, deadline, scope
+):
+    """Restore fixed policy while the caller owns the administration gate."""
+    config.unit_sources()
+    _policy_inventory(policies)
+    if set(policies) != {""} or set(policies[""]) != {"bootstrap"}:
+        raise ValueError("Boot recovery requires the original flat bootstrap policy.")
+    name = _attachment_authority(config, lock, helper, compiled, source, compiler_lock)
+    with scope, ExitStack() as pins:
+        generation_limits(config.reservation, config.generation)
+        for bound in (helper, config.slice_unit, config.reservation, compiler_lock):
+            pins.enter_context(bound.open_verified())
+        policy, device = _policy_root()
+        parent = policy / "namespaces"
+        _policy_directory(parent, policy, device)
+        namespace = parent / config.generation
+        if not namespace.exists() and not namespace.is_symlink():
+            namespace.mkdir()
+        _policy_directory(namespace, policy, device)
+        details = namespace.lstat()
+        identity = (details.st_dev, details.st_ino)
+        children = namespace / "namespaces"
+        _policy_directory(children, policy, device)
+        if next(children.iterdir(), None) is not None:
+            raise ValueError("Unexpected generation namespace inventory.")
+        profile_dir = namespace / "profiles"
+        _policy_directory(profile_dir, policy, device)
+        bootstrap = []
+        for entry in profile_dir.iterdir():
+            _policy_directory(entry, policy, device)
+            existing = read_policy_bytes(entry / "name", MAX_NATIVE_PROFILE_NAME_BYTES).strip()
+            if existing == b"bootstrap":
+                bootstrap.append(entry)
+        if len(bootstrap) > 1:
+            raise ValueError("Ambiguous generation bootstrap inventory.")
+        if bootstrap:
+            entry = bootstrap[0]
+            if (
+                read_policy_bytes(entry / "mode", MAX_NATIVE_POLICY_MODE_BYTES).strip()
+                != b"enforce"
+                or read_policy_bytes(entry / "raw_data", MAX_COMPILED_BYTES)
+                != policies[""]["bootstrap"]
+            ):
+                raise ValueError("Generation bootstrap differs from fixed authority.")
+        else:
+            if next(profile_dir.iterdir(), None) is not None:
+                raise ValueError("Payload policies exist without their bootstrap.")
+            _load_policy_data(
+                namespace / ".load", policy, device, policies[""]["bootstrap"], deadline
+            )
+        if _attachment_entry(policy, device, name) is None:
+            _load_policy_data(policy / ".load", policy, device, compiled, deadline)
+        generation_policy_cache(config, identity, policies, helper, compiled)
+        for bound in (helper, config.slice_unit, config.reservation, compiler_lock):
+            pins.enter_context(bound.open_verified())
+        if time.monotonic() >= deadline:
+            raise TimeoutError("Generation policy recovery deadline expired.")
+        return identity
 
 
 def activate_generation(
@@ -1899,7 +2086,7 @@ def activate_generation(
             + runtime.unit_sources()[name + SYSTEMD_SERVICE_TEMPLATE_SUFFIX]
         ):
             raise ValueError("Loaded service template differs from fixed authority.")
-        _retired_instances(tool, runtime, published["service_unit"], deadline)
+        attest_idle_generation_instances(tool, runtime, published["service_unit"], deadline)
         if _manager(tool, ["list-jobs", "--no-legend", "--", name + "*"], deadline).strip():
             raise ValueError("Pending generation activation; confinement retained.")
         unit_state = _unit_state(tool, runtime.slice_unit, deadline)
@@ -2002,7 +2189,7 @@ def _retired_properties(
     return actual
 
 
-def _retired_instances(
+def attest_idle_generation_instances(
     tool: HostFile,
     config: "GenerationAdmission",
     service: HostFile,
@@ -2010,8 +2197,25 @@ def _retired_instances(
     *,
     removed: bool = False,
 ) -> list[str]:
-    """Authenticate bounded inactive instances, or require none after known template deletion."""
+    """Authenticate bounded inactive generation instances against the saved service authority.
+
+    Args:
+        tool (HostFile): Bound system manager executable.
+        config (GenerationAdmission): Fixed generation identity and receiver authority.
+        service (HostFile): Authenticated original service template binding.
+        deadline (float): Absolute monotonic deadline for manager inspection.
+        removed (bool): Require no instances after the known template deletion when true.
+
+    Returns:
+        list[str]: Names of authenticated inactive or failed instances, in manager order.
+
+    Raises:
+        ValueError: A saved template or instance has unverified or active authority.
+        TimeoutError: The manager inspection exceeds its deadline.
+        OSError: Manager inspection or protected authority access fails.
+    """
     prefix = NATIVE_UNIT_PREFIX + config.generation
+    _retirement_sources(config, service)
     lines = _manager(
         tool,
         ["list-units", "--all", "--plain", "--no-legend", "--", prefix + "@*.service"],
@@ -2051,7 +2255,7 @@ def _retired_instances(
             SYSTEMD_CONTROL_GROUP_PROPERTY: "",
             "Slice": prefix + SYSTEMD_SLICE_UNIT_SUFFIX,
             "Delegate": "no",
-            "ExitType": "cgroup",
+            "ExitType": "main",
         }
         actual = _retired_properties(
             tool, name, wanted.keys() | {SYSTEMD_ACTIVE_STATE_PROPERTY}, deadline
@@ -2259,7 +2463,9 @@ def _reclaim_generation(
         if tracking_absent:
             _unit_state(tool, config.slice_unit, deadline, removed=True)
             _unit_state(tool, files["socket_unit"], deadline, removed=True)
-            _retired_instances(tool, config, files["service_unit"], deadline, removed=True)
+            attest_idle_generation_instances(
+                tool, config, files["service_unit"], deadline, removed=True
+            )
             _recursive_idle(CGROUP_ROOT / config.slice_unit.path.name, absent=True)
             original_helper = artifacts.get("helper")
             if original_helper is None or original_helper.path != helper:
@@ -2390,7 +2596,7 @@ def _reclaim_generation(
             or list(config.reservation.path.parent.iterdir()) != [config.reservation.path]
         ):
             raise ValueError("Generation artifact inventory differs; capacity retained.")
-        instances = _retired_instances(
+        instances = attest_idle_generation_instances(
             tool, config, files["service_unit"], deadline, removed=template_removed
         )
         for authority in preserved:
@@ -2453,7 +2659,9 @@ def _reclaim_generation(
         if socket_removed:
             _unit_state(tool, files["socket_unit"], deadline, removed=True)
         if template_removed:
-            _retired_instances(tool, config, files["service_unit"], deadline, removed=True)
+            attest_idle_generation_instances(
+                tool, config, files["service_unit"], deadline, removed=True
+            )
         for bound in units:
             if (
                 slice_removed
@@ -2475,7 +2683,9 @@ def _reclaim_generation(
         if tracking_absent:
             _unit_state(tool, config.slice_unit, deadline, removed=True)
             _unit_state(tool, files["socket_unit"], deadline, removed=True)
-            _retired_instances(tool, config, files["service_unit"], deadline, removed=True)
+            attest_idle_generation_instances(
+                tool, config, files["service_unit"], deadline, removed=True
+            )
             _retired_records_absent(
                 tool,
                 prefix,

@@ -1,11 +1,14 @@
 """Verify trusted mapped payload inputs and fail-closed irreversible handoff."""
 
 import base64
+import binascii
 import io
 import json
 import os
 import runpy
+import stat
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -22,7 +25,11 @@ def payload(monkeypatch, tmp_path):
     entry.write_bytes(b"trusted installed entry")
     monkeypatch.setattr(module, "__file__", str(entry))
     monkeypatch.setattr(module.sys, "path", list(module.sys.path))
-    monkeypatch.setattr(SandboxRequest, "from_wire", Mock(return_value="restored request"))
+    monkeypatch.setattr(
+        SandboxRequest,
+        "from_wire",
+        Mock(return_value=SimpleNamespace(terminal=False, egress_origins=(), local_network=True)),
+    )
     record = {
         "path": "/trusted/control",
         "identity": [1, 2, 0o100444, 1, 4, 5, 6],
@@ -34,6 +41,7 @@ def payload(monkeypatch, tmp_path):
         "profile": "payload_profile",
         "namespace": "generation",
         "uid": 1000,
+        "tracking": [1, 2, "loopgen_native@instance.service"],
         **{role: record for role in ("apparmor", "bootstrap", "cache_lock", "reservation")},
     }
     monkeypatch.setattr(module.sys, "stdin", Mock(buffer=io.BytesIO(json.dumps(value).encode())))
@@ -54,13 +62,112 @@ def test_payload_enters_bound_setup_and_replaces_private_input(payload):
     module.os.dup2.assert_called_once_with(8, 0)
     module.os.close.assert_called_once_with(8)
     args = linux_bootstrap.execute_payload.call_args
-    assert args.args[0] == "restored request" and args.args[4:] == (
+    assert args.args[0] == SandboxRequest.from_wire.return_value and args.args[4:] == (
         b"policy",
         "payload_profile",
         "generation",
         1000,
     )
     assert args.kwargs["reservation"].path == Path("/trusted/control")
+
+
+@pytest.mark.parametrize("session_leader", [False, True])
+def test_payload_attaches_only_its_receiver_owned_terminal(payload, monkeypatch, session_leader):
+    """The inherited slave becomes stdin and the process's own controlling terminal."""
+    SandboxRequest.from_wire.return_value = SimpleNamespace(
+        terminal=True, egress_origins=(), local_network=True
+    )
+    module.os.isatty.side_effect = lambda fd: fd in (1, 2)
+    module.os.getpid.return_value = 13
+    module.os.getsid.return_value = 13 if session_leader else 12
+    ioctl = Mock()
+    monkeypatch.setattr(module.fcntl, "ioctl", ioctl)
+
+    module.main()
+
+    module.os.dup2.assert_called_once_with(1, 0)
+    assert module.os.setsid.call_count == (not session_leader)
+    ioctl.assert_called_once_with(0, module.termios.TIOCSCTTY, 0)
+    module.os.open.assert_not_called()
+    linux_bootstrap.execute_payload.assert_called_once()
+
+
+@pytest.mark.parametrize("missing", [1, 2])
+def test_payload_refuses_missing_receiver_terminal_slave(payload, missing):
+    """A missing slave aborts before stdin binding or source execution."""
+    SandboxRequest.from_wire.return_value = SimpleNamespace(
+        terminal=True, egress_origins=(), local_network=True
+    )
+    module.os.isatty.side_effect = lambda fd: fd != missing
+    with pytest.raises(ValueError, match="receiver-owned terminal"):
+        module.main()
+    module.os.dup2.assert_not_called()
+    linux_bootstrap.execute_payload.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "case", ["valid", "missing", "boolean", "stdio", "not-socket", "unexpected"]
+)
+def test_payload_requires_one_bound_socket_only_for_mediated_attempts(payload, monkeypatch, case):
+    """The protected handoff rejects absent, forged, or extra proxy descriptors."""
+    value = json.loads(module.sys.stdin.buffer.getvalue())
+    if case != "missing":
+        value["egress_fd"] = True if case == "boolean" else 1 if case == "stdio" else 9
+    monkeypatch.setattr(module.sys, "stdin", Mock(buffer=io.BytesIO(json.dumps(value).encode())))
+    SandboxRequest.from_wire.return_value = SimpleNamespace(
+        egress_origins=() if case == "unexpected" else ("http://example.com",),
+        terminal=False,
+        local_network=True,
+    )
+    module.os.fstat.return_value = SimpleNamespace(
+        st_mode=(stat.S_IFREG if case == "not-socket" else stat.S_IFSOCK) | 0o600
+    )
+    if case == "valid":
+        module.main()
+        assert linux_bootstrap.execute_payload.call_args.kwargs["egress_descriptor"] == 9
+        module.os.fstat.assert_called_once_with(9)
+    else:
+        with pytest.raises(ValueError, match="Mediated egress|Unexpected mediated"):
+            module.main()
+        linux_bootstrap.execute_payload.assert_not_called()
+
+
+@pytest.mark.parametrize("case", ["valid", "missing", "unexpected", "malformed"])
+def test_payload_requires_filter_exactly_for_local_deny(payload, monkeypatch, case):
+    """The trusted setup envelope carries a filter only for a denied local request."""
+    value = json.loads(module.sys.stdin.buffer.getvalue())
+    if case in {"valid", "unexpected"}:
+        value["local_network_filter"] = base64.b64encode(b"filter").decode()
+    elif case == "malformed":
+        value["local_network_filter"] = "!"
+    monkeypatch.setattr(module.sys, "stdin", Mock(buffer=io.BytesIO(json.dumps(value).encode())))
+    SandboxRequest.from_wire.return_value = SimpleNamespace(
+        terminal=False,
+        egress_origins=(),
+        local_network=case == "unexpected",
+    )
+    if case == "valid":
+        module.main()
+        assert linux_bootstrap.execute_payload.call_args.kwargs["local_network_filter"] == b"filter"
+    else:
+        with pytest.raises((ValueError, binascii.Error)):
+            module.main()
+        linux_bootstrap.execute_payload.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "tracking",
+    [None, [], [1, 2], [True, 2, "service"], [1, "2", "service"], [1, -1, "service"], [1, 2, 3]],
+)
+def test_payload_refuses_malformed_tracking(payload, monkeypatch, tracking):
+    """Malformed trusted tracking data cannot reach bootstrap or execute a command."""
+    value = json.loads(module.sys.stdin.buffer.getvalue())
+    value["tracking"] = tracking
+    monkeypatch.setattr(module.sys, "stdin", Mock(buffer=io.BytesIO(json.dumps(value).encode())))
+    with pytest.raises(ValueError, match="Invalid generation tracking"):
+        module.main()
+    linux_bootstrap.enter_bootstrap.assert_not_called()
+    linux_bootstrap.execute_payload.assert_not_called()
 
 
 @pytest.mark.parametrize("failure", ["name", "alias", "entry", "dup", "execute"])

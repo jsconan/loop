@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import platform
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from threading import Event
@@ -104,6 +105,43 @@ def output_interaction() -> MagicMock:
     interaction.confirm.return_value = True
     interaction.prompt.return_value = ApprovalChoice.ONCE
     return interaction
+
+
+def test_default_loop_routes_runner_confirmations_through_yolo(tmp_path):
+    """The direct factory honors current permission state without hiding the user interface."""
+    interaction = output_interaction()
+    interaction.confirm.return_value = False
+    permissions = PermissionManager(tmp_path, yolo=True)
+    loop = Loop.create_default(
+        backend=loop_backend(),
+        interaction=interaction,
+        permission_manager=permissions,
+        working_directory=tmp_path,
+    )
+    assert loop.interaction is interaction
+    assert loop.agent_runner.interaction.confirm("Proceed?", default=False) is True
+    interaction.confirm.assert_not_called()
+    permissions.set_yolo(False)
+    assert loop.agent_runner.interaction.confirm("Proceed?", default=False) is False
+    interaction.confirm.assert_called_once_with("Proceed?", default=False)
+
+
+def test_default_loop_routes_async_runner_confirmations_through_yolo(tmp_path):
+    """Direct async runner confirmations use the same current YOLO policy."""
+    interaction = MagicMock(spec=ConsoleInteraction)
+    interaction.confirm_async = AsyncMock(return_value=False)
+    permissions = PermissionManager(tmp_path, yolo=True)
+    loop = Loop.create_default(
+        backend=loop_backend(),
+        interaction=interaction,
+        permission_manager=permissions,
+        working_directory=tmp_path,
+    )
+    assert asyncio.run(loop.agent_runner.interaction.confirm_async("Proceed?")) is True
+    interaction.confirm_async.assert_not_awaited()
+    permissions.set_yolo(False)
+    assert asyncio.run(loop.agent_runner.interaction.confirm_async("Proceed?")) is False
+    interaction.confirm_async.assert_awaited_once_with("Proceed?", default=False)
 
 
 def test_loop_exposes_its_configured_state(tmp_path):
@@ -276,7 +314,7 @@ def test_runtime_command_providers_keep_contextual_completion_in_the_active_loop
 
     command_names = {command.name for command in loop.command_manager.commands}
     assert {"config", "app", "workspace"} <= command_names
-    assert "loop.debug" in config_arguments
+    assert "app.debug" in config_arguments
     assert "path=" not in config_arguments
     assert {"destination=", "workspace_id=", "force="} <= app_arguments
     assert "workspace-id" in workspace_arguments
@@ -391,8 +429,9 @@ def test_loop_applies_live_settings_through_owning_components(tmp_path):
     loop = Loop.create_default(backend=loop_backend(), working_directory=tmp_path)
     settings = ApplicationSettings.model_validate(
         {
-            "loop": {
+            "app": {
                 "debug": True,
+                "yolo": True,
                 "stream": False,
                 "max_agent_turns": 7,
                 "prompt_on_recoverable_error": False,
@@ -407,14 +446,15 @@ def test_loop_applies_live_settings_through_owning_components(tmp_path):
     )
 
     for path in (
-        "loop.debug",
-        "loop.stream",
-        "loop.max_agent_turns",
-        "loop.prompt_on_recoverable_error",
-        "loop.compaction_threshold",
-        "loop.model",
-        "loop.temperature",
-        "loop.reasoning_effort",
+        "app.debug",
+        "app.yolo",
+        "app.stream",
+        "app.max_agent_turns",
+        "app.prompt_on_recoverable_error",
+        "app.compaction_threshold",
+        "app.model",
+        "app.temperature",
+        "app.reasoning_effort",
         "web.user_agent",
         "tools.command_timeout",
     ):
@@ -423,6 +463,7 @@ def test_loop_applies_live_settings_through_owning_components(tmp_path):
         "saved; restart required"
     )
     assert loop.debug is True
+    assert loop.permission_manager.yolo is True
     assert loop.agent_runner.max_turns == 7
     assert loop.agent_runner.prompt_on_recoverable_error is False
     assert loop.model == "configured"
@@ -448,12 +489,12 @@ def test_loop_applies_model_changes_through_async_backend_metadata(tmp_path):
         get_context_window=replacement_sync_lookup,
         get_context_window_async=AsyncMock(return_value=4096),
     )
-    settings = ApplicationSettings.model_validate({"loop": {"debug": True, "model": "updated"}})
+    settings = ApplicationSettings.model_validate({"app": {"debug": True, "model": "updated"}})
 
     async def apply():
         """Apply a model update, a scalar update, and an async backend replacement."""
-        assert await loop.apply_runtime_settings_async("loop.model", settings) == "applied now"
-        assert await loop.apply_runtime_settings_async("loop.debug", settings) == "applied now"
+        assert await loop.apply_runtime_settings_async("app.model", settings) == "applied now"
+        assert await loop.apply_runtime_settings_async("app.debug", settings) == "applied now"
         await loop.replace_backend_async(replacement)
 
     asyncio.run(apply())
@@ -522,7 +563,7 @@ def test_loop_continues_with_supervised_defaults_after_permission_load_failure(t
     """The manager completes interactive fallback during Loop construction."""
     path = tmp_path / ".loop" / "permissions.yaml"
     path.parent.mkdir()
-    path.write_text("version: 2\n", "utf-8")
+    path.write_text("version: 3\n", "utf-8")
     interaction = output_interaction()
     interaction.prompt.return_value = choice
 
@@ -541,7 +582,7 @@ def test_loop_resets_invalid_permission_policy_only_after_user_selection(tmp_pat
     """The reset choice delegates archival and default activation to PermissionManager."""
     path = tmp_path / ".loop" / "permissions.yaml"
     path.parent.mkdir()
-    path.write_text("version: 2\n", "utf-8")
+    path.write_text("version: 3\n", "utf-8")
     interaction = output_interaction()
     interaction.prompt.return_value = "reset"
 
@@ -561,7 +602,7 @@ def test_loop_can_exit_when_permission_recovery_is_declined(tmp_path, choice):
     """The recovery prompt can stop startup without changing the invalid policy file."""
     path = tmp_path / ".loop" / "permissions.yaml"
     path.parent.mkdir()
-    path.write_text("version: 2\n", "utf-8")
+    path.write_text("version: 3\n", "utf-8")
     interaction = output_interaction()
     interaction.prompt.return_value = choice
 
@@ -570,7 +611,7 @@ def test_loop_can_exit_when_permission_recovery_is_declined(tmp_path, choice):
             backend=loop_backend(), interaction=interaction, working_directory=tmp_path
         )
 
-    assert path.read_text("utf-8") == "version: 2\n"
+    assert path.read_text("utf-8") == "version: 3\n"
 
 
 def test_loop_reports_presets_excluded_by_permission_manager(tmp_path, monkeypatch):
@@ -637,20 +678,19 @@ def test_default_loop_registers_single_sandbox_provider_with_main_app_authority(
     tmp_path, monkeypatch, main_app
 ):
     """Linux registration supplies management dispatch with explicit main-app context."""
-    import loop.execution.sandbox.commands as sandbox_commands
-    from loop.execution.sandbox.linux import management as linux_management
-    from loop.execution.sandbox.linux import setup as linux_setup
+    from loop.execution.sandbox.linux import commands as linux_commands
 
-    monkeypatch.setattr(linux_management, "installation_status", Mock(return_value="Inventory"))
-    monkeypatch.setattr(sandbox_commands.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(linux_commands, "installation_status", Mock(return_value="Inventory"))
+    monkeypatch.setattr(platform, "system", lambda: "Linux")
     interaction = output_interaction()
 
-    def manage(action, review, *, main_app):
+    def manage(action, review, *, main_app, helper_bytes):
         """Model direct management consent only when the main app is authorized."""
+        assert helper_bytes is None
         return review("reviewed setup") if main_app else False
 
     management = Mock(side_effect=manage)
-    monkeypatch.setattr(linux_setup, "manage_setup", management)
+    monkeypatch.setattr(linux_commands, "manage_setup", management)
     refresh_backend = Mock(prepare_context=Mock(side_effect=list))
     loop = Loop.create_default(
         loop_backend(),
@@ -661,7 +701,7 @@ def test_default_loop_registers_single_sandbox_provider_with_main_app_authority(
     )
     assert [command.name for command in loop.command_manager.commands].count("sandbox") == 1
     loop.command_manager.call("sandbox", "uninstall")
-    assert management.call_args.kwargs == {"main_app": main_app}
+    assert management.call_args.kwargs == {"main_app": main_app, "helper_bytes": None}
     if main_app:
         refresh_backend.assert_called_once_with()
     else:
@@ -670,9 +710,7 @@ def test_default_loop_registers_single_sandbox_provider_with_main_app_authority(
 
 def test_default_loop_omits_linux_management_on_macos(tmp_path, monkeypatch):
     """A macOS app registers no Linux installation command."""
-    import loop.execution.sandbox.commands as sandbox_commands
-
-    monkeypatch.setattr(sandbox_commands.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(platform, "system", lambda: "Darwin")
     loop = Loop.create_default(
         loop_backend(), working_directory=tmp_path, interaction=output_interaction()
     )
@@ -1853,15 +1891,28 @@ def test_new_message_cancels_unstarted_recovery_tools_and_confirms_uncertain_ret
     loop.agent_runner.compaction.compact_if_needed = Mock(return_value=False)
     loop.agent_runner.compaction.compact_if_needed_async = AsyncMock(return_value=False)
 
-    def execute(name, *_args, **kwargs):
-        """Allow only the explicitly approved uncertain retry after the new message is saved."""
+    def check_retry(name):
+        """Allow only the approved uncertain retry after the new message is saved."""
         assert retry_uncertain
         assert name == "uncertain"
         assert sessions.messages[-1].content == "only list files"
+
+    def execute(name, *_args, **kwargs):
+        """Record the synchronous retry's durable start and admission."""
+        check_retry(name)
+        kwargs["execution_started"]()
+        assert kwargs["execution_admission"]()
+        return '{"ok":true}', 0.01
+
+    async def execute_async(name, *_args, **kwargs):
+        """Record the asynchronous retry's durable start and admission."""
+        check_retry(name)
+        await kwargs["execution_started"]()
+        assert kwargs["execution_admission"]()
         return '{"ok":true}', 0.01
 
     loop.agent.tools.call_with_timing = Mock(side_effect=execute)
-    loop.agent.tools.call_with_timing_async = AsyncMock(side_effect=execute)
+    loop.agent.tools.call_with_timing_async = AsyncMock(side_effect=execute_async)
     values = iter(("only list files", False))
 
     async def read_async(_completer):
@@ -2713,6 +2764,7 @@ def test_run_async_recovers_session_changes_and_resumes_on_new_input(
 ):
     """Session selection checks recovery and new input explicitly resumes its boundary."""
     interaction = output_interaction()
+    interaction.worker_calls_routed = True
     loop = Loop.create_default(
         backend=loop_backend(),
         interaction=interaction,
@@ -4031,7 +4083,7 @@ def test_handle_tool_calls_delegates_session_updates(tmp_path):
     registry.call_with_timing.assert_called_once_with(
         fn_call.name,
         fn_call.arguments,
-        interaction=loop.interaction,
+        interaction=loop.agent_runner.interaction,
         instructions_manager=loop.instructions_manager,
         permission_manager=loop.permission_manager,
         call_id="call_123",

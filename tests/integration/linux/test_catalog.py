@@ -20,7 +20,7 @@ def test_catalog_imports_without_application_or_site_packages(tmp_path):
     """Use reviewed distribution bytes for execution and setup imports."""
     contents, _, _, _ = runtime_catalog(Path("/usr/local/libexec/loop/native"), "native_test")
     package = files("loop")
-    for name in ("catalog.py", "setup.py"):
+    for name in ("catalog.py", "managed_bubblewrap.py", "setup.py"):
         contents["loop/execution/sandbox/linux/" + name] = package.joinpath(
             "execution/sandbox/linux/" + name
         ).read_bytes()

@@ -6,8 +6,10 @@ import os
 import re
 import stat
 import sys
+import tempfile
 import time
 from contextlib import ExitStack, nullcontext
+from dataclasses import replace
 from pathlib import Path
 
 from .... import constants
@@ -25,13 +27,18 @@ from ....constants import (
 from ....utils.json import load_unique_json
 from .admission import GenerationAdmission
 from .constants import (
+    BOOT_FILENAME,
+    BOOT_SERVICE_NAME,
+    BOOTSTRAP_ARTIFACT,
     CACHE_LOCK_FILENAME,
     CGROUP_ROOT,
     COMPILER_LOCK_FILENAME,
     MANAGEMENT_LOCK_FILENAME,
     MANAGEMENT_RECORD_NAME,
     NATIVE_RESERVATIONS_DIRECTORY_NAME,
+    PROC_BOOT_ID_PATH,
     RECEIPT_FILENAME,
+    SYSTEM_PYTHON_PATH,
     SYSTEM_RUNTIME_DIRECTORY,
     SYSTEMCTL_PATH,
     SYSTEMD_ACTIVE_STATE_PROPERTY,
@@ -56,7 +63,9 @@ from .host import (
     bind_host_file,
     compile_policy_source,
     discover_tool,
+    installation_files,
     protected_path,
+    publish_volatile_file,
     read_policy_bytes,
 )
 from .installation import (
@@ -68,11 +77,15 @@ from .installation import (
     _policy_directory,
     _policy_inventory,
     _policy_root,
+    _provision_generation_units,
+    _recover_generation_policy,
     _recursive_idle,
     _remove_generation_attachment,
     _retired_properties,
     _retired_records_absent,
+    _unit_state,
     activate_generation,
+    attest_idle_generation_instances,
     drained_generation,
     generation_limits,
     load_generation_policy,
@@ -95,6 +108,152 @@ _MAX_MANAGEMENT_STATUS_ENTRIES = 512
 _MAX_GENERATION_CGROUP_CHILDREN = 32
 _MANAGEMENT_STATUS_TIMEOUT_SECONDS = 2.0
 _NATIVE_RECORD = NATIVE_INSTALLATION_DIRECTORY / _RECORD
+_BOOT_UNIT_DIRECTORY = Path("/etc/systemd/system")
+
+
+def _boot_unit_source(directory: Path) -> bytes:
+    """Render the fixed root-owned systemd service for the installed recovery entry."""
+    if re.fullmatch(r"/[A-Za-z0-9_./ -]+", str(directory)) is None or ".." in directory.parts:
+        raise ValueError("Invalid installed boot entry directory.")
+    entry = str(directory / BOOT_FILENAME)
+    if " " in entry:
+        entry = f'"{entry}"'
+    return (
+        f"[Unit]\nDescription={constants.APP_DISPLAY_NAME} sandbox boot activation\n"
+        "After=apparmor.service\n"
+        "[Service]\nType=oneshot\n"
+        f"ExecStart={SYSTEM_PYTHON_PATH} -I -B {entry}\n"
+        "RemainAfterExit=yes\nRestart=on-failure\nRestartSec=5s\n"
+        "[Install]\nWantedBy=multi-user.target\n"
+    ).encode("ascii")
+
+
+def boot_activation_state(directory: Path, deadline: float) -> str:
+    """Inspect the authenticated fixed boot service's current systemd activation state.
+
+    Args:
+        directory (Path): Protected installed runtime directory.
+        deadline (float): Absolute monotonic deadline for systemd inspection.
+
+    Returns:
+        str: Systemd's active, activating, inactive, deactivating, reloading or failed state.
+
+    Raises:
+        ValueError: The boot unit or installed location differs from fixed authority.
+        TimeoutError: The inspection deadline expires.
+        OSError: Protected unit or system manager authority cannot be inspected.
+    """
+    unit = bind_host_file(_BOOT_UNIT_DIRECTORY / BOOT_SERVICE_NAME, deadline=deadline)
+    with unit.open_verified(deadline=deadline) as descriptor:
+        if stat.S_IMODE(unit.identity[2]) != constants.READ_ONLY_FILE_MODE or os.pread(
+            descriptor, MAX_NATIVE_UNIT_BYTES + 1, 0
+        ) != _boot_unit_source(directory):
+            raise ValueError("Boot unit differs from fixed authority.")
+    tool = bind_host_file(SYSTEMCTL_PATH, deadline=deadline)
+    output = _manager(
+        tool, ["show", "--all", "--property=ActiveState,Job", "--", BOOT_SERVICE_NAME], deadline
+    )
+    fields = {}
+    for line in output.splitlines():
+        key, separator, value = line.partition("=")
+        if not separator or key in fields:
+            raise ValueError("Ambiguous boot activation state.")
+        fields[key] = value
+    if fields.keys() != {"ActiveState", "Job"}:
+        raise ValueError("Ambiguous boot activation state.")
+    state = fields["ActiveState"]
+    if state not in {"active", "activating", "inactive", "deactivating", "reloading", "failed"}:
+        raise ValueError("Ambiguous boot activation state.")
+    if state == "inactive" and fields["Job"]:
+        return "activating"
+    return state
+
+
+def _install_boot_unit(directory: Path, lock: HostFile, deadline: float) -> None:
+    """Publish and enable only the fixed protected boot service under management ownership."""
+    source = _boot_unit_source(directory)
+    unit = _BOOT_UNIT_DIRECTORY / BOOT_SERVICE_NAME
+    wants = _BOOT_UNIT_DIRECTORY / "multi-user.target.wants"
+    link = wants / BOOT_SERVICE_NAME
+    with _administration(lock):
+        entry = bind_host_file(directory / BOOT_FILENAME, deadline=deadline)
+        if entry.path != directory / BOOT_FILENAME:
+            raise ValueError("Boot entry differs from fixed installation authority.")
+        if protected_path(_BOOT_UNIT_DIRECTORY, directory=True) != _BOOT_UNIT_DIRECTORY:
+            raise ValueError("Boot unit directory aliases other authority.")
+        if not wants.exists() and not wants.is_symlink():
+            wants.mkdir(mode=constants.PUBLIC_DIRECTORY_MODE)
+        if protected_path(wants, directory=True) != wants:
+            raise ValueError("Boot enablement directory aliases other authority.")
+        if not unit.exists() and not unit.is_symlink():
+            descriptor, temporary = tempfile.mkstemp(
+                prefix=f".{constants.APP_NAME}-boot-unit-", dir=_BOOT_UNIT_DIRECTORY
+            )
+            try:
+                with os.fdopen(descriptor, "wb") as stream:
+                    stream.write(source)
+                    stream.flush()
+                    os.fchmod(stream.fileno(), constants.READ_ONLY_FILE_MODE)
+                    os.fsync(stream.fileno())
+                os.link(temporary, unit, follow_symlinks=False)
+            finally:
+                Path(temporary).unlink()
+        authority = bind_host_file(unit, deadline=deadline)
+        with (
+            authority.open_verified(deadline=deadline) as descriptor,
+            entry.open_verified(deadline=deadline),
+        ):
+            if (
+                stat.S_IMODE(authority.identity[2]) != constants.READ_ONLY_FILE_MODE
+                or os.pread(descriptor, MAX_NATIVE_UNIT_BYTES + 1, 0) != source
+            ):
+                raise ValueError("Existing boot unit differs from fixed authority.")
+        if not link.exists() and not link.is_symlink():
+            link.symlink_to(Path("..") / BOOT_SERVICE_NAME)
+        if not link.is_symlink() or os.readlink(link) != "../" + BOOT_SERVICE_NAME:
+            raise ValueError("Existing boot enablement differs from fixed authority.")
+        for directory_path in (_BOOT_UNIT_DIRECTORY, wants):
+            descriptor = os.open(directory_path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        tool = bind_host_file(SYSTEMCTL_PATH, deadline=deadline)
+        _manager(tool, ["daemon-reload"], deadline)
+
+
+def _remove_boot_unit(directory: Path, lock: HostFile, deadline: float) -> None:
+    """Remove only the exact fixed boot service and its owned enablement link."""
+    unit = _BOOT_UNIT_DIRECTORY / BOOT_SERVICE_NAME
+    wants = _BOOT_UNIT_DIRECTORY / "multi-user.target.wants"
+    link = wants / BOOT_SERVICE_NAME
+    with _administration(lock):
+        if protected_path(_BOOT_UNIT_DIRECTORY, directory=True) != _BOOT_UNIT_DIRECTORY:
+            raise ValueError("Boot unit directory aliases other authority.")
+        if (wants.exists() or wants.is_symlink()) and protected_path(
+            wants, directory=True
+        ) != wants:
+            raise ValueError("Boot enablement directory aliases other authority.")
+        if (link.exists() or link.is_symlink()) and (
+            not link.is_symlink() or os.readlink(link) != "../" + BOOT_SERVICE_NAME
+        ):
+            raise ValueError("Boot enablement differs from fixed authority.")
+        if unit.exists() or unit.is_symlink():
+            bound = bind_host_file(unit, deadline=deadline)
+            with bound.open_verified(deadline=deadline) as descriptor:
+                if stat.S_IMODE(bound.identity[2]) != constants.READ_ONLY_FILE_MODE or os.pread(
+                    descriptor, MAX_NATIVE_UNIT_BYTES + 1, 0
+                ) != _boot_unit_source(directory):
+                    raise ValueError("Boot unit differs from fixed authority.")
+            tool = bind_host_file(SYSTEMCTL_PATH, deadline=deadline)
+            _manager(tool, ["stop", "--", BOOT_SERVICE_NAME], deadline)
+            if link.is_symlink():
+                link.unlink()
+            with bound.open_verified(deadline=deadline):
+                unit.unlink()
+            _manager(tool, ["daemon-reload"], deadline)
+        elif link.is_symlink():
+            link.unlink()
 
 
 def _staging_temporary(path: Path, limit: int, finals: set[Path]) -> tuple[bytes, int]:
@@ -266,6 +425,137 @@ def generation_status(record: Path) -> str:
     return "Installed authority authenticated; runtime enforcement is checked before each command."
 
 
+def recover_boot_generation(record: Path, deadline: float) -> None:
+    """Restore volatile policy and admission from the original protected installation at boot.
+
+    Hold the management gate throughout recovery, recreate only exact fixed unit and policy
+    bytes, publish a root-owned current-boot binding, and start the original socket. Existing
+    enforcing profiles are never replaced or removed. Interrupted add-only recovery can retry.
+
+    Args:
+        record (Path): Fixed protected management record for the installed generation.
+        deadline (float): Absolute monotonic deadline for boot recovery and socket activation.
+
+    Raises:
+        PermissionError: Initial-host administrator authority is absent.
+        ValueError: Durable, current-boot or loaded native authority differs from the installation.
+        TimeoutError: Recovery or activation exceeds its deadline.
+        OSError: Protected state or native management operations cannot be completed.
+    """
+    installed, authority = read_generation(
+        record, partial=True, boot_recovery=True, deadline=deadline
+    )
+    with _administration(installed.lock), authority.open_verified():
+        installed, current = read_generation(
+            record, partial=True, boot_recovery=True, deadline=deadline
+        )
+        if current != authority or any(
+            not bound.path.exists() or bound.path.is_symlink()
+            for bound in (
+                *installed.artifacts.values(),
+                installed.helper,
+                installed.config.reservation,
+            )
+        ):
+            raise ValueError("Durable boot installation authority is incomplete or changed.")
+        units = _provision_generation_units(
+            installed.config, installed.lock, nullcontext(), boot_recovery=True
+        )
+        config = replace(installed.config, slice_unit=units["slice_unit"])
+        receipt = installation_files(record.parent / RECEIPT_FILENAME, deadline=deadline)
+        if any(
+            receipt[role] != units[role] for role in ("receiver", "socket_unit", "service_unit")
+        ):
+            raise ValueError("Boot unit bindings differ from the original receipt.")
+        identity = _recover_generation_policy(
+            config,
+            installed.lock,
+            installed.helper,
+            installed.policies,
+            installed.compiled,
+            installed.source,
+            installed.compiler_lock,
+            deadline,
+            nullcontext(),
+        )
+        marker = SYSTEM_RUNTIME_DIRECTORY / f"{NATIVE_UNIT_PREFIX}{config.generation}.boot"
+        if not marker.exists() and not marker.is_symlink():
+            if protected_path(SYSTEM_RUNTIME_DIRECTORY, directory=True) != SYSTEM_RUNTIME_DIRECTORY:
+                raise ValueError("Boot runtime directory aliases other authority.")
+            data = json.dumps(
+                {
+                    "schema": 1,
+                    "generation": config.generation,
+                    "record": authority.digest,
+                    "boot": PROC_BOOT_ID_PATH.read_text(encoding="ascii").strip(),
+                    "namespace": list(identity),
+                    "files": {
+                        role: units[role].to_record(deadline=deadline)
+                        for role in ("slice_unit", "socket_unit", "service_unit")
+                    },
+                },
+                sort_keys=True,
+            ).encode("ascii")
+            publish_volatile_file(SYSTEM_RUNTIME_DIRECTORY, marker.name, data)
+        recovered, rebound = read_generation(record, deadline=deadline)
+        if (
+            rebound != authority
+            or recovered.namespace != identity
+            or recovered.config != config
+            or any(recovered.files[role] != units[role] for role in recovered.files)
+        ):
+            raise ValueError("Published boot bindings differ from recovered authority.")
+        tool = bind_host_file(SYSTEMCTL_PATH, deadline=deadline)
+        with tool.open_verified(deadline=deadline):
+            _manager(tool, ["daemon-reload"], deadline)
+            state = _unit_state(tool, config.slice_unit, deadline)
+            socket = units["socket_unit"]
+            _unit_state(tool, socket, deadline)
+            group = CGROUP_ROOT / config.slice_unit.path.name
+            if (
+                state[SYSTEMD_ACTIVE_STATE_PROPERTY] == "inactive"
+                and state[SYSTEMD_SUB_STATE_PROPERTY] == "dead"
+                and not state[SYSTEMD_CONTROL_GROUP_PROPERTY]
+            ):
+                _manager(tool, ["stop", "--", socket.path.name], deadline)
+                listener_state = _unit_state(tool, socket, deadline)
+                listener = SYSTEM_RUNTIME_DIRECTORY / socket.path.name
+                if (
+                    listener_state[SYSTEMD_ACTIVE_STATE_PROPERTY] != "inactive"
+                    or listener_state[SYSTEMD_SUB_STATE_PROPERTY] != "dead"
+                    or listener_state[SYSTEMD_CONTROL_GROUP_PROPERTY]
+                    or listener.exists()
+                    or listener.is_symlink()
+                ):
+                    raise ValueError("Generation listener closure is unverified.")
+                prefix = NATIVE_UNIT_PREFIX + config.generation
+                if _manager(
+                    tool, ["list-jobs", "--no-legend", "--", prefix + "*"], deadline
+                ).strip():
+                    raise ValueError("Pending generation activation; confinement retained.")
+                attest_idle_generation_instances(tool, config, units["service_unit"], deadline)
+                _recursive_idle(group, absent=True)
+                _manager(tool, ["start", "--", config.slice_unit.path.name], deadline)
+                state = _unit_state(tool, config.slice_unit, deadline)
+                if _manager(
+                    tool, ["list-jobs", "--no-legend", "--", prefix + "*"], deadline
+                ).strip():
+                    raise ValueError("Pending generation activation; confinement retained.")
+                attest_idle_generation_instances(tool, config, units["service_unit"], deadline)
+                _recursive_idle(group)
+            if (
+                state[SYSTEMD_ACTIVE_STATE_PROPERTY] != "active"
+                or state[SYSTEMD_SUB_STATE_PROPERTY] != "active"
+                or state[SYSTEMD_CONTROL_GROUP_PROPERTY] != "/" + group.name
+            ):
+                raise ValueError(
+                    "Generation tracking is missing or inactive; confinement retained."
+                )
+            _manager(tool, ["start", "--", units["socket_unit"].path.name], deadline)
+        with authority.open_verified(deadline=deadline):
+            pass
+
+
 def uninstall_authority(record: Path) -> tuple[HostFile, HostFile]:
     """Bind the complete record and retained exported uninstaller before a human decision.
 
@@ -301,11 +591,22 @@ def uninstall_generation(record: Path, deadline: float) -> None:
         OSError: Live membership, contention or checked teardown prevents completion.
     """
     installed, authority = read_generation(record, partial=True, deadline=deadline)
+    marker = SYSTEM_RUNTIME_DIRECTORY / f"{NATIVE_UNIT_PREFIX}{installed.config.generation}.boot"
+    boot_marker = (
+        bind_host_file(marker, deadline=deadline)
+        if marker.exists() or marker.is_symlink()
+        else None
+    )
     installed.retire(authority, deadline)
+    cleanup_deadline = max(deadline, time.monotonic() + NATIVE_MANAGEMENT_TIMEOUT_SECONDS)
+    _remove_boot_unit(record.parent, installed.lock, cleanup_deadline)
+    if boot_marker is not None:
+        with boot_marker.open_verified(deadline=cleanup_deadline):
+            marker.unlink()
 
 
 def verify_uninstalled(root: Path, deadline: float) -> None:
-    """Prove that an absent record has no remaining Loop installation authority.
+    """Prove that an absent record has no remaining installation authority.
 
     Args:
         root (Path): Fixed protected installation directory.
@@ -316,6 +617,10 @@ def verify_uninstalled(root: Path, deadline: float) -> None:
         OSError: Protected native state cannot be inspected.
         TimeoutError: The native inspection deadline expires.
     """
+    boot_unit = _BOOT_UNIT_DIRECTORY / BOOT_SERVICE_NAME
+    boot_link = _BOOT_UNIT_DIRECTORY / "multi-user.target.wants" / BOOT_SERVICE_NAME
+    if any(path.exists() or path.is_symlink() for path in (boot_unit, boot_link)):
+        raise ValueError("Native boot activation remains installed.")
     if root.exists() or root.is_symlink():
         if protected_path(root, directory=True) != root:
             raise ValueError("Installation directory aliases other authority.")
@@ -345,9 +650,9 @@ def verify_uninstalled(root: Path, deadline: float) -> None:
         raise ValueError("System unit directory aliases other authority.")
     if (
         next(_UNIT_DIRECTORY.glob(NATIVE_UNIT_PREFIX + "*"), None) is not None
-        or next(_UNIT_DIRECTORY.glob(".loop-unit-native_*-*"), None) is not None
+        or next(_UNIT_DIRECTORY.glob(f".{constants.APP_NAME}-unit-native_*-*"), None) is not None
     ):
-        raise ValueError("Loop system unit fragments remain.")
+        raise ValueError("Native system unit fragments remain.")
     tool = bind_host_file(SYSTEMCTL_PATH)
     prefix = NATIVE_UNIT_PREFIX + "native_"
     rows = _manager(
@@ -357,7 +662,7 @@ def verify_uninstalled(root: Path, deadline: float) -> None:
     for row in rows:
         fields = row.split()
         if not fields or len(names) >= _MAX_MANAGEMENT_INVENTORY_ENTRIES or fields[0] in names:
-            raise ValueError("Ambiguous Loop manager inventory remains.")
+            raise ValueError("Ambiguous native manager inventory remains.")
         name = fields[0]
         if (
             re.fullmatch(
@@ -367,18 +672,18 @@ def verify_uninstalled(root: Path, deadline: float) -> None:
             )
             is None
         ):
-            raise ValueError("Unknown Loop manager record remains.")
+            raise ValueError("Unknown native manager record remains.")
         names.add(name)
     _retired_records_absent(tool, prefix, names, deadline)
     if _manager(tool, ["list-jobs", "--no-legend", "--", prefix + "*"], deadline).strip():
-        raise ValueError("Loop manager jobs remain.")
+        raise ValueError("Native manager jobs remain.")
     if next(CGROUP_ROOT.glob(prefix + "*" + SYSTEMD_SLICE_UNIT_SUFFIX), None) is not None:
-        raise ValueError("Loop tracking remains.")
+        raise ValueError("Native tracking remains.")
     if (
         next(SYSTEM_RUNTIME_DIRECTORY.glob(prefix + "*" + SYSTEMD_SOCKET_UNIT_SUFFIX), None)
         is not None
     ):
-        raise ValueError("Loop listener remains.")
+        raise ValueError("Native listener remains.")
     policy, device = _policy_root()
     namespaces = policy / "namespaces"
     _policy_directory(namespaces, policy, device)
@@ -386,7 +691,7 @@ def verify_uninstalled(root: Path, deadline: float) -> None:
         if count > _MAX_POLICY_DIRECTORY_ENTRIES:
             raise ValueError("AppArmor namespace inventory exceeds its bound.")
         if path.name.startswith("native_"):
-            raise ValueError("Loop AppArmor namespace remains.")
+            raise ValueError("Native AppArmor namespace remains.")
     profiles = policy / "profiles"
     _policy_directory(profiles, policy, device)
     for count, path in enumerate(profiles.iterdir(), 1):
@@ -399,7 +704,7 @@ def verify_uninstalled(root: Path, deadline: float) -> None:
             .strip()
             .startswith(prefix)
         ):
-            raise ValueError("Loop AppArmor attachment remains.")
+            raise ValueError("Native AppArmor attachment remains.")
 
 
 def clean_unrecorded_installation(
@@ -487,7 +792,7 @@ def clean_unrecorded_installation(
                 path.parent == root
                 and path.name.startswith(".receipt-")
                 or path.parent in {candidate.parent for candidate in expected}
-                and path.name.startswith(".loop-file-")
+                and path.name.startswith(f".{constants.APP_NAME}-file-")
             )
             if count > MAX_NATIVE_INSTALLATION_ENTRIES or path not in expected and not temporary:
                 raise ValueError("Unknown partial installation file inventory.")
@@ -571,10 +876,12 @@ def clean_unrecorded_installation(
                 SYSTEMD_SERVICE_TEMPLATE_SUFFIX,
             )
         )
-        temporary_units = set(_UNIT_DIRECTORY.glob(".loop-unit-" + config.generation + "-*"))
+        temporary_units = set(
+            _UNIT_DIRECTORY.glob(f".{constants.APP_NAME}-unit-{config.generation}-*")
+        )
         if (
             set(_UNIT_DIRECTORY.glob(NATIVE_UNIT_PREFIX + "native_*")) - set(fragments)
-            or set(_UNIT_DIRECTORY.glob(".loop-unit-native_*-*")) - temporary_units
+            or set(_UNIT_DIRECTORY.glob(f".{constants.APP_NAME}-unit-native_*-*")) - temporary_units
         ):
             raise ValueError("Unknown partial installation unit inventory.")
         tool = bind_host_file(SYSTEMCTL_PATH)
@@ -650,6 +957,7 @@ def clean_unrecorded_installation(
             raise ValueError("Foreign native listener remains.")
         for fragment in fragments:
             fields = {
+                "Id",
                 SYSTEMD_LOAD_STATE_PROPERTY,
                 SYSTEMD_ACTIVE_STATE_PROPERTY,
                 SYSTEMD_SUB_STATE_PROPERTY,
@@ -659,11 +967,19 @@ def clean_unrecorded_installation(
                 SYSTEMD_NEED_DAEMON_RELOAD_PROPERTY,
                 SYSTEMD_TRANSIENT_PROPERTY,
             }
-            state = _retired_properties(tool, fragment.name, fields, deadline)
+            unit_name = fragment.name.replace("@.service", "@status.service")
+            state = _retired_properties(tool, unit_name, fields, deadline)
             if (
                 state.keys() != fields
+                or state.get("Id") != unit_name
                 or state.get(SYSTEMD_LOAD_STATE_PROPERTY)
-                != ("loaded" if fragment.exists() else "not-found")
+                not in (
+                    {"loaded"}
+                    if fragment.exists()
+                    else {"not-found", "loaded"}
+                    if fragment.suffix == SYSTEMD_SLICE_UNIT_SUFFIX
+                    else {"not-found"}
+                )
                 or state.get(SYSTEMD_ACTIVE_STATE_PROPERTY) != "inactive"
                 or state.get(SYSTEMD_SUB_STATE_PROPERTY) != "dead"
                 or state.get(SYSTEMD_CONTROL_GROUP_PROPERTY)
@@ -1157,8 +1473,15 @@ def _profile_settings(policy: Path, device: int, generation: str) -> list[str]:
 def _installation_cache(config, contents, executables, sources, source):
     """Validate required runtime roles and reserve generated policy/receipt catalog names."""
     receiver = config.receiver.name
-    bootstrap = "loop/execution/sandbox/linux/bootstrap.py"
-    fixed = {receiver, "helper", UNINSTALLER_FILENAME, CACHE_LOCK_FILENAME, bootstrap}
+    bootstrap = BOOTSTRAP_ARTIFACT
+    fixed = {
+        receiver,
+        "helper",
+        UNINSTALLER_FILENAME,
+        BOOT_FILENAME,
+        CACHE_LOCK_FILENAME,
+        bootstrap,
+    }
     cache = {"attachment.apparmor": source}
     for relative, profiles in sources.items():
         for profile in profiles:
@@ -1204,7 +1527,7 @@ def install_generation(
         lock (HostFile): Persistent immutable installation management lock.
         compiler_lock (HostFile): Distinct immutable installation-wide compiler lock.
         contents (dict[str, bytes]): Complete reviewed private runtime catalog, including original
-            receiver, helper, bootstrap module, cache lock and retained uninstall entry.
+            receiver, helper, bootstrap module, cache lock, boot entry and retained uninstall entry.
         executables (set[str]): Exact executable runtime entries; must include helper, receiver
             and loop_uninstall.py. Other entries remain immutable read-only files.
         sources (dict[str, dict[str, bytes]]): Trusted bounded namespace/profile source inventory.
@@ -1222,7 +1545,7 @@ def install_generation(
         BaseExceptionGroup: Activation and its bounded listener closure both fail.
     """
     directory = config.receiver.parent
-    bootstrap = "loop/execution/sandbox/linux/bootstrap.py"
+    bootstrap = BOOTSTRAP_ARTIFACT
     cache = _installation_cache(config, contents, executables, sources, source)
     staged = stage_generation_files(directory, dict(contents), set(executables), lock)
     with config.slice_unit.open_verified():
@@ -1295,6 +1618,7 @@ def install_generation(
             raise ValueError("Activated installation differs from recorded authority.")
         with record.open_verified():
             pass
+        _install_boot_unit(directory, lock, deadline)
     except (ValueError, OSError) as error:
         try:
             with drained_generation(

@@ -3,18 +3,23 @@
 from __future__ import annotations
 
 import ctypes
+import errno
+import fcntl
 import hashlib
 import io
 import os
+import platform
 import re
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Callable, Generator
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 from .... import constants
 from ....constants import MAX_NATIVE_RECEIPT_BYTES, NATIVE_FILE_READ_CHUNK_BYTES
@@ -37,13 +42,14 @@ from .constants import (
 _SUDO_FORBIDDEN_MODE_BITS = 0o2022
 
 NATIVE_LOCK_SEEDS = {
-    MANAGEMENT_LOCK_FILENAME: b"Loop native management\n",
-    COMPILER_LOCK_FILENAME: b"Loop native compiler\n",
+    MANAGEMENT_LOCK_FILENAME: f"{constants.APP_DISPLAY_NAME} native management\n".encode("ascii"),
+    COMPILER_LOCK_FILENAME: f"{constants.APP_DISPLAY_NAME} native compiler\n".encode("ascii"),
 }
 
 _MAX_HOST_FILE_BYTES = 32 * 1024 * 1024
 _MAX_SYMLINKS_PER_PREPARATION = 40
 _MAX_SYSTEM_SERVICE_UID = 999
+_AT_EMPTY_PATH = 0x1000
 MAX_SOURCE_BYTES = 65536
 MAX_COMPILED_BYTES = 1048576
 MAX_DIAGNOSTIC_BYTES = 65536
@@ -52,6 +58,104 @@ COMPILER_SECONDS = 5
 LIBRARY_DISCOVERY_SECONDS = 5.0
 _MAX_LINKER_CACHE_OUTPUT_BYTES = 1_048_576
 _MAX_LINKER_CACHE_ERROR_BYTES = 4_096
+_COMPRESSED_POLICY_HEADER = re.compile(rb"\x01[\x00-\xff]\x00{6}\x28\xb5\x2f\xfd")
+_MIN_FIXED_BUBBLEWRAP_VERSION = (0, 12, 0)
+# Linux fcntl seals are not exported by every supported Python build.
+_LINUX_F_ADD_SEALS = 1033
+_LINUX_FULL_FILE_SEALS = 0xF
+
+
+class ManagedBubblewrapIdentity(NamedTuple):
+    """Bind reviewed helper architecture, ELF machine, size and digest.
+
+    Args:
+        architecture (str): Platform architecture named in the reviewed artifact.
+        machine (int): Expected ELF machine number.
+        size (int): Exact artifact byte length.
+        digest (str): SHA256 digest of the reviewed artifact.
+    """
+
+    architecture: str
+    machine: int
+    size: int
+    digest: str
+
+
+_MANAGED_BUBBLEWRAP = {
+    "x86_64": (
+        "amd64",
+        62,
+        80424,
+        "5d1f77a455d3a5cc1a45bdbf2e23b89cbd7b33e640dd9ae3b5ce2573d133889e",
+    ),
+    "aarch64": (
+        "arm64",
+        183,
+        133624,
+        "e2a3e04708d2b6d7dbb536671375643c717bf799e3bdb83ee524a00c1a82a0f7",
+    ),
+}
+# Retain prior reviewed digests here when the download manifest advances, so a protected
+# compatible generation remains usable until an actual security invalidation requires refresh.
+_OLDER_MANAGED_BUBBLEWRAP_DIGESTS: dict[str, frozenset[str]] = {}
+
+
+def publish_volatile_file(directory: Path, name: str, data: bytes) -> None:
+    """Atomically add a read-only file without a named intermediate on a Linux runtime filesystem.
+
+    The caller must authenticate the protected directory and serialize its own management
+    transaction. A kernel-created unnamed inode disappears automatically if interrupted before
+    publication. A preexisting destination is never replaced.
+
+    Args:
+        directory (Path): Original protected absolute runtime directory.
+        name (str): One literal filename inside that directory.
+        data (bytes): Exact nonempty bytes to publish read-only.
+
+    Raises:
+        ValueError: The directory, filename or data is malformed.
+        OSError: Unnamed files, atomic linking, writing or synchronization fails.
+    """
+    if (
+        not directory.is_absolute()
+        or ".." in directory.parts
+        or not name
+        or Path(name).name != name
+        or name in {".", ".."}
+        or not isinstance(data, bytes)
+        or not data
+    ):
+        raise ValueError("Invalid volatile file publication input.")
+    flag = getattr(os, "O_TMPFILE", None)
+    if flag is None:
+        raise OSError(errno.ENOTSUP, "Unnamed runtime files are unavailable.")
+    parent = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    try:
+        descriptor = os.open(".", flag | os.O_WRONLY | os.O_CLOEXEC, 0o600, dir_fd=parent)
+        try:
+            if os.write(descriptor, data) != len(data):
+                raise OSError(errno.EIO, "Incomplete volatile file write.")
+            os.fchmod(descriptor, constants.READ_ONLY_FILE_MODE)
+            os.fsync(descriptor)
+            libc = ctypes.CDLL(None, use_errno=True)
+            link = libc.linkat
+            link.argtypes = [
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+            ]
+            link.restype = ctypes.c_int
+            if link(descriptor, b"", parent, os.fsencode(name), _AT_EMPTY_PATH) != 0:
+                error = ctypes.get_errno()
+                raise OSError(error, os.strerror(error))
+            os.fsync(parent)
+        finally:
+            os.close(descriptor)
+    finally:
+        os.close(parent)
+
 
 RUNTIME_READ_FILES = tuple(
     Path(name)
@@ -69,7 +173,13 @@ RUNTIME_READ_FILES = tuple(
 )
 
 
-def protected_path(path: Path, *, directory: bool = False, system_elevation: bool = False) -> Path:
+def protected_path(
+    path: Path,
+    *,
+    directory: bool = False,
+    system_elevation: bool = False,
+    allow_root_owned_hardlinks: bool = False,
+) -> Path:
     """Resolve a protected host file, accepting protected distribution symlinks.
 
     Call in the initial host user namespace, before UID mapping. Root administrator and
@@ -81,6 +191,9 @@ def protected_path(path: Path, *, directory: bool = False, system_elevation: boo
         directory (bool): Require a directory instead of a single-link regular file.
         system_elevation (bool): Permit only the setuid bit on the resolved fixed /usr/bin/sudo
             executable for explicitly consented system authentication; False by default.
+        allow_root_owned_hardlinks (bool): Permit multiple links to an otherwise protected
+            regular file. Use only for a selected system executable already inside the fixed
+            read-only runtime roots; trusted helper and policy files still require one link.
 
     Returns:
         Path: Canonical file or directory with protected ownership and ancestors.
@@ -129,7 +242,9 @@ def protected_path(path: Path, *, directory: bool = False, system_elevation: boo
     if directory:
         safe = stat.S_ISDIR(details.st_mode)
     else:
-        safe = stat.S_ISREG(details.st_mode) and details.st_nlink == 1
+        safe = stat.S_ISREG(details.st_mode) and (
+            details.st_nlink == 1 or allow_root_owned_hardlinks
+        )
 
     if system_elevation and not details.st_mode & constants.EXECUTE_MODE_MASK:
         raise ValueError("System elevation tool is not executable.")
@@ -547,7 +662,7 @@ def discover_tool(name: str, *, deadline: float | None = None) -> HostFile:
         OSError: The tool is absent or cannot be inspected.
     """
     locations = {
-        "bwrap": ("/usr/bin/bwrap", "/bin/bwrap"),
+        "bwrap": ("/usr/local/bin/bwrap", "/usr/bin/bwrap", "/bin/bwrap"),
         "apparmor_parser": ("/usr/sbin/apparmor_parser", "/sbin/apparmor_parser"),
         "prlimit": ("/usr/bin/prlimit", "/bin/prlimit"),
     }
@@ -561,6 +676,189 @@ def discover_tool(name: str, *, deadline: float | None = None) -> HostFile:
                 raise ValueError("Native management tool is not executable.")
             return bound
     raise OSError(f"Installed {name} is unavailable.")
+
+
+def require_fixed_bubblewrap(helper: HostFile, *, deadline: float | None = None) -> None:
+    """Require an authenticated Bubblewrap release with safe setup-symlink resolution.
+
+    Args:
+        helper (HostFile): Protected, pinned Bubblewrap executable selected for native use.
+        deadline (float | None): Optional absolute deadline shared with native preparation.
+
+    Raises:
+        ValueError: The executable does not report a fixed upstream version.
+        TimeoutError: Version inspection exceeds the bounded preparation deadline.
+        OSError: The protected executable changes or cannot be inspected.
+    """
+    deadline = _bubblewrap_deadline(deadline)
+    with helper.open_verified(deadline=deadline) as descriptor:
+        _require_bubblewrap_version(descriptor, deadline)
+
+
+def _bubblewrap_deadline(deadline: float | None) -> float:
+    """Bound helper inspection independently of a longer caller deadline."""
+    limit = time.monotonic() + 5
+    bound = min(deadline, limit) if deadline is not None else limit
+    if time.monotonic() >= bound:
+        raise TimeoutError("Bubblewrap version inspection deadline expired.")
+    return bound
+
+
+def _require_bubblewrap_version(descriptor: int, deadline: float) -> None:
+    """Execute only a pinned descriptor and require an unambiguous fixed release."""
+    process = subprocess.Popen(
+        [f"/proc/self/fd/{descriptor}", "--version"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="ascii",
+        errors="replace",
+        env={
+            PATH_ENVIRONMENT_VARIABLE: SYSTEM_COMMAND_PATH,
+            LC_ALL_ENVIRONMENT_VARIABLE: SYSTEM_LOCALE,
+        },
+        cwd="/",
+        pass_fds=(descriptor,),
+        close_fds=True,
+        start_new_session=True,
+    )
+    result = supervise_process(process, deadline, stdout_limit=128, stderr_limit=128)
+    if result.status is ProcessCaptureStatus.TIMED_OUT:
+        raise TimeoutError("Bubblewrap version inspection deadline expired.")
+    if (
+        result.status is not ProcessCaptureStatus.COMPLETED
+        or result.exit_code != 0
+        or result.stderr
+        or result.stdout_discarded
+        or result.stderr_discarded
+    ):
+        raise OSError("Protected Bubblewrap version inspection failed.")
+    version = re.fullmatch(r"bubblewrap ([0-9]+)\.([0-9]+)\.([0-9]+)\n?", result.stdout)
+    if (
+        version is None
+        or tuple(int(part) for part in version.groups()) < _MIN_FIXED_BUBBLEWRAP_VERSION
+    ):
+        raise ValueError("Bubblewrap 0.12.0 or newer is required for secure sandbox setup.")
+
+
+def _managed_bubblewrap_identity() -> ManagedBubblewrapIdentity:
+    """Select only the two reviewed Ubuntu 24.04 ELF targets."""
+    release = platform.freedesktop_os_release()
+    selected = _MANAGED_BUBBLEWRAP.get(platform.machine())
+    if (
+        sys.platform != "linux"
+        or release.get("ID") != "ubuntu"
+        or release.get("VERSION_ID") != "24.04"
+        or selected is None
+    ):
+        raise OSError("No managed Bubblewrap is qualified for this Linux host.")
+    return ManagedBubblewrapIdentity(*selected)
+
+
+def is_managed_bubblewrap(digest: str) -> bool:
+    """Recognize a reviewed managed helper for the current supported host.
+
+    Args:
+        digest (str): SHA256 of a protected installed helper.
+
+    Returns:
+        bool: Whether the digest is the reviewed binary for this Ubuntu 24.04 architecture.
+    """
+    try:
+        current = _managed_bubblewrap_identity().digest
+        return digest == current or digest in _OLDER_MANAGED_BUBBLEWRAP_DIGESTS.get(
+            platform.machine(), frozenset()
+        )
+    except OSError:
+        return False
+
+
+def _verify_managed_bubblewrap(data: bytes, *, deadline: float | None = None) -> None:
+    """Check reviewed bytes, ELF architecture and executable host compatibility."""
+    identity = _managed_bubblewrap_identity()
+    if (
+        len(data) != identity.size
+        or hashlib.sha256(data).hexdigest() != identity.digest
+        or data[:6] != b"\x7fELF\x02\x01"
+        or int.from_bytes(data[18:20], "little") != identity.machine
+    ):
+        raise ValueError("Managed Bubblewrap artifact integrity or architecture differs.")
+    bound = _bubblewrap_deadline(deadline)
+    descriptor = os.memfd_create("loop-reviewed-bwrap", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
+    try:
+        if os.write(descriptor, data) != len(data):
+            raise OSError("Incomplete managed Bubblewrap staging.")
+        os.fchmod(descriptor, 0o500)
+        fcntl.fcntl(descriptor, _LINUX_F_ADD_SEALS, _LINUX_FULL_FILE_SEALS)
+        _require_bubblewrap_version(descriptor, bound)
+    finally:
+        os.close(descriptor)
+
+
+def require_managed_bubblewrap_bytes(data: bytes) -> None:
+    """Validate downloaded executable bytes and host ABI before setup.
+
+    Args:
+        data (bytes): Exact executable extracted from a reviewed Ubuntu archive package.
+
+    Raises:
+        ValueError: Reviewed artifact bytes or architecture differ.
+        OSError: The host is unsupported or the executable cannot run on it.
+        TimeoutError: Bounded compatibility inspection expires.
+    """
+    _verify_managed_bubblewrap(data)
+
+
+def require_reviewed_bubblewrap_bytes(data: bytes) -> None:
+    """Revalidate reviewed helper bytes before privileged installation changes.
+
+    Args:
+        data (bytes): Exact helper bytes received in the reviewed setup catalog.
+
+    Raises:
+        ValueError: Artifact bytes or architecture differ from the reviewed source.
+        OSError: No fixed protected host or qualified managed helper matches the bytes.
+        TimeoutError: Compatibility inspection expires.
+    """
+    if is_managed_bubblewrap(hashlib.sha256(data).hexdigest()):
+        _verify_managed_bubblewrap(data)
+        return
+    helper = discover_tool("bwrap")
+    require_fixed_bubblewrap(helper)
+    if hashlib.sha256(data).hexdigest() != helper.digest:
+        raise ValueError("Reviewed system helper changed.")
+
+
+def partial_bubblewrap_bytes(directory: Path) -> bytes:
+    """Recover only authenticated helper bytes from an unrecorded protected stage.
+
+    Args:
+        directory (Path): Fixed protected installation directory with a reservation.
+
+    Returns:
+        bytes: Verified staged helper, or empty bytes if staging never reached the helper.
+
+    Raises:
+        ValueError: Staged inode or bytes differ from trusted managed or system authority.
+        OSError: Staged authority or required host inputs cannot be inspected.
+        TimeoutError: Helper inspection exceeds its bounded deadline.
+    """
+    path = directory / "helper"
+    if not path.exists() and not path.is_symlink():
+        return b""
+    bound = bind_host_file(path)
+    with bound.open_verified() as descriptor:
+        data = os.pread(descriptor, bound.identity[4] + 1, 0)
+    if len(data) != bound.identity[4] or hashlib.sha256(data).hexdigest() != bound.digest:
+        raise ValueError("Partial Bubblewrap helper changed during read.")
+    if (
+        is_managed_bubblewrap(bound.digest)
+        and bound.digest != _managed_bubblewrap_identity().digest
+    ):
+        require_fixed_bubblewrap(bound)
+    else:
+        require_reviewed_bubblewrap_bytes(data)
+    return data
 
 
 def apparmor_library() -> HostFile:
@@ -720,7 +1018,9 @@ def compile_policy_source(source: bytes, deadline: float, *, names: bool = False
     Pin and reverify protected parser, limiter and ABI inputs. Use a private anonymous input,
     empty parser configuration, one worker, no cache, no kernel loading and strict diagnostics.
     Bound address space to 256 MiB, CPU to five seconds, output to one MiB and diagnostics to
-    64 KiB. Both enumeration and compilation consume the caller's existing deadline.
+    64 KiB. If a newer parser emits a compressed policy container, recompile without container
+    compression so kernel-exported bytes can still be attested exactly. The retry shares the same
+    input authority, bounds and deadline. Uncompressed parsers still require one launch.
 
     Args:
         source (bytes): Nonempty administrator-generated policy source, at most 64 KiB.
@@ -750,63 +1050,70 @@ def compile_policy_source(source: bytes, deadline: float, *, names: bool = False
             inputs.enter_context(authority.open_verified(deadline=deadline))
         stream = inputs.enter_context(tempfile.TemporaryFile())
         stream.write(source)
-        stream.seek(0)
+        uncompressed = False
+        while True:
+            stream.seek(0)
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Policy compilation deadline expired.")
 
-        if time.monotonic() >= deadline:
-            raise TimeoutError("Policy compilation deadline expired.")
+            process = subprocess.Popen(
+                [
+                    str(limiter.path),
+                    f"--as={COMPILER_ADDRESS_BYTES}:{COMPILER_ADDRESS_BYTES}",
+                    f"--cpu={COMPILER_SECONDS}:{COMPILER_SECONDS}",
+                    "--core=0:0",
+                    "--",
+                    str(parser.path),
+                    "--config-file=/dev/null",
+                    "--base=/etc/apparmor.d",
+                    "--jobs=0",
+                    "--names" if names else "--stdout",
+                    "--skip-kernel-load",
+                    "--skip-cache",
+                    "--warn=all",
+                    "--Werror",
+                    *(["--zstd-compress-level=0"] if uncompressed else []),
+                ],
+                stdin=stream,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd="/",
+                env={
+                    PATH_ENVIRONMENT_VARIABLE: SYSTEM_COMMAND_PATH,
+                    LC_ALL_ENVIRONMENT_VARIABLE: SYSTEM_LOCALE,
+                },
+                close_fds=True,
+                start_new_session=True,
+            )
+            # Latin-1 is a byte-preserving transport for the shared text supervisor. Disabling
+            # newline conversion is essential: compiled bytes can contain CR, LF and CRLF.
+            process.stdout = io.TextIOWrapper(process.stdout, encoding="latin1", newline="")
+            process.stderr = io.TextIOWrapper(process.stderr, encoding="latin1", newline="")
+            result = supervise_process(
+                process,
+                deadline,
+                stdout_limit=MAX_COMPILED_BYTES,
+                stderr_limit=MAX_DIAGNOSTIC_BYTES,
+            )
+            if result.status is ProcessCaptureStatus.TIMED_OUT:
+                raise TimeoutError("Policy compilation deadline expired.")
 
-        process = subprocess.Popen(
-            [
-                str(limiter.path),
-                f"--as={COMPILER_ADDRESS_BYTES}:{COMPILER_ADDRESS_BYTES}",
-                f"--cpu={COMPILER_SECONDS}:{COMPILER_SECONDS}",
-                "--core=0:0",
-                "--",
-                str(parser.path),
-                "--config-file=/dev/null",
-                "--base=/etc/apparmor.d",
-                "--jobs=0",
-                "--names" if names else "--stdout",
-                "--skip-kernel-load",
-                "--skip-cache",
-                "--warn=all",
-                "--Werror",
-            ],
-            stdin=stream,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd="/",
-            env={
-                PATH_ENVIRONMENT_VARIABLE: SYSTEM_COMMAND_PATH,
-                LC_ALL_ENVIRONMENT_VARIABLE: SYSTEM_LOCALE,
-            },
-            close_fds=True,
-            start_new_session=True,
-        )
-        # Latin-1 is a byte-preserving transport for the shared text supervisor. Disabling
-        # newline conversion is essential: compiled bytes can contain CR, LF and CRLF.
-        process.stdout = io.TextIOWrapper(process.stdout, encoding="latin1", newline="")
-        process.stderr = io.TextIOWrapper(process.stderr, encoding="latin1", newline="")
-        result = supervise_process(
-            process,
-            deadline,
-            stdout_limit=MAX_COMPILED_BYTES,
-            stderr_limit=MAX_DIAGNOSTIC_BYTES,
-        )
-        if result.status is ProcessCaptureStatus.TIMED_OUT:
-            raise TimeoutError("Policy compilation deadline expired.")
+            if (
+                result.status is not ProcessCaptureStatus.COMPLETED
+                or result.exit_code != 0
+                or not result.stdout
+                or result.stderr
+                or result.stdout_discarded != 0
+                or result.stderr_discarded != 0
+            ):
+                raise OSError("Bounded policy compilation failed.")
 
-        if (
-            result.status is not ProcessCaptureStatus.COMPLETED
-            or result.exit_code != 0
-            or not result.stdout
-            or result.stderr
-            or result.stdout_discarded != 0
-            or result.stderr_discarded != 0
-        ):
-            raise OSError("Bounded policy compilation failed.")
+            for authority in (parser, limiter, abi):
+                inputs.enter_context(authority.open_verified(deadline=deadline))
 
-        for authority in (parser, limiter, abi):
-            inputs.enter_context(authority.open_verified(deadline=deadline))
-
-        return result.stdout.encode("latin1")
+            output = result.stdout.encode("latin1")
+            if names or _COMPRESSED_POLICY_HEADER.match(output) is None:
+                return output
+            if uncompressed:
+                raise OSError("Parser returned compressed policy after uncompressed retry.")
+            uncompressed = True

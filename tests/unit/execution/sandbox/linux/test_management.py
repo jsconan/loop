@@ -4,21 +4,23 @@ import hashlib
 import os
 from contextlib import nullcontext
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 
 from loop.execution.sandbox.linux import host as linux_host
 from loop.execution.sandbox.linux import installation as linux_installation
 from loop.execution.sandbox.linux import management as linux_management
+from loop.execution.sandbox.linux import records as linux_records
 from loop.execution.sandbox.linux.admission import GenerationAdmission
 
-from .helpers import publish, rewrite
+from .helpers import mountinfo_path, publish, rewrite
 
 
 @pytest.fixture(autouse=True)
-def native_inventory(monkeypatch):
+def native_inventory(monkeypatch, tmp_path):
     """Keep fixed host tracking and listener inventory independent of real installations."""
+    monkeypatch.setattr(linux_management, "_BOOT_UNIT_DIRECTORY", tmp_path / "absent-boot-units")
     original = Path.glob
 
     def glob(path, pattern, **kwargs):
@@ -43,6 +45,7 @@ def test_original_record_status_export_and_uninstall(installation, monkeypatch):
     )
     retire = Mock()
     monkeypatch.setattr(linux_installation.GenerationLifecycle, "retire", retire)
+    monkeypatch.setattr(linux_management, "_remove_boot_unit", Mock())
     monkeypatch.setattr(linux_management.time, "monotonic", lambda: 10)
     linux_management.uninstall_generation(record, 123)
     assert retire.call_args.args[0] == authority
@@ -50,6 +53,167 @@ def test_original_record_status_export_and_uninstall(installation, monkeypatch):
     with pytest.raises(FileExistsError, match="already exists"):
         publish(installation)
     assert linux_host.bind_host_file(record) == authority
+
+
+@pytest.fixture
+def boot_recovery(installation, monkeypatch, tmp_path):
+    """Isolate reboot orchestration while retaining real record and marker verification."""
+    record, arguments = installation
+    authority = publish(installation)
+    config, files = arguments[:2]
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    boot_id = tmp_path / "boot-id"
+    boot_id.write_text("current-boot\n")
+    uid_map = tmp_path / "uid-map"
+    uid_map.write_text("0 0 4294967295\n")
+    tool = tmp_path / "systemctl"
+    tool.write_bytes(b"tool")
+    tool.chmod(0o555)
+    monkeypatch.setattr(linux_records.os, "getuid", lambda: 0)
+    monkeypatch.setattr(linux_records, "PROC_UID_MAP_PATH", uid_map)
+    monkeypatch.setattr(linux_records, "PROC_BOOT_ID_PATH", boot_id)
+    monkeypatch.setattr(linux_records, "SYSTEM_RUNTIME_DIRECTORY", runtime)
+    monkeypatch.setattr(linux_management, "PROC_BOOT_ID_PATH", boot_id)
+    monkeypatch.setattr(linux_management, "SYSTEM_RUNTIME_DIRECTORY", runtime)
+    monkeypatch.setattr(linux_management, "SYSTEMCTL_PATH", tool)
+    monkeypatch.setattr(linux_management, "_administration", lambda _: nullcontext())
+    monkeypatch.setattr(linux_management, "protected_path", lambda path, **kwargs: path)
+    monkeypatch.setattr(linux_management.time, "monotonic", lambda: 10)
+    units = {**files, "slice_unit": config.slice_unit}
+    monkeypatch.setattr(linux_management, "_provision_generation_units", Mock(return_value=units))
+    monkeypatch.setattr(linux_management, "installation_files", Mock(return_value=files))
+    policy = Mock(return_value=(101, 202))
+    monkeypatch.setattr(linux_management, "_recover_generation_policy", policy)
+    manager = Mock(return_value="")
+    monkeypatch.setattr(linux_management, "_manager", manager)
+    monkeypatch.setattr(
+        linux_management,
+        "attest_idle_generation_instances",
+        Mock(return_value=["retained.service"]),
+    )
+    monkeypatch.setattr(
+        linux_management,
+        "_unit_state",
+        Mock(
+            return_value={
+                "ActiveState": "active",
+                "SubState": "active",
+                "ControlGroup": "/" + config.slice_unit.path.name,
+            }
+        ),
+    )
+
+    def publish_marker(directory, name, data):
+        """Model one atomic publication in the isolated runtime directory."""
+        path = directory / name
+        path.write_bytes(data)
+        path.chmod(0o444)
+
+    monkeypatch.setattr(linux_management, "publish_volatile_file", publish_marker)
+    return record, arguments, authority, runtime, units, policy, manager
+
+
+def test_boot_recovery_recreates_bindings_and_is_idempotent(boot_recovery):
+    """Recreated authority is published once and repeated recovery preserves the same marker."""
+    record, _, authority, runtime, units, policy, manager = boot_recovery
+    linux_management.recover_boot_generation(record, 50)
+    marker = runtime / "loopgen_test.boot"
+    original = linux_host.bind_host_file(marker)
+    recovered, rebound = linux_records.read_generation(record)
+    assert rebound == authority and recovered.namespace == (101, 202)
+    assert recovered.config.slice_unit == units["slice_unit"]
+    linux_management.recover_boot_generation(record, 50)
+    assert linux_host.bind_host_file(marker) == original
+    assert policy.call_count == 2
+    assert sum(call.args[1][0] == "start" for call in manager.call_args_list) == 2
+
+
+def test_boot_recovery_starts_idle_tracking_before_admission(boot_recovery, monkeypatch):
+    """An empty absent cgroup is restored before the receiver socket opens."""
+    record, _, _, _, units, _, manager = boot_recovery
+    slice_name = units["slice_unit"].path.name
+    inactive = {"ActiveState": "inactive", "SubState": "dead", "ControlGroup": ""}
+    active = {"ActiveState": "active", "SubState": "active", "ControlGroup": "/" + slice_name}
+    linux_management._unit_state.side_effect = [inactive, inactive, inactive, active]
+    idle = Mock()
+    monkeypatch.setattr(linux_management, "_recursive_idle", idle)
+    linux_management.recover_boot_generation(record, 50)
+    assert idle.call_args_list == [
+        call(linux_management.CGROUP_ROOT / slice_name, absent=True),
+        call(linux_management.CGROUP_ROOT / slice_name),
+    ]
+    starts = [call.args[1][-1] for call in manager.call_args_list if call.args[1][0] == "start"]
+    assert starts == [slice_name, units["socket_unit"].path.name]
+    assert linux_management.attest_idle_generation_instances.call_count == 2
+
+
+@pytest.mark.parametrize(
+    "change",
+    ["jobs", "instances", "cgroup", "changed", "listener", "jobs_after", "instances_after"],
+)
+def test_boot_recovery_rejects_ambiguous_idle_tracking(boot_recovery, monkeypatch, change):
+    """Neither an ambiguous manager nor a changed cgroup can reopen admission."""
+    record, _, _, _, _, _, manager = boot_recovery
+    inactive = {"ActiveState": "inactive", "SubState": "dead", "ControlGroup": ""}
+    linux_management._unit_state.return_value = inactive
+    if change in {"jobs", "instances", "jobs_after", "instances_after"}:
+        seen = []
+
+        def response(tool, args, deadline):
+            """Report an unexpected job or receiver before or after tracking starts."""
+            if args[0] != "list-jobs":
+                return ""
+            seen.append(args[0])
+            occurrence = 2 if change.endswith("_after") else 1
+            return "unexpected\n" if change.startswith("jobs") and len(seen) == occurrence else ""
+
+        manager.side_effect = response
+        if change.startswith("instances"):
+            failure = ValueError("Generation receiver instances changed")
+            linux_management.attest_idle_generation_instances.side_effect = (
+                [[], failure] if change.endswith("_after") else failure
+            )
+        monkeypatch.setattr(linux_management, "_recursive_idle", Mock())
+        if change.endswith("_after"):
+            active = {"ActiveState": "active", "SubState": "active", "ControlGroup": "/test"}
+            linux_management._unit_state.side_effect = [inactive, inactive, inactive, active]
+    elif change == "listener":
+        active = {"ActiveState": "active", "SubState": "listening", "ControlGroup": ""}
+        linux_management._unit_state.side_effect = [inactive, inactive, active]
+    else:
+        idle = Mock(side_effect=ValueError("tracking changed")) if change == "cgroup" else Mock()
+        monkeypatch.setattr(linux_management, "_recursive_idle", idle)
+    with pytest.raises(ValueError, match="Pending|instances|tracking|listener"):
+        linux_management.recover_boot_generation(record, 50)
+    assert not any(
+        call.args[1][-1].endswith(".socket")
+        for call in manager.call_args_list
+        if call.args[1][0] == "start"
+    )
+
+
+@pytest.mark.parametrize("change", ["missing", "receipt", "policy", "binding", "runtime"])
+def test_boot_recovery_refuses_drift_before_starting_admission(boot_recovery, monkeypatch, change):
+    """Missing or altered durable and boot authority cannot start the sandbox socket."""
+    record, arguments, _, _, units, policy, manager = boot_recovery
+    if change == "missing":
+        arguments[-1]["loop_uninstall.py"].path.unlink()
+    elif change == "receipt":
+        linux_management.installation_files.return_value = {**units, "receiver": arguments[6]}
+    elif change == "policy":
+        policy.side_effect = ValueError("changed policy")
+    elif change == "binding":
+        linux_management.recover_boot_generation(record, 50)
+        manager.reset_mock()
+        policy.return_value = (303, 404)
+    else:
+        monkeypatch.setattr(
+            linux_management, "protected_path", lambda path, **kwargs: path / "alias"
+        )
+    with pytest.raises(ValueError, match="incomplete|receipt|policy|bindings|aliases"):
+        linux_management.recover_boot_generation(record, 50)
+    assert not any(call.args[1][0] == "start" for call in manager.call_args_list)
 
 
 def test_saved_record_cannot_rebind_a_different_existing_file(installation):
@@ -229,6 +393,17 @@ def test_absent_record_refuses_remaining_authority(tmp_path, monkeypatch, case):
     "case",
     [
         "clean",
+        "implicit_slice",
+        "implicit_other_unit",
+        "wrong_unit_id",
+        "implicit_slice_active",
+        "implicit_slice_substate",
+        "implicit_slice_cgroup",
+        "implicit_slice_fragment",
+        "implicit_slice_dropins",
+        "implicit_slice_reload",
+        "implicit_slice_transient",
+        "implicit_slice_extra",
         "changed",
         "temporary",
         "linked",
@@ -274,7 +449,9 @@ def test_absent_record_refuses_remaining_authority(tmp_path, monkeypatch, case):
         "attachment_limit",
     ],
 )
-def test_unrecorded_stage_is_cleaned_from_reviewed_bytes(tmp_path, monkeypatch, case):
+def test_unrecorded_stage_is_cleaned_from_reviewed_bytes(
+    tmp_path, monkeypatch, logical_admission_sources, case
+):
     """A pre-record failure removes only exact reviewed stage files and its reservation."""
     from contextlib import nullcontext
 
@@ -297,6 +474,7 @@ def test_unrecorded_stage_is_cleaned_from_reviewed_bytes(tmp_path, monkeypatch, 
         "loop_receiver.py": b"receiver",
         "helper": b"helper",
         "loop_uninstall.py": b"uninstall",
+        "loop_boot.py": b"boot",
         "cache.lock": b"cache",
         "loop/execution/sandbox/linux/bootstrap.py": b"bootstrap",
     }
@@ -355,16 +533,49 @@ def test_unrecorded_stage_is_cleaned_from_reviewed_bytes(tmp_path, monkeypatch, 
         linux_management,
         "_retired_properties",
         lambda tool, name, fields, deadline: {
-            "LoadState": "loaded" if (units / name).exists() else "not-found",
+            "Id": "foreign.slice" if case == "wrong_unit_id" else name,
+            "LoadState": (
+                "loaded"
+                if (units / name.replace("@status.service", "@.service")).exists()
+                or case.startswith("implicit_slice")
+                and name.endswith(".slice")
+                or case == "implicit_other_unit"
+                and name.endswith(".socket")
+                else "not-found"
+            ),
             "ActiveState": "inactive",
             "SubState": "dead",
             "ControlGroup": "",
-            "FragmentPath": str(units / name) if (units / name).exists() else "",
+            "FragmentPath": (
+                str(units / name.replace("@status.service", "@.service"))
+                if (units / name.replace("@status.service", "@.service")).exists()
+                else ""
+            ),
             "DropInPaths": "",
             "NeedDaemonReload": "no",
             "Transient": "no",
         },
     )
+    if case.startswith("implicit_slice_"):
+        original_properties = linux_management._retired_properties
+        changes = {
+            "implicit_slice_active": {"ActiveState": "active"},
+            "implicit_slice_substate": {"SubState": "running"},
+            "implicit_slice_cgroup": {"ControlGroup": "/unexpected"},
+            "implicit_slice_fragment": {"FragmentPath": "/unexpected"},
+            "implicit_slice_dropins": {"DropInPaths": "/unexpected"},
+            "implicit_slice_reload": {"NeedDaemonReload": "yes"},
+            "implicit_slice_transient": {"Transient": "yes"},
+            "implicit_slice_extra": {"Unexpected": "value"},
+        }
+        monkeypatch.setattr(
+            linux_management,
+            "_retired_properties",
+            lambda tool, name, fields, deadline: {
+                **original_properties(tool, name, fields, deadline),
+                **(changes[case] if name.endswith(".slice") else {}),
+            },
+        )
     monkeypatch.setattr(linux_management, "verify_uninstalled", Mock())
     monkeypatch.setattr(
         linux_management,
@@ -375,14 +586,14 @@ def test_unrecorded_stage_is_cleaned_from_reviewed_bytes(tmp_path, monkeypatch, 
             else b"compiled"
         ),
     )
-    read_text = Path.read_text
+    read_bytes = Path.read_bytes
     monkeypatch.setattr(
         Path,
-        "read_text",
-        lambda path, *args, **kwargs: (
-            "1 0 0:1 / / rw - tmpfs tmpfs rw\n"
+        "read_bytes",
+        lambda path: (
+            b"1 0 0:1 / / rw - tmpfs tmpfs rw\n"
             if path == Path("/proc/self/mountinfo")
-            else read_text(path, *args, **kwargs)
+            else read_bytes(path)
         ),
     )
     if case == "changed":
@@ -561,11 +772,11 @@ def test_unrecorded_stage_is_cleaned_from_reviewed_bytes(tmp_path, monkeypatch, 
     elif case == "mount":
         monkeypatch.setattr(
             Path,
-            "read_text",
-            lambda path, *args, **kwargs: (
-                f"1 0 0:1 / {root} rw - tmpfs tmpfs rw\n"
+            "read_bytes",
+            lambda path: (
+                f"1 0 0:1 / {mountinfo_path(root)} rw - tmpfs tmpfs rw\n".encode()
                 if path == Path("/proc/self/mountinfo")
-                else read_text(path, *args, **kwargs)
+                else read_bytes(path)
             ),
         )
     elif case == "record_present":
@@ -698,6 +909,21 @@ def test_unrecorded_stage_is_cleaned_from_reviewed_bytes(tmp_path, monkeypatch, 
         20,
     )
     refusals = {
+        "implicit_other_unit": "unit remains active",
+        "wrong_unit_id": "unit remains active",
+        **{
+            name: "unit remains active"
+            for name in (
+                "implicit_slice_active",
+                "implicit_slice_substate",
+                "implicit_slice_cgroup",
+                "implicit_slice_fragment",
+                "implicit_slice_dropins",
+                "implicit_slice_reload",
+                "implicit_slice_transient",
+                "implicit_slice_extra",
+            )
+        },
         "changed": "differs from reviewed package",
         "bad_temporary": "differs from reviewed staging",
         "bad_receipt": "receipt differs",
@@ -1369,7 +1595,7 @@ def test_management_private_inventory_bound_refuses_before_retirement(installati
 
 
 @pytest.fixture
-def composition(installation, monkeypatch):
+def composition(installation, monkeypatch, tmp_path):
     """Bind realistic installer inputs and isolate each native lifecycle owner at its public API."""
     record, arguments = installation
     config, files, lock, compiler, namespace, policies, helper, compiled, source, original = (
@@ -1380,7 +1606,13 @@ def composition(installation, monkeypatch):
         for name, bound in original.items()
         if name not in {"attachment.bin", "attachment.apparmor", "bootstrap.bin"}
     }
-    contents.update({"cache.lock": b"cache", "loop/execution/sandbox/linux/bootstrap.py": b"code"})
+    contents.update(
+        {
+            "cache.lock": b"cache",
+            "loop_boot.py": b"boot",
+            "loop/execution/sandbox/linux/bootstrap.py": b"code",
+        }
+    )
     executables = {"helper", "receiver", "loop_uninstall.py"}
     calls = []
 
@@ -1411,6 +1643,18 @@ def composition(installation, monkeypatch):
         return result
 
     monkeypatch.setattr(linux_management, "drained_generation", Mock(return_value=nullcontext()))
+    boot_units = tmp_path / "boot-units"
+    boot_units.mkdir()
+    (boot_units / "multi-user.target.wants").mkdir()
+    tool = tmp_path / "systemctl"
+    tool.write_bytes(b"tool")
+    tool.chmod(0o555)
+    monkeypatch.setattr(linux_management, "_BOOT_UNIT_DIRECTORY", boot_units)
+    monkeypatch.setattr(linux_management, "SYSTEMCTL_PATH", tool)
+    monkeypatch.setattr(linux_management, "_administration", lambda _: nullcontext())
+    monkeypatch.setattr(linux_management, "protected_path", lambda path, **_: path)
+    monkeypatch.setattr(linux_management, "_manager", Mock())
+    monkeypatch.setattr(linux_management.time, "monotonic", lambda: 10)
     stage_mock = collaborator("stage_generation_files", stage)
     collaborator("load_generation_policy", (namespace, policies, compiled))
     collaborator("provision_generation_units", {**files, "slice_unit": config.slice_unit})
@@ -1471,6 +1715,191 @@ def test_composed_installation_persists_authority_before_activation(composition)
     assert activation.call_args.args[-1] == inputs[-1]
     assert inputs[3] == contents
     assert inputs[4] == executables
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_installation_enables_exact_boot_service(composition, existing):
+    """Install creates or exactly reuses the fixed persistent boot activation."""
+    inputs, _, authority, *_ = composition
+    if existing:
+        assert linux_management.install_generation(*inputs) == authority
+    else:
+        (linux_management._BOOT_UNIT_DIRECTORY / "multi-user.target.wants").rmdir()
+    assert linux_management.install_generation(*inputs) == authority
+    unit = linux_management._BOOT_UNIT_DIRECTORY / "loop-native-boot.service"
+    link = unit.parent / "multi-user.target.wants" / unit.name
+    assert unit.is_file() and unit.stat().st_mode & 0o777 == 0o444
+    assert link.is_symlink() and os.readlink(link) == "../" + unit.name
+    assert str(inputs[0].receiver.parent / "loop_boot.py") in unit.read_text()
+
+
+@pytest.mark.parametrize(
+    "output,expected",
+    [
+        ("ActiveState=activating\nJob=\n", "activating"),
+        ("ActiveState=inactive\nJob=17\n", "activating"),
+        ("ActiveState=active\nJob=\n", "active"),
+        ("ActiveState=failed\nJob=\n", "failed"),
+    ],
+)
+def test_boot_state_authenticates_unit_and_manager(composition, output, expected):
+    """Only the fixed protected unit and an unambiguous systemd state drive boot waiting."""
+    inputs, *_ = composition
+    linux_management.install_generation(*inputs)
+    linux_management._manager.return_value = output
+    assert linux_management.boot_activation_state(inputs[0].receiver.parent, 50) == expected
+
+
+@pytest.mark.parametrize("change", ["unit", "duplicate", "malformed", "missing", "unknown"])
+def test_boot_state_refuses_untrusted_or_ambiguous_input(composition, change):
+    """A changed boot unit or ambiguous manager response cannot authorize a wait."""
+    inputs, *_ = composition
+    linux_management.install_generation(*inputs)
+    unit = linux_management._BOOT_UNIT_DIRECTORY / "loop-native-boot.service"
+    if change == "unit":
+        unit.chmod(0o644)
+    outputs = {
+        "duplicate": "ActiveState=active\nActiveState=active\nJob=\n",
+        "malformed": "bad-line\n",
+        "missing": "ActiveState=active\n",
+        "unknown": "ActiveState=other\nJob=\n",
+    }
+    linux_management._manager.return_value = outputs.get(change, "ActiveState=active\nJob=\n")
+    with pytest.raises(ValueError, match="Boot|boot"):
+        linux_management.boot_activation_state(inputs[0].receiver.parent, 50)
+
+
+@pytest.mark.parametrize("change", ["unit", "link", "entry", "directory", "wants"])
+def test_installation_refuses_unsafe_boot_activation(composition, monkeypatch, change):
+    """Conflicting boot files or ancestry stop installation without opening new authority."""
+    inputs, _, _, *_ = composition
+    root = linux_management._BOOT_UNIT_DIRECTORY
+    unit = root / "loop-native-boot.service"
+    link = root / "multi-user.target.wants" / unit.name
+    if change == "unit":
+        unit.write_text("foreign")
+        unit.chmod(0o444)
+    elif change == "link":
+        link.symlink_to("../foreign.service")
+    elif change == "entry":
+        real_bind = linux_management.bind_host_file
+        monkeypatch.setattr(
+            linux_management,
+            "bind_host_file",
+            lambda path, **kwargs: (
+                real_bind(inputs[0].receiver, **kwargs)
+                if path.name == "loop_boot.py"
+                else real_bind(path, **kwargs)
+            ),
+        )
+    else:
+        selected = root if change == "directory" else root / "multi-user.target.wants"
+        monkeypatch.setattr(
+            linux_management,
+            "protected_path",
+            lambda path, **kwargs: path / "other" if path == selected else path,
+        )
+    with pytest.raises(ValueError, match="boot|Boot"):
+        linux_management.install_generation(*inputs)
+
+
+def test_boot_state_rejects_unsafe_boot_entry_path(composition):
+    """A boot entry path that cannot be represented safely in systemd is rejected."""
+    inputs, *_ = composition
+    linux_management.install_generation(*inputs)
+    with pytest.raises(ValueError, match="Invalid installed boot entry directory"):
+        linux_management.boot_activation_state(Path("/unsafe;path"), 50)
+
+
+@pytest.mark.parametrize("directory", [Path("/safe path"), Path("/safe-path")])
+def test_boot_state_accepts_safe_entry_path(composition, directory):
+    """A space in a boot entry is represented as one quoted systemd argument."""
+    inputs, *_ = composition
+    linux_management.install_generation(*inputs)
+    unit = linux_management._BOOT_UNIT_DIRECTORY / "loop-native-boot.service"
+    original = str(inputs[0].receiver.parent / "loop_boot.py")
+    original_argument = f'"{original}"' if " " in original else original
+    alternate = str(directory / "loop_boot.py")
+    alternate_argument = f'"{alternate}"' if " " in alternate else alternate
+    source = unit.read_text().replace(original_argument, alternate_argument)
+    unit.chmod(0o644)
+    unit.write_text(source)
+    unit.chmod(0o444)
+    linux_management._manager.return_value = "ActiveState=active\nJob=\n"
+    assert linux_management.boot_activation_state(directory, 50) == "active"
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        None,
+        "marker",
+        "missing_unit",
+        "missing_link",
+        "missing_both",
+        "bad_unit",
+        "bad_link",
+        "bad_wants",
+        "bad_directory",
+    ],
+)
+def test_uninstall_retires_boot_activation(composition, monkeypatch, tmp_path, change):
+    """Uninstall removes only authenticated boot state and preserves conflicting host files."""
+    from types import SimpleNamespace
+
+    inputs, _, authority, *_ = composition
+    linux_management.install_generation(*inputs)
+    config, lock = inputs[0], inputs[1]
+    root = linux_management._BOOT_UNIT_DIRECTORY
+    unit = root / "loop-native-boot.service"
+    link = root / "multi-user.target.wants" / unit.name
+    runtime = tmp_path / "run"
+    runtime.mkdir()
+    monkeypatch.setattr(linux_management, "SYSTEM_RUNTIME_DIRECTORY", runtime)
+    marker = runtime / f"loopgen_{config.generation}.boot"
+    if change == "marker":
+        marker.write_text("recorded boot")
+        marker.chmod(0o444)
+    elif change == "missing_unit":
+        unit.unlink()
+    elif change == "missing_link":
+        link.unlink()
+    elif change == "missing_both":
+        unit.unlink()
+        link.unlink()
+    elif change == "bad_unit":
+        unit.chmod(0o644)
+        unit.write_text("foreign")
+        unit.chmod(0o444)
+    elif change == "bad_link":
+        link.unlink()
+        link.symlink_to("../foreign.service")
+    elif change in {"bad_wants", "bad_directory"}:
+        selected = link.parent if change == "bad_wants" else root
+        monkeypatch.setattr(
+            linux_management,
+            "protected_path",
+            lambda path, **kwargs: path / "other" if path == selected else path,
+        )
+    installed = SimpleNamespace(config=config, lock=lock, retire=Mock())
+    monkeypatch.setattr(
+        linux_management, "read_generation", Mock(return_value=(installed, authority))
+    )
+    if change in {"bad_unit", "bad_link", "bad_wants", "bad_directory"}:
+        with pytest.raises(ValueError, match="Boot"):
+            linux_management.uninstall_generation(authority.path, 50)
+    else:
+        linux_management.uninstall_generation(authority.path, 50)
+        assert not unit.exists() and not link.is_symlink() and not marker.exists()
+    installed.retire.assert_called_once_with(authority, 50)
+
+
+def test_uninstalled_check_rejects_remaining_boot_activation(composition, tmp_path):
+    """An enabled persistent boot service prevents reporting a completed uninstall."""
+    inputs, *_ = composition
+    linux_management.install_generation(*inputs)
+    with pytest.raises(ValueError, match="boot activation remains installed"):
+        linux_management.verify_uninstalled(tmp_path / "absent", 50)
 
 
 @pytest.mark.parametrize("change", ["missing", "executable", "reserved"])

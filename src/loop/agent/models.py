@@ -52,3 +52,17 @@ class ToolCallCancelled(asyncio.CancelledError):
     def __init__(self, metrics: ToolExecutionMetrics) -> None:
         super().__init__()
         self.metrics = metrics
+
+
+class ToolCallInterrupted(KeyboardInterrupt):
+    """Carry a durably published tool completion through synchronous interruption.
+
+    Args:
+        metrics (ToolExecutionMetrics): Metrics for the completed interrupted invocation.
+    """
+
+    metrics: ToolExecutionMetrics
+
+    def __init__(self, metrics: ToolExecutionMetrics) -> None:
+        super().__init__()
+        self.metrics = metrics

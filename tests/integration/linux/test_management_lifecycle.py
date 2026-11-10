@@ -285,6 +285,70 @@ else:
     print("LIVE_DETACHED_CHILD_REMOVAL_AND_CONCURRENT_ADMISSION_REFUSAL=PASS", flush=True)
 
 
+def idle_tracking_recovery_fixture(interaction, generation):
+    """Recover an authenticated idle slice without withdrawing policy or its installation."""
+    from loop.execution.sandbox.linux.host import bind_host_file
+    from loop.execution.sandbox.linux.management import uninstall_authority
+
+    authority, _ = uninstall_authority(ROOT / "management.json")
+    source = r"""import hashlib,os,stat,subprocess,sys,time
+from pathlib import Path
+root=Path('/usr/local/libexec/loop/native')
+if os.getuid()!=0 or Path('/proc/self/uid_map').read_text().split()!=['0','0','4294967295']: raise PermissionError('initial root required')
+for path in (root,*root.parents):
+ d=path.lstat()
+ if not stat.S_ISDIR(d.st_mode) or d.st_uid!=0 or d.st_mode&0o6022: raise ValueError('protected ancestry differs')
+record=root/'management.json'
+if hashlib.sha256(record.read_bytes()).hexdigest()!=sys.argv[1]: raise ValueError('reviewed authority changed')
+sys.path.insert(0,str(root))
+from loop.execution.sandbox.linux.records import read_generation
+from loop.execution.sandbox.linux.installation import drained_generation
+from loop.execution.sandbox.linux.management import recover_boot_generation
+installed,authority=read_generation(record)
+if installed.config.generation!=sys.argv[2]: raise ValueError('reviewed generation changed')
+group=Path('/sys/fs/cgroup')/installed.config.slice_unit.path.name
+def stop_idle_tracking():
+ with authority.open_verified(),drained_generation(installed.config,installed.files,installed.lock,time.monotonic()+5):
+  subprocess.run(['/usr/bin/systemctl','--system','--no-pager','stop','--',installed.config.slice_unit.path.name],check=True,timeout=5)
+ if group.exists() or group.is_symlink(): raise ValueError('idle tracking remains')
+stop_idle_tracking()
+with authority.open_verified(),drained_generation(installed.config,installed.files,installed.lock,time.monotonic()+5):
+ if (group/'cgroup.events').read_text().splitlines().count('populated 0')!=1: raise ValueError('recovered tracking is not idle')
+stop_idle_tracking()
+recover_boot_generation(record,time.monotonic()+5)
+if subprocess.run(['/usr/bin/systemctl','is-active','--quiet',installed.files['socket_unit'].path.name],check=False).returncode: raise ValueError('boot admission was not restored')
+print('AUTHENTICATED_IDLE_TRACKING_AND_BOOT_RECOVERY=PASS')
+"""
+    sudo = bind_host_file(Path("/usr/bin/sudo"), system_elevation=True)
+    python = bind_host_file(Path("/usr/bin/python3"))
+    interaction.info(
+        "Qualification closes and drains this installation, stops its idle slice, and restores "
+        "tracking and admission without removing policy or other native authority."
+    )
+    require(
+        interaction.confirm("Run this exact administrator tracking fixture?", default=False)
+        is True,
+        "tracking fixture declined",
+    )
+    with authority.open_verified(), sudo.open_verified(), python.open_verified():
+        subprocess.run(
+            [
+                str(sudo.path),
+                "--",
+                str(python.path),
+                "-I",
+                "-S",
+                "-B",
+                "-c",
+                source,
+                authority.digest,
+                generation,
+            ],
+            check=True,
+            timeout=30,
+        )
+
+
 def partial_removal_fixture(interaction, generation):
     """Simulate lost ephemeral authority only after authenticated idle drain, preserving file bindings."""
     from loop.execution.sandbox.linux.host import bind_host_file
@@ -353,6 +417,69 @@ print('AUTHENTICATED_IDLE_PARTIAL_REMOVAL_WITH_ORIGINAL_HELPER=PASS')
         (ROOT / "helper").stat().st_mode & 0o777 == 0o555,
         "partial fixture changed original helper mode",
     )
+
+
+def externally_cleaned_policy_fixture(interaction, generation):
+    """Remove only the idle generation's profiles while retaining its original namespace."""
+    from loop.execution.sandbox.linux.host import bind_host_file
+    from loop.execution.sandbox.linux.management import uninstall_authority
+
+    authority, _ = uninstall_authority(ROOT / "management.json")
+    source = r"""import hashlib,os,stat,sys,time
+from pathlib import Path
+root=Path('/usr/local/libexec/loop/native')
+if os.getuid()!=0 or Path('/proc/self/uid_map').read_text().split()!=['0','0','4294967295']: raise PermissionError('initial root required')
+for path in (root,*root.parents):
+ d=path.lstat()
+ if not stat.S_ISDIR(d.st_mode) or d.st_uid!=0 or d.st_mode&0o6022: raise ValueError('protected ancestry differs')
+record=root/'management.json'
+if hashlib.sha256(record.read_bytes()).hexdigest()!=sys.argv[1]: raise ValueError('reviewed authority changed')
+sys.path.insert(0,str(root))
+from loop.execution.sandbox.linux.records import read_generation
+from loop.execution.sandbox.linux.installation import drained_generation,generation_policy_cache
+installed,authority=read_generation(record)
+if installed.config.generation!=sys.argv[2]: raise ValueError('reviewed generation changed')
+namespace=Path('/sys/kernel/security/apparmor/policy/namespaces')/installed.config.generation
+with drained_generation(installed.config,installed.files,installed.lock,time.monotonic()+5):
+ with authority.open_verified():
+  policies=generation_policy_cache(installed.config,installed.namespace,installed.policies,installed.helper,installed.compiled)
+  if set(policies)!={''}: raise ValueError('unexpected child namespace')
+  for name in policies['']:
+   data=name.encode('ascii')
+   with (namespace/'.remove').open('wb',buffering=0) as output:
+    if output.write(data)!=len(data): raise OSError('incomplete profile removal')
+  data=('loopgen_'+installed.config.generation).encode()+b'\0'
+  with Path('/sys/kernel/security/apparmor/.remove').open('wb',buffering=0) as output:
+   if output.write(data)!=len(data): raise OSError('incomplete attachment removal')
+  if any((namespace/'profiles').iterdir()) or any((namespace/'namespaces').iterdir()): raise ValueError('namespace is not empty')
+print('AUTHENTICATED_IDLE_EXTERNAL_POLICY_CLEANUP=PASS')
+"""
+    sudo = bind_host_file(Path("/usr/bin/sudo"), system_elevation=True)
+    python = bind_host_file(Path("/usr/bin/python3"))
+    interaction.info(
+        "Qualification-only removal of the idle installation's exact profiles and attachment, leaving its original namespace and files for checked recovery."
+    )
+    require(
+        interaction.confirm("Run this exact administrator policy fixture?", default=False) is True,
+        "external policy fixture declined",
+    )
+    with authority.open_verified(), sudo.open_verified(), python.open_verified():
+        subprocess.run(
+            [
+                str(sudo.path),
+                "--",
+                str(python.path),
+                "-I",
+                "-S",
+                "-B",
+                "-c",
+                source,
+                authority.digest,
+                generation,
+            ],
+            check=True,
+            timeout=30,
+        )
 
 
 def main():
@@ -490,6 +617,8 @@ def main():
         )
     generations = [first]
     public_probe(incoming / "workspace")
+    idle_tracking_recovery_fixture(interaction, first)
+    public_probe(incoming / "workspace")
     live_removal_refusal(app, interaction, incoming / "workspace", first)
     print("PRODUCTION_INSTALLED_APP_PUBLIC_NATIVE_COMMAND=PASS", flush=True)
     app.command_manager.handle_user_command("/sandbox refresh")
@@ -499,7 +628,15 @@ def main():
     absent([first])
     public_probe(incoming / "workspace")
     print("PRODUCTION_INSTALLED_APP_CHECKED_SAME_LOCATION_REFRESH=PASS", flush=True)
-    partial_removal_fixture(interaction, second)
+    externally_cleaned_policy_fixture(interaction, second)
+    app.command_manager.handle_user_command("/sandbox install")
+    recovered = json.loads((ROOT / "management.json").read_bytes())["config"]["generation"]
+    require(recovered not in generations, "external cleanup recovery reused a generation")
+    generations.append(recovered)
+    absent([second])
+    public_probe(incoming / "workspace")
+    print("PRODUCTION_INSTALLED_APP_EXTERNAL_POLICY_CLEANUP_RECOVERY=PASS", flush=True)
+    partial_removal_fixture(interaction, recovered)
     app.command_manager.handle_user_command("/sandbox uninstall")
     absent(generations)
     require(
@@ -623,6 +760,15 @@ def test_installed_app_management_requires_real_consent_and_authentication(tmp_p
         pytest.fail("LOOP_NATIVE_MANAGEMENT_WHEEL must identify the reviewed application wheel")
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         pytest.fail("Run this opt-in lifecycle test with pytest -s from a real terminal")
+    pip = subprocess.run(
+        [sys.executable, "-I", "-m", "pip", "--version"],
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if pip.returncode:
+        pytest.fail("The isolated wheel-installed test interpreter must have pip available")
     output = tmp_path / "management-output"
     output.mkdir()
     environment = {

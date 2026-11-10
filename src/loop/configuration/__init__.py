@@ -1,6 +1,7 @@
 """Configuration package."""
 
 __all__ = [
+    "AppSettings",
     "ApplicationSettings",
     "BackendSettings",
     "ConfigurationCommands",
@@ -8,7 +9,6 @@ __all__ = [
     "ConfigurationManager",
     "ConversationSettings",
     "LoggingSettings",
-    "LoopSettings",
     "TelemetrySettings",
     "ToolSettings",
     "WebSettings",
@@ -18,11 +18,11 @@ from .commands import ConfigurationCommands
 from .manager import ConfigurationManager
 from .models import (
     ApplicationSettings,
+    AppSettings,
     BackendSettings,
     ConfigurationEntry,
     ConversationSettings,
     LoggingSettings,
-    LoopSettings,
     TelemetrySettings,
     ToolSettings,
     WebSettings,

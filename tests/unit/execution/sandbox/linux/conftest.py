@@ -1,17 +1,52 @@
 """Provide shared protected-record fixtures for Linux sandbox unit suites."""
 
 import hashlib
+from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
 from loop.execution.sandbox.linux import host as linux_host
 from loop.execution.sandbox.linux import management as linux_management
+from loop.execution.sandbox.linux import namespace as linux_namespace
 from loop.execution.sandbox.linux import records as linux_records
 from loop.execution.sandbox.linux.admission import GenerationAdmission
 
+from ..helpers import logical_private_name
+
 
 @pytest.fixture
-def installation(tmp_path, monkeypatch):
+def logical_alias_private_names(monkeypatch, tmp_path):
+    """Apply private-name rules to synthetic aliases independently of scratch ancestry."""
+    monkeypatch.setattr(
+        linux_namespace,
+        "is_protected_external_read",
+        lambda path: logical_private_name(path, tmp_path),
+    )
+
+
+@pytest.fixture
+def logical_admission_sources(monkeypatch, tmp_path):
+    """Render owned fixture receivers under an ordinary synthetic installation identity."""
+    case_root = tmp_path.parent
+    original = GenerationAdmission.unit_sources
+
+    def logical(path):
+        """Translate only the physical case prefix into a fixed logical namespace."""
+        if path.is_relative_to(case_root):
+            return Path("/unit-installation") / path.relative_to(case_root)
+        return path
+
+    def render(config):
+        """Map only the owned case prefix before exercising real fixed-unit validation."""
+        return original(replace(config, receiver=logical(config.receiver)))
+
+    monkeypatch.setattr(GenerationAdmission, "unit_sources", render)
+    return logical
+
+
+@pytest.fixture
+def installation(tmp_path, monkeypatch, logical_admission_sources):
     """Prepare immutable generation artifacts with isolated host ownership checks."""
 
     def bind(path, **_kwargs):

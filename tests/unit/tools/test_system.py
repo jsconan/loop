@@ -2,38 +2,85 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import platform
 import sqlite3
 import tempfile
 from contextlib import closing
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from loop import BUILTIN_TOOLS, PermissionManager, ToolContext, ToolRegistry
-from loop.constants import MAX_OUTPUT_CHARS
+from loop import BUILTIN_TOOLS, PermissionManager, ToolContext, ToolRegistration, ToolRegistry
+from loop.constants import MAX_OUTPUT_CHARS, MAX_TOOL_RESULT_BYTES
 from loop.execution import CommandExecutionService
 from loop.execution.coordinator import HostCommandRequest, LocalHostCommandExecutor
-from loop.execution.sandbox import CommandProcessResult, SandboxOutcome, UnavailableSandboxBackend
+from loop.execution.sandbox import (
+    CommandProcessResult,
+    SandboxCapability,
+    SandboxOutcome,
+    UnavailableSandboxBackend,
+)
+from loop.execution.sandbox.constants import (
+    HOME_ENVIRONMENT_VARIABLE,
+    LANG_ENVIRONMENT_VARIABLE,
+    PATH_ENVIRONMENT_VARIABLE,
+    TEMP_ENVIRONMENT_VARIABLE,
+    TMP_ENVIRONMENT_VARIABLE,
+    TMPDIR_ENVIRONMENT_VARIABLE,
+    WORKSPACE_ROOT_ENVIRONMENT_VARIABLE,
+    XDG_CACHE_HOME_ENVIRONMENT_VARIABLE,
+)
 from loop.execution.sandbox.linux import backend as linux
-from loop.execution.sandbox.macos import MacOSSeatbeltBackend
+from loop.execution.sandbox.macos import backend as macos_backend
+from loop.execution.sandbox.macos.backend import MacOSSeatbeltBackend
 from loop.instructions import InstructionsManager, RuntimeEnvironment
 from loop.permissions import (
+    Action,
     CommandFinding,
     CommandInspection,
     CommandReviewStatus,
+    Decision,
+    FileTarget,
     Operation,
+    PermissionRule,
+    PolicyScope,
     ProcessBoundary,
     ProcessTarget,
 )
+from loop.tooling import get_tool_arguments_model
+from loop.tools.system import _command_plan
+from loop.tools.system import cancel_command_job as cancel_command_job_tool
+from loop.tools.system import control_command_terminal as control_command_terminal_tool
+from loop.tools.system import inspect_command_jobs as inspect_command_jobs_tool
+from loop.tools.system import read_command_job as read_command_job_tool
+from loop.tools.system import request_host_command as request_host_command_tool
 from loop.tools.system import resolve_executable as resolve_executable_tool
 from loop.tools.system import run_command as run_command_tool
 from loop.utils import VirtualPath
 
+from ..execution.sandbox.helpers import logical_private_name
+
+
+@pytest.fixture(autouse=True)
+def logical_policy_names(monkeypatch, tmp_path):
+    """Keep fixture storage ancestry separate from protected policy components."""
+
+    def logical(path):
+        """Preserve protected components inside this case's logical roots."""
+        return logical_private_name(path, tmp_path.parent)
+
+    monkeypatch.setattr("loop.execution.facade.is_protected_external_read", logical)
+    monkeypatch.setattr("loop.execution.sandbox.linux.paths.is_protected_external_read", logical)
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.is_protected_external_read", logical)
+
 
 class ApprovingInteraction:
     """Approve every explicit one-off native command prompt."""
+
+    supports_fresh_host_approval = True
 
     def info(self, message):
         """Accept informational output."""
@@ -144,12 +191,434 @@ def call(registry, command, cwd=".", interaction=None, instructions_manager=None
     return payload.get("result"), payload.get("problem")
 
 
+@pytest.mark.parametrize(
+    ("tool", "arguments"),
+    [
+        (inspect_command_jobs_tool, ()),
+        (read_command_job_tool, ("a" * 32,)),
+        (cancel_command_job_tool, ("a" * 32,)),
+    ],
+)
+def test_command_job_tools_require_the_execution_service(tool, arguments):
+    """Continuation tools fail safely when native command execution is unavailable."""
+    result = tool(ToolContext(None, tool.__name__), *arguments)
+    assert result.code == "command_job.unavailable"
+
+
+def test_command_job_tools_delegate_to_current_execution_service():
+    """Continuation calls forward exact handle, cursor, and wait to the bound owner."""
+    service = MagicMock()
+    service.inspect_command_jobs.return_value = {"jobs": []}
+    service.read_command_job.return_value = {"events": []}
+    service.cancel_command_job.return_value = {"cancel_requested": True}
+    context = ToolContext(None, "inspect_command_jobs", execution_service=service)
+    assert inspect_command_jobs_tool(context) == {"jobs": []}
+    assert read_command_job_tool(context, "a" * 32, 3, 2) == {"events": []}
+    assert cancel_command_job_tool(context, "a" * 32) == {"cancel_requested": True}
+    service.read_command_job.assert_called_once_with(context, "a" * 32, 3, 2, False)
+    service.cancel_command_job.assert_called_once_with(context, "a" * 32)
+
+
+def test_terminal_control_tool_requires_and_uses_the_bound_execution_service():
+    """Only the bound execution service receives exact transient terminal controls."""
+    missing = control_command_terminal_tool(
+        ToolContext(None, "control_command_terminal"), "a" * 32, "eof"
+    )
+    assert missing.code == "command_terminal.unavailable"
+    service = MagicMock()
+    service.control_command_terminal.return_value = {"terminal": True}
+    context = ToolContext(None, "control_command_terminal", execution_service=service)
+    assert control_command_terminal_tool(context, "a" * 32, "write", "text") == {"terminal": True}
+    service.control_command_terminal.assert_called_once_with(
+        context, "a" * 32, "write", "text", None, None
+    )
+
+
+@pytest.mark.parametrize("action", ["write", "eof", "resize"])
+@pytest.mark.parametrize("spelling", ["None", "nOnE", "null", "NULL"])
+def test_terminal_controls_preserve_literal_input_and_accept_unused_nulls(action, spelling):
+    """The write action sends literal text while unused controls become absent."""
+    service = MagicMock()
+    service.control_command_terminal.return_value = {"terminal": True}
+    registry = ToolRegistry([control_command_terminal_tool], execution_service=service)
+    arguments = {
+        "handle": "a" * 32,
+        "action": action,
+        "content": spelling,
+        "rows": 24 if action == "resize" else spelling,
+        "columns": 80 if action == "resize" else spelling,
+    }
+    result = json.loads(registry.call("control_command_terminal", json.dumps(arguments)))
+    assert result["ok"]
+    context, handle, selected, content, rows, columns = (
+        service.control_command_terminal.call_args.args
+    )
+    assert isinstance(context, ToolContext)
+    assert (handle, selected) == ("a" * 32, action)
+    assert content == (spelling if action == "write" else None)
+    assert (rows, columns) == ((24, 80) if action == "resize" else (None, None))
+
+
 def lookup(registry, name, cwd=None, **context):
     """Dispatch one named host executable lookup through the public registry."""
     arguments = {"name": name}
     if cwd is not None:
         arguments["cwd"] = cwd
     return json.loads(registry.call("resolve_executable", json.dumps(arguments), **context))
+
+
+def test_explicit_host_tool_requires_fresh_approval_for_each_run(tmp_path):
+    """The host tool uses ordinary policy and asks again even after an approved host run."""
+    backend = MagicMock()
+    host = MagicMock()
+    host.run_host_command.return_value = CommandProcessResult(
+        SandboxOutcome.COMPLETED, exit_code=0, stdout="host-output"
+    )
+    permissions = PermissionManager(tmp_path)
+    permissions.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    permissions.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW, scope=PolicyScope.SESSION)
+    registry = ToolRegistry(
+        BUILTIN_TOOLS,
+        permission_manager=permissions,
+        execution_service=CommandExecutionService(backend, host),
+    )
+    interaction = MagicMock()
+    interaction.prompt.return_value = "approve"
+    interaction.supports_fresh_host_approval = True
+    payload = json.dumps({"command": "printf host", "cwd": str(tmp_path), "reason": "Need host"})
+
+    first = json.loads(registry.call("request_host_command", payload, interaction=interaction))
+    second = json.loads(registry.call("request_host_command", payload, interaction=interaction))
+
+    assert first["result"]["boundary"] == "host"
+    assert first["result"]["stdout"]["content"] == "host-output"
+    assert second["result"]["exit_code"] == 0
+    assert interaction.prompt.call_count == 2
+    assert host.run_host_command.call_count == 2
+    backend.run.assert_not_called()
+
+
+def test_explicit_host_tool_uses_one_prompt_for_process_ask(tmp_path):
+    """The host prompt alone decides an explicit request under generic process ask."""
+    host = MagicMock()
+    host.run_host_command.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
+    permissions = PermissionManager(tmp_path)
+    permissions.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    registry = ToolRegistry(
+        BUILTIN_TOOLS,
+        permission_manager=permissions,
+        execution_service=CommandExecutionService(MagicMock(), host),
+    )
+    interaction = MagicMock()
+    interaction.supports_fresh_host_approval = True
+    interaction.prompt.return_value = "approve"
+    payload = json.dumps({"command": "printf host", "cwd": str(tmp_path), "reason": "Needed"})
+
+    result = json.loads(registry.call("request_host_command", payload, interaction=interaction))
+
+    assert result["ok"]
+    interaction.prompt.assert_called_once()
+    assert "without the OS sandbox" in interaction.prompt.call_args.args[0]
+    host.run_host_command.assert_called_once()
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_explicit_host_tool_enables_session_gate_and_approves_in_one_call(tmp_path, asynchronous):
+    """A gate-only block can be cleared and the exact host request approved in one call."""
+    host = MagicMock()
+    host.run_host_command.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
+    permissions = PermissionManager(tmp_path)
+    registry = ToolRegistry(
+        BUILTIN_TOOLS,
+        permission_manager=permissions,
+        execution_service=CommandExecutionService(MagicMock(), host),
+    )
+    interaction = MagicMock()
+    interaction.supports_fresh_host_approval = True
+    interaction.prompt.side_effect = ["enable", "approve"] if not asynchronous else ["approve"]
+    interaction.prompt_async = AsyncMock(side_effect=["enable", "approve"])
+    payload = json.dumps({"command": "printf host", "cwd": str(tmp_path), "reason": "Needed"})
+
+    raw = (
+        asyncio.run(registry.call_async("request_host_command", payload, interaction=interaction))
+        if asynchronous
+        else registry.call("request_host_command", payload, interaction=interaction)
+    )
+
+    assert json.loads(raw)["ok"], raw
+    assert permissions.effective_configuration.limits.allow_host_processes
+    assert interaction.prompt.call_count == (0 if asynchronous else 2)
+    assert interaction.prompt_async.await_count == (2 if asynchronous else 0)
+    gate_prompt = (
+        interaction.prompt_async.await_args_list[0]
+        if asynchronous
+        else interaction.prompt.call_args_list[0]
+    )
+    assert gate_prompt.kwargs["choices"] == {
+        "deny": "Deny",
+        "enable": "Enable for this session",
+    }
+    assert gate_prompt.kwargs["index"] == {"deny": "N", "enable": "Y"}
+    host.run_host_command.assert_called_once()
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("change", ["before", "after"])
+def test_explicit_host_gate_rechecks_policy_during_enablement(
+    tmp_path, monkeypatch, asynchronous, change
+):
+    """A host deny introduced during eligibility review prevents execution."""
+    host = MagicMock()
+    permissions = PermissionManager(tmp_path)
+    registry = ToolRegistry(
+        BUILTIN_TOOLS,
+        permission_manager=permissions,
+        execution_service=CommandExecutionService(MagicMock(), host),
+    )
+    interaction = MagicMock()
+    interaction.supports_fresh_host_approval = True
+    interaction.prompt.return_value = "enable"
+    interaction.prompt_async = AsyncMock(return_value="enable")
+    original = permissions.enable_host_gate_if_current
+
+    def changed(operations, revision):
+        """Change the policy immediately before or after gate enablement."""
+        if change == "before":
+            permissions.set_default(
+                Action.PROCESS_EXECUTE, Decision.DENY, scope=PolicyScope.SESSION
+            )
+        enabled = original(operations, revision)
+        if change == "after":
+            permissions.set_default(
+                Action.PROCESS_EXECUTE, Decision.DENY, scope=PolicyScope.SESSION
+            )
+        return enabled
+
+    monkeypatch.setattr(permissions, "enable_host_gate_if_current", changed)
+    payload = json.dumps({"command": "printf host", "cwd": str(tmp_path), "reason": "Needed"})
+
+    raw = (
+        asyncio.run(registry.call_async("request_host_command", payload, interaction=interaction))
+        if asynchronous
+        else registry.call("request_host_command", payload, interaction=interaction)
+    )
+
+    assert json.loads(raw)["problem"]["code"] == "tool.denied"
+    host.run_host_command.assert_not_called()
+
+
+def test_explicit_host_tool_trusted_grant_bypasses_file_tool_deny_only_when_eligible(tmp_path):
+    """An exact trusted host shell is independent of file-tool policy but obeys host denies."""
+    host = MagicMock()
+    host.run_host_command.return_value = CommandProcessResult(
+        SandboxOutcome.COMPLETED, exit_code=0, stdout="synthetic-secret"
+    )
+    permissions = PermissionManager(tmp_path)
+    permissions.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    permissions.add_rule(
+        PermissionRule(
+            decision=Decision.DENY, tool="read_text_file", action=Action.FILESYSTEM_READ
+        ),
+        scope=PolicyScope.SESSION,
+    )
+    permissions.trust_host_command("cat private")
+    registry = ToolRegistry(
+        BUILTIN_TOOLS,
+        permission_manager=permissions,
+        execution_service=CommandExecutionService(MagicMock(), host),
+    )
+    denied_file = Operation(
+        tool_id="read_text_file",
+        action=Action.FILESYSTEM_READ,
+        target=FileTarget(path=str(tmp_path / "private")),
+    )
+    assert permissions.evaluate((denied_file,)).decision is Decision.DENY
+    payload = json.dumps({"command": "cat private", "cwd": str(tmp_path), "reason": "Needed"})
+
+    result = json.loads(registry.call("request_host_command", payload))
+
+    assert result["result"]["stdout"]["content"] == "synthetic-secret"
+    assert "sandbox restrictions did not apply" in result["result"]["authority_notice"]
+    host.run_host_command.assert_called_once()
+    permissions.add_rule(
+        PermissionRule(
+            decision=Decision.DENY, tool="request_host_command", action=Action.PROCESS_EXECUTE
+        ),
+        scope=PolicyScope.SESSION,
+    )
+    blocked = json.loads(registry.call("request_host_command", payload))
+    assert blocked["problem"]["code"] == "tool.denied"
+    host.run_host_command.assert_called_once()
+
+
+def test_explicit_host_tool_without_service_fails_closed():
+    """The host tool cannot run when the execution service is unavailable."""
+    result = request_host_command_tool(ToolContext(None, "request_host_command"), "pwd", "Needed")
+    assert result.code == "host_command.unavailable"
+
+
+def test_renamed_host_tool_keeps_its_fresh_input_requirement(tmp_path):
+    """Renaming the host tool cannot bypass the early interactive-input gate."""
+    manager = PermissionManager(tmp_path)
+    manager.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    host = MagicMock()
+    registry = ToolRegistry(
+        [ToolRegistration(request_host_command_tool, name="renamed_host")],
+        permission_manager=manager,
+        execution_service=CommandExecutionService(MagicMock(), host),
+    )
+    interaction = MagicMock()
+    interaction.supports_fresh_host_approval = False
+    payload = json.dumps({"command": "pwd", "cwd": str(tmp_path), "reason": "Needed"})
+
+    result = json.loads(registry.call("renamed_host", payload, interaction=interaction))
+
+    assert result["problem"]["code"] == "host_command.denied"
+    interaction.prompt.assert_not_called()
+    host.run_host_command.assert_not_called()
+
+
+@pytest.mark.parametrize("mode", ["policy", "headless", "decline", "automatic"])
+def test_explicit_host_tool_refuses_unapproved_launch(tmp_path, mode):
+    """Host policy, absent or automatic input, and decline prevent any host launch."""
+    backend = MagicMock()
+    host = MagicMock()
+    permissions = PermissionManager(tmp_path)
+    if mode != "policy":
+        permissions.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+        if mode != "automatic":
+            permissions.set_default(
+                Action.PROCESS_EXECUTE, Decision.ALLOW, scope=PolicyScope.SESSION
+            )
+    registry = ToolRegistry(
+        BUILTIN_TOOLS,
+        permission_manager=permissions,
+        execution_service=CommandExecutionService(backend, host),
+    )
+    interaction = MagicMock() if mode != "headless" else None
+    if interaction is not None:
+        interaction.prompt.return_value = "deny"
+        interaction.supports_fresh_host_approval = mode != "automatic"
+    payload = json.dumps({"command": "printf host", "cwd": str(tmp_path), "reason": "Need host"})
+
+    result = json.loads(registry.call("request_host_command", payload, interaction=interaction))
+
+    assert not result["ok"]
+    if mode == "automatic":
+        interaction.prompt.assert_not_called()
+        assert not permissions.persistent_rules
+    host.run_host_command.assert_not_called()
+    backend.run.assert_not_called()
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_explicit_host_gate_denial_is_durably_audited(tmp_path, asynchronous):
+    """A rejected host request leaves a minimized decision even before an offer exists."""
+    audit_path = tmp_path / "audit.sqlite"
+    permissions = PermissionManager(tmp_path, audit_path=audit_path, workspace_id="workspace")
+    host = MagicMock()
+    registry = ToolRegistry(
+        BUILTIN_TOOLS,
+        permission_manager=permissions,
+        execution_service=CommandExecutionService(MagicMock(), host),
+    )
+    payload = json.dumps(
+        {"command": "printf synthetic-secret", "cwd": str(tmp_path), "reason": "Needed"}
+    )
+
+    raw = (
+        asyncio.run(registry.call_async("request_host_command", payload))
+        if asynchronous
+        else registry.call("request_host_command", payload)
+    )
+
+    assert json.loads(raw)["problem"]["code"] == "tool.denied"
+    host.run_host_command.assert_not_called()
+    with closing(sqlite3.connect(audit_path)) as connection:
+        rows = connection.execute(
+            "SELECT event_name, payload_json FROM permission_audit_records"
+        ).fetchall()
+    assert len(rows) == 1
+    assert rows[0][0] == "host_command.denied"
+    assert json.loads(rows[0][1])["source"] == "policy"
+    assert "synthetic-secret" not in rows[0][1]
+    permissions.close()
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("denial", ["workspace", "session", "rule"])
+def test_explicit_host_tool_explains_the_effective_denial(tmp_path, asynchronous, denial):
+    """A gate-only denial offers session eligibility without overriding a policy deny."""
+    permissions = PermissionManager(tmp_path)
+    if denial != "workspace":
+        permissions.set_limit("allow_host_processes", True, scope=PolicyScope.WORKSPACE)
+    if denial == "session":
+        permissions.set_limit("allow_host_processes", False, scope=PolicyScope.SESSION)
+    elif denial == "rule":
+        permissions.add_rule(
+            PermissionRule(
+                decision=Decision.DENY,
+                tool="request_host_command",
+                action=Action.PROCESS_EXECUTE,
+            ),
+            scope=PolicyScope.SESSION,
+        )
+    host = MagicMock()
+    registry = ToolRegistry(
+        BUILTIN_TOOLS,
+        permission_manager=permissions,
+        execution_service=CommandExecutionService(MagicMock(), host),
+    )
+    interaction = MagicMock()
+    interaction.supports_fresh_host_approval = True
+    interaction.prompt.return_value = "deny"
+    interaction.prompt_async = AsyncMock(return_value="deny")
+    payload = json.dumps({"command": "printf host", "cwd": str(tmp_path), "reason": "Need host"})
+
+    output = (
+        asyncio.run(registry.call_async("request_host_command", payload, interaction=interaction))
+        if asynchronous
+        else registry.call("request_host_command", payload, interaction=interaction)
+    )
+
+    result = json.loads(output)
+    assert result["problem"]["code"] == "tool.denied"
+    detail = result["problem"]["detail"]
+    if denial == "rule":
+        assert "/permissions limit set" not in detail
+        interaction.prompt.assert_not_called()
+        interaction.prompt_async.assert_not_awaited()
+    else:
+        assert "Host eligibility was declined" in detail
+        if asynchronous:
+            interaction.prompt_async.assert_awaited_once()
+        else:
+            interaction.prompt.assert_called_once()
+    host.run_host_command.assert_not_called()
+
+
+def test_explicit_host_tool_rejects_automatic_async_input_before_policy_prompt(tmp_path):
+    """Async automatic input cannot cause a remembered approval or start a host process."""
+    manager = PermissionManager(tmp_path)
+    manager.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    host = MagicMock()
+    registry = ToolRegistry(
+        BUILTIN_TOOLS,
+        permission_manager=manager,
+        execution_service=CommandExecutionService(MagicMock(), host),
+    )
+    interaction = MagicMock()
+    interaction.supports_fresh_host_approval = False
+    payload = json.dumps({"command": "printf host", "cwd": str(tmp_path), "reason": "Need host"})
+
+    result = json.loads(
+        asyncio.run(registry.call_async("request_host_command", payload, interaction=interaction))
+    )
+
+    assert result["problem"]["code"] == "host_command.denied"
+    interaction.prompt.assert_not_called()
+    assert not manager.persistent_rules
+    host.run_host_command.assert_not_called()
 
 
 def test_public_host_session_approval_reuses_across_fresh_scratch(tmp_path):
@@ -161,6 +630,7 @@ def test_public_host_session_approval_reuses_across_fresh_scratch(tmp_path):
         SandboxOutcome.COMPLETED, exit_code=0, stdout="host\n"
     )
     permissions = PermissionManager(tmp_path)
+    permissions.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
     registry = ToolRegistry(
         BUILTIN_TOOLS,
         permission_manager=permissions,
@@ -185,8 +655,22 @@ def test_public_host_session_approval_reuses_across_fresh_scratch(tmp_path):
     assert len(permissions.host_command_rules()) == 1
 
 
+def scope_receipt_opener(tmp_path, monkeypatch):
+    """Anchor owned fixture receipt reads without accessing the host root."""
+    opener = macos_backend.open_selected_file
+
+    def open_owned_file(root, path, identity):
+        """Keep fixture receipt reads beneath the owned temporary directory."""
+        if root == Path("/") and path.is_relative_to(tmp_path):
+            return opener(tmp_path, path, identity)
+        return opener(root, path, identity)
+
+    monkeypatch.setattr(macos_backend, "open_selected_file", open_owned_file)
+
+
 def homebrew_fixture(tmp_path, monkeypatch, receipt=None):
     """Create a disposable Homebrew-shaped executable and optional dependency receipt."""
+    scope_receipt_opener(tmp_path, monkeypatch)
     prefix = tmp_path / "brew"
     package = prefix / "Cellar" / "sample" / "1.0"
     binaries = package / "bin"
@@ -229,6 +713,24 @@ def test_resolve_executable_reports_plain_and_symlinked_tools(tmp_path, monkeypa
     assert plain_result["grant_reference"] != linked_result["grant_reference"]
     assert "both references as a list" in plain_result["grant_note"]
     assert "executed" not in json.dumps((plain_result, linked_result))
+    assert not (tmp_path / "marker").exists()
+
+
+def test_resolve_executable_accepts_project_tool_list(tmp_path, monkeypatch, registry):
+    """Public lookup reports each requested tool independently without executing it."""
+    for name in ("build-tool", "format-tool"):
+        executable = tmp_path / name
+        executable.write_text("#!/bin/sh\nprintf executed > marker\n", encoding="utf-8")
+        executable.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+
+    result = lookup(registry, ["build-tool", "missing-tool", "format-tool"])["result"]
+
+    first, missing, second = result["executables"]
+    assert first["name"] == "build-tool" and first["grant_reference"]
+    assert missing == {"name": "missing-tool", "status": "absent_from_host_path"}
+    assert second["name"] == "format-tool" and second["grant_reference"]
+    assert first["grant_reference"] != second["grant_reference"]
     assert not (tmp_path / "marker").exists()
 
 
@@ -494,7 +996,7 @@ def test_lookup_never_grants_a_protected_external_tool(tmp_path, monkeypatch, re
 def test_external_lookup_reference_round_trips_through_public_virtual_boundary(
     tmp_path, monkeypatch
 ):
-    """Request a bound tool grant without exposing a host path or starting a host retry."""
+    """Request a bound tool grant while preserving command output without a host retry."""
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     scratch = tmp_path / "scratch"
@@ -544,8 +1046,7 @@ def test_external_lookup_reference_round_trips_through_public_virtual_boundary(
         )
     )
     assert payload["result"]["exit_code"] == 0
-    assert str(installation) not in json.dumps(payload)
-    assert "<external>/sampletool" in payload["result"]["stderr"]["content"]
+    assert payload["result"]["stderr"]["content"] == f"loaded {installation}/sampletool"
     assert backend.run.call_args.args[0].read_roots == (installation,)
     assert backend.run.call_args.args[0].automatic_tool_reads == ()
     assert "Read the installed sampletool tool folder" in interaction.info.call_args.args[0]
@@ -559,10 +1060,9 @@ def test_external_lookup_reference_round_trips_through_public_virtual_boundary(
     assert json.loads(row[0])["automatic_tool_reads"] == []
 
 
-def test_managed_toolchain_and_workspace_link_run_without_explicit_references(
-    tmp_path, monkeypatch
-):
-    """The execution facade binds a named managed tool and its workspace PATH child."""
+def test_managed_toolchain_binds_named_tools_and_explicit_children(tmp_path, monkeypatch):
+    """Unrelated workspace PATH symlinks do not grant their managed installation roots."""
+    scope_receipt_opener(tmp_path, monkeypatch)
     workspace = tmp_path / "workspace"
     binaries = workspace / "bin"
     binaries.mkdir(parents=True)
@@ -597,43 +1097,60 @@ def test_managed_toolchain_and_workspace_link_run_without_explicit_references(
     assert problem is None
     assert result["boundary"] == "sandbox"
     request = backend.run.call_args.args[0]
+    assert request.automatic_tool_reads == (roots[0],)
+    assert request.read_roots == (roots[0],)
+    interaction.prompt.assert_not_called()
+    host.run_host_command.assert_not_called()
+
+    direct, problem = call(
+        registry, "sampletool; childtool", cwd=str(workspace), interaction=interaction
+    )
+    assert problem is None and direct["exit_code"] == 0
+    assert set(backend.run.call_args.args[0].automatic_tool_reads) == set(roots)
+
+    child = lookup(registry, "childtool", cwd=str(workspace))["result"]["grant_reference"]
+    result, problem = call(
+        registry,
+        "sampletool",
+        cwd=str(workspace),
+        interaction=interaction,
+        executable_grant=child,
+    )
+    assert problem is None and result["exit_code"] == 0
+    request = backend.run.call_args.args[0]
     assert set(request.automatic_tool_reads) == set(roots)
     assert set(request.read_roots) == set(roots)
     interaction.prompt.assert_not_called()
-    host.run_host_command.assert_not_called()
 
 
 def test_managed_toolchain_discovery_rejects_unsafe_or_unavailable_candidates(
     tmp_path, monkeypatch
 ):
-    """Malformed shell source and unstable workspace PATH entries grant no authority."""
+    """A failed managed lookup adds no installation-root authority to a command."""
     workspace = tmp_path / "workspace"
-    binaries = workspace / "bin"
-    binaries.mkdir(parents=True)
-    service = CommandExecutionService(MagicMock(), MagicMock())
-    context = MagicMock()
-    assert service._automatic_tool_references(context, "echo '", workspace, "/usr/bin") == ()
-    assert service._automatic_tool_references(context, "env", workspace, "/usr/bin") == ()
-    assert service._automatic_tool_references(context, "echo ok &&", workspace, "/usr/bin") == ()
-    assert service._automatic_tool_references(context, "/bad/name", workspace, "/usr/bin") == ()
-
-    original_iterdir = Path.iterdir
-
-    def unreadable(self):
-        """Simulate a PATH directory becoming unreadable during discovery."""
-        if self == binaries:
-            raise OSError("changed")
-        return original_iterdir(self)
-
-    monkeypatch.setattr(Path, "iterdir", unreadable)
-    assert service._automatic_tool_references(context, "env", workspace, str(binaries)) == ()
-    monkeypatch.setattr(Path, "iterdir", original_iterdir)
-    for index in range(129):
-        (binaries / f"entry-{index}").touch()
-    assert service._automatic_tool_references(context, "env", workspace, str(binaries)) == ()
-
+    workspace.mkdir()
+    binaries = tmp_path / "tools"
+    binaries.mkdir()
+    executable = binaries / "tool"
+    executable.write_text("tool", encoding="utf-8")
+    executable.chmod(0o755)
+    monkeypatch.setenv("PATH", str(binaries))
+    backend = MagicMock()
+    backend.run.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
+    service = CommandExecutionService(backend, MagicMock())
     monkeypatch.setattr(service, "resolve_executable", MagicMock(side_effect=ValueError("bad")))
-    assert service._automatic_tool_references(context, "missing", workspace, "/usr/bin") == ()
+    registry = ToolRegistry(
+        BUILTIN_TOOLS,
+        permission_manager=PermissionManager(workspace),
+        execution_service=service,
+    )
+
+    result, problem = call(registry, "tool", cwd=str(workspace))
+
+    assert problem is None and result["exit_code"] == 0
+    request = backend.run.call_args.args[0]
+    assert request.read_roots == () and request.automatic_tool_reads == ()
+    assert request.executable_identities[0][0] == "tool"
 
 
 def test_public_extra_read_contexts_and_protected_root_fail_closed(tmp_path):
@@ -670,7 +1187,10 @@ def test_public_extra_read_contexts_and_protected_root_fail_closed(tmp_path):
         assert "result" in output, output
         assert output["result"]["exit_code"] == 0
         assert expected in interaction.info.call_args.args[0]
-        assert root not in interaction.info.call_args.args[0]
+        scope = json.loads(
+            interaction.info.call_args.args[0].split("\nScope: ", 1)[1].split("\n", 1)[0]
+        )
+        assert root in scope["read_roots"]
     before = backend.run.call_count
     output = json.loads(
         registry.call(
@@ -708,8 +1228,9 @@ def test_homebrew_grants_run_without_prompt_but_manual_read_still_prompts(tmp_pa
         permission_manager=PermissionManager(workspace),
         execution_service=CommandExecutionService(backend, MagicMock()),
     )
-    first_ref = lookup(registry, "sampletool")["result"]["grant_reference"]
-    second_ref = lookup(registry, "othertool")["result"]["grant_reference"]
+    tools = lookup(registry, ["sampletool", "othertool"])["result"]["executables"]
+    first_ref = tools[0]["grant_reference"]
+    second_ref = tools[1]["grant_reference"]
 
     for grants, manual, expected, roots in (
         (first_ref, None, None, (package,)),
@@ -900,8 +1421,85 @@ def test_run_command_explains_external_tool_read_authority(registry):
 
     description = definition.parameters["properties"]["read_roots"]["description"]
     assert "executable and support files" in description
+    assert "An identifiable scope is requested in this call" in description
+    assert "when it cannot be identified" in description
     assert "Unused PATH entries grant lookup metadata only" in description
     assert "that exact file without its neighbors" in description
+
+
+def test_run_command_explains_tool_temporary_directory_settings(registry):
+    """The public schema explains session scratch without assuming a particular tool."""
+    definition = next(item for item in registry.definitions() if item.name == "run_command")
+
+    description = definition.parameters["properties"]["command"]["description"]
+    assert f'"{VirtualPath.TEMPORARY}/..."' in description
+    assert "Configure each tool's output, cache and environment updates" in description
+    assert "Do not rerun a command that may have had effects" in description
+
+
+def test_platform_command_capabilities_shape_live_model_definitions(monkeypatch):
+    """Native support shapes model fields and places nullable guidance on each argument."""
+    backend = MagicMock(capabilities=frozenset())
+    service = CommandExecutionService(backend, MagicMock())
+    registry = ToolRegistry(
+        [
+            ToolRegistration(run_command_tool, name="sandbox_shell"),
+            ToolRegistration(control_command_terminal_tool, name="terminal_control"),
+            read_command_job_tool,
+        ],
+        execution_service=service,
+    )
+
+    unavailable = {item.name: item for item in registry.definitions()}
+    properties = unavailable["sandbox_shell"].parameters["properties"]
+    assert "interactive" not in properties
+    assert "egress_origins" not in properties
+    assert "interactive" not in unavailable["sandbox_shell"].parameters["required"]
+    assert "egress_origins" not in unavailable["sandbox_shell"].parameters["required"]
+    assert "terminal_control" not in unavailable
+    assert "read_command_job" in unavailable
+    assert "until result is non-null, then stop" in unavailable["read_command_job"].description
+    wait = unavailable["read_command_job"].parameters["properties"]["wait_seconds"]
+    assert "use 30 to avoid empty polls" in wait["description"]
+    assert "terminal_control" in registry.names
+
+    monkeypatch.setattr(
+        "loop.execution.facade.select_sandbox_backend",
+        lambda: MagicMock(
+            capabilities=frozenset({SandboxCapability.TERMINAL, SandboxCapability.MEDIATED_EGRESS})
+        ),
+    )
+    service.refresh_backend()
+    supported = {item.name: item for item in registry.view().definitions()}
+    assert "interactive" in supported["sandbox_shell"].parameters["properties"]
+    assert "egress_origins" in supported["sandbox_shell"].parameters["properties"]
+    assert "Run sandboxed shell source" in supported["sandbox_shell"].description
+    assert "JSON null" not in supported["sandbox_shell"].description
+    for name in ("read_roots", "write_roots", "executable_grant", "egress_origins", "reason"):
+        field = supported["sandbox_shell"].parameters["properties"][name]
+        assert "JSON null (unquoted)" in field["description"]
+        assert {"type": "null"} in field["anyOf"]
+    assert (
+        supported["sandbox_shell"]
+        .parameters["properties"]["egress_origins"]["description"]
+        .startswith("Exact HTTP(S) origins requested")
+    )
+    egress_description = supported["sandbox_shell"].parameters["properties"]["egress_origins"][
+        "description"
+    ]
+    assert "The native mediator configures a proxy" in egress_description
+    assert "macOS" not in egress_description
+    assert "uv" not in egress_description
+    assert (
+        "Cannot combine with egress_origins"
+        in supported["sandbox_shell"].parameters["properties"]["interactive"]["description"]
+    )
+    assert "terminal_control" in supported
+    assert (
+        "resize needs rows and columns"
+        in supported["terminal_control"].parameters["properties"]["action"]["description"]
+    )
+    assert "interactive" not in unavailable["sandbox_shell"].parameters["properties"]
 
 
 def test_run_command_accepts_opaque_shell_and_returns_bounded_result(monkeypatch, registry):
@@ -927,10 +1525,148 @@ def test_run_command_accepts_opaque_shell_and_returns_bounded_result(monkeypatch
         "TEMP",
         "WORKSPACE_ROOT",
         "XDG_CACHE_HOME",
+        "HOME",
     }
     assert Path(environment["XDG_CACHE_HOME"]).parent == Path(environment["TMPDIR"])
+    assert environment["HOME"] == environment["TMPDIR"]
     assert Path(environment["TMPDIR"]).is_dir()
     assert environment["TMP"] == environment["TEMP"] == environment["TMPDIR"]
+
+
+@pytest.mark.parametrize("spelling", ["None", "nOnE", "null", "NULL"])
+def test_command_optional_capability_null_spelling_keeps_narrow_sandbox_authority(
+    tmp_path, monkeypatch, spelling
+):
+    """Optional null spellings add no scope and retain sandbox authorization."""
+    backend = MagicMock()
+    backend.run.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
+    host = MagicMock()
+    registry = ToolRegistry(
+        [run_command_tool],
+        permission_manager=PermissionManager(tmp_path),
+        execution_service=CommandExecutionService(backend, host),
+    )
+    interaction = MagicMock()
+    result, problem = call(
+        registry,
+        "printf ready",
+        cwd=str(tmp_path),
+        interaction=interaction,
+        read_only=True,
+        read_roots=spelling,
+        write_roots=spelling,
+        executable_grant=spelling,
+        egress_origins=spelling,
+    )
+    assert problem is None
+    assert result["boundary"] == "sandbox"
+    request = backend.run.call_args.args[0]
+    assert request.read_roots == request.write_roots == request.egress_origins == ()
+    assert request.network is False
+    interaction.prompt.assert_not_called()
+    host.run_host_command.assert_not_called()
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("spelling", ["None", "nOnE", "null", "NULL"])
+def test_command_null_spelling_does_not_override_a_process_deny(tmp_path, asynchronous, spelling):
+    """A process denial remains binding for both synchronous and asynchronous dispatch."""
+    permissions = PermissionManager(tmp_path)
+    permissions.set_default(Action.PROCESS_EXECUTE, Decision.DENY, scope=PolicyScope.SESSION)
+    backend, host = MagicMock(), MagicMock()
+    registry = ToolRegistry(
+        [run_command_tool],
+        permission_manager=permissions,
+        execution_service=CommandExecutionService(backend, host),
+    )
+    arguments = json.dumps({"command": ":", "cwd": str(tmp_path), "read_roots": spelling})
+    raw = (
+        asyncio.run(registry.call_async("run_command", arguments))
+        if asynchronous
+        else registry.call("run_command", arguments)
+    )
+    assert json.loads(raw)["problem"]["code"] == "tool.denied"
+    backend.run.assert_not_called()
+    host.run_host_command.assert_not_called()
+
+
+def test_command_null_spelling_never_rewrites_other_values():
+    """Only exact top-level optional capability sentinels normalize to null."""
+    model = get_tool_arguments_model(run_command_tool, "run_command")
+    parsed = model.model_validate(
+        {
+            "command": "None",
+            "cwd": "None",
+            "read_roots": ["None"],
+            "write_roots": ["None"],
+            "executable_grant": ["None"],
+            "egress_origins": ["None"],
+            "reason": "None",
+        }
+    )
+    assert parsed.command == parsed.cwd == parsed.reason == "None"
+    assert parsed.read_roots == parsed.write_roots == ["None"]
+    assert parsed.executable_grant == parsed.egress_origins == ["None"]
+    with pytest.raises(ValueError):
+        model.model_validate({"command": ":", "read_roots": " None "})
+
+
+@pytest.mark.parametrize("approved", [False, True])
+def test_command_null_spelling_preserves_scoped_read_approval(tmp_path, approved):
+    """An explicit read root still requires its own approval alongside null spellings."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    external = tmp_path / "external"
+    external.mkdir()
+    backend = MagicMock()
+    backend.run.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
+    host = MagicMock()
+    registry = ToolRegistry(
+        [run_command_tool],
+        permission_manager=PermissionManager(workspace),
+        execution_service=CommandExecutionService(backend, host),
+    )
+    interaction = MagicMock()
+    interaction.prompt.return_value = "approve" if approved else "deny"
+    result, problem = call(
+        registry,
+        ":",
+        cwd=str(workspace),
+        interaction=interaction,
+        read_only=True,
+        read_roots=[str(external)],
+        write_roots="None",
+        executable_grant="None",
+        egress_origins="None",
+    )
+    interaction.prompt.assert_called_once()
+    if approved:
+        assert problem is None and result["boundary"] == "sandbox"
+        request = backend.run.call_args.args[0]
+        assert request.read_roots == (external,)
+        assert request.write_roots == request.egress_origins == ()
+    else:
+        assert result is None and problem["code"] == "tool.denied"
+        backend.run.assert_not_called()
+    host.run_host_command.assert_not_called()
+
+
+@pytest.mark.parametrize("field", ["executable_grant", "egress_origins"])
+def test_command_null_spelling_does_not_authorize_an_invalid_explicit_capability(tmp_path, field):
+    """An invalid real grant or origin remains refused even beside a null spelling."""
+    backend = MagicMock(capabilities=frozenset({SandboxCapability.MEDIATED_EGRESS}))
+    host = MagicMock()
+    registry = ToolRegistry(
+        [run_command_tool],
+        permission_manager=PermissionManager(tmp_path),
+        execution_service=CommandExecutionService(backend, host),
+    )
+    invalid = "not-a-valid-grant" if field == "executable_grant" else ["None"]
+    result, problem = call(registry, ":", cwd=str(tmp_path), read_roots="None", **{field: invalid})
+    assert result is None
+    assert problem is not None
+    backend.run.assert_not_called()
+    host.run_host_command.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -987,9 +1723,16 @@ def test_read_only_command_uses_a_nonwritable_workspace_policy(monkeypatch, regi
     assert result["scratch"]["lifetime"] == "this session"
     assert backend.run.call_args.args[0].write_roots == ()
     environment = dict(backend.run.call_args.args[0].environment)
-    assert Path(environment["COVERAGE_FILE"]).parent == Path(environment["TMPDIR"])
-    assert environment["RUFF_NO_CACHE"] == "true"
-    assert environment["UV_NO_SYNC"] == "1"
+    assert set(environment) == {
+        LANG_ENVIRONMENT_VARIABLE,
+        PATH_ENVIRONMENT_VARIABLE,
+        TEMP_ENVIRONMENT_VARIABLE,
+        TMP_ENVIRONMENT_VARIABLE,
+        TMPDIR_ENVIRONMENT_VARIABLE,
+        WORKSPACE_ROOT_ENVIRONMENT_VARIABLE,
+        XDG_CACHE_HOME_ENVIRONMENT_VARIABLE,
+        HOME_ENVIRONMENT_VARIABLE,
+    }
     interaction.prompt.assert_not_called()
 
 
@@ -1177,7 +1920,10 @@ def test_linked_git_status_requests_metadata_read_grant(monkeypatch, registry, t
     assert request.write_roots == (linked,)
     assert request.read_roots == (gitdir,)
     assert "read files outside this workspace" in interaction.info.call_args.args[0]
-    assert str(gitdir) not in interaction.info.call_args.args[0]
+    scope = json.loads(
+        interaction.info.call_args.args[0].split("\nScope: ", 1)[1].split("\n", 1)[0]
+    )
+    assert str(gitdir) in scope["read_roots"]
 
 
 @pytest.mark.parametrize("pointer", ["invalid", "gitdir: missing"])
@@ -1260,6 +2006,72 @@ def test_run_command_preserves_nonzero_exit(monkeypatch, registry):
     assert problem["code"] == "process.nonzero_exit"
     assert problem["metadata"]["exit_code"] == 17
     assert "host_offer" not in problem["metadata"]
+
+
+def test_run_command_displays_escaped_explanation_for_requested_network(tmp_path):
+    """Public dispatch presents the model explanation and actual network scope to the user."""
+    backend = MagicMock(
+        run=MagicMock(return_value=CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0))
+    )
+    host = MagicMock()
+    interaction = MagicMock()
+    interaction.prompt.return_value = "approve"
+    manager = PermissionManager(tmp_path)
+    manager.set_limit("deny_private_networks", False)
+    registry = ToolRegistry(
+        BUILTIN_TOOLS,
+        permission_manager=manager,
+        execution_service=CommandExecutionService(backend, host),
+    )
+    reason = "Fetch dependencies\n\x1b[2J"
+
+    result, problem = call(
+        registry, ":", cwd=str(tmp_path), interaction=interaction, network=True, reason=reason
+    )
+
+    assert problem is None
+    message = interaction.info.call_args.args[0]
+    scope_text = message.split("\nScope: ", 1)[1].split("\n", 1)[0]
+    explanation = message.split("\nAgent explanation: ", 1)[1]
+    assert json.loads(scope_text)["network"] is True
+    assert json.loads(explanation) == reason
+    assert "\x1b" not in message
+    assert "Fetch dependencies" not in json.dumps(result)
+    backend.run.assert_called_once()
+    host.run_host_command.assert_not_called()
+
+
+def test_run_command_reports_unqualified_egress_without_prompt_or_host_offer(tmp_path):
+    """Exact origin syntax cannot open broad networking or trigger host recovery."""
+    backend = MagicMock(capabilities=frozenset())
+    host = MagicMock()
+    interaction = MagicMock()
+    registry = ToolRegistry(
+        BUILTIN_TOOLS,
+        permission_manager=PermissionManager(tmp_path),
+        execution_service=CommandExecutionService(backend, host),
+    )
+
+    result, problem = call(
+        registry,
+        "printf safe",
+        cwd=str(tmp_path),
+        interaction=interaction,
+        egress_origins=["https://EXAMPLE.com"],
+    )
+
+    assert result is None
+    assert problem["code"] == "sandbox.unavailable"
+    assert "qualified sandboxed HTTP proxy route" in problem["detail"]
+    interaction.prompt.assert_not_called()
+    backend.run.assert_not_called()
+    host.run_host_command.assert_not_called()
+
+
+def test_command_planner_rejects_nonlist_egress_scope():
+    """Malformed callers cannot bypass exact-origin normalization in the planner."""
+    with pytest.raises(ValueError, match="origins must be a list"):
+        _command_plan({"command": "true", "cwd": ".", "egress_origins": "http://example.com"})
 
 
 def test_run_command_binds_empty_and_relative_path_entries_from_command_cwd(
@@ -1430,8 +2242,8 @@ def test_run_command_preserves_system_path_in_redacted_output(tmp_path):
     assert payload["result"]["stdout"]["content"] == "/usr/bin/true\n"
 
 
-def test_observed_denial_preserves_exit_and_offers_fresh_retry(monkeypatch, registry):
-    """A verified denial remains diagnostic while the shell exit stays authoritative."""
+def test_observed_denial_preserves_exit_without_host_retry(monkeypatch, registry):
+    """A completed shell exit and its output remain authoritative over an observed denial."""
     backend = MagicMock(
         run=MagicMock(
             return_value=CommandProcessResult(
@@ -1450,18 +2262,83 @@ def test_observed_denial_preserves_exit_and_offers_fresh_retry(monkeypatch, regi
 
     assert problem["code"] == "process.nonzero_exit"
     assert problem["metadata"]["exit_code"] == 7
-    assert problem["metadata"]["sandbox_diagnostic"] == "file-read-data /outside/secret"
-    assert "may be unrelated" in problem["metadata"]["host_offer"]
+    assert problem["metadata"]["stderr"]["content"] == "Operation not permitted: /outside/secret"
+    assert problem["metadata"]["sandbox_diagnostics"]["observed_denial"] is None
+    assert problem["metadata"]["sandbox_diagnostics"]["denial_candidates"][0] == {
+        "observation": "file-read-data /outside/secret",
+        "classification": "unclassified",
+        "attribution": "unknown",
+        "truncated": False,
+    }
+    assert "sandbox_diagnostic" not in problem["metadata"]
+    assert "executable_hint" not in problem["metadata"]
+    assert "host_offer" not in problem["metadata"]
     host.run_host_command.assert_not_called()
 
 
-def test_exit_127_with_incidental_denial_stays_in_sandbox(monkeypatch, registry):
+def test_denial_candidate_survives_bounded_command_output(monkeypatch, registry):
+    """A large command result retains the candidate in its first model-facing response."""
+    denial = "Sandbox: tool(1) deny(1) file-read-data /outside/secret"
+    backend = MagicMock(
+        run=MagicMock(
+            return_value=CommandProcessResult(
+                SandboxOutcome.COMPLETED,
+                exit_code=7,
+                stdout="x" * (MAX_TOOL_RESULT_BYTES * 2),
+                stderr="y" * (MAX_TOOL_RESULT_BYTES * 2),
+                observed_denial=denial,
+                diagnostic_status="available",
+                diagnostic_source="macos-kernel-log",
+            )
+        )
+    )
+    monkeypatch.setattr(registry._execution_service, "_backend", backend)
+
+    _, problem = call(registry, "exit 7")
+
+    metadata = problem["metadata"]
+    assert metadata["exit_code"] == 7
+    assert metadata["sandbox_diagnostics"]["denial_candidates"][0]["observation"] == denial
+    assert metadata["sandbox_diagnostics"]["denial_candidates"][0]["attribution"] == "unknown"
+    assert metadata["stdout"]["truncated"] and metadata["stderr"]["truncated"]
+
+
+def test_control_character_tails_keep_command_result_within_budget(monkeypatch, registry):
+    """Both serialized tails retain useful endings without displacing exit diagnostics."""
+    backend = MagicMock(
+        run=MagicMock(
+            return_value=CommandProcessResult(
+                SandboxOutcome.COMPLETED,
+                exit_code=7,
+                stdout="\x01" * (MAX_TOOL_RESULT_BYTES * 2) + "stdout-end",
+                stderr="\x02" * (MAX_TOOL_RESULT_BYTES * 2) + "stderr-end",
+                observed_denial="Sandbox: fixture deny file-read-data /outside/secret",
+                diagnostic_status="available",
+                diagnostic_source="macos-kernel-log",
+            )
+        )
+    )
+    monkeypatch.setattr(registry._execution_service, "_backend", backend)
+
+    _, problem = call(registry, "exit 7")
+
+    metadata = problem["metadata"]
+    assert metadata["exit_code"] == 7
+    assert metadata["sandbox_diagnostics"]["denial_candidates"]
+    assert metadata["stdout"]["tail"]["content"].endswith("stdout-end")
+    assert metadata["stderr"]["tail"]["content"].endswith("stderr-end")
+
+
+@pytest.mark.parametrize("exit_code", [126, 127])
+def test_executable_failure_hint_preserves_unknown_cause_and_effects(
+    monkeypatch, registry, exit_code
+):
     """A missing executable suggests grants without offering an unrelated host retry."""
     backend = MagicMock(
         run=MagicMock(
             return_value=CommandProcessResult(
                 SandboxOutcome.COMPLETED,
-                exit_code=127,
+                exit_code=exit_code,
                 stderr="/bin/sh: tool: command not found\n",
                 observed_denial="file-read-data /Library/Preferences/unrelated.plist",
             )
@@ -1475,16 +2352,19 @@ def test_exit_127_with_incidental_denial_stays_in_sandbox(monkeypatch, registry)
 
     assert problem["code"] == "process.nonzero_exit"
     metadata = problem["metadata"]
-    assert metadata["exit_code"] == 127
+    assert metadata["exit_code"] == exit_code
     assert "resolve_executable" in metadata["executable_hint"]
     assert "host_offer" not in metadata
-    assert "pass their references as a list" in metadata["executable_hint"]
+    assert "indirect tools remain unidentified" in metadata["executable_hint"]
+    assert "look up each one" not in metadata["executable_hint"]
     assert "caused" not in metadata["executable_hint"]
+    assert "may already have had effects" in metadata["executable_hint"]
     host.run_host_command.assert_not_called()
 
 
-def test_approved_observed_denial_retry_retains_sandbox_attempt(monkeypatch, registry):
-    """A fresh approved host run reports the original sandbox exit and denial separately."""
+def test_observed_denial_never_prompts_for_host_retry(monkeypatch, registry):
+    """Even an approving interaction cannot turn a completed denial into a host run."""
+    registry.permission_manager.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
     backend = MagicMock(
         run=MagicMock(
             return_value=CommandProcessResult(
@@ -1505,13 +2385,42 @@ def test_approved_observed_denial_retry_retains_sandbox_attempt(monkeypatch, reg
 
     result, problem = call(registry, "cat outside", interaction=ApprovingHostInteraction())
 
-    assert problem is None
-    assert result["boundary"] == "host"
-    assert result["sandbox_attempt"] == {
-        "exit_code": 1,
-        "observed_denial": "file-read-data /outside/secret",
-    }
-    host.run_host_command.assert_called_once()
+    assert result is None
+    assert problem["code"] == "process.nonzero_exit"
+    assert problem["metadata"]["boundary"] == "sandbox"
+    assert problem["metadata"]["stderr"]["content"] == "Operation not permitted: /outside/secret"
+    assert problem["metadata"]["sandbox_diagnostics"]["observed_denial"] is None
+    assert (
+        problem["metadata"]["sandbox_diagnostics"]["denial_candidates"][0]["attribution"]
+        == "unknown"
+    )
+    assert "sandbox_diagnostic" not in problem["metadata"]
+    assert "host_offer" not in problem["metadata"]
+    host.run_host_command.assert_not_called()
+
+
+def test_boundary_failure_keeps_observed_diagnostic(monkeypatch, registry):
+    """A sandbox boundary failure retains its own diagnostic without a host retry."""
+    backend = MagicMock(
+        run=MagicMock(
+            return_value=CommandProcessResult(
+                SandboxOutcome.UNAVAILABLE,
+                detail="Sandbox capture failed.",
+                possible_effects=True,
+                observed_denial="file-read-data /outside/secret",
+            )
+        )
+    )
+    host = MagicMock()
+    monkeypatch.setattr(registry._execution_service, "_backend", backend)
+    monkeypatch.setattr(registry._execution_service, "_host_executor", host)
+
+    _, problem = call(registry, "cat outside")
+
+    assert problem["code"] == "sandbox.unavailable"
+    assert problem["metadata"]["sandbox_diagnostic"] == "file-read-data /outside/secret"
+    assert "host_offer" not in problem["metadata"]
+    host.run_host_command.assert_not_called()
 
 
 def test_run_command_reports_typed_sandbox_failure(monkeypatch, registry):
@@ -1544,9 +2453,11 @@ def test_public_startup_capability_failure_requires_separate_host_approval(
     backend.run = MagicMock(wraps=backend.run)
     host = CountingHostCommandExecutor()
     interaction = RecordingHostOfferInteraction(host, host_answer)
+    permissions = PermissionManager(tmp_path)
+    permissions.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
     registry = ToolRegistry(
         BUILTIN_TOOLS,
-        permission_manager=PermissionManager(tmp_path),
+        permission_manager=permissions,
         execution_service=CommandExecutionService(backend, host),
     )
 
@@ -1563,6 +2474,7 @@ def test_public_startup_capability_failure_requires_separate_host_approval(
     assert len(interaction.information) == 1
     assert "The sandbox was unavailable." in interaction.information[0]
     assert str(tmp_path) not in interaction.information[0]
+    assert json.dumps(str(tmp_path))[1:-1] not in interaction.information[0]
     if approved:
         assert problem is None
         assert result["boundary"] == "host"
@@ -1576,28 +2488,39 @@ def test_public_startup_capability_failure_requires_separate_host_approval(
         assert host.requests == []
 
 
-def test_run_command_warns_that_host_retry_may_repeat_effects(monkeypatch, registry):
-    """The public host offer names repeat risk after a partially effective attempt."""
+@pytest.mark.parametrize("outcome", [SandboxOutcome.DENIED, SandboxOutcome.UNAVAILABLE])
+def test_run_command_does_not_retry_after_possible_effects(monkeypatch, registry, outcome):
+    """A possibly effective attempt cannot produce an offer or launch a host retry."""
+    registry.permission_manager.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    host = MagicMock()
+    monkeypatch.setattr(registry._execution_service, "_host_executor", host)
     monkeypatch.setattr(
         registry._execution_service,
         "_backend",
         MagicMock(
             run=MagicMock(
                 return_value=CommandProcessResult(
-                    SandboxOutcome.DENIED, detail="file read denied", possible_effects=True
+                    outcome, detail="sandbox stopped", possible_effects=True
                 )
             )
         ),
     )
 
-    _, problem = call(registry, "printf changed > file; cat secret")
+    _, problem = call(
+        registry, "printf changed > file; cat secret", interaction=ApprovingHostInteraction()
+    )
 
-    assert problem["code"] == "sandbox.denied"
-    assert "may repeat" in problem["metadata"]["host_offer"]
+    assert problem["code"] == f"sandbox.{outcome.value}"
+    assert problem["metadata"]["sandbox_diagnostics"]["possible_effects"] is True
+    assert "request_host_command" in problem["metadata"]["recovery_hint"]
+    assert "may repeat effects" in problem["metadata"]["recovery_hint"]
+    assert "host_offer" not in problem["metadata"]
+    host.run_host_command.assert_not_called()
 
 
 def test_run_command_host_retry_requires_a_second_prompt(monkeypatch, registry):
     """A distinct approved host retry is marked as unrestricted in the public result."""
+    registry.permission_manager.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
     backend = MagicMock(
         run=MagicMock(
             return_value=CommandProcessResult(SandboxOutcome.UNAVAILABLE, detail="no profile")
@@ -1622,6 +2545,7 @@ def test_run_command_host_retry_requires_a_second_prompt(monkeypatch, registry):
 
 def test_run_command_keeps_host_timeout_distinct(monkeypatch, registry):
     """A separately approved host timeout is labeled as a host outcome."""
+    registry.permission_manager.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
     monkeypatch.setattr(
         registry._execution_service,
         "_backend",
@@ -1711,8 +2635,17 @@ def test_run_command_fails_when_request_paths_are_invalid(tmp_path):
     manager.authorize_sandboxed_command.assert_not_called()
 
 
-def test_run_command_preserves_source_without_temporary_aliases(monkeypatch, tmp_path):
-    """Opaque commands need no temporary path aliases or shell source rewriting."""
+@pytest.mark.parametrize(
+    "source",
+    [
+        "cat $WORKSPACE_ROOT/file",
+        "printf '%s' '$WORKSPACE_ROOT/file'",
+        "printf '%s' '/.loop-private-paths/r0/file'",
+        "python -c 'print(\"$TMPDIR/example\")'",
+    ],
+)
+def test_run_command_preserves_opaque_shell_source(monkeypatch, tmp_path, source):
+    """Opaque source, including quoted and embedded paths, reaches the backend unchanged."""
     backend = MagicMock(
         run=MagicMock(return_value=CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0))
     )
@@ -1732,7 +2665,7 @@ def test_run_command_preserves_source_without_temporary_aliases(monkeypatch, tmp
                 tool_id="run_command",
                 action="process.execute",
                 target=ProcessTarget(
-                    argv=("/bin/sh", "-c", "cat $WORKSPACE_ROOT/file"),
+                    argv=("/bin/sh", "-c", source),
                     cwd=str(tmp_path),
                     boundary=ProcessBoundary.SANDBOXED,
                 ),
@@ -1742,12 +2675,11 @@ def test_run_command_preserves_source_without_temporary_aliases(monkeypatch, tmp
         execution_service=execution_service,
     )
 
-    result = run_command_tool(context, "cat $WORKSPACE_ROOT/file")
+    result = run_command_tool(context, source)
 
     assert result["boundary"] == "sandbox"
     request = backend.run.call_args.args[0]
-    assert request.aliases == ()
-    assert request.execution_source == request.source == "cat $WORKSPACE_ROOT/file"
+    assert request.execution_source == request.source == source
 
 
 def test_run_command_honors_fresh_denial(monkeypatch, registry):
@@ -1816,6 +2748,7 @@ def test_linux_integrity_failure_never_uses_host_offer_or_session_rule(
     host = MagicMock()
     host.run_host_command.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
     permissions = PermissionManager(tmp_path)
+    permissions.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
     interaction = RememberingHostInteraction()
     registry = ToolRegistry(
         BUILTIN_TOOLS,
@@ -1823,10 +2756,11 @@ def test_linux_integrity_failure_never_uses_host_offer_or_session_rule(
         execution_service=CommandExecutionService(native, host),
     )
 
-    def unavailable(_record, payload, _deadline):
+    def unavailable(_record, payload, _deadline, *, observer):
         """Allow an explicit host session decision before introducing integrity drift."""
         from loop.execution.sandbox import SandboxRequest
 
+        assert observer is not None
         request = SandboxRequest.from_wire(payload)
         return CommandProcessResult(SandboxOutcome.UNAVAILABLE).to_wire(request.attempt_id)
 
@@ -1842,8 +2776,10 @@ def test_linux_integrity_failure_never_uses_host_offer_or_session_rule(
         # New application selection must preserve invalid authority, including an existing
         # host session rule; select under the public Linux composition route.
         native = linux.LinuxNativeBackend(record)
-        monkeypatch.setattr(selection.platform, "system", lambda: "Linux")
-        monkeypatch.setattr("loop.execution.sandbox.linux.LinuxNativeBackend", lambda: native)
+        monkeypatch.setattr(platform, "system", lambda: "Linux")
+        monkeypatch.setattr(
+            "loop.execution.sandbox.linux.backend.LinuxNativeBackend", lambda: native
+        )
         selected = selection.select_sandbox_backend()
         registry = ToolRegistry(
             BUILTIN_TOOLS,
@@ -1874,8 +2810,9 @@ def test_linux_public_timeout_retains_capture_or_reports_unknown_loss(
     monkeypatch.setattr(linux.LinuxNativeBackend, "file_creation_mask", 0o022)
     monkeypatch.setattr(linux.LinuxNativeBackend, "managed_tool_root", lambda *_: False)
 
-    def exchange(_record, payload, _deadline):
+    def exchange(_record, payload, _deadline, *, observer):
         """Return timeout output after native cleanup or a failed result-delivery budget."""
+        assert observer is not None
         if not delivered:
             raise TimeoutError("delivery expired")
         request = SandboxRequest.from_wire(payload)
@@ -1904,5 +2841,6 @@ def test_linux_public_timeout_retains_capture_or_reports_unknown_loss(
         assert capture["content"] == (text if delivered else "")
         assert capture["capture_complete"] is False
         assert capture["discarded_characters"] is None
+        assert capture["decoding_loss"] == "unknown"
     assert interaction.host_prompts == 0
     host.run_host_command.assert_not_called()

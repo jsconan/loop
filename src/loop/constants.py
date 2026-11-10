@@ -15,25 +15,30 @@ APP_DISPLAY_NAME = APP_NAME.capitalize()
 APP_DIRECTORY = Path(f".{APP_NAME}")
 APP_CONFIGURATION_FILENAME = "config.toml"
 
+# The command boundary binds this shell independently of the caller's PATH.
+SHELL_COMMAND_PATH = "/bin/sh"
+SHELL_COMMAND_OPTION = "-c"
+SHELL_PRINT_BUILTIN = "printf"
+
 # Default backend configuration constants
 DEFAULT_BASE_URL = "http://localhost:8000/v1"
 DEFAULT_MODEL = "nvidia/Qwen3.6-35B-A3B-NVFP4"
 DEFAULT_API_KEY = "local-api-key"
 
 # Default agent configuration constants
-DEFAULT_AGENT_NAME = "Loop"
+DEFAULT_AGENT_NAME = APP_DISPLAY_NAME
 DEFAULT_CONVERSATION_INPUT_MODE = "queue"
-TEMPORARY_DIRECTORY_PREFIX = "loop-"
-TEMPORARY_CONTENT_DIRECTORY_PREFIX = "loop-content-"
+TEMPORARY_DIRECTORY_PREFIX = f"{APP_NAME}-"
+TEMPORARY_CONTENT_DIRECTORY_PREFIX = f"{APP_NAME}-content-"
 
-# Marker file for identifying the root of a Loop project.
+# Marker file for identifying the root of a project workspace.
 GIT_DIRECTORY = Path(".git")
 
 # Session-related constants
 SESSION_DATABASE_FILENAME = "sessions.db"
 WORKSPACE_DATABASE_FILENAME = "workspaces.db"
 TELEMETRY_DATABASE_FILENAME = "telemetry.db"
-OPERATIONAL_LOG_FILENAME = "loop.log"
+OPERATIONAL_LOG_FILENAME = "app.log"
 DEFAULT_SESSION_NAME = "Untitled session"
 INITIAL_SESSION_NAME_MAX_CHARS = 48
 SESSION_NAME_MAX_CHARS = 80
@@ -128,11 +133,13 @@ NATIVE_ADMISSION_SOCKET_MODE = 0o600
 MAX_PATH_LENGTH = 16_384
 MAX_COMMAND_PATH_LENGTH = 127
 MAX_COMMAND_PATH_COUNT = 128
-DEFAULT_COMMAND_TIMEOUT = 60.0
+DEFAULT_COMMAND_TIMEOUT = 3600.0
+# Native preparation after command approval must finish before this independent ceiling.
+COMMAND_PREPARATION_SECONDS = 60.0
 COMMAND_CLEANUP_WAIT_SECONDS = 0.1
 # Linux delivery includes common reader cleanup, watcher join, cgroup proof and bounded send.
 NATIVE_RESULT_DELIVERY_SECONDS = 5.0
-NATIVE_INSTALLATION_DIRECTORY = Path("/usr/local/libexec/loop/native")
+NATIVE_INSTALLATION_DIRECTORY = Path("/usr/local/libexec") / APP_NAME / "native"
 
 # Error handling and recovery
 DEFAULT_MAX_RETRIES = 2

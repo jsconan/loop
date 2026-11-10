@@ -242,6 +242,25 @@ class Session:
             self.messages.append(message)
             self._add_conversation_event(len(self.messages) - 1)
 
+    def tool_call_index(self, call_id: str) -> int | None:
+        """Find the latest durable occurrence of a provider tool-call identifier.
+
+        Args:
+            call_id (str): Provider identifier to locate in the complete session history.
+
+        Returns:
+            int | None: Stable message index of the latest occurrence, or None if absent.
+        """
+        return next(
+            (
+                index
+                for index in range(len(self.messages) - 1, -1, -1)
+                if isinstance(self.messages[index], ToolCall)
+                and self.messages[index].call_id == call_id
+            ),
+            None,
+        )
+
     def add_tool_call_event(self, call_id: str) -> None:
         """Place one persisted model tool call in the replay timeline.
 
@@ -251,15 +270,7 @@ class Session:
         Raises:
             ValueError: If the call is unknown or already present in the timeline.
         """
-        item_index = next(
-            (
-                index
-                for index in range(len(self.messages) - 1, -1, -1)
-                if isinstance(self.messages[index], ToolCall)
-                and self.messages[index].call_id == call_id
-            ),
-            None,
-        )
+        item_index = self.tool_call_index(call_id)
         recorded = {
             event.item_index for event in self.events if isinstance(event, ConversationItemEvent)
         }
@@ -710,7 +721,7 @@ class Session:
             raise ValueError(  # noqa: TRY004 - preserve the public deserialization contract.
                 f"Expected a conversation item, got {type(message)}"
             )
-        return message
+        return message.for_storage() if isinstance(message, ToolCall) else message
 
     def serialize(self) -> str:
         """Serialize the session into its versioned JSON format.
