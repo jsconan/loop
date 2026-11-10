@@ -7,6 +7,7 @@ import shlex
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 from .models import CommandFinding, CommandReviewStatus
 
@@ -20,7 +21,15 @@ _SHELL_TOKEN = re.compile(
 
 @dataclass(frozen=True)
 class ShellToken:
-    """Retain word quoting and operator identity for bounded lexical inspection."""
+    """Retain one shell word or operator and its location in the original source.
+
+    Args:
+        value (str): Decoded word or literal operator.
+        raw (str): Exact source spelling, including quotes and escapes.
+        operator (bool): Whether the token is a shell operator.
+        start (int): Inclusive source character offset.
+        end (int): Exclusive source character offset.
+    """
 
     value: str
     raw: str
@@ -29,8 +38,18 @@ class ShellToken:
     end: int
 
 
-def _shell_tokens(source: str) -> list[ShellToken]:
-    """Tokenize shell words without mistaking quoted punctuation for operators."""
+def shell_tokens(source: str) -> list[ShellToken]:
+    """Tokenize shell words without mistaking quoted punctuation for operators.
+
+    Args:
+        source (str): Shell source to inspect without executing it.
+
+    Returns:
+        list[ShellToken]: Ordered tokens with their decoded and original spellings.
+
+    Raises:
+        ValueError: Source contains an unsupported or incomplete shell word.
+    """
     tokens = []
     position = 0
     while position < len(source):
@@ -56,19 +75,151 @@ def _shell_tokens(source: str) -> list[ShellToken]:
     return tokens
 
 
+def literal_shell_word(raw: str) -> bool:
+    """Identify a quoted or escaped shell word with no runtime expansion.
+
+    Args:
+        raw (str): Original word spelling as returned by ``shell_tokens``.
+
+    Returns:
+        bool: Whether the entire word is a literal without shell expansion.
+    """
+    quote = None
+    index = 0
+    while index < len(raw):
+        char = raw[index]
+        if quote == "'":
+            if char == "'":
+                quote = None
+        elif char == "\\":
+            if quote == '"' and raw[index + 1] not in '\\"\n':
+                return False
+            index += 1
+        elif quote == '"':
+            if char == '"':
+                quote = None
+            elif char in "$`":
+                return False
+        elif char in "'\"":
+            quote = char
+        elif char in "$`*?[{}" or (index == 0 and char == "~"):
+            return False
+        index += 1
+    return True
+
+
+def _path_mutating_expansion(raw: str) -> bool:
+    """Detect unescaped shell expansions that can assign PATH before a command runs."""
+    if "$" not in raw:
+        return False
+    quote = None
+    index = 0
+    while index < len(raw):
+        char = raw[index]
+        if quote == "'":
+            if char == "'":
+                quote = None
+        elif char == "\\" and (quote is None or raw[index + 1] in '$`"\\\n'):
+            index += 1
+        elif char == '"':
+            quote = None if quote == '"' else '"'
+        elif char == "'" and quote is None:
+            quote = "'"
+        elif char == "$":
+            if raw.startswith(("${PATH=", "${PATH:="), index):
+                return True
+            if raw.startswith("$((", index):
+                end = raw.find("))", index + 3)
+                if end < 0:
+                    return True
+                expression = raw[index + 3 : end]
+                expression = re.sub(
+                    r"(?<![A-Za-z0-9_])(?:0[xX][0-9a-fA-F]+|[0-9]+#[0-9A-Za-z@_]+)",
+                    "0",
+                    expression,
+                )
+                if re.fullmatch(r"[0-9\s+\-*/%<>=&|^~!?:(),]*", expression) is None:
+                    return True
+                index = end + 1
+        index += 1
+    return False
+
+
+def _set_enables_keyword(arguments: list[str]) -> bool:
+    """Recognize the shell option that changes where assignment words are applied."""
+    position = 0
+    while position < len(arguments):
+        option = arguments[position]
+        if option == "--" or not option.startswith(("-", "+")) or option in {"-", "+"}:
+            break
+        if option in {"-o", "+o"}:
+            position += 1
+            if position < len(arguments) and option == "-o" and arguments[position] == "keyword":
+                return True
+        elif option.startswith("-") and ("k" in option[1:] or option[1:].endswith("okeyword")):
+            return True
+        position += 1
+    return False
+
+
 @dataclass(frozen=True)
 class CommandAnalysis:
-    """Hold advisory findings, Git-read intent, and executable candidates.
+    """Hold advisory findings, Git-read intent, and literal invocation candidates.
 
     Args:
         findings (tuple[CommandFinding, ...]): Recognized effects requiring review.
         git_read (bool): Whether a recognized Git command may read repository metadata.
         executables (tuple[str, ...]): Bounded command names for tool resolution.
+        path_arguments (tuple[str, ...]): Bounded literal path and name hints, not authority.
+        first_executable_literal (bool): Whether the first parsed executable is a literal word.
+        first_executable_initial (bool): Whether it is in the initial simple command.
+        first_executable_argument (str | None): Literal first argument, or None when unknown.
+        first_path_inherited (bool): Whether supported prefixes preserve inherited PATH lookup.
+        inherited_path_executables (tuple[tuple[str, bool], ...]): Literal executables with known
+            inherited PATH, paired with whether their working directory is unchanged.
+        first_executable_arguments (tuple[str, ...]): Literal argument prefix before any
+            expansion, bounded independently of later shell commands.
     """
 
     findings: tuple[CommandFinding, ...]
     git_read: bool
     executables: tuple[str, ...]
+    path_arguments: tuple[str, ...] = ()
+    first_executable_literal: bool = False
+    first_executable_initial: bool = False
+    first_executable_argument: str | None = None
+    first_path_inherited: bool = False
+    inherited_path_executables: tuple[tuple[str, bool], ...] = ()
+    first_executable_arguments: tuple[str, ...] = ()
+
+
+class CommandScanResult(NamedTuple):
+    """Carry one shell level's provisional findings and invocation hints.
+
+    Args:
+        findings (list[CommandFinding | None]): Matcher-aligned provisional findings.
+        git_read (bool): Whether this level may read Git metadata.
+        executables (list[str]): Candidate executable spellings.
+        path_arguments (list[str]): Literal path hints without authority.
+        first_literal (bool): Whether the first executable is literal.
+        first_initial (bool): Whether it belongs to the initial simple command.
+        first_argument (str | None): First literal argument, when known.
+        first_path_inherited (bool): Whether the first command retains inherited PATH lookup.
+        inherited_executables (list[tuple[str, bool]]): Literal inherited-PATH candidates and
+            whether their working directory is unchanged.
+        first_arguments (list[str]): Literal argument prefix of the first command.
+    """
+
+    findings: list[CommandFinding | None]
+    git_read: bool
+    executables: list[str]
+    path_arguments: list[str]
+    first_literal: bool
+    first_initial: bool
+    first_argument: str | None
+    first_path_inherited: bool
+    inherited_executables: list[tuple[str, bool]]
+    first_arguments: list[str]
 
 
 def match_destructive_command(command: list[str]) -> CommandFinding | None:
@@ -169,6 +320,76 @@ class CommandInspection:
 
     SHELLS = frozenset({"sh", "bash", "zsh"})
     SEPARATORS = frozenset({";", "&&", "||", "|", "&", "(", ")"})
+    PATH_CONTEXT_MUTATORS = frozenset(
+        {
+            ".",
+            "builtin",
+            "declare",
+            "enable",
+            "eval",
+            "export",
+            "fc",
+            "getopts",
+            "hash",
+            "let",
+            "local",
+            "mapfile",
+            "read",
+            "readarray",
+            "readonly",
+            "source",
+            "shopt",
+            "trap",
+            "typeset",
+            "unset",
+        }
+    )
+    SHELL_BUILTINS = frozenset(
+        {
+            ":",
+            "[",
+            "break",
+            "cd",
+            "command",
+            "continue",
+            "echo",
+            "exec",
+            "exit",
+            "false",
+            "getopts",
+            "hash",
+            "popd",
+            "printf",
+            "pushd",
+            "pwd",
+            "return",
+            "set",
+            "shift",
+            "test",
+            "true",
+            "umask",
+            "wait",
+        }
+    )
+    SHELL_KEYWORDS = frozenset(
+        {
+            "if",
+            "then",
+            "else",
+            "elif",
+            "fi",
+            "for",
+            "while",
+            "until",
+            "do",
+            "done",
+            "case",
+            "esac",
+            "in",
+            "{",
+            "}",
+        }
+    )
     WRITE_REDIRECTIONS = frozenset({">", ">|", ">>", "<>", "&>", "&>>", ">&"})
     REDIRECTIONS = WRITE_REDIRECTIONS | frozenset({"<", "<&", "<<", "<<-"})
     DEFAULT_COMMAND_MATCHERS = (match_git_mutation, match_destructive_command)
@@ -218,11 +439,20 @@ class CommandInspection:
         Returns:
             CommandAnalysis: Bounded advisory classification; absence never proves safety.
         """
-        findings, git_read, executables = self._scan(source, temporary_roots)
+        scan = self._scan(source, temporary_roots)
         return CommandAnalysis(
-            tuple(finding for finding in findings if finding is not None),
-            git_read,
-            tuple(dict.fromkeys(executables))[:128],
+            tuple(finding for finding in scan.findings if finding is not None),
+            scan.git_read,
+            tuple(dict.fromkeys(scan.executables))[:128],
+            tuple(sorted(dict.fromkeys(scan.path_arguments), key=lambda word: "/" not in word))[
+                :128
+            ],
+            scan.first_literal,
+            scan.first_initial,
+            scan.first_argument,
+            scan.first_path_inherited,
+            tuple(dict.fromkeys(scan.inherited_executables))[:128],
+            tuple(scan.first_arguments),
         )
 
     def _scan(
@@ -230,15 +460,35 @@ class CommandInspection:
         source: str,
         temporary_roots: tuple[Path, ...],
         depth: int = 0,
-    ) -> tuple[list[CommandFinding | None], bool, list[str]]:
+    ) -> CommandScanResult:
         """Scan one shell level and merge bounded nested command classifications."""
         findings = [None] * len(self._matchers)
         git_read = False
         executables = []
+        path_arguments = []
+        first_literal = False
+        first_initial = False
+        first_argument = None
+        first_arguments = []
+        first_path_inherited = False
+        inherited_executables = []
+        path_stable = True
+        cwd_stable = True
         try:
-            tokens = _shell_tokens(source)
+            tokens = shell_tokens(source)
         except ValueError:
-            return findings, git_read, executables
+            return CommandScanResult(
+                findings,
+                git_read,
+                executables,
+                path_arguments,
+                first_literal,
+                first_initial,
+                None,
+                first_path_inherited,
+                inherited_executables,
+                first_arguments,
+            )
         start = 0
         for index in range(len(tokens) + 1):
             if index < len(tokens) and not (
@@ -246,36 +496,110 @@ class CommandInspection:
             ):
                 continue
             segment = tokens[start:index]
+            initial = start == 0
             start = index + 1
-            command, review = self._strip_redirections(segment, temporary_roots)
+            word_tokens, review = self.strip_redirections(segment, temporary_roots)
             if review:
                 self._add_destructive_finding(findings, redirection=True)
-            command, ambiguous = self._strip_shell_prefixes(command)
+            command, ambiguous = self._strip_shell_prefixes([token.value for token in word_tokens])
             if ambiguous:
                 self._add_destructive_finding(findings)
+                path_stable = False
                 continue
+            expansion_changes_path = any(
+                _path_mutating_expansion(token.raw) for token in segment if not token.operator
+            )
+            if expansion_changes_path:
+                path_stable = False
             if not command:
+                if any(token.value.startswith("PATH=") for token in word_tokens):
+                    path_stable = False
                 continue
+            prefixes = word_tokens[: -len(command)]
+            valid_prefixes = all(
+                token.value in {"command", "exec"}
+                or re.match(r"[A-Za-z_][A-Za-z0-9_]*=", token.raw) is not None
+                for token in prefixes
+            )
+            inherited = (
+                path_stable
+                and valid_prefixes
+                and not any(token.value.startswith("PATH=") for token in prefixes)
+            )
+            literal = literal_shell_word(word_tokens[-len(command)].raw)
+            function_syntax = index < len(tokens) and tokens[index].value == "("
+            if (
+                inherited
+                and literal
+                and not function_syntax
+                and command[0]
+                not in self.PATH_CONTEXT_MUTATORS | self.SHELL_KEYWORDS | self.SHELL_BUILTINS
+            ):
+                inherited_executables.append((command[0], cwd_stable))
+            if not executables:
+                first_literal = literal
+                first_initial = initial and not function_syntax and valid_prefixes
+                first_path_inherited = inherited
+                argument_start = len(word_tokens) - len(command) + 1
+                for token in word_tokens[argument_start : argument_start + 128]:
+                    if not literal_shell_word(token.raw):
+                        break
+                    first_arguments.append(token.value)
+                first_argument = first_arguments[0] if first_arguments else None
             name = Path(command[0]).name
             executables.append(command[0])
+            arguments = command[1:]
+            shell_source = (
+                arguments.index("-c") + 1 if name in self.SHELLS and "-c" in arguments else -1
+            )
+            path_arguments.extend(
+                word
+                for position, word in enumerate(arguments)
+                if position != shell_source
+                and word
+                and not word.startswith(("-", "~"))
+                and not any(char in word for char in "$`*?[")
+            )
             if name == "git" and len(command) > 1:
                 git_read = git_read or command[1] not in {"--version", "version", "help"}
             for position, matcher in enumerate(self._matchers):
                 if findings[position] is None and (finding := matcher(command)) is not None:
                     findings[position] = finding
-            if Path(command[0]).name in self.SHELLS and depth < 2 and "-c" in command[1:]:
-                arguments = command[1:]
-                position = arguments.index("-c")
-                if position + 1 < len(arguments):
-                    nested_findings, nested_git_read, nested_executables = self._scan(
-                        arguments[position + 1], temporary_roots, depth + 1
+            if name in self.SHELLS and depth < 2 and 0 <= shell_source < len(arguments):
+                nested = self._scan(arguments[shell_source], temporary_roots, depth + 1)
+                git_read = git_read or nested.git_read
+                executables.extend(nested.executables)
+                path_arguments.extend(nested.path_arguments)
+                if inherited and literal_shell_word(
+                    word_tokens[-len(command) + 1 + shell_source].raw
+                ):
+                    inherited_executables.extend(
+                        (name, cwd_stable and nested_cwd_stable)
+                        for name, nested_cwd_stable in nested.inherited_executables
                     )
-                    git_read = git_read or nested_git_read
-                    executables.extend(nested_executables)
-                    for nested_position, finding in enumerate(nested_findings):
-                        if findings[nested_position] is None:
-                            findings[nested_position] = finding
-        return findings, git_read, executables
+                for nested_position, finding in enumerate(nested.findings):
+                    if findings[nested_position] is None:
+                        findings[nested_position] = finding
+            if command[0] in self.PATH_CONTEXT_MUTATORS | self.SHELL_KEYWORDS or function_syntax:
+                path_stable = False
+            if command[0] == "printf" and len(command) > 1 and command[1].startswith("-v"):
+                path_stable = False
+            if command[0] == "set" and _set_enables_keyword(command[1:]):
+                path_stable = False
+            if command[0] in {"cd", "pushd", "popd"} and command[1:] != ["."]:
+                cwd_stable = False
+        return CommandScanResult(
+            findings,
+            git_read,
+            executables,
+            path_arguments,
+            first_literal,
+            first_initial,
+            first_argument,
+            first_path_inherited,
+            inherited_executables,
+            first_arguments,
+        )
 
     def _add_destructive_finding(
         self,
@@ -299,12 +623,20 @@ class CommandInspection:
                     ),
                 )
 
-    def _strip_redirections(
+    def strip_redirections(
         self,
         tokens: list[ShellToken],
         temporary_roots: tuple[Path, ...],
-    ) -> tuple[list[str], bool]:
-        """Separate command words from redirects, retaining review for unproven destinations."""
+    ) -> tuple[list[ShellToken], bool]:
+        """Separate command words from redirects and identify unproven write destinations.
+
+        Args:
+            tokens (list[ShellToken]): Tokens for one shell command segment.
+            temporary_roots (tuple[Path, ...]): Canonical temporary directories approved for writes.
+
+        Returns:
+            tuple[list[ShellToken], bool]: Remaining words and whether a write needs review.
+        """
         words = []
         last_word_position = -1
         review = False
@@ -312,7 +644,7 @@ class CommandInspection:
         while position < len(tokens):
             token = tokens[position]
             if not token.operator or token.value not in self.REDIRECTIONS:
-                words.append(token.value)
+                words.append(token)
                 last_word_position = position
                 position += 1
                 continue

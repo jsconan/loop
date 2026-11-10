@@ -8,9 +8,30 @@ from loop.permissions import (
     CommandFinding,
     CommandInspection,
     CommandReviewStatus,
+    literal_shell_word,
     match_destructive_command,
     match_git_mutation,
+    shell_tokens,
 )
+
+
+def test_shell_inspection_exposes_exact_tokens_and_literal_classification():
+    """Discovery can inspect source offsets and literals through the shared public boundary."""
+    tokens = shell_tokens("tool 'two words' $VALUE > /dev/null")
+    assert [(token.value, token.raw, token.operator) for token in tokens] == [
+        ("tool", "tool", False),
+        ("two words", "'two words'", False),
+        ("$VALUE", "$VALUE", False),
+        (">", ">", True),
+        ("/dev/null", "/dev/null", False),
+    ]
+    assert literal_shell_word(tokens[1].raw)
+    assert not literal_shell_word(tokens[2].raw)
+    words, review = CommandInspection().strip_redirections(tokens, ())
+    assert [token.value for token in words] == ["tool", "two words", "$VALUE"]
+    assert not review
+    with pytest.raises(ValueError, match="Unsupported or incomplete shell word"):
+        shell_tokens("tool 'unfinished")
 
 
 def test_command_inspection_collects_every_default_finding_from_nested_shell():
@@ -24,6 +45,192 @@ def test_command_inspection_collects_every_default_finding_from_nested_shell():
     ]
     assert all(finding.status is CommandReviewStatus.FRESH for finding in findings)
     assert [finding.requests_git_write for finding in findings] == [True, False]
+
+
+def test_command_analysis_retains_literal_path_arguments_without_granting_authority():
+    """Literal path hints exclude redirects and paths requiring shell expansion."""
+    analysis = CommandInspection().analyze(
+        "./launcher task './tools/job with space' $WORKSPACE_ROOT/dynamic ./glob* ~/dynamic "
+        "--option=./value > ./output; sh -c 'other ../nested/task'"
+    )
+
+    assert analysis.executables == ("./launcher", "sh", "other")
+    assert analysis.path_arguments == ("./tools/job with space", "../nested/task", "task")
+
+
+def test_command_analysis_prioritizes_explicit_paths_with_many_arguments():
+    """Bare-name hints cannot crowd explicit paths out of bounded discovery."""
+    names = " ".join(f"item{index}" for index in range(150))
+    analysis = CommandInspection().analyze(f"launcher {names} ./selected ''")
+
+    assert len(analysis.path_arguments) == 128
+    assert analysis.path_arguments[0] == "./selected"
+    assert "" not in analysis.path_arguments
+
+
+@pytest.mark.parametrize(
+    ("source", "literal"),
+    [
+        ("./tool", True),
+        ("$NAME/tool", False),
+        ('"$NAME/tool"', False),
+        ("'$NAME/tool'", True),
+        (r"\$NAME/tool", True),
+        (r"./tool\ with\ space", True),
+        ("./'tool with space'", True),
+        (r"./to\?l", True),
+        ("./to?l", False),
+        ("'./to?l'", True),
+        ('"./to?l"', True),
+        (r'"./\$NAME/tool"', False),
+        ("./{one,two}", False),
+        ("~/tool", False),
+        ("'~/tool'", True),
+        ("exec './tool with space'", True),
+        ("VALUE=literal command './tool with space'", True),
+        (">/dev/null './tool with space'", True),
+        ("2>/dev/null exec './tool with space'", True),
+        ("VALUE=literal", False),
+        ("$NAME/tool; '$NAME/tool'", False),
+        ("'$NAME/tool'; $NAME/tool", True),
+        ("'", False),
+    ],
+)
+def test_command_analysis_identifies_literal_first_executable(source, literal):
+    """Quoted literals and escaped characters differ from shell-expanded command words."""
+    assert CommandInspection().analyze(source).first_executable_literal is literal
+
+
+@pytest.mark.parametrize(
+    ("source", "initial"),
+    [
+        ("exec ./task; :", True),
+        ("OPTION=value ./task && :", True),
+        ("OPTION='value with space' ./task && :", True),
+        ("'OPTION=value' ./task", False),
+        ("env ./task", False),
+        (">/dev/null ./task; :", True),
+        (":; ./task", True),
+        ("; ./task", False),
+        ("( ./task )", False),
+        ("./task() { :; }", False),
+        ("'", False),
+    ],
+)
+def test_command_analysis_identifies_initial_simple_command(source, initial):
+    """Only the initial simple command can drive first-call interpreter preparation."""
+    assert CommandInspection().analyze(source).first_executable_initial is initial
+
+
+@pytest.mark.parametrize(
+    ("source", "argument"),
+    [
+        ("./launcher ./task", "./task"),
+        ("./launcher './task with space'", "./task with space"),
+        ("./launcher $TASK", None),
+        ('./launcher "$TASK"', None),
+        ("./launcher ./task*", None),
+        ("./launcher '$TASK'", "$TASK"),
+        ("./launcher >/dev/null ./task", "./task"),
+        ("./launcher", None),
+        ("'", None),
+    ],
+)
+def test_command_analysis_retains_only_a_literal_first_argument(source, argument):
+    """A first argument requiring shell expansion cannot identify a selected file."""
+    assert CommandInspection().analyze(source).first_executable_argument == argument
+
+
+@pytest.mark.parametrize(
+    ("source", "arguments"),
+    [
+        ("./outer ./inner ./tool --flag", ("./inner", "./tool", "--flag")),
+        ("./outer './inner with space' '$NAME'", ("./inner with space", "$NAME")),
+        ("./outer ./inner $TOOL ./later", ("./inner",)),
+        ("./outer $INNER ./tool", ()),
+        ("./outer ./inner ./tool* ./later", ("./inner",)),
+        ("./outer >/dev/null ./inner ./tool; other", ("./inner", "./tool")),
+        ("./outer", ()),
+        ("'", ()),
+    ],
+)
+def test_command_analysis_retains_the_literal_argument_prefix(source, arguments):
+    """Later words are not treated as positional arguments after an expansion."""
+    assert CommandInspection().analyze(source).first_executable_arguments == arguments
+
+
+def test_command_analysis_bounds_the_literal_argument_prefix():
+    """Argument discovery remains bounded even for very long command lines."""
+    analysis = CommandInspection().analyze("./outer " + " ".join(f"item{n}" for n in range(140)))
+
+    assert analysis.first_executable_arguments == tuple(f"item{n}" for n in range(128))
+
+
+@pytest.mark.parametrize(
+    ("source", "inherited"),
+    [
+        ("fixture", True),
+        ("VALUE=one fixture", True),
+        ("exec fixture", True),
+        ("PATH=/other fixture", False),
+        ("VALUE=one PATH=/other fixture", False),
+        ("env fixture", False),
+        ("env -i fixture", False),
+        ("'", False),
+    ],
+)
+def test_command_analysis_identifies_inherited_path_lookup(source, inherited):
+    """Only supported prefixes that preserve PATH can use inherited lookup for discovery."""
+    assert CommandInspection().analyze(source).first_path_inherited is inherited
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("first; second", (("first", True), ("second", True))),
+        ("PATH=/other first; second", (("second", True),)),
+        ("first; PATH=/other second", (("first", True),)),
+        ("PATH=/other; second", ()),
+        ("export PATH=/other; second", ()),
+        (': "${PATH:=/other}"; second', ()),
+        ('VALUE="${PATH:=/other}"; second', ()),
+        (': "$((PATH=1))"; second', ()),
+        (': "$((PATH[0]=1))"; second', ()),
+        (': "$((1+$((PATH=1))))"; second', ()),
+        (': "$((PATH=1)"; second', ()),
+        (': "$((1+2))"; second', (("second", True),)),
+        (': "$((0xff+1))"; second', (("second", True),)),
+        (': "$((16#ff+1))"; second', (("second", True),)),
+        (': "$((VALUE))"; second', ()),
+        (': "$((1+$VALUE))"; second', ()),
+        (": '${PATH:=/other}'; second", (("second", True),)),
+        (r': "\${PATH:=/other}"; second', (("second", True),)),
+        (r': "\\${PATH:=/other}"; second', ()),
+        ("printf -v PATH value; second", ()),
+        ("set -e; second", (("second", True),)),
+        ("set -k; second", ()),
+        ("set -o keyword; second", ()),
+        ("set -ek; second", ()),
+        ("set -okeyword; second", ()),
+        ("set +o keyword; second", (("second", True),)),
+        ("set -o; second", (("second", True),)),
+        ("set -; second", (("second", True),)),
+        ("set +; second", (("second", True),)),
+        ("set -- -k; second", (("second", True),)),
+        ("set value -k; second", (("second", True),)),
+        ("pushd somewhere; second", (("second", False),)),
+        ("env -i first; second", (("second", True),)),
+        ("cd somewhere; second", (("second", False),)),
+        ("cd .; second", (("second", True),)),
+        ("if first; then second; fi", ()),
+        ("fixture() { :; }; fixture", ()),
+        ("sh -c 'first; second'", (("sh", True), ("first", True), ("second", True))),
+        ('sh -c "$SOURCE"', (("sh", True),)),
+    ],
+)
+def test_command_analysis_tracks_inherited_path_candidates(source, expected):
+    """Known PATH changes never authorize lookup using an unrelated inherited search path."""
+    assert CommandInspection().analyze(source).inherited_path_executables == expected
 
 
 @pytest.mark.parametrize(

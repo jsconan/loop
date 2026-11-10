@@ -46,10 +46,13 @@ __all__ = [
     "SandboxedCommandRule",
     "SessionPolicyOverrides",
     "SessionTarget",
+    "ShellToken",
     "UserPermissionConfiguration",
+    "literal_shell_word",
     "match_destructive_command",
     "match_git_mutation",
     "protected_workspace_paths",
+    "shell_tokens",
 ]
 
 from .audit import SQLitePermissionAudit
@@ -58,8 +61,11 @@ from .inspection import (
     CommandAnalysis,
     CommandInspection,
     CommandMatcher,
+    ShellToken,
+    literal_shell_word,
     match_destructive_command,
     match_git_mutation,
+    shell_tokens,
 )
 from .manager import PermissionManager
 from .models import (
