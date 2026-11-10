@@ -17,7 +17,7 @@ def compiler(monkeypatch):
     @contextmanager
     def verified(*, deadline):
         """Model a pinned compiler lock."""
-        assert deadline == min(state.request.deadline, 15)
+        assert deadline in (state.request.deadline, min(state.request.deadline, 15))
         yield 99
 
     state = SimpleNamespace(
@@ -33,6 +33,7 @@ def compiler(monkeypatch):
     monkeypatch.setattr(linux_compiler, "compile_policy_source", state.compile)
     monkeypatch.setattr(linux_compiler.fcntl, "flock", state.flock)
     monkeypatch.setattr(linux_compiler.time, "monotonic", lambda: next(state.times))
+    monkeypatch.setattr(linux_compiler.time, "sleep", Mock())
     return state
 
 
@@ -57,14 +58,53 @@ def test_compile_payload_serializes_and_revalidates(compiler):
         99, linux_compiler.fcntl.LOCK_EX | linux_compiler.fcntl.LOCK_NB
     )
     assert compiler.lock.open_verified.call_args_list == [
-        call(deadline=min(compiler.request.deadline, 15)),
+        call(deadline=compiler.request.deadline),
         call(deadline=min(compiler.request.deadline, 15)),
     ]
 
 
-@pytest.mark.parametrize(
-    "cause", ["source", "lock", "expired", "contention", "drift", "request", "compile"]
-)
+def test_compile_payload_waits_for_compiler_lock(compiler):
+    """Concurrent compilation joins the lock within the original request budget."""
+    compiler.times = iter([10, 10, 10])
+    compiler.flock.side_effect = [BlockingIOError("busy"), None]
+    assert compile_request(compiler) == b"compiled"
+    assert compiler.flock.call_count == 2
+    linux_compiler.time.sleep.assert_called_once_with(0.01)
+
+
+def test_compile_payload_times_out_waiting_for_compiler_lock(compiler):
+    """A busy compiler cannot extend the request deadline."""
+    compiler.times = iter([10, 100])
+    compiler.flock.side_effect = BlockingIOError("busy")
+    with pytest.raises(TimeoutError, match="Payload compilation deadline expired"):
+        compile_request(compiler)
+    compiler.compile.assert_not_called()
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_compile_payload_observes_cancellation_while_waiting(compiler, cancelled):
+    """A cancelled request never compiles while another request owns the lock."""
+    compiler.times = iter([10, 10, 10])
+    compiler.flock.side_effect = [BlockingIOError("busy"), None]
+    check = Mock(return_value=cancelled)
+    args = (
+        compiler.request,
+        Path("/scratch"),
+        Path("/cache"),
+        "payload",
+        (Path("/usr"),),
+        compiler.lock,
+    )
+    if cancelled:
+        with pytest.raises(linux_compiler.CompilationCancelled, match="compilation cancelled"):
+            linux_compiler.compile_payload(*args, cancelled=check)
+        compiler.compile.assert_not_called()
+    else:
+        assert linux_compiler.compile_payload(*args, cancelled=check) == b"compiled"
+    check.assert_called_once_with()
+
+
+@pytest.mark.parametrize("cause", ["source", "lock", "expired", "drift", "request", "compile"])
 def test_compile_payload_refuses_unsafe_preparation(compiler, cause):
     """Unsafe or stale authority and failed preparation never return usable compiled policy."""
     exception, message = ValueError, "bound|read-only|changed"
@@ -75,9 +115,6 @@ def test_compile_payload_refuses_unsafe_preparation(compiler, cause):
     elif cause == "expired":
         compiler.request.deadline = 10
         exception, message = TimeoutError, "deadline expired"
-    elif cause == "contention":
-        compiler.flock.side_effect = BlockingIOError("busy")
-        exception, message = BlockingIOError, "busy"
     elif cause == "drift":
         compiler.lock.open_verified.side_effect = ValueError("authority changed")
     elif cause == "request":
