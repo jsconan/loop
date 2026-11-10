@@ -222,16 +222,23 @@ class WorkspaceCommands:
                     raise
                 raise WorkspaceSwitchRequested(target, self._switch_lock.release)
             if action == "attach":
-                if workspace_id is not None and not context.interaction.confirm(
-                    f"Associate {value} with workspace {workspace_id}?", default=False
+                if (
+                    workspace_id is not None
+                    and context.interaction.confirm(
+                        f"Associate {value} with workspace {workspace_id}?", default=False
+                    )
+                    is not True
                 ):
                     context.interaction.info("Workspace attach cancelled.")
                     return
                 attached = self._repository.attach(value, workspace_id)
                 context.interaction.info(f"Attached workspace {attached.id} at {attached.root}.")
                 return
-            if not context.interaction.confirm(
-                f"Confirm workspace {action} for {value}?", default=False
+            if (
+                context.interaction.confirm(
+                    f"Confirm workspace {action} for {value}?", default=False
+                )
+                is not True
             ):
                 context.interaction.info(f"Workspace {action} cancelled.")
                 return

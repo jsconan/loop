@@ -400,10 +400,16 @@ class ModelSelection:
                 f"Model '{selection}' was already unavailable; the same "
                 "failure is likely to re-occur unless the backend is updated."
             )
-            if interaction.confirm(
+            if getattr(interaction, "yolo", False):
+                interaction.warning("Select a different model to continue recovery.")
+                return False
+            confirmed = interaction.confirm(
                 "Continue with this model, or select a different one?", default=True
-            ):
+            )
+            if confirmed is True:
                 break
+            if confirmed is not False:
+                return False
         self.select(selection)
         interaction.info(f"Using model: {selection}")
         return True
@@ -456,10 +462,15 @@ class ModelSelection:
                 f"Model '{selection}' was already unavailable; the same "
                 "failure is likely to re-occur unless the backend is updated."
             )
+            if getattr(interaction, "yolo", False):
+                interaction.warning("Select a different model to continue recovery.")
+                return False
             prompt = "Continue with this model, or select a different one?"
             confirmed = await async_interaction.confirm_async(prompt, default=True)
-            if confirmed:
+            if confirmed is True:
                 break
+            if confirmed is not False:
+                return False
         await self.select_async(selection)
         interaction.info(f"Using model: {selection}")
         return True

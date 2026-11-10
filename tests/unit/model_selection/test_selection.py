@@ -495,6 +495,62 @@ def test_async_fallback_retries_the_unavailable_choice_after_confirmation():
     assert selection.selected == "unavailable"
 
 
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("decision", [True, False, "invalid"])
+def test_fallback_requires_a_boolean_to_retry_an_unavailable_model(asynchronous, decision):
+    """Only explicit approval retries; a decline permits another selection."""
+    models = [ModelInfo(id="unavailable"), ModelInfo(id="replacement")]
+    active_backend = backend(
+        get_models=Mock(return_value=models),
+        get_models_async=AsyncMock(return_value=models),
+    )
+    selection = ModelSelection(active_backend, SessionManager(), selected="unavailable")
+    interaction = MagicMock(spec=ConsoleInteraction)
+    interaction.prompt.side_effect = ["unavailable", "replacement"]
+    interaction.prompt_async = AsyncMock(side_effect=["unavailable", "replacement"])
+    interaction.confirm.return_value = decision
+    interaction.confirm_async = AsyncMock(return_value=decision)
+
+    result = (
+        asyncio.run(selection.select_fallback_async(interaction))
+        if asynchronous
+        else selection.select_fallback(interaction)
+    )
+
+    assert result is (decision != "invalid")
+    assert selection.selected == ("replacement" if decision is False else "unavailable")
+    assert (
+        interaction.prompt_async.await_count if asynchronous else interaction.prompt.call_count
+    ) == (2 if decision is False else 1)
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_yolo_fallback_refuses_an_unavailable_model_without_confirming(asynchronous):
+    """No-prompt mode asks for a different model instead of guessing a repeated failure."""
+    models = [ModelInfo(id="unavailable")]
+    active_backend = backend(
+        get_models=Mock(return_value=models),
+        get_models_async=AsyncMock(return_value=models),
+    )
+    selection = ModelSelection(active_backend, SessionManager(), selected="unavailable")
+    interaction = MagicMock(spec=ConsoleInteraction)
+    interaction.yolo = True
+    interaction.prompt.return_value = "unavailable"
+    interaction.prompt_async = AsyncMock(return_value="unavailable")
+
+    result = (
+        asyncio.run(selection.select_fallback_async(interaction))
+        if asynchronous
+        else selection.select_fallback(interaction)
+    )
+
+    assert result is False
+    assert selection.selected == "unavailable"
+    interaction.confirm.assert_not_called()
+    interaction.confirm_async.assert_not_called()
+    assert "Select a different model" in interaction.warning.call_args.args[0]
+
+
 def test_async_fallback_reprompts_when_the_user_declines_the_same_model():
     """Declining the unavailable model keeps the recovery loop open for another choice."""
     active_backend = backend(

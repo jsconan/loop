@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import shlex
 from threading import Event, get_ident
 from unittest.mock import Mock
 from zipfile import ZipFile
@@ -369,7 +370,7 @@ def test_export_command_writes_a_markdown_transcript_for_the_active_session(tmp_
     manager.register_provider(SessionCommands(SessionManager(session=active), Mock()))
     target = tmp_path / "current.md"
 
-    manager.call("session", f"export {target}")
+    manager.call("session", f"export {shlex.quote(str(target))}")
 
     assert "Export this conversation." in target.read_text(encoding="utf-8")
     interaction.info.assert_called_once_with(
@@ -440,7 +441,7 @@ def test_export_command_selects_a_persisted_session_without_resuming_it(tmp_path
     positional_target = tmp_path / "selected-positional.zip"
     named_target = tmp_path / "selected-named.zip"
 
-    manager.call("export", f"saved {positional_target} archive")
+    manager.call("export", f"saved {shlex.quote(str(positional_target))} archive")
     manager.call("export", f'saved destination="{named_target}" format=archive')
 
     assert sessions.session is active
@@ -548,16 +549,19 @@ def test_sessions_export_writes_a_saved_session_to_a_quoted_destination(tmp_path
     assert sessions.session is active
 
 
-def test_export_command_preserves_existing_destination_when_replacement_is_declined(tmp_path):
-    """A no response leaves an existing export untouched."""
+@pytest.mark.parametrize("response", [False, object()])
+def test_export_command_preserves_existing_destination_when_replacement_is_declined(
+    tmp_path, response
+):
+    """Only an explicit approval permits replacing an existing export."""
     interaction = Mock(spec=ConsoleInteraction)
-    interaction.confirm.return_value = False
+    interaction.confirm.return_value = response
     manager = CommandManager(interaction=interaction)
     manager.register_provider(SessionCommands(SessionManager(), Mock()))
     target = tmp_path / "existing.md"
     target.write_text("Keep this file.", encoding="utf-8")
 
-    manager.call("session", f"export {target}")
+    manager.call("session", f"export {shlex.quote(str(target))}")
 
     assert target.read_text(encoding="utf-8") == "Keep this file."
     interaction.confirm.assert_called_once_with(
@@ -592,7 +596,9 @@ def test_async_export_dispatch_keeps_file_work_off_the_event_loop(tmp_path, monk
         """Let the event loop release the simulated blocking export operation."""
         owner_thread = get_ident()
         pending = asyncio.create_task(
-            manager.call_async("session", f"export {target}", interaction=interaction)
+            manager.call_async(
+                "session", f"export {shlex.quote(str(target))}", interaction=interaction
+            )
         )
         try:
             assert await asyncio.to_thread(started.wait, 5)
@@ -620,7 +626,7 @@ def test_export_command_replaces_existing_destination_after_confirmation(tmp_pat
     target = tmp_path / "existing.md"
     target.write_text("Old contents.", encoding="utf-8")
 
-    manager.call("session", f"export {target}")
+    manager.call("session", f"export {shlex.quote(str(target))}")
 
     assert "Old contents." not in target.read_text(encoding="utf-8")
     interaction.confirm.assert_called_once_with(
@@ -654,7 +660,7 @@ def test_export_command_prompts_if_the_destination_appears_during_export(tmp_pat
 
     monkeypatch.setattr(session_commands_module, "export_session", race_once)
 
-    manager.call("session", f"export {target}")
+    manager.call("session", f"export {shlex.quote(str(target))}")
 
     assert attempts == 2
     interaction.confirm.assert_called_once_with(
@@ -686,7 +692,7 @@ def test_export_command_reports_write_collisions_after_replacement_confirmation(
         fail_after_confirmation,
     )
 
-    manager.call("session", f"export {target}")
+    manager.call("session", f"export {shlex.quote(str(target))}")
 
     assert target.name in interaction.report.call_args.args[0].detail
     assert target.read_text(encoding="utf-8") == "Preserve this file."
@@ -706,9 +712,9 @@ def test_export_command_rejects_directories_and_the_session_database(tmp_path):
     directory = tmp_path / "directory"
     directory.mkdir()
 
-    manager.call("session", f"export {directory}")
+    manager.call("session", f"export {shlex.quote(str(directory))}")
     assert "destination must be a file" in interaction.report.call_args.args[0].detail
-    manager.call("session", f"export {database}")
+    manager.call("session", f"export {shlex.quote(str(database))}")
     assert "must not be the session database" in interaction.report.call_args.args[0].detail
     interaction.prompt.assert_not_called()
     interaction.confirm.assert_not_called()

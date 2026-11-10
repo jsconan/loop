@@ -6,6 +6,7 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field
 
+from .. import constants
 from ..commands import CommandArgumentError, CommandContext, CommandRegistration
 from ..completion import (
     CommandCompletion,
@@ -291,7 +292,7 @@ class SessionCommands:
                         f"Replace the existing file at '{target}'?",
                         default=False,
                     )
-                    if not confirmed:
+                    if confirmed is not True:
                         context.interaction.info("Session export stopped.")
                         return
                     overwrite = True
@@ -527,4 +528,4 @@ def _default_export_path(session: Session, format: SessionExportFormat) -> Path:
     ):
         session_id = hashlib.sha256(session_id.encode("utf-8", errors="surrogatepass")).hexdigest()
     extension = "zip" if format == "archive" else "md"
-    return Path.cwd() / f"loop-session-{session_id}.{extension}"
+    return Path.cwd() / f"{constants.APP_NAME}-session-{session_id}.{extension}"

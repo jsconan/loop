@@ -139,6 +139,23 @@ def test_workspace_attach_forwards_an_explicit_existing_identity(tmp_path):
     repository.attach.assert_called_once_with(str(tmp_path), "chosen")
 
 
+@pytest.mark.parametrize("action", ["attach", "forget", "rekey"])
+def test_workspace_mutations_reject_invalid_confirmation(tmp_path, action):
+    """Truthy non-boolean responses cannot authorize workspace mutations."""
+    workspace = Workspace(tmp_path, tmp_path, "active", "active", "directory", 1, 1)
+    repository = Mock()
+    commands = WorkspaceCommands(workspace, repository)
+    interaction = Mock(spec=ConsoleInteraction)
+    interaction.confirm.return_value = object()
+    context = CommandContext("workspace", interaction)
+
+    commands.workspace(context, action, str(tmp_path), "chosen" if action == "attach" else None)
+
+    repository.attach.assert_not_called()
+    repository.forget.assert_not_called()
+    repository.rekey.assert_not_called()
+
+
 def test_workspace_completion_skips_locations_without_persisted_identity(tmp_path):
     """Workspace completion omits an ID candidate when a location has no identity."""
     active = Workspace(tmp_path, tmp_path, "active", "Active", "directory", 1, 1)
@@ -148,7 +165,9 @@ def test_workspace_completion_skips_locations_without_persisted_identity(tmp_pat
     providers = commands.get_completion_providers()
 
     assert providers[0].provider() == ()
-    assert {value.value for value in providers[1].provider()} == {str(tmp_path.resolve())}
+    assert {value.value for value in providers[1].provider()} == {
+        shlex.quote(str(tmp_path.resolve()))
+    }
 
 
 def test_workspace_path_completion_quotes_paths_with_spaces(tmp_path):
