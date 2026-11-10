@@ -24,7 +24,7 @@ def host(monkeypatch):
         seccomp_init=Mock(return_value=123),
         seccomp_release=Mock(),
         seccomp_attr_set=Mock(return_value=0),
-        seccomp_syscall_resolve_name_arch=Mock(side_effect=[212, 243, 425, 426, 427]),
+        seccomp_syscall_resolve_name_arch=Mock(side_effect=[212, 243, 425, 426, 427, 198, 199]),
         seccomp_rule_add_exact_array=Mock(return_value=0),
         seccomp_export_bpf=Mock(),
     )
@@ -43,10 +43,10 @@ def host(monkeypatch):
 @pytest.mark.parametrize(
     ("machine", "name", "architecture", "numbers"),
     [
-        ("aarch64", b"aarch64", 0xC00000B7, [212, 243, 425, 426, 427]),
-        ("arm64", b"aarch64", 0xC00000B7, [212, 243, 425, 426, 427]),
-        ("x86_64", b"x86_64", 0xC000003E, [47, 299, 425, 426, 427]),
-        ("AMD64", b"x86_64", 0xC000003E, [47, 299, 425, 426, 427]),
+        ("aarch64", b"aarch64", 0xC00000B7, [212, 243, 425, 426, 427, 198, 199]),
+        ("arm64", b"aarch64", 0xC00000B7, [212, 243, 425, 426, 427, 198, 199]),
+        ("x86_64", b"x86_64", 0xC000003E, [47, 299, 425, 426, 427, 41, 53]),
+        ("AMD64", b"x86_64", 0xC000003E, [47, 299, 425, 426, 427, 41, 53]),
     ],
 )
 def test_descriptor_filter_resolves_native_rules_and_exports(
@@ -70,16 +70,111 @@ def test_descriptor_filter_resolves_native_rules_and_exports(
             b"io_uring_setup",
             b"io_uring_enter",
             b"io_uring_register",
+            b"socket",
+            b"socketpair",
         )
     ]
-    assert library.seccomp_rule_add_exact_array.call_args_list == [
+    calls = library.seccomp_rule_add_exact_array.call_args_list
+    assert calls[:5] == [
         ((123, 0x50000 | error, number, 0, None),)
-        for number, error in zip(numbers, [1, 1, 38, 38, 38], strict=True)
+        for number, error in zip(numbers[:5], [1, 1, 38, 38, 38], strict=True)
     ]
+    assert len(calls[5:]) == 99
+    assert all(call.args[:2] == (123, 0x50001) for call in calls[5:])
+    assert [(call.args[2], call.args[3]) for call in calls[5:]] == (
+        [(numbers[5], 1)] * 32
+        + [(numbers[5], 2)] * 32
+        + [(numbers[6], 1)] * 32
+        + [(numbers[6], 2)] * 3
+    )
     library.seccomp_release.assert_called_once_with(123)
     host.loader.assert_called_once_with("/lib/libseccomp.so.2")
     assert library.seccomp_init.restype is linux_seccomp.ctypes.c_void_p
     assert library.seccomp_rule_add_exact_array.argtypes[-1] is linux_seccomp.ctypes.c_void_p
+
+
+@pytest.mark.parametrize("mediated", [False, True])
+def test_local_network_filter_compiles_for_attempt_mode(host, mediated):
+    """Host preparation exports a filter blocking listeners and excess socket families."""
+    library = host.library
+    library.seccomp_syscall_resolve_name_arch.side_effect = [49, 50, 41]
+    assert linux_seccomp.local_network_filter(mediated_egress=mediated) == (
+        b"\x06\0\0\0\0\0\xff\x7f"
+    )
+    assert [call.args[1] for call in library.seccomp_syscall_resolve_name_arch.call_args_list] == [
+        b"bind",
+        b"listen",
+        b"socket",
+    ]
+    library.seccomp_export_bpf.assert_called_once()
+    assert library.seccomp_rule_add_exact_array.call_count == (7 if mediated else 3)
+    library.seccomp_release.assert_called_once_with(123)
+
+
+def test_local_network_filter_rejects_wrong_mode_and_unsupported_host(host, monkeypatch):
+    """An invalid setup input or architecture cannot install a partial filter."""
+    with pytest.raises(TypeError, match="mediator mode"):
+        linux_seccomp.local_network_filter(mediated_egress=1)
+    monkeypatch.setattr(linux_seccomp.platform, "machine", lambda: "i386")
+    with pytest.raises(ValueError, match="filter ABI"):
+        linux_seccomp.local_network_filter(mediated_egress=False)
+    host.loader.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", ["arch", "allocation", "syscall", "socket", "rule", "export"])
+def test_local_network_filter_fails_closed_on_native_errors(host, failure):
+    """Native preparation and export errors stop before command source runs."""
+    library = host.library
+    library.seccomp_syscall_resolve_name_arch.side_effect = [49, 50, 41]
+    if failure == "arch":
+        library.seccomp_arch_native.return_value = 0
+    elif failure == "allocation":
+        library.seccomp_init.return_value = 0
+    elif failure == "syscall":
+        library.seccomp_syscall_resolve_name_arch.side_effect = [-1]
+    elif failure == "socket":
+        library.seccomp_syscall_resolve_name_arch.side_effect = [49, 50, -1]
+    elif failure == "rule":
+        library.seccomp_rule_add_exact_array.return_value = -errno.EPERM
+    else:
+        library.seccomp_export_bpf.side_effect = lambda _context, _fd: -errno.EPERM
+    with pytest.raises((ValueError, OSError)):
+        linux_seccomp.local_network_filter(mediated_egress=False)
+    if failure in {"arch", "allocation"}:
+        library.seccomp_release.assert_not_called()
+    else:
+        library.seccomp_release.assert_called_once_with(123)
+
+
+def test_local_network_filter_rejects_invalid_export_and_expired_budget(host):
+    """An empty BPF export or elapsed preparation deadline cannot authorize a payload."""
+    host.library.seccomp_syscall_resolve_name_arch.side_effect = [49, 50, 41]
+    host.library.seccomp_export_bpf.side_effect = lambda _context, _fd: 0
+    with pytest.raises(ValueError, match="Invalid native local-network filter export"):
+        linux_seccomp.local_network_filter(mediated_egress=False)
+
+    def export(_context, descriptor):
+        """Supply a minimal valid native program after the prior invalid export."""
+        os.write(descriptor, b"\x06\0\0\0\0\0\xff\x7f")
+        return 0
+
+    host.library.seccomp_export_bpf.side_effect = export
+    host.library.seccomp_syscall_resolve_name_arch.side_effect = [49, 50, 41]
+    with pytest.raises(TimeoutError, match="deadline expired"):
+        linux_seccomp.local_network_filter(mediated_egress=False, deadline=0)
+
+
+def test_local_network_filter_install_validates_program_and_kernel_result(monkeypatch):
+    """The isolated payload installs only a bounded BPF program and fails closed on refusal."""
+    with pytest.raises(ValueError, match="inherited local-network filter"):
+        linux_seccomp.install_local_network_filter(b"bad")
+    library = SimpleNamespace(prctl=Mock(return_value=0))
+    monkeypatch.setattr(linux_seccomp.ctypes, "CDLL", Mock(return_value=library))
+    linux_seccomp.install_local_network_filter(b"\x06\0\0\0\0\0\xff\x7f")
+    assert library.prctl.call_args.args[0:2] == (22, 2)
+    library.prctl.return_value = -1
+    with pytest.raises(OSError, match="filter installation failed"):
+        linux_seccomp.install_local_network_filter(b"\x06\0\0\0\0\0\xff\x7f")
 
 
 @pytest.mark.parametrize(
@@ -139,6 +234,15 @@ def test_descriptor_filter_refuses_missing_and_pseudo_syscalls(host, number):
     with pytest.raises(ValueError, match="syscall is unavailable"):
         linux_seccomp.descriptor_filter()
     host.library.seccomp_rule_add_exact_array.assert_not_called()
+    host.library.seccomp_export_bpf.assert_not_called()
+    host.library.seccomp_release.assert_called_once_with(123)
+
+
+def test_descriptor_filter_refuses_missing_unix_creation_syscall(host):
+    """An unavailable Unix socket syscall cannot silently remove its denial."""
+    host.library.seccomp_syscall_resolve_name_arch.side_effect = [212, 243, 425, 426, 427, -1]
+    with pytest.raises(ValueError, match="syscall is unavailable"):
+        linux_seccomp.descriptor_filter()
     host.library.seccomp_export_bpf.assert_not_called()
     host.library.seccomp_release.assert_called_once_with(123)
 

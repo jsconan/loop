@@ -14,14 +14,14 @@ pytestmark = [pytest.mark.integration, pytest.mark.linux]
 
 # Independent test expectations, never used to construct the production filter.
 _ABIS = {
-    "aarch64": (0xC00000B7, (212, 243, 425, 426, 427), 63),
-    "arm64": (0xC00000B7, (212, 243, 425, 426, 427), 63),
-    "x86_64": (0xC000003E, (47, 299, 425, 426, 427), 0),
-    "amd64": (0xC000003E, (47, 299, 425, 426, 427), 0),
+    "aarch64": (0xC00000B7, (212, 243, 425, 426, 427), 63, (198, 199)),
+    "arm64": (0xC00000B7, (212, 243, 425, 426, 427), 63, (198, 199)),
+    "x86_64": (0xC000003E, (47, 299, 425, 426, 427), 0, (41, 53)),
+    "amd64": (0xC000003E, (47, 299, 425, 426, 427), 0, (41, 53)),
 }
 
 
-def evaluate(program, architecture, syscall):
+def evaluate(program, architecture, syscall, arg0=0, arg1=0, arg2=0):
     """Interpret exported classic BPF against a synthetic seccomp record without execution."""
     instructions = tuple(struct.iter_unpack("=HBBI", program))
     index = 0
@@ -29,8 +29,17 @@ def evaluate(program, architecture, syscall):
     for _ in range(len(instructions)):
         opcode, yes, no, value = instructions[index]
         if opcode == 0x20:
-            assert value in (0, 4)
-            accumulator = architecture if value == 4 else syscall
+            assert value in (0, 4, 16, 20, 24, 28, 32, 36)
+            accumulator = {
+                0: syscall,
+                4: architecture,
+                16: arg0 & 0xFFFFFFFF,
+                20: arg0 >> 32,
+                24: arg1 & 0xFFFFFFFF,
+                28: arg1 >> 32,
+                32: arg2 & 0xFFFFFFFF,
+                36: arg2 >> 32,
+            }[value]
         elif opcode == 0x15:
             index += yes if accumulator == value else no
         elif opcode == 0x35:
@@ -39,6 +48,8 @@ def evaluate(program, architecture, syscall):
             index += yes if accumulator > value else no
         elif opcode == 0x45:
             index += yes if accumulator & value else no
+        elif opcode == 0x54:
+            accumulator &= value
         elif opcode == 0x05:
             index += value
         elif opcode == 0x06:
@@ -60,31 +71,50 @@ def native_filter():
 
 def test_export_rejects_foreign_and_compatibility_abis(native_filter):
     """Actual exported BPF kills foreign audit architectures and x32 syscall aliases."""
-    program, (architecture, numbers, ordinary) = native_filter
+    program, (architecture, numbers, ordinary, unix_calls) = native_filter
     for foreign in (0, 0x40000003, 0x40000028, 0xC000003E, 0xC00000B7):
         if foreign != architecture:
-            for number in (*numbers, ordinary):
+            for number in (*numbers, ordinary, *unix_calls):
                 assert evaluate(program, foreign, number) == 0x80000000
     if architecture == 0xC000003E:
-        for number in (*numbers, ordinary):
+        for number in (*numbers, ordinary, *unix_calls):
             assert evaluate(program, architecture, 0x40000000 | number) == 0x80000000
 
 
 def test_export_preserves_required_denials_and_other_calls(native_filter):
     """Real native export denies receivers and io_uring while retaining ordinary calls."""
-    program, (architecture, numbers, ordinary) = native_filter
+    program, (architecture, numbers, ordinary, unix_calls) = native_filter
     for number, error in zip(numbers, (1, 1, 38, 38, 38), strict=True):
         assert evaluate(program, architecture, number) == 0x50000 | error
     assert evaluate(program, architecture, ordinary) == 0x7FFF0000
     assert evaluate(program, architecture, 424) == 0x7FFF0000
     assert evaluate(program, architecture, 428) == 0x7FFF0000
+    socket_call, pair_call = unix_calls
+    for domain in (1, 0x100000001, 0xFFFFFFFF00000001):
+        assert evaluate(program, architecture, socket_call, domain, 1) == 0x50001
+        for kind in (*[value for value in range(16) if value not in (1, 5)], 0x100000002):
+            assert evaluate(program, architecture, pair_call, domain, kind) == 0x50001
+        for kind in (1, 5, 0x801, 0x805, 0x80001, 0x80005, 0x100000001, 0x100000005):
+            assert evaluate(program, architecture, pair_call, domain, kind) == 0x7FFF0000
+    for domain in range(64):
+        expected = 0x7FFF0000 if domain in (2, 10, 16) else 0x50001
+        for spelling in (domain, domain | 0x100000000, domain | 0xFFFFFFFF00000000):
+            assert evaluate(program, architecture, socket_call, spelling, 1, 0) == expected
+            if domain != 1:
+                assert evaluate(program, architecture, pair_call, spelling, 1, 0) == 0x50001
+    for domain in (64, 127, 255, 0x80000000, 0xFFFFFFFF):
+        assert evaluate(program, architecture, socket_call, domain, 1, 0) == 0x50001
+        assert evaluate(program, architecture, pair_call, domain, 1, 0) == 0x50001
+    for protocol in (1, 2, 4, 15, 31, 0x80000000):
+        assert evaluate(program, architecture, socket_call, 16, 3, protocol) == 0x50001
+    assert evaluate(program, architecture, socket_call, 16, 3, 0x100000000) == 0x7FFF0000
 
 
 def test_kernel_enforces_filter_and_child_inheritance(native_filter, tmp_path):
     """A disposable ordinary child and its descendant receive exact kernel denial errors."""
-    program, (_, numbers, _) = native_filter
+    program, (_, numbers, _, unix_calls) = native_filter
     code = r"""
-import ctypes, json, os, sys
+import ctypes, json, os, socket, sys
 class Instruction(ctypes.Structure):
     _fields_ = [('code', ctypes.c_ushort), ('jt', ctypes.c_ubyte),
                 ('jf', ctypes.c_ubyte), ('k', ctypes.c_uint32)]
@@ -99,12 +129,33 @@ libc.syscall.restype = ctypes.c_long
 if libc.prctl(38, 1, 0, 0, 0) != 0 or libc.prctl(22, 2, ctypes.byref(program), 0, 0) != 0:
     raise OSError(ctypes.get_errno(), 'Filter installation failed')
 numbers = json.loads(sys.argv[2])
+unix_calls = json.loads(sys.argv[3])
 def check():
     results = []
     for number in numbers:
         ctypes.set_errno(0)
         result = libc.syscall(number, -1, 0, 0, 0, 0, 0)
         results.append([result, ctypes.get_errno()])
+    for number, kind in zip(unix_calls, (1, 2)):
+        for domain in (1, 0x100000001, 0xffffffff00000001):
+            ctypes.set_errno(0)
+            result = libc.syscall(number, ctypes.c_uint64(domain), kind, 0, 0, 0, 0)
+            results.append([result, ctypes.get_errno()])
+    for domain in (1, 0x100000001, 0xffffffff00000001):
+        for kind in (1, 5, 0x100000001, 0x100000005):
+            fds = (ctypes.c_int * 2)()
+            assert libc.syscall(unix_calls[1], ctypes.c_uint64(domain), ctypes.c_uint64(kind), 0, fds) == 0
+            os.write(fds[0],b'x')
+            assert os.read(fds[1],1) == b'x'
+            os.close(fds[0]); os.close(fds[1])
+    internet = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    internet.close()
+    route = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, 0)
+    route.close()
+    for domain, protocol in ((40, 0), (16, 2), (31, 0)):
+        ctypes.set_errno(0)
+        assert libc.syscall(unix_calls[0], domain, 1, protocol) == -1
+        assert ctypes.get_errno() == 1
     return results
 print(json.dumps(check()), flush=True)
 child = os.fork()
@@ -115,7 +166,15 @@ if os.waitpid(child, 0)[1] != 0:
     raise RuntimeError('Child failed')
 """
     result = subprocess.run(
-        [sys.executable, "-I", "-c", code, program.hex(), json.dumps(numbers)],
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            code,
+            program.hex(),
+            json.dumps(numbers),
+            json.dumps(unix_calls),
+        ],
         capture_output=True,
         text=True,
         cwd=tmp_path,
@@ -124,5 +183,5 @@ if os.waitpid(child, 0)[1] != 0:
         check=False,
     )
     assert result.returncode == 0 and not result.stderr
-    expected = [[-1, error] for error in (1, 1, 38, 38, 38)]
+    expected = [[-1, error] for error in (1, 1, 38, 38, 38, 1, 1, 1, 1, 1, 1)]
     assert [json.loads(line) for line in result.stdout.splitlines()] == [expected, expected]
