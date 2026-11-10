@@ -1693,11 +1693,10 @@ def remove_generation_attachment(
 
     Require the generation namespace already absent in the authenticated initial-host policy
     hierarchy. Under the qualified drain lock, authenticate the single enforcing global profile
-    named for the generation, its literal helper attachment and exact compiled bytes. Strictly
-    enumerate exactly that profile and recompile its fixed literal source under the distinct
-    installation-wide payload compiler lock, requiring byte equality
-    with both administrator authority and the loaded export. An opaque kernel attachment display
-    is accepted only with this compilation proof; other display drift is refused. The helper
+    named for the generation, its literal helper attachment and exact installed compiled bytes.
+    An opaque kernel attachment display is accepted when the loaded export matches the protected
+    installation record; other display drift is refused. Removal does not depend on the current
+    compiler producing the original bytes. The helper
     must be the private single-link protected file named helper beside the trusted receiver.
     Change its mode to 0444 and sync that withdrawal before unloading, denying new ordinary
     execution even through a previously opened descriptor. Recheck recursive emptiness
@@ -1762,15 +1761,6 @@ def _remove_generation_attachment(
         namespace = policy / "namespaces" / config.generation
         if namespace.exists() or namespace.is_symlink():
             raise ValueError("Generation namespace remains; attachment retained.")
-        with ExitStack() as compiler_inputs:
-            compiler_descriptor = compiler_inputs.enter_context(compiler_lock.open_verified())
-            fcntl.flock(compiler_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            if (
-                compile_policy_source(source, deadline, names=True) != name.encode("ascii") + b"\n"
-                or compile_policy_source(source, deadline) != compiled
-            ):
-                raise ValueError("Generation attachment compilation differs from fixed authority.")
-            compiler_inputs.enter_context(compiler_lock.open_verified())
         for withdrawn in (False, True):
             _attest_attachment(policy, device, name, helper, compiled)
             if not withdrawn:

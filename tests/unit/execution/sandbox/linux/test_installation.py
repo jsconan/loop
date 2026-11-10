@@ -2029,26 +2029,25 @@ def test_attachment_removal_reauthenticates_protected_helper_before_policy_acces
     assert not state.commands and state.config.reservation.path.exists()
 
 
-def test_attachment_removal_accepts_opaque_display_only_with_compilation_proof(attachment_removal):
-    """An opaque DFA display requires the exact fixed single-profile source and loaded bytes."""
+def test_attachment_removal_accepts_installed_bytes_when_compiler_has_changed(attachment_removal):
+    """Remove the authenticated installed attachment without invoking the current compiler."""
     state = attachment_removal
     (state.attachment_entry / "attach").write_bytes(b"<unknown>\n")
+    state.compile_attachment.side_effect = RuntimeError("compiler changed")
     remove_attachment(state)
-    assert state.compile_attachment.call_args_list[0].kwargs == {"names": True}
-    assert state.compile_attachment.call_args_list[1].args == (state.attachment_source, 15)
+    state.compile_attachment.assert_not_called()
     assert state.commands == [b"loopgen_generation\0"]
 
 
 @pytest.mark.parametrize(
     "change",
-    ["source_type", "source_empty", "source_large", "header", "metachar", "names", "compiled"],
+    ["source_type", "source_empty", "source_large", "header", "metachar", "writable", "same"],
 )
-def test_attachment_removal_refuses_unproved_literal_compilation(attachment_removal, change):
-    """Missing literal provenance, extra profiles and compilation drift retain all authority."""
+def test_attachment_removal_refuses_invalid_installed_authority(attachment_removal, change):
+    """Malformed installed authority cannot trigger helper withdrawal or policy removal."""
     from dataclasses import replace
 
     state = attachment_removal
-    (state.attachment_entry / "attach").write_bytes(b"<unknown>\n")
     if change == "source_type":
         state.attachment_source = "text"
     elif change == "source_empty":
@@ -2063,26 +2062,7 @@ def test_attachment_removal_refuses_unproved_literal_compilation(attachment_remo
             receiver=state.config.receiver.parent.with_name("wild*") / state.config.receiver.name,
         )
         state.helper = replace(state.helper, path=state.config.receiver.parent / "helper")
-    elif change == "names":
-        state.compile_attachment.side_effect = [b"loopgen_generation\nextra\n"]
-    else:
-        state.compile_attachment.side_effect = [b"loopgen_generation\n", b"drift"]
-    with pytest.raises(ValueError, match="fixed authority|fixed generation attachment"):
-        remove_attachment(state)
-    assert not state.commands and state.helper_path.stat().st_mode & 0o777 == 0o555
-    assert state.config.reservation.path.exists() and state.attachment_entry.exists()
-
-
-@pytest.mark.parametrize("change", ["writable", "same", "busy", "drift"])
-def test_attachment_removal_requires_distinct_serialized_compiler_authority(
-    attachment_removal, monkeypatch, change
-):
-    """Unsafe, reused, contended or changed compiler locks retain helper execution and policy."""
-    from dataclasses import replace
-
-    state = attachment_removal
-    exception, message = ValueError, "fixed generation attachment|compiler changed"
-    if change == "writable":
+    elif change == "writable":
         state.compiler_lock = replace(
             state.compiler_lock,
             identity=(
@@ -2091,29 +2071,9 @@ def test_attachment_removal_requires_distinct_serialized_compiler_authority(
                 *state.compiler_lock.identity[3:],
             ),
         )
-    elif change == "same":
-        state.compiler_lock = state.lock
-    elif change == "busy":
-        monkeypatch.setattr(
-            linux_installation.fcntl,
-            "flock",
-            Mock(side_effect=[None, BlockingIOError("compiler busy")]),
-        )
-        exception, message = BlockingIOError, "compiler busy"
     else:
-        original_verified = linux_host.HostFile.open_verified
-        calls = []
-
-        def verified(bound, **kwargs):
-            """Refuse compiler authority that changes after successful compilation."""
-            if bound == state.compiler_lock:
-                calls.append(bound)
-                if len(calls) == 2:
-                    raise ValueError("compiler changed")
-            return original_verified(bound, **kwargs)
-
-        monkeypatch.setattr(linux_host.HostFile, "open_verified", verified)
-    with pytest.raises(exception, match=message):
+        state.compiler_lock = state.lock
+    with pytest.raises(ValueError, match="fixed generation attachment"):
         remove_attachment(state)
     assert not state.commands and state.helper_path.stat().st_mode & 0o777 == 0o555
     assert state.config.reservation.path.exists() and state.attachment_entry.exists()
@@ -5799,7 +5759,7 @@ def test_retirement_stops_on_partial_failure_without_releasing_capacity(retireme
         state.policies["inner"]["payload"] = b"changed"
     elif change == "attachment":
         state.attachment_bytes = b"changed"
-        message = "compilation"
+        message = "attachment differs"
     else:
         (state.root / "unknown").write_bytes(b"unknown")
     with pytest.raises(expected, match=message):
