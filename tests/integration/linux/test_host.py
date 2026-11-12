@@ -2,13 +2,51 @@
 
 import ctypes
 import os
+import subprocess
+import time
+from pathlib import Path
 
 import pytest
 
-from loop.execution.sandbox.linux.host import apparmor_library, bind_host_file, discover_tool
+from loop.execution.sandbox.linux.host import (
+    apparmor_library,
+    bind_host_file,
+    compile_policy_source,
+    discover_tool,
+)
 from loop.execution.sandbox.linux.mountinfo import read_descriptor_mount_ids, read_mountinfo
+from loop.execution.sandbox.linux.policy import runtime_policy_sources
 
 pytestmark = [pytest.mark.integration, pytest.mark.linux]
+
+
+def test_compiler_preserves_native_binary_output():
+    """The supervised compiler returns exactly the parser's binary policy bytes."""
+    _, source = runtime_policy_sources(Path("/usr/local/libexec/loop/native"), "native_" + "a" * 32)
+    parser = discover_tool("apparmor_parser")
+    arguments = [
+        str(parser.path),
+        "--config-file=/dev/null",
+        "--base=/etc/apparmor.d",
+        "--jobs=0",
+        "--stdout",
+        "--skip-kernel-load",
+        "--skip-cache",
+        "--warn=all",
+        "--Werror",
+    ]
+    options = {
+        "input": source,
+        "capture_output": True,
+        "timeout": 5,
+        "env": {"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"},
+    }
+    expected = subprocess.run(arguments, check=True, **options).stdout
+    if expected[:1] == b"\x01" and expected[2:12] == b"\0" * 6 + b"\x28\xb5\x2f\xfd":
+        expected = subprocess.run(
+            [*arguments, "--zstd-compress-level=0"], check=True, **options
+        ).stdout
+    assert compile_policy_source(source, time.monotonic() + 5) == expected
 
 
 def test_live_mount_inventory_matches_the_open_root_descriptor():

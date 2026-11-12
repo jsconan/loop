@@ -1240,6 +1240,7 @@ def test_compile_policy_source_preserves_binary_and_bounds_every_launch(policy_c
     assert policy_compiler.supervise.call_args.kwargs == {
         "stdout_limit": 1048576,
         "stderr_limit": 65536,
+        "preserve_newlines": True,
     }
     for bound in (policy_compiler.parser, policy_compiler.limiter, policy_compiler.abi):
         assert bound.open_verified.call_count == 2

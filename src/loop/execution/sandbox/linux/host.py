@@ -1094,6 +1094,7 @@ def compile_policy_source(source: bytes, deadline: float, *, names: bool = False
                 deadline,
                 stdout_limit=MAX_COMPILED_BYTES,
                 stderr_limit=MAX_DIAGNOSTIC_BYTES,
+                preserve_newlines=True,
             )
             if result.status is ProcessCaptureStatus.TIMED_OUT:
                 raise TimeoutError("Policy compilation deadline expired.")
