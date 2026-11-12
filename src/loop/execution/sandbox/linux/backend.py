@@ -170,6 +170,16 @@ class LinuxNativeBackend:
         """
         if result is not None and result.outcome is SandboxOutcome.UNSUPPORTED:
             return result
+        if (
+            result is not None
+            and result.outcome is SandboxOutcome.INVALID
+            and "bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted" in result.stderr
+        ):
+            reason = (
+                "Native sandbox capability probe failed: Bubblewrap could not configure "
+                "namespace loopback (RTM_NEWADDR: Operation not permitted). Check host "
+                "AppArmor and user-namespace restrictions."
+            )
         return CommandProcessResult(SandboxOutcome.INVALID, detail=reason)
 
     def close(self) -> None:

@@ -69,6 +69,21 @@ def test_backend_qualification_uses_installed_run_contract(backend, monkeypatch)
     run.assert_called_once_with(probe)
 
 
+def test_qualification_failure_identifies_denied_loopback_setup(backend):
+    """Report the known native loopback failure without exposing arbitrary stderr."""
+    result = CommandProcessResult(
+        SandboxOutcome.INVALID,
+        stderr="bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted\nprivate data",
+    )
+
+    failure = backend.qualification_failure(result, "generic failure")
+
+    assert failure.outcome is SandboxOutcome.INVALID
+    assert "RTM_NEWADDR: Operation not permitted" in failure.detail
+    assert "AppArmor" in failure.detail
+    assert "private data" not in failure.detail
+
+
 @pytest.mark.parametrize("deadline", [float("nan"), float("inf"), float("-inf"), True, "20"])
 def test_backend_rejects_invalid_deadline_before_exchange(backend, deadline):
     """A forged deadline cannot start native admission or transport."""
