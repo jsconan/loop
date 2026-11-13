@@ -17,7 +17,12 @@ from ..execution import CommandExecutionService
 from ..instructions import InstructionsManager
 from ..interaction import AsyncInteractionInput, Interaction
 from ..loop import Loop
-from ..permissions import PermissionManager
+from ..permissions import (
+    PermissionLoadFailure,
+    PermissionManager,
+    PermissionNamespaceError,
+    PermissionPresetError,
+)
 from ..session import SessionManager, SQLiteSessionStore
 from ..telemetry import (
     SQLiteTelemetryAdapter,
@@ -33,6 +38,10 @@ from ..utils import run_in_worker_async
 from ..workspace import Workspace, WorkspaceCommands, WorkspaceRepository
 from .commands import ApplicationCommands
 from .paths import ApplicationPaths, WorkspacePaths
+
+
+class RuntimeRollbackError(RuntimeError):
+    """Report that a failed runtime construction did not release all owned resources."""
 
 
 class ApplicationRuntime:
@@ -83,6 +92,54 @@ class ApplicationRuntime:
         self._closed = False
 
     @classmethod
+    async def create_interactively_async(
+        cls,
+        workspace: Workspace,
+        paths: ApplicationPaths,
+        workspace_paths: WorkspacePaths,
+        settings: ApplicationSettings,
+        configuration: ConfigurationManager,
+        workspace_repository: WorkspaceRepository,
+        interaction: Interaction,
+    ) -> ApplicationRuntime:
+        """Build a runtime, retrying construction after permission recovery.
+
+        Args:
+            workspace (Workspace): Initialized active workspace.
+            paths (ApplicationPaths): Application storage paths.
+            workspace_paths (WorkspacePaths): Workspace storage paths.
+            settings (ApplicationSettings): Validated application settings.
+            configuration (ConfigurationManager): Configuration owner.
+            workspace_repository (WorkspaceRepository): Workspace registry owner.
+            interaction (Interaction): User interaction service.
+
+        Returns:
+            ApplicationRuntime: Fully composed runtime.
+
+        Raises:
+            ShutdownRequested: If the user declines permission recovery.
+            RuntimeRollbackError: If failed construction cannot be rolled back safely.
+        """
+        accepted_failures = ()
+        while True:
+            try:
+                return cls.create(
+                    workspace,
+                    paths,
+                    workspace_paths,
+                    settings,
+                    configuration,
+                    workspace_repository,
+                    interaction,
+                    main_app=True,
+                    accepted_preset_failures=accepted_failures,
+                )
+            except (PermissionPresetError, PermissionNamespaceError) as error:
+                exclude = await PermissionManager.recover_startup_async(error, interaction)
+                if exclude and isinstance(error, PermissionPresetError):
+                    accepted_failures = error.failures
+
+    @classmethod
     def create(
         cls,
         workspace: Workspace,
@@ -94,6 +151,7 @@ class ApplicationRuntime:
         interaction: Interaction,
         *,
         main_app: bool = False,
+        accepted_preset_failures: tuple[PermissionLoadFailure, ...] = (),
     ) -> ApplicationRuntime:
         """Build a runtime from initialized workspace and application-owned references.
 
@@ -107,6 +165,8 @@ class ApplicationRuntime:
             interaction (Interaction): User interaction service.
             main_app (bool): Enable direct main-app terminal management decisions; False
                 (default) prevents library command dispatch from elevating.
+            accepted_preset_failures (tuple[PermissionLoadFailure, ...]): Preset failures
+                explicitly acknowledged for this startup attempt.
 
         Returns:
             ApplicationRuntime: Fully composed active runtime.
@@ -114,6 +174,7 @@ class ApplicationRuntime:
         Raises:
             ValueError: If the workspace has not been initialized.
             PermissionNamespaceError: If a trusted policy requires recovery before model work.
+            RuntimeRollbackError: If policy recovery cannot retry because rollback failed.
         """
         if workspace.id is None:
             raise ValueError("Application runtime requires an initialized workspace.")
@@ -185,6 +246,7 @@ class ApplicationRuntime:
                 bootstrap_pristine_policy=True,
                 user_namespace_identity=str(paths.data_root),
                 interaction=active_interaction,
+                accepted_preset_failures=accepted_preset_failures,
                 yolo=settings.app.yolo,
             )
             cls._track_close(permission_manager, cleanup_callbacks)
@@ -286,7 +348,11 @@ class ApplicationRuntime:
             telemetry_activity("application.started", severity="info", component="main")
             return runtime
         except BaseException as error:
-            cls._cleanup(cleanup_callbacks, primary=error)
+            cleanup_succeeded = cls._cleanup(cleanup_callbacks, primary=error)
+            if not cleanup_succeeded:
+                raise RuntimeRollbackError(
+                    "Runtime rollback failed; policy recovery cannot retry."
+                ) from error
             raise
 
     def __enter__(self) -> Self:
@@ -579,8 +645,10 @@ class ApplicationRuntime:
 
     @staticmethod
     def _cleanup(
-        callbacks: list[Callable[[], object]], *, primary: BaseException | None = None
-    ) -> None:
+        callbacks: list[Callable[[], object]],
+        *,
+        primary: BaseException | None = None,
+    ) -> bool:
         """Run owned cleanup in reverse order without obscuring a primary failure."""
         cleanup_errors = []
         while callbacks:
@@ -592,7 +660,7 @@ class ApplicationRuntime:
         if primary is not None:
             for error in cleanup_errors:
                 primary.add_note(f"Runtime rollback also failed: {type(error).__name__}: {error}")
-            return
+            return not cleanup_errors
         if cleanup_errors:
             first = cleanup_errors[0]
             for error in cleanup_errors[1:]:
@@ -600,6 +668,7 @@ class ApplicationRuntime:
                     f"Additional runtime cleanup failed: {type(error).__name__}: {error}"
                 )
             raise first
+        return True
 
     @staticmethod
     async def _cleanup_async(

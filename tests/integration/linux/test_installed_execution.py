@@ -30,7 +30,6 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
-import yaml
 from packaging.requirements import Requirement
 
 from loop import (
@@ -90,6 +89,7 @@ from loop.tools.system import (
     run_command,
 )
 from loop.utils import PathHolder, VirtualPath
+from loop.utils.yaml import load_yaml
 
 _ALIAS_DIRECTORY = os.environ.get("LOOP_NATIVE_SOCKET_ALIAS_DIRECTORY")
 _ALTERNATIVE_CANARY = os.environ.get("LOOP_NATIVE_ALTERNATIVE_CANARY")
@@ -4257,7 +4257,7 @@ def test_public_make_prepares_a_literal_indirect_tool_in_one_call(
     assert canary.read_text(encoding="utf-8") == "outside-private-canary"
     assert len(interaction.prompts) == (2 if policy_case == "custom_saved" else 1)
     if policy_case == "custom_saved":
-        policy = yaml.safe_load(interaction.configuration_path.read_text(encoding="utf-8"))
+        policy = load_yaml(interaction.configuration_path.read_text(encoding="utf-8"))
         assert policy["limit_classifications"]["readable_roots"] == "approval"
         assert policy["limits"]["readable_roots"] == ["workspace"]
     assert any(str(root) in message for message in interaction.infos)

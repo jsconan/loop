@@ -1,6 +1,7 @@
 """Tests for workspace configuration loading and persistence."""
 
 import os
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
@@ -41,6 +42,132 @@ def test_manager_snapshots_its_configuration_path(tmp_path):
 
     assert manager.path == path
     assert path.is_file()
+
+
+def test_recovery_defaults_cannot_initialize_a_missing_file(tmp_path):
+    """A defaults bypass cannot create a persistent configuration through initialization."""
+    path = tmp_path / "missing.toml"
+    manager = ConfigurationManager(path)
+    manager.use_defaults()
+
+    with pytest.raises(ValueError, match="Repair and reload"):
+        manager.initialize()
+    assert not path.exists()
+
+
+def test_recovery_reload_retries_the_failed_environment(tmp_path):
+    """Bypassing a bad environment does not silently discard it on the next reload."""
+    manager = ConfigurationManager(tmp_path / "config.toml")
+    with pytest.raises(ValidationError):
+        manager.load({"LOOP_DEBUG": "invalid"})
+    manager.use_defaults()
+
+    with pytest.raises(ValidationError):
+        manager.reload()
+    assert manager.reload({}).app.debug is False
+
+
+def test_recovery_rejected_session_edit_preserves_the_previous_override(tmp_path):
+    """A rejected edit cannot remove a prior session value during later updates."""
+    manager = ConfigurationManager(tmp_path / "config.toml")
+    manager.use_defaults()
+    manager.set_session("app.debug", True)
+    with pytest.raises(ValidationError):
+        manager.set_session("app.debug", "invalid")
+    assert manager.effective.app.debug is True
+    assert manager.set_session("app.stream", False).app.debug is True
+
+
+def test_recovery_entered_before_publication_preserves_the_saved_document(tmp_path):
+    """A trusted pre-save callback cannot publish after it enters defaults-only recovery."""
+    path = tmp_path / "config.toml"
+    path.write_text("# preserve me\n[app]\ndebug = false\n", encoding="utf-8")
+    manager = ConfigurationManager(path)
+    manager.load({})
+    original = path.read_bytes()
+
+    with pytest.raises(ValueError, match="Repair and reload"):
+        manager.set("app.debug", True, scope="user", before_save=manager.use_defaults)
+    assert path.read_bytes() == original
+    assert manager.saved_yolo is None
+    assert manager.effective.app.debug is False
+
+
+@pytest.mark.parametrize("operation", ["set", "unset", "reset_user", "reset_workspace", "save"])
+def test_recovery_defaults_protect_saved_configuration_until_reload(tmp_path, operation):
+    """A defaults bypass leaves the invalid document untouched and refuses durable writes."""
+    user = tmp_path / "user.toml"
+    user.write_text('[app]\ndebug = "invalid"\n', encoding="utf-8")
+    manager = ConfigurationManager(user, tmp_path / "workspace.toml")
+    original = user.read_bytes()
+
+    assert manager.use_defaults().app.yolo is False
+    assert manager.saved_yolo is None
+    operations = {
+        "set": lambda: manager.set("app.debug", True, scope="user"),
+        "unset": lambda: manager.unset("app.debug", scope="workspace"),
+        "reset_user": lambda: manager.reset_all(scope="user"),
+        "reset_workspace": lambda: manager.reset_all(scope="workspace"),
+        "save": manager.save,
+    }
+    with pytest.raises(ValueError, match="Repair and reload"):
+        operations[operation]()
+    assert user.read_bytes() == original
+    assert manager.set_session("app.debug", True).app.debug is True
+    user.write_text("[app]\ndebug = false\n", encoding="utf-8")
+    assert manager.reload({}).app.debug is True
+    manager.set("app.stream", False, scope="user")
+
+
+@pytest.mark.parametrize("source", ["workspace", "environment"])
+def test_invalid_section_type_is_reported_before_merging_overrides(tmp_path, source):
+    """A non-table setting section fails validation instead of crashing during merge."""
+    user = tmp_path / "user.toml"
+    workspace = tmp_path / "workspace.toml"
+    user.write_text("app = 1\n", encoding="utf-8")
+    if source == "workspace":
+        workspace.write_text("[app]\ndebug = true\n", encoding="utf-8")
+    environment = {"LOOP_DEBUG": "true"} if source == "environment" else {}
+
+    with pytest.raises(ValueError, match="section 'app' must be a table"):
+        ConfigurationManager(user, workspace).load(environment)
+
+
+@pytest.mark.parametrize("scope", ["user", "workspace"])
+def test_invalid_toml_reports_source_without_exposing_content(tmp_path, scope):
+    """Syntax errors name the file and position without including its source text."""
+    user = tmp_path / "user.toml"
+    workspace = tmp_path / "workspace.toml"
+    selected = user if scope == "user" else workspace
+    selected.write_text('[backend]\napi_key = "synthetic-secret\n', encoding="utf-8")
+
+    with pytest.raises(ValueError) as raised:
+        ConfigurationManager(user, workspace).load({})
+    assert str(selected) in str(raised.value)
+    assert "line" in str(raised.value)
+    assert "synthetic-secret" not in str(raised.value)
+
+
+def test_duplicate_toml_key_is_reported_without_disclosing_its_name(tmp_path):
+    """Duplicate keys produce a safe named-file syntax error."""
+    path = tmp_path / "config.toml"
+    path.write_text("[app]\nsynthetic_secret = 1\nsynthetic_secret = 2\n", encoding="utf-8")
+
+    with pytest.raises(ValueError) as raised:
+        ConfigurationManager(path).load({})
+    assert str(path) in str(raised.value)
+    assert "KeyAlreadyPresent" in str(raised.value)
+    assert "synthetic_secret" not in str(raised.value)
+
+
+def test_invalid_utf8_configuration_reports_its_file_and_offset(tmp_path):
+    """Invalid encoded input identifies its source and byte offset without showing bytes."""
+    path = tmp_path / "config.toml"
+    path.write_bytes(b"[app]\n\xff")
+
+    with pytest.raises(ValueError, match="byte 6") as raised:
+        ConfigurationManager(path).load({})
+    assert str(path) in str(raised.value)
 
 
 def test_version_one_loop_sections_load_and_save_as_app_without_losing_overrides(tmp_path):
@@ -784,3 +911,458 @@ def test_unset_all_removes_only_the_selected_scope(tmp_path):
     assert "config_version" in document
     assert "[app]" in document
     assert manager.unset_all(scope="session").app.stream is True
+
+
+@pytest.mark.parametrize("scope", ["user", "workspace"])
+def test_unsupported_configuration_version_is_rejected(tmp_path, scope):
+    """Neither settings layer silently ignores a version it cannot interpret."""
+    user = tmp_path / "user.toml"
+    workspace = tmp_path / "workspace.toml"
+    target = user if scope == "user" else workspace
+    target.write_text("config_version = 999\n", encoding="utf-8")
+    manager = ConfigurationManager(user, workspace)
+    with pytest.raises(ValueError, match="config_version"):
+        manager.load({})
+
+
+def test_defaults_recovery_initialize_preserves_an_existing_file(tmp_path):
+    """Recovery can report an existing path without writing over its contents."""
+    path = tmp_path / "config.toml"
+    path.write_text("invalid = true\n", encoding="utf-8")
+    manager = ConfigurationManager(path)
+    manager.use_defaults()
+    assert manager.initialize() == path
+    assert path.read_text(encoding="utf-8") == "invalid = true\n"
+
+
+@pytest.mark.parametrize("scope", ["user", "workspace"])
+def test_invalid_configuration_is_not_hidden_by_environment(tmp_path, scope):
+    """An environment override cannot conceal a broken setting in either file."""
+    user = tmp_path / "user.toml"
+    workspace = tmp_path / "workspace.toml"
+    target = user if scope == "user" else workspace
+    target.write_text('[app]\ndebug = "invalid"\n', encoding="utf-8")
+    manager = ConfigurationManager(user, workspace)
+    with pytest.raises(ValidationError, match="app.debug") as error:
+        manager.load({"LOOP_DEBUG": "true"})
+    assert str(target) in error.value.title
+
+
+@pytest.mark.parametrize("scope", ["user", "workspace"])
+def test_configuration_accepts_natural_boolean_strings(tmp_path, scope):
+    """Recognized boolean strings retain their meaning in either settings file."""
+    user, workspace = tmp_path / "user.toml", tmp_path / "workspace.toml"
+    target = user if scope == "user" else workspace
+    target.write_text('[app]\ndebug = "yes"\nstream = "no"\n', encoding="utf-8")
+    settings = ConfigurationManager(user, workspace).load({})
+    assert settings.app.debug is True
+    assert settings.app.stream is False
+
+
+def test_invalid_environment_is_not_hidden_by_session_override(tmp_path):
+    """An existing session value cannot conceal a broken environment value on reload."""
+    manager = ConfigurationManager(tmp_path / "config.toml")
+    manager.load({})
+    manager.set_session("app.debug", False)
+    with pytest.raises(ValidationError, match="app.debug") as error:
+        manager.reload({"LOOP_DEBUG": "invalid"})
+    assert "LOOP_DEBUG" in error.value.title
+
+
+@pytest.mark.parametrize(
+    "content", ["config_version = 999\n", "app = 7\n", "[app]\nunknown_secret = 1\n"]
+)
+def test_invalid_workspace_diagnostic_identifies_source_without_unknown_keys(tmp_path, content):
+    """Schema diagnostics identify the file while redacting unrecognized names."""
+    workspace = tmp_path / "workspace.toml"
+    workspace.write_text(content, encoding="utf-8")
+    manager = ConfigurationManager(tmp_path / "user.toml", workspace)
+    with pytest.raises(ValueError) as error:
+        manager.load({})
+    detail = error.value.title if isinstance(error.value, ValidationError) else str(error.value)
+    assert str(workspace) in detail
+    assert "unknown_secret" not in detail
+
+
+def test_workspace_can_declare_the_supported_configuration_version(tmp_path):
+    """A workspace version is validated without overriding the user document version."""
+    workspace = tmp_path / "workspace.toml"
+    workspace.write_text("config_version = 1\n[app]\ndebug = true\n", encoding="utf-8")
+    manager = ConfigurationManager(tmp_path / "user.toml", workspace)
+    assert manager.load({}).app.debug is True
+
+
+@pytest.mark.parametrize(
+    "field", ["request_timeout_seconds", "max_generation_seconds", "repetition_penalty"]
+)
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_backend_nonfinite_fields_remain_invalid(field, value):
+    """Every duration and repetition penalty rejects all non-finite values."""
+    with pytest.raises(ValidationError):
+        BackendSettings.model_validate({field: value})
+
+
+@pytest.mark.parametrize("scope", ["user", "workspace"])
+@pytest.mark.parametrize("content", ["[app\n", '[app]\ndebug = "invalid"\n'])
+def test_recovery_reset_archives_only_the_invalid_file(tmp_path, scope, content):
+    """An identified invalid file is archived and replaced by the appropriate defaults."""
+    user = tmp_path / "user.toml"
+    workspace = tmp_path / "workspace.toml"
+    target = user if scope == "user" else workspace
+    target.write_text(content, encoding="utf-8")
+    manager = ConfigurationManager(user, workspace)
+    with pytest.raises(ValueError) as error:
+        manager.load({})
+    candidate = manager.recovery_candidate(error.value)
+    assert candidate is not None
+    backup = manager.reset_invalid_file(candidate)
+    assert backup.read_text(encoding="utf-8") == content
+    assert manager.load({}).app.debug is False
+    assert target.exists() is (scope == "user")
+
+
+def test_recovery_reset_does_not_offer_to_archive_changed_validation_failure(tmp_path):
+    """A different invalid revision is not represented as the diagnosed failure."""
+    target = tmp_path / "config.toml"
+    target.write_text('[app]\ndebug = "bad"\n', encoding="utf-8")
+    manager = ConfigurationManager(target)
+    with pytest.raises(ValueError) as error:
+        manager.load({})
+    target.write_text('[app]\nstream = "bad"\n', encoding="utf-8")
+    assert manager.recovery_candidate(error.value) is None
+
+
+def test_recovery_reset_retains_concurrent_edits(tmp_path):
+    """A change after the choice is archived and restored rather than discarded."""
+    target = tmp_path / "config.toml"
+    target.write_text('[app]\ndebug = "bad"\n', encoding="utf-8")
+    manager = ConfigurationManager(target)
+    with pytest.raises(ValueError) as error:
+        manager.load({})
+    candidate = manager.recovery_candidate(error.value)
+    assert candidate is not None
+    target.write_text("[app]\ndebug = true\n", encoding="utf-8")
+    with pytest.raises(OSError, match="preserved at"):
+        manager.reset_invalid_file(candidate)
+    assert target.read_text(encoding="utf-8") == "[app]\ndebug = true\n"
+
+
+def test_recovery_reset_is_unavailable_for_environment_failures(tmp_path):
+    """The application cannot reset an invalid environment variable by archiving a file."""
+    manager = ConfigurationManager(tmp_path / "config.toml")
+    with pytest.raises(ValidationError) as error:
+        manager.load({"LOOP_DEBUG": "bad"})
+    assert manager.recovery_candidate(error.value) is None
+
+
+def test_startup_can_reset_invalid_configuration(tmp_path):
+    """Startup archives a verified invalid file before using newly created defaults."""
+    import asyncio
+    from unittest.mock import AsyncMock, Mock
+
+    from loop.interaction import ConsoleInteraction
+
+    path = tmp_path / "config.toml"
+    path.write_text('[app]\ndebug = "bad"\n', encoding="utf-8")
+    manager = ConfigurationManager(path)
+    interaction = Mock(spec=ConsoleInteraction)
+    interaction.prompt_async = AsyncMock(return_value="reset")
+    assert asyncio.run(manager.load_interactively_async(interaction)).app.debug is False
+    assert next(tmp_path.glob(".config.toml.backup-*/config.toml")).read_text() == (
+        '[app]\ndebug = "bad"\n'
+    )
+
+
+@pytest.mark.parametrize("selection", ["continue", "retry"])
+def test_startup_reports_failed_reset_before_next_action(tmp_path, monkeypatch, selection):
+    """A failed reset requires a fresh decision rather than automatically bypassing the file."""
+    import asyncio
+    from unittest.mock import AsyncMock, Mock
+
+    from loop.interaction import ConsoleInteraction
+
+    path = tmp_path / "config.toml"
+    path.write_text('[app]\ndebug = "bad"\n', encoding="utf-8")
+    manager = ConfigurationManager(path)
+    interaction = Mock(spec=ConsoleInteraction)
+    interaction.prompt_async = AsyncMock(side_effect=["reset", selection, "continue"])
+
+    def fail_reset(_candidate):
+        """Refuse the attempted reset without changing the file."""
+        raise OSError(13, "denied")
+
+    monkeypatch.setattr(manager, "reset_invalid_file", fail_reset)
+    assert asyncio.run(manager.load_interactively_async(interaction)).app.debug is False
+    assert interaction.prompt_async.call_count == (3 if selection == "retry" else 2)
+    assert path.read_text() == '[app]\ndebug = "bad"\n'
+    assert any(
+        call.args[0].code == "configuration.reset_failed"
+        for call in interaction.report.call_args_list
+    )
+
+
+def test_recovery_candidate_supports_invalid_section_and_rejects_unrelated_error(tmp_path):
+    """Only attributable section failures identify a file for reset."""
+    path = tmp_path / "config.toml"
+    path.write_text("app = 3\n", encoding="utf-8")
+    manager = ConfigurationManager(path)
+    with pytest.raises(ValueError) as error:
+        manager.load({})
+    assert manager.recovery_candidate(error.value) is not None
+    assert manager.recovery_candidate(ValueError("unrelated")) is None
+
+
+@pytest.mark.parametrize("replacement", ["symlink", "missing", "mixed", "valid"])
+def test_recovery_candidate_rejects_changed_or_unreadable_file(tmp_path, replacement):
+    """A missing, aliased or differently invalid file cannot be reset as the earlier failure."""
+    path = tmp_path / "config.toml"
+    path.write_text('[app]\ndebug = "bad"\n', encoding="utf-8")
+    manager = ConfigurationManager(path)
+    with pytest.raises(ValueError) as error:
+        manager.load({})
+    if replacement == "missing":
+        path.unlink()
+    elif replacement == "symlink":
+        path.unlink()
+        other = tmp_path / "other.toml"
+        other.write_text('[app]\ndebug = "bad"\n', encoding="utf-8")
+        path.symlink_to(other)
+    elif replacement == "mixed":
+        path.write_text("[loop]\ndebug = true\n[app]\ndebug = false\n", encoding="utf-8")
+    else:
+        path.write_text("[app]\ndebug = true\n", encoding="utf-8")
+    assert manager.recovery_candidate(error.value) is None
+
+
+def test_recovery_reset_rejects_a_different_managers_candidate(tmp_path):
+    """A recovery decision cannot be applied to another configuration destination."""
+    path = tmp_path / "config.toml"
+    path.write_text('[app]\ndebug = "bad"\n', encoding="utf-8")
+    manager = ConfigurationManager(path)
+    with pytest.raises(ValueError) as error:
+        manager.load({})
+    candidate = manager.recovery_candidate(error.value)
+    assert candidate is not None
+    with pytest.raises(ValueError, match="does not belong"):
+        ConfigurationManager(tmp_path / "other.toml").reset_invalid_file(candidate)
+    assert path.exists()
+
+
+@pytest.mark.parametrize("during", ["restore", "publish", "write"])
+def test_recovery_reset_preserves_archive_during_io_races(tmp_path, monkeypatch, during):
+    """Competing files are not overwritten and reset failures retain the archived source."""
+    path = tmp_path / "config.toml"
+    original_content = '[app]\ndebug = "bad"\n'
+    path.write_text(original_content, encoding="utf-8")
+    manager = ConfigurationManager(path)
+    with pytest.raises(ValueError) as error:
+        manager.load({})
+    candidate = manager.recovery_candidate(error.value)
+    assert candidate is not None
+    original_link = os.link
+    original_open = os.open
+    if during == "restore":
+        path.write_text("changed", encoding="utf-8")
+
+    def competing_link(source, destination, *args, **kwargs):
+        """Publish another file at the instant Loop attempts an exclusive link."""
+        path.write_text("concurrent", encoding="utf-8")
+        return original_link(source, destination, *args, **kwargs)
+
+    def refused_open(target, flags, *args, **kwargs):
+        """Refuse creation of the reset replacement."""
+        if str(target).endswith("defaults.toml"):
+            raise PermissionError("refused")
+        return original_open(target, flags, *args, **kwargs)
+
+    if during in {"restore", "publish"}:
+        monkeypatch.setattr(configuration_module.os, "link", competing_link)
+    else:
+        monkeypatch.setattr(configuration_module.os, "open", refused_open)
+    if during == "publish":
+        backup = manager.reset_invalid_file(candidate)
+        assert path.read_text() == "concurrent"
+    else:
+        with pytest.raises(OSError, match="preserved at"):
+            manager.reset_invalid_file(candidate)
+        backup = next(tmp_path.glob(".config.toml.backup-*/config.toml"))
+    assert backup.read_text() == ("changed" if during == "restore" else original_content)
+
+
+@pytest.mark.parametrize("scope", ["user", "workspace"])
+def test_boolean_configuration_version_requires_recovery(tmp_path, scope):
+    """A boolean in a TOML version field is rejected at the source file."""
+    user = tmp_path / "user.toml"
+    workspace = tmp_path / "workspace.toml"
+    target = user if scope == "user" else workspace
+    target.write_text("config_version = true\n", encoding="utf-8")
+    with pytest.raises(ValidationError, match="config_version"):
+        ConfigurationManager(user, workspace).load({})
+
+
+@pytest.mark.parametrize("scope", ["user", "workspace"])
+def test_inaccessible_configuration_requires_interactive_recovery(tmp_path, monkeypatch, scope):
+    """An unreadable existing file is reported rather than bypassed during startup."""
+    import asyncio
+    from unittest.mock import AsyncMock, Mock
+
+    from loop.interaction import ConsoleInteraction
+
+    user = tmp_path / "user.toml"
+    workspace = tmp_path / "workspace.toml"
+    target = user if scope == "user" else workspace
+    target.write_text("[app]\ndebug = true\n", encoding="utf-8")
+    target = target.resolve()
+    original = Path.read_bytes
+
+    def deny_read(path):
+        """Refuse the selected configuration read with its source path."""
+        if path == target:
+            raise PermissionError(13, "synthetic-secret", str(path))
+        return original(path)
+
+    monkeypatch.setattr(Path, "read_bytes", deny_read)
+    interaction = Mock(spec=ConsoleInteraction)
+    interaction.prompt_async = AsyncMock(return_value="continue")
+    manager = ConfigurationManager(user, workspace)
+    assert asyncio.run(manager.load_interactively_async(interaction)).app.debug is False
+    problem = interaction.report.call_args.args[0]
+    assert "Permission denied" in problem.detail
+    assert str(target) in problem.detail
+    assert "synthetic-secret" not in problem.detail
+    interaction.prompt_async.assert_awaited_once()
+    assert original(target) == b"[app]\ndebug = true\n"
+
+
+def test_initialization_does_not_overwrite_inaccessible_user_configuration(tmp_path, monkeypatch):
+    """An existence-check denial is propagated before any default file is published."""
+    user = tmp_path / "user.toml"
+    user.write_text("[app]\ndebug = true\n", encoding="utf-8")
+    original = Path.lstat
+
+    def deny_stat(path, *args, **kwargs):
+        """Deny only the user configuration's metadata lookup."""
+        if path == user:
+            raise PermissionError(13, "denied", str(path))
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "lstat", deny_stat)
+    with pytest.raises(PermissionError, match="denied"):
+        ConfigurationManager(user).initialize()
+    assert user.read_text(encoding="utf-8") == "[app]\ndebug = true\n"
+
+
+@pytest.mark.parametrize("scope", ["user", "workspace"])
+def test_broken_configuration_symlink_is_not_treated_as_absent(tmp_path, scope):
+    """A dangling configuration link is reported and left intact."""
+    user = tmp_path / "user.toml"
+    workspace = tmp_path / "workspace.toml"
+    target = user if scope == "user" else workspace
+    target.symlink_to(tmp_path / "missing.toml")
+    manager = ConfigurationManager(user, workspace)
+    if scope == "user":
+        manager.initialize()
+    with pytest.raises(FileNotFoundError):
+        manager.load({})
+    assert target.is_symlink()
+
+
+@pytest.mark.parametrize("scope", ["user", "workspace"])
+def test_broken_configuration_directory_symlink_is_not_treated_as_absent(tmp_path, scope):
+    """A dangling configuration ancestor cannot hide a missing policy source."""
+    directory = tmp_path / "alias"
+    directory.symlink_to(tmp_path / "missing-directory", target_is_directory=True)
+    target = directory / "config.toml"
+    user = target if scope == "user" else tmp_path / "user.toml"
+    workspace = target if scope == "workspace" else None
+    with pytest.raises(FileNotFoundError):
+        ConfigurationManager(user, workspace).load({})
+    assert directory.is_symlink()
+
+
+def test_missing_workspace_config_under_valid_symlink_remains_optional(tmp_path):
+    """A missing file under a valid directory alias still uses the defaults."""
+    actual = tmp_path / "actual"
+    actual.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(actual, target_is_directory=True)
+    manager = ConfigurationManager(tmp_path / "user.toml", alias / "missing.toml")
+    assert manager.load({}).app.debug is False
+
+
+def test_workspace_alias_changed_after_selection_is_reported(tmp_path):
+    """A new alias target cannot be silently skipped after the canonical path was selected."""
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    (second / "config.toml").write_text("[app]\ndebug = true\n", encoding="utf-8")
+    alias = tmp_path / "alias"
+    alias.symlink_to(first, target_is_directory=True)
+    manager = ConfigurationManager(tmp_path / "user.toml", alias / "config.toml")
+    alias.unlink()
+    alias.symlink_to(second, target_is_directory=True)
+    with pytest.raises(OSError, match="changed during loading"):
+        manager.load({})
+
+
+@pytest.mark.parametrize("scope", ["user", "workspace"])
+@pytest.mark.parametrize(
+    ("invalid", "override", "message"),
+    [
+        (
+            "repetition_min_pattern_size = 10\nrepetition_max_pattern_size = 5\n",
+            "repetition_min_pattern_size = 2\n",
+            "Minimum repetition pattern size cannot exceed the maximum",
+        ),
+        (
+            "repetition_max_pattern_size = 5\nrepetition_min_count = 1\n",
+            "repetition_min_count = 3\n",
+            "Repetition minimum count must be at least two",
+        ),
+    ],
+)
+def test_invalid_source_repetition_pair_cannot_be_masked(
+    tmp_path, scope, invalid, override, message
+):
+    """An explicit contradictory pair is rejected before higher-precedence values merge."""
+    user = tmp_path / "user.toml"
+    workspace = tmp_path / "workspace.toml"
+    if scope == "user":
+        user.write_text("[backend]\n" + invalid, encoding="utf-8")
+        workspace.write_text("[backend]\n" + override, encoding="utf-8")
+        manager = ConfigurationManager(user, workspace)
+        environment = {}
+    else:
+        workspace.write_text("[backend]\n" + invalid, encoding="utf-8")
+        manager = ConfigurationManager(user, workspace)
+        environment = {
+            "LOOP_REPETITION_MIN_PATTERN_SIZE": "2",
+            "LOOP_REPETITION_MIN_COUNT": "3",
+        }
+    with pytest.raises(ValidationError, match=message) as error:
+        manager.load(environment)
+    assert str(user if scope == "user" else workspace) in error.value.title
+
+
+def test_sparse_repetition_values_can_be_completed_by_higher_layer(tmp_path):
+    """Absent source fields are not treated as defaults when checking source-local pairs."""
+    user = tmp_path / "user.toml"
+    workspace = tmp_path / "workspace.toml"
+    user.write_text("[backend]\nrepetition_min_pattern_size = 20\n", encoding="utf-8")
+    workspace.write_text("[backend]\nrepetition_max_pattern_size = 25\n", encoding="utf-8")
+    result = ConfigurationManager(user, workspace).load({})
+    assert result.backend.repetition_min_pattern_size == 20
+    assert result.backend.repetition_max_pattern_size == 25
+
+
+def test_environment_repetition_pair_cannot_be_hidden_by_session_value(tmp_path):
+    """An invalid pair within environment variables remains visible on reload."""
+    manager = ConfigurationManager(tmp_path / "user.toml")
+    manager.load({})
+    manager.set_session("backend.repetition_min_pattern_size", 2)
+    with pytest.raises(ValidationError, match="Minimum repetition pattern size") as error:
+        manager.reload(
+            {"LOOP_REPETITION_MIN_PATTERN_SIZE": "10", "LOOP_REPETITION_MAX_PATTERN_SIZE": "5"}
+        )
+    assert "environment variables" in error.value.title

@@ -21,9 +21,9 @@ dependencies = [
     "pydantic>=2.13.0,<3",
     "pydantic-settings>=2.15.0,<3",
     "python-dotenv>=1.2.2,<2",
-    "pyyaml>=6.0.3,<7",
     "regex>=2025.0.0,<2027",
     "rich>=14.1.0,<15",
+    "ruamel-yaml>=0.18.16,<0.19",
     "tomlkit>=0.15.1,<1",
 ]
 classifiers = [

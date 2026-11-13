@@ -4,13 +4,13 @@ import json
 from unittest.mock import Mock
 
 import pytest
-import yaml
 
 from loop.application.paths import ApplicationPaths
 from loop.execution import CommandExecutionService
 from loop.permissions import PermissionManager
 from loop.tooling import ToolRegistry
 from loop.tools.catalog import BUILTIN_TOOLS
+from loop.utils.yaml import dump_yaml, load_yaml
 from loop.workspace import Workspace, WorkspaceRepository
 
 pytestmark = pytest.mark.integration
@@ -80,11 +80,11 @@ def test_marked_previous_policy_migrates_before_public_tool_dispatch(tmp_path):
     }
     first = PermissionManager(root, **arguments)
     first.close()
-    payload = yaml.safe_load(policy_path.read_text(encoding="utf-8"))
+    payload = load_yaml(policy_path.read_text(encoding="utf-8"))
     generation = payload["namespace_generation"]
     payload["version"] = 1
     payload["limits"].pop("deny_local_networks")
-    original = yaml.safe_dump(payload).encode("utf-8")
+    original = dump_yaml(payload).encode("utf-8")
     policy_path.write_bytes(original)
     manager = PermissionManager(root, **arguments)
     registry = ToolRegistry(
@@ -101,7 +101,7 @@ def test_marked_previous_policy_migrates_before_public_tool_dispatch(tmp_path):
             )
         )
         assert result["ok"] is True
-        saved = yaml.safe_load(policy_path.read_text(encoding="utf-8"))
+        saved = load_yaml(policy_path.read_text(encoding="utf-8"))
         assert saved["version"] == 2
         assert saved["limits"]["deny_local_networks"] is True
         assert (

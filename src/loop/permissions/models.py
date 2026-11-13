@@ -11,10 +11,11 @@ from pathlib import Path
 from typing import Annotated, Any, Literal, Protocol
 from uuid import uuid4
 
-import yaml
 from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
+from pydantic_core import PydanticCustomError
 
-from ..utils import VirtualPath, sha256_digest
+from ..errors import safe_error_detail
+from ..utils import VirtualPath, YAMLError, load_yaml, sha256_digest
 
 type FileKind = Literal["file", "directory", "symlink"]
 type Operations = tuple[Operation, ...]
@@ -381,7 +382,9 @@ class PermissionRule(BaseModel):
             ValueError: If both a resource glob and exact typed target are configured.
         """
         if self.resource is not None and self.target is not None:
-            raise ValueError("Permission rules cannot combine resource and target matchers.")
+            raise PydanticCustomError(
+                "loop_rule_matcher", "Permission rules cannot combine resource and target matchers."
+            )
         return self
 
 
@@ -449,7 +452,10 @@ class HostCommandRule(BaseModel):
             or len(self.signature) != 64
             or any(character not in "0123456789abcdef" for character in self.signature)
         ):
-            raise ValueError("Host rule must contain only virtual context and a SHA-256 digest.")
+            raise PydanticCustomError(
+                "loop_host_rule",
+                "Host rule must contain only virtual context and a SHA-256 digest.",
+            )
         return self
 
 
@@ -501,6 +507,7 @@ class PermissionLoadResult(StrEnum):
     LOADED = "loaded"
     DEFAULTED = "defaulted"
     RETAINED = "retained"
+    BLOCKED = "blocked"
 
 
 class PermissionArtifactError(Exception):
@@ -575,7 +582,7 @@ class PermissionPreset(BaseModel):
     enforcement limits, which remain the user-controlled boundaries for every preset.
 
     Args:
-        version (Literal[1]): Preset schema version.
+        version (int): Preset schema version.
         kind (Literal["app.permission-preset"]): Artifact type discriminator.
         metadata (PresetMetadata): Identity and explanation shown before replacement.
         confirmation_warning (str | None): Warning shown before the required confirmation, or
@@ -586,7 +593,7 @@ class PermissionPreset(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    version: Literal[1] = 1
+    version: int = Field(default=1, ge=1, le=1, strict=True)
     kind: Literal["app.permission-preset"] = "app.permission-preset"
     metadata: PresetMetadata
     confirmation_warning: str | None = None
@@ -605,12 +612,15 @@ class PermissionPreset(BaseModel):
                 identifier.
         """
         if set(self.defaults) != set(Action):
-            raise ValueError(
-                "Permission preset defaults must contain every known action exactly once."
+            raise PydanticCustomError(
+                "loop_preset_defaults",
+                "Permission preset defaults must contain every known action exactly once.",
             )
         identifiers = [rule.id for rule in self.rules]
         if len(identifiers) != len(set(identifiers)):
-            raise ValueError("Permission preset rule identifiers must be unique.")
+            raise PydanticCustomError(
+                "loop_preset_rule_ids", "Permission preset rule identifiers must be unique."
+            )
         return self
 
     @property
@@ -652,14 +662,43 @@ class PermissionPreset(BaseModel):
         presets = []
         failures = []
         directory = files(__package__).joinpath("presets")
-        for entry in sorted(directory.iterdir(), key=lambda item: item.name):
-            if not entry.name.endswith((".yaml", ".yml")):
-                continue
+        try:
+            entries = sorted(
+                (entry for entry in directory.iterdir() if entry.name.endswith((".yaml", ".yml"))),
+                key=lambda item: item.name,
+            )
+        except OSError as error:
+            return (), (
+                PermissionLoadFailure(
+                    source="preset",
+                    path=str(directory),
+                    message=(
+                        f"Cannot read preset directory: {error.strerror or type(error).__name__}."
+                    ),
+                ),
+            )
+        if not entries:
+            failures.append(
+                PermissionLoadFailure(
+                    source="preset", path=str(directory), message="Preset directory is empty."
+                )
+            )
+        for entry in entries:
             try:
-                presets.append(cls.model_validate(yaml.safe_load(entry.read_text("utf-8"))))
-            except (OSError, UnicodeError, ValueError, yaml.YAMLError) as exc:
+                presets.append(
+                    cls.model_validate(load_yaml(entry.read_text("utf-8")), extra="forbid")
+                )
+            except (OSError, UnicodeError, ValueError, YAMLError) as exc:
                 failures.append(
-                    PermissionLoadFailure(source="preset", path=str(entry), message=str(exc))
+                    PermissionLoadFailure(
+                        source="preset",
+                        path=str(entry),
+                        message=safe_error_detail(
+                            exc,
+                            cls,
+                            trusted_types=(YAMLError,),
+                        ),
+                    )
                 )
         unique_presets = []
         identifiers = set()
@@ -774,7 +813,9 @@ class PolicyLimitClassifications(BaseModel):
             source not in {"builtin", "legacy", "user", "session"}
             for source in self.sources.values()
         ):
-            raise ValueError("Permission limit classification provenance is invalid.")
+            raise PydanticCustomError(
+                "loop_limit_provenance", "Permission limit classification provenance is invalid."
+            )
         return self
 
 
@@ -795,7 +836,7 @@ class PermissionConfiguration(BaseModel):
     """Represent a complete persisted local operation policy.
 
     Args:
-        version (Literal[1, 2]): Configuration schema version.
+        version (int): Configuration schema version.
         defaults (dict[Action, Decision]): Fallback decision for every known action.
         limits (PolicyLimits): User-configurable ceilings ordinary rules cannot override.
         limit_classifications (PolicyLimitClassifications): Provenance-sensitive sandbox grant
@@ -807,7 +848,7 @@ class PermissionConfiguration(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    version: Literal[1, 2] = 2
+    version: int = Field(default=2, ge=1, le=2, strict=True)
     defaults: dict[Action, Decision] = Field(default_factory=_default_decisions)
     limits: PolicyLimits = Field(default_factory=PolicyLimits)
     limit_classifications: PolicyLimitClassifications = Field(
@@ -828,7 +869,9 @@ class PermissionConfiguration(BaseModel):
         """
         identifiers = [rule.id for rule in self.rules]
         if len(identifiers) != len(set(identifiers)):
-            raise ValueError("Permission rule identifiers must be unique.")
+            raise PydanticCustomError(
+                "loop_rule_ids", "Permission rule identifiers must be unique."
+            )
         return self
 
 
@@ -839,7 +882,7 @@ class UserPermissionConfiguration(BaseModel):
     would widen authority beyond a single reviewed approval and require their own management flow.
 
     Args:
-        version (Literal[1, 2]): Persisted schema version.
+        version (int): Persisted schema version.
         rules (list[PermissionRule]): Exact user-approved operation rules.
         sandboxed_command_rules (list[SandboxedCommandRule]): User-persisted sandbox-only approvals.
         trusted_host_command_rules (list[HostCommandRule]): Human-approved durable host grants.
@@ -848,7 +891,7 @@ class UserPermissionConfiguration(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    version: Literal[1, 2] = 2
+    version: int = Field(default=2, ge=1, le=2, strict=True)
     rules: list[PermissionRule] = Field(default_factory=list)
     sandboxed_command_rules: list[SandboxedCommandRule] = Field(default_factory=list)
     trusted_host_command_rules: list[HostCommandRule] = Field(default_factory=list)
@@ -868,14 +911,20 @@ class UserPermissionConfiguration(BaseModel):
         sandbox_identifiers = [rule.id for rule in self.sandboxed_command_rules]
         host_identifiers = [rule.id for rule in self.trusted_host_command_rules]
         if len(identifiers) != len(set(identifiers)):
-            raise ValueError("Permission rule identifiers must be unique.")
+            raise PydanticCustomError(
+                "loop_rule_ids", "Permission rule identifiers must be unique."
+            )
         if len(sandbox_identifiers) != len(set(sandbox_identifiers)):
-            raise ValueError("Sandbox command rule identifiers must be unique.")
+            raise PydanticCustomError(
+                "loop_sandbox_rule_ids", "Sandbox command rule identifiers must be unique."
+            )
         if len(host_identifiers) != len(set(host_identifiers)) or any(
             rule.scope not in {ApprovalChoice.WORKSPACE, ApprovalChoice.USER}
             for rule in self.trusted_host_command_rules
         ):
-            raise ValueError("Durable host grants require distinct IDs and durable scopes.")
+            raise PydanticCustomError(
+                "loop_host_rule_ids", "Durable host grants require distinct IDs and durable scopes."
+            )
         return self
 
 

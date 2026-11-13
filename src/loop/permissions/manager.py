@@ -33,18 +33,23 @@ from urllib.parse import quote, urlsplit
 from uuid import uuid4
 from weakref import WeakSet
 
-import yaml
-
 from .. import constants
-from ..errors import Problem, log_problem
-from ..interaction import Interaction, require_async_interaction
+from ..errors import Problem, log_problem, safe_error_detail
+from ..interaction import (
+    Interaction,
+    prompt_recovery,
+    prompt_recovery_async,
+    require_async_interaction,
+)
 from ..telemetry import telemetry_audit, telemetry_error, telemetry_trace_event
 from ..utils import (
     PathReference,
-    ShutdownRequested,
     VirtualPath,
+    YAMLError,
     canonical_path,
+    dump_yaml,
     ensure_private_directory,
+    load_yaml,
     local_now,
     run_in_worker_async,
     sha256_digest,
@@ -68,6 +73,7 @@ from .models import (
     OperationTarget,
     PermissionConfiguration,
     PermissionConfigurationError,
+    PermissionLoadFailure,
     PermissionLoadPolicy,
     PermissionLoadResult,
     PermissionNamespaceError,
@@ -156,6 +162,14 @@ _LIMIT_NAMES = (
     "allow_host_processes",
 )
 _LOGGER = logging.getLogger(__name__)
+_TRUSTED_POLICY_ERRORS = frozenset(
+    {
+        "Policy document must be a mapping.",
+        "Policy document must not be empty.",
+        "Marked policy fields are incomplete.",
+        "Marked policy limits or provenance are incomplete.",
+    }
+)
 _ASYNC_POLICY_ATTEMPTS = 3
 _POLICY_LOCK_POLL_SECONDS = 0.01
 _MAX_CANCELLATION_NOTES = 8
@@ -241,6 +255,8 @@ class PermissionManager:
             unavailable when durable policy namespaces are configured.
         presets (Iterable[PermissionPreset] | None): Additional selectable presets alongside
             the built-in catalog. Duplicate identifiers are rejected.
+        accepted_preset_failures (tuple[PermissionLoadFailure, ...]): Exact invalid preset
+            diagnostics already acknowledged for this startup attempt.
         load_policy (PermissionLoadPolicy | None): Artifact failure behavior. Defaults to
             interactive recovery when an interaction is available and strict errors otherwise.
         command_inspection (CommandInspection | None): Trusted command inspection. Defaults to
@@ -263,6 +279,7 @@ class PermissionManager:
     _workspace_root: Path | None
     _configuration_path: Path | None
     _user_configuration_path: Path | None
+    _user_configuration_source_path: Path | None
     _interaction: Interaction | None
     _recorder: PermissionRecorder | None
     _configuration: PermissionConfiguration
@@ -320,6 +337,7 @@ class PermissionManager:
         recorder: PermissionRecorder | None = None,
         configuration: PermissionConfiguration | None = None,
         presets: Iterable[PermissionPreset] | None = None,
+        accepted_preset_failures: tuple[PermissionLoadFailure, ...] = (),
         load_policy: PermissionLoadPolicy | None = None,
         command_inspection: CommandInspection | None = None,
         async_blocking_runner: Callable[..., Awaitable[Any]] | None = None,
@@ -375,13 +393,18 @@ class PermissionManager:
                 if self._workspace_root is not None
                 else None
             )
+            self._user_configuration_source_path = (
+                Path(user_configuration_path).expanduser().absolute()
+                if user_configuration_path is not None
+                else None
+            )
             self._user_configuration_path = (
                 (
-                    Path(user_configuration_path).expanduser().absolute()
+                    self._user_configuration_source_path
                     if self._namespace_catalog_path is not None
-                    else Path(user_configuration_path).expanduser().resolve()
+                    else self._user_configuration_source_path.resolve()
                 )
-                if user_configuration_path is not None
+                if self._user_configuration_source_path is not None
                 else None
             )
             self._workspace_id = workspace_id
@@ -456,7 +479,7 @@ class PermissionManager:
                     "workspace before policy admission."
                 )
             self._session_overrides = SessionPolicyOverrides()
-            builtin_presets = self._load_presets()
+            builtin_presets = self._load_presets(accepted_preset_failures)
             catalog = (*builtin_presets, *(presets or ()))
             identifiers = [preset.metadata.id for preset in catalog]
             if len(identifiers) != len(set(identifiers)):
@@ -3887,7 +3910,13 @@ class PermissionManager:
             or self._managed_error is not None
             or self._managed_policy_store.may_be_installed()
         )
-        if self._namespace_catalog_path is not None or managed_present:
+        if (
+            self._namespace_catalog_path is not None
+            or self._configuration_path is not None
+            or self._user_configuration_path is not None
+            or self._namespace_errors
+            or managed_present
+        ):
             namespace, cancellation = await self._run_blocking_settled_async(
                 self._namespace_recovery_decision
             )
@@ -3963,21 +3992,36 @@ class PermissionManager:
             if source == "managed:recovery_required":
                 path = self._managed_policy_store.expectation_path or "administrator policy"
                 mitigation = (
-                    "Have an administrator repair the protected policy, then restart the "
-                    "application."
+                    "Have an administrator repair the protected policy, then reload it or "
+                    "restart the application."
                 )
             elif source == "namespace:user:recovery_required":
                 path = self._user_configuration_path or "user policy"
                 mitigation = (
-                    "Restore or repair the user policy and registry, then restart the application."
+                    "Restore or repair the user policy and registry, then reload or restart."
                 )
             else:
                 path = self._configuration_path or "workspace policy"
                 mitigation = (
-                    "Restore or repair the workspace policy and registry, then restart the "
-                    "application."
+                    "Restore or repair the workspace policy and registry, then reload or restart."
                 )
             raise PermissionNamespaceError(path, f"{denial.reason} {mitigation}")
+
+    def suspend_policy(self, scope: str, reason: str) -> None:
+        """Block permission admission until a failed policy scope is successfully reloaded.
+
+        Args:
+            scope (str): Exact ``workspace`` or ``user`` policy scope.
+            reason (str): Safe explanation of the loading failure.
+
+        Raises:
+            ValueError: If the scope or diagnostic is invalid.
+        """
+        if scope not in {"workspace", "user"} or not reason:
+            raise ValueError("A valid policy scope and recovery reason are required.")
+        with self.policy_update():
+            self._namespace_errors[scope] = reason
+            self._policy_revision += 1
 
     @staticmethod
     def _compose_policy_decisions(
@@ -4487,7 +4531,8 @@ class PermissionManager:
             retain_on_failure=True,
             interaction=active_interaction,
         )
-        self._load_user_configuration()
+        if self._load_user_configuration(interaction=active_interaction):
+            return PermissionLoadResult.BLOCKED
         return result
 
     def reset_configuration(self, scope: str) -> Path | None:
@@ -4506,6 +4551,24 @@ class PermissionManager:
             PermissionNamespaceError: If a durable policy namespace requires recovery.
             OSError: If the policy is stale or busy, or reset state cannot be written.
         """
+        with self.policy_update():
+            failed_revision = (
+                self._failed_workspace_revision
+                if scope == "workspace"
+                else self._failed_user_revision
+            )
+            failure = None
+            if self._namespace_catalog_path is None and failed_revision is not None:
+                failure = self._namespace_errors.pop(scope, None)
+            try:
+                return self._reset_configuration(scope)
+            except BaseException:
+                if failure is not None:
+                    self._namespace_errors[scope] = failure
+                raise
+
+    def _reset_configuration(self, scope: str) -> Path | None:
+        """Reset a policy while its owner lock is held."""
         if scope not in {"workspace", "user"}:
             raise ValueError(f"Unknown permission policy scope '{scope}'.")
         path = self._configuration_path if scope == "workspace" else self._user_configuration_path
@@ -4879,7 +4942,7 @@ class PermissionManager:
         path.parent.mkdir(mode=constants.PRIVATE_DIRECTORY_MODE, parents=True, exist_ok=True)
         payload = configuration.model_dump(mode="json")
         temporary_path = path.with_suffix(path.suffix + ".tmp")
-        content = f"# app-revision: {uuid4().hex}\n" + yaml.safe_dump(payload, sort_keys=False)
+        content = f"# app-revision: {uuid4().hex}\n" + dump_yaml(payload)
         flags = os.O_WRONLY | os.O_CREAT
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW | os.O_NONBLOCK
@@ -5153,16 +5216,20 @@ class PermissionManager:
             return self._read_namespaced_configuration(
                 self._configuration_path, "workspace", self._workspace_id
             )
-        if not self._configuration_path.exists():
-            self._require_completed_reset()
-            if not self._configuration_path.exists():
-                return None if retain_on_missing else PermissionConfiguration()
         try:
-            revision = self._configuration_path.read_bytes()
+            revision = self._read_optional_policy(self._configuration_path)
+            if revision is None:
+                return None if retain_on_missing else PermissionConfiguration()
             self._failed_workspace_revision = revision
-            payload = yaml.safe_load(revision.decode("utf-8"))
-            values = payload or {}
-            if isinstance(values, dict) and "limit_classifications" not in values:
+            payload = load_yaml(revision.decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError(  # noqa: TRY004 - invalid document content, not a caller type.
+                    "Policy document must be a mapping."
+                )
+            if not payload:
+                raise ValueError("Policy document must not be empty.")
+            values = payload
+            if "limit_classifications" not in values:
                 values = {
                     **values,
                     "limit_classifications": PolicyLimitClassifications(
@@ -5176,49 +5243,88 @@ class PermissionManager:
                         },
                     ).model_dump(mode="json"),
                 }
-            configuration = PermissionConfiguration.model_validate(values)
+            configuration = PermissionConfiguration.model_validate(values, extra="forbid")
             self._workspace_storage_revision = revision
             self._failed_workspace_revision = None
             return configuration
-        except (OSError, UnicodeError, ValueError, yaml.YAMLError) as exc:
-            raise PermissionConfigurationError(self._configuration_path, str(exc)) from exc
+        except (OSError, UnicodeError, ValueError, YAMLError) as exc:
+            raise PermissionConfigurationError(
+                self._configuration_path,
+                safe_error_detail(
+                    exc,
+                    PermissionConfiguration,
+                    trusted_types=(YAMLError,),
+                    trusted_messages=_TRUSTED_POLICY_ERRORS,
+                ),
+            ) from exc
+
+    def _read_optional_policy(self, path: Path, source: Path | None = None) -> bytes | None:
+        """Read a policy twice around reset checks before accepting a genuinely missing path."""
+        try:
+            return path.read_bytes()
+        except FileNotFoundError:
+            self._require_completed_reset(path)
+        try:
+            return path.read_bytes()
+        except FileNotFoundError as missing:
+            for candidate in (path, source):
+                if candidate is None:
+                    continue
+                try:
+                    candidate.lstat()
+                except FileNotFoundError:
+                    for parent in candidate.parents:
+                        try:
+                            details = parent.lstat()
+                        except FileNotFoundError:
+                            continue
+                        if stat.S_ISLNK(details.st_mode):
+                            parent.stat()
+                else:
+                    raise missing
+            return None
 
     @staticmethod
     def _read_namespaced_file(path: Path) -> tuple[bytes | None, int | None]:
         """Read one policy inode without following its final link or accepting a swapped file."""
-        if path.parent.resolve() != path.parent:
-            raise PermissionNamespaceError(path, "Policy directory has an aliased ancestor.")
         try:
-            details = path.lstat()
-        except FileNotFoundError:
-            return None, None
-        except OSError as error:
-            raise PermissionNamespaceError(path, str(error)) from error
-        if not hasattr(os, "O_NOFOLLOW"):
-            raise PermissionNamespaceError(path, "No-follow policy loading is unavailable.")
-        try:
+            if path.parent.resolve() != path.parent:
+                raise PermissionNamespaceError(path, "Policy directory has an aliased ancestor.")
+            try:
+                details = path.lstat()
+            except FileNotFoundError:
+                return None, None
+            if not hasattr(os, "O_NOFOLLOW"):
+                raise PermissionNamespaceError(path, "No-follow policy loading is unavailable.")
             descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-        except OSError as error:
-            raise PermissionNamespaceError(path, "Policy file changed during loading.") from error
-        try:
-            opened = os.fstat(descriptor)
-            if (
-                not stat.S_ISREG(opened.st_mode)
-                or opened.st_nlink != 1
-                or opened.st_uid != os.getuid()
-                or (opened.st_dev, opened.st_ino) != (details.st_dev, details.st_ino)
-            ):
-                raise PermissionNamespaceError(path, "Policy file provenance is invalid.")
-            with os.fdopen(descriptor, "rb") as stream:
-                descriptor = -1
-                revision = stream.read()
-        finally:
-            if descriptor >= 0:
-                os.close(descriptor)
-        try:
+            try:
+                opened = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(opened.st_mode)
+                    or opened.st_nlink != 1
+                    or opened.st_uid != os.getuid()
+                    or (opened.st_dev, opened.st_ino) != (details.st_dev, details.st_ino)
+                ):
+                    raise PermissionNamespaceError(path, "Policy file provenance is invalid.")
+                with os.fdopen(descriptor, "rb") as stream:
+                    descriptor = -1
+                    revision = stream.read()
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
             current = path.lstat()
         except OSError as error:
-            raise PermissionNamespaceError(path, "Policy file changed during loading.") from error
+            if error.errno == errno.ELOOP:
+                detail = "Policy file provenance is invalid; symbolic links are not allowed."
+            elif error.errno in {errno.ENOENT, errno.ESTALE}:
+                detail = "Policy file changed during loading."
+            elif isinstance(error, PermissionError):
+                detail = "Permission denied while reading the policy."
+            elif error.errno is not None:
+                detail = f"Policy read failed: {os.strerror(error.errno)} (errno {error.errno})."
+            else:
+                detail = "Policy read failed (I/O error; errno unavailable)."
+            raise PermissionNamespaceError(path, detail) from error
         if (current.st_dev, current.st_ino) != (details.st_dev, details.st_ino):
             raise PermissionNamespaceError(path, "Policy file changed during loading.")
         return revision, opened.st_mode
@@ -5312,13 +5418,13 @@ class PermissionManager:
         with self._storage_lock(path):
             self._require_completed_reset(path)
             revision, file_mode = self._read_namespaced_file(path)
+            model = PermissionConfiguration if scope == "workspace" else UserPermissionConfiguration
             try:
-                payload = yaml.safe_load(revision.decode("utf-8")) if revision is not None else None
+                payload = load_yaml(revision.decode("utf-8")) if revision is not None else None
                 if revision is not None and not isinstance(payload, dict):
                     raise ValueError("Policy document must be a mapping.")
-                model = (
-                    PermissionConfiguration if scope == "workspace" else UserPermissionConfiguration
-                )
+                if revision is not None and not payload:
+                    raise ValueError("Policy document must not be empty.")
                 if (
                     revision is not None
                     and scope == "workspace"
@@ -5353,10 +5459,20 @@ class PermissionManager:
                             for name, fields in required.items()
                         ):
                             raise ValueError("Marked policy limits or provenance are incomplete.")
-                configuration = model.model_validate(payload) if revision is not None else None
-            except (UnicodeError, ValueError, yaml.YAMLError) as error:
+                configuration = (
+                    model.model_validate(payload, extra="forbid") if revision is not None else None
+                )
+            except (UnicodeError, ValueError, YAMLError) as error:
                 raise PermissionNamespaceError(
-                    path, f"Policy content is invalid: {error}"
+                    path,
+                    f"Policy content is invalid: {
+                        safe_error_detail(
+                            error,
+                            model,
+                            trusted_types=(YAMLError,),
+                            trusted_messages=_TRUSTED_POLICY_ERRORS,
+                        )
+                    }",
                 ) from error
             generation = configuration.namespace_generation if configuration is not None else None
             if revision is not None and file_mode & 0o022:
@@ -5582,46 +5698,132 @@ class PermissionManager:
             self._user_storage_revision = None
             self._failed_user_revision = None
             return None
-        if not self._user_configuration_path.exists():
-            self._require_completed_reset(self._user_configuration_path)
-            if not self._user_configuration_path.exists():
+        try:
+            revision = self._read_optional_policy(
+                self._user_configuration_path,
+                self._user_configuration_source_path,
+            )
+            if revision is None:
                 self._user_storage_revision = None
                 self._failed_user_revision = None
                 return None
-        try:
-            revision = self._user_configuration_path.read_bytes()
             self._failed_user_revision = revision
-            payload = yaml.safe_load(revision.decode("utf-8"))
-            configuration = UserPermissionConfiguration.model_validate(payload or {})
+            payload = load_yaml(revision.decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError(  # noqa: TRY004 - invalid document content, not a caller type.
+                    "Policy document must be a mapping."
+                )
+            if not payload:
+                raise ValueError("Policy document must not be empty.")
+            configuration = UserPermissionConfiguration.model_validate(payload, extra="forbid")
             self._user_storage_revision = revision
             self._failed_user_revision = None
             return configuration
-        except (OSError, UnicodeError, ValueError, yaml.YAMLError) as exc:
-            raise PermissionConfigurationError(self._user_configuration_path, str(exc)) from exc
+        except (OSError, UnicodeError, ValueError, YAMLError) as exc:
+            raise PermissionConfigurationError(
+                self._user_configuration_path,
+                safe_error_detail(
+                    exc,
+                    UserPermissionConfiguration,
+                    trusted_types=(YAMLError,),
+                    trusted_messages=_TRUSTED_POLICY_ERRORS,
+                ),
+            ) from exc
 
-    def _load_user_configuration(self) -> None:
-        """Load user rules, retaining only restrictions if their file is unavailable."""
+    def _load_user_configuration(self, *, interaction: Interaction | None = None) -> bool:
+        """Load user rules or request an explicit fail-closed recovery decision."""
+        active_interaction = interaction if interaction is not None else self._interaction
+        while True:
+            failure, revision = self._try_load_user_configuration()
+            if failure is None:
+                return False
+            if active_interaction is None:
+                raise failure
+            problem = Problem.from_exception(
+                failure,
+                code="permission.user_configuration_invalid",
+                title="Invalid user permission policy",
+                operation="load_user_permission_policy",
+                metadata={"path": failure.path},
+            )
+            log_problem(_LOGGER, problem, failure)
+            active_interaction.report(problem)
+            choice = prompt_recovery(
+                active_interaction,
+                "User permission policy recovery:",
+                continue_label="Continue with permission operations blocked",
+                reset_label=(
+                    None
+                    if isinstance(failure.__cause__, OSError)
+                    else "Archive the file and remove all saved user rules, including denials"
+                ),
+            )
+            if choice == "retry":
+                continue
+            reset_failure = None
+            with self.policy_update():
+                if revision != self._policy_revision:
+                    continue
+                if choice == "reset":
+                    try:
+                        backup = self.reset_configuration("user")
+                    except OSError as error:
+                        reset_failure = error
+                    else:
+                        active_interaction.info(
+                            f"Reset user approvals; archived the policy at {backup}."
+                        )
+                        return False
+            if reset_failure is not None:
+                choice = self._recover_reset_failure(
+                    active_interaction,
+                    reset_failure,
+                    self._user_configuration_path,
+                )
+                if choice == "retry":
+                    continue
+            with self.policy_update():
+                if revision != self._policy_revision:
+                    continue
+                self._namespace_errors["user"] = failure.message
+                self._user_configuration = UserPermissionConfiguration(
+                    rules=[
+                        rule
+                        for rule in self._user_configuration.rules
+                        if rule.decision is not Decision.ALLOW
+                    ]
+                )
+                self._policy_revision += 1
+            active_interaction.warning(
+                "Permission operations remain blocked until the policy is repaired."
+            )
+            return True
+
+    def _try_load_user_configuration(self) -> tuple[PermissionConfigurationError | None, int]:
+        """Load user rules under the policy lock or return an interactive failure."""
         with self.policy_update():
-            if self._namespace_catalog_path is None and self._user_configuration_path is not None:
-                self._require_completed_reset(self._user_configuration_path)
             try:
-                if (
-                    self._namespace_catalog_path is not None
-                    and self._user_configuration_path is not None
-                ):
+                if self._user_configuration_path is not None:
                     self._require_completed_reset(self._user_configuration_path)
                 configuration = self._read_user_configuration()
             except PermissionNamespaceError as exc:
+                self._namespace_errors["user"] = exc.message
+                self._policy_revision += 1
                 if self._namespace_catalog_path is None:
                     raise
-                self._namespace_errors["user"] = exc.message
                 configuration = None
             except PermissionConfigurationError as exc:
+                self._namespace_errors["user"] = exc.message
+                self._policy_revision += 1
                 self._require_completed_reset(self._user_configuration_path)
-                if isinstance(exc.__cause__, OSError):
+                if isinstance(exc.__cause__, OSError) and (
+                    self.yolo or self._load_policy is not PermissionLoadPolicy.INTERACTIVE
+                ):
                     raise
                 if self.yolo or self._load_policy is PermissionLoadPolicy.ERROR:
                     raise
+                if self._load_policy is PermissionLoadPolicy.INTERACTIVE:
+                    return exc, self._policy_revision
                 configuration = None
                 self._report_user_configuration_error(exc)
             if configuration is None:
@@ -5637,6 +5839,7 @@ class PermissionManager:
             with self.policy_update():
                 self._user_configuration = configuration
                 self._policy_revision += 1
+            return None, self._policy_revision
 
     def _load_configuration(
         self,
@@ -5647,33 +5850,35 @@ class PermissionManager:
         """Load configuration and completely handle the selected failure policy."""
         while True:
             with self.policy_update():
-                if self._namespace_catalog_path is None:
-                    self._require_completed_reset()
                 try:
-                    if self._namespace_catalog_path is not None:
-                        self._require_completed_reset()
+                    self._require_completed_reset()
                     configuration = self._read_configuration(retain_on_missing=retain_on_failure)
                 except PermissionNamespaceError as exc:
+                    self._namespace_errors["workspace"] = exc.message
+                    self._policy_revision += 1
                     if self._namespace_catalog_path is None:
                         raise
-                    self._namespace_errors["workspace"] = exc.message
                     self._workspace_storage_revision = None
                     return PermissionLoadResult.RETAINED
                 except PermissionConfigurationError as exc:
+                    self._namespace_errors["workspace"] = exc.message
+                    self._policy_revision += 1
                     self._require_completed_reset()
-                    if isinstance(exc.__cause__, OSError):
+                    if isinstance(exc.__cause__, OSError) and (
+                        self.yolo or self._load_policy is not PermissionLoadPolicy.INTERACTIVE
+                    ):
                         raise
                     if self.yolo or self._load_policy is PermissionLoadPolicy.ERROR:
                         raise
                     if self._load_policy is PermissionLoadPolicy.AUTO:
                         self._report_configuration_error(exc)
                         if retain_on_failure:
-                            return PermissionLoadResult.RETAINED
+                            return PermissionLoadResult.BLOCKED
                         self._workspace_storage_revision = self._failed_workspace_revision
                         with self.policy_update():
                             self._configuration = PermissionConfiguration()
                             self._policy_revision += 1
-                        return PermissionLoadResult.DEFAULTED
+                        return PermissionLoadResult.BLOCKED
                     active_interaction = (
                         interaction if interaction is not None else self._interaction
                     )
@@ -5726,57 +5931,89 @@ class PermissionManager:
         )
         log_problem(_LOGGER, problem, error)
         interaction.report(problem)
-        continue_description = (
-            "Keep the current permission policy"
-            if retain_on_failure
-            else "Use supervised defaults for this session"
-        )
         # Construction and reload are synchronous; async callers must use a native prompt path.
-        choice = interaction.prompt(
+        choice = prompt_recovery(
+            interaction,
             "Permission policy recovery:",
-            exit_commands=(),
-            choices={
-                "retry": "Retry after fixing the permission file",
-                "continue": continue_description,
-                "reset": "Archive the invalid file and reset to supervised defaults",
-                "exit": "Exit application",
-            },
-            index={"retry": "R", "continue": "S", "reset": "A", "exit": "Q"},
+            continue_label="Continue with permission operations blocked",
+            reset_label=(
+                None
+                if isinstance(error.__cause__, OSError)
+                else "Archive the file and replace saved rules and limits with defaults"
+            ),
         )
         if choice == "retry":
             return PermissionLoadResult.LOADED
-        if choice == "exit" or choice is False:
-            raise ShutdownRequested()
         with self.policy_update():
             if revision != self._policy_revision:
                 return PermissionLoadResult.LOADED
-            return self._finish_configuration_recovery(
-                choice, interaction=interaction, retain_on_failure=retain_on_failure
-            )
+            if choice != "reset":
+                return self._finish_configuration_recovery(
+                    interaction=interaction,
+                    retain_on_failure=retain_on_failure,
+                )
+            try:
+                backup_path = self.reset_configuration("workspace")
+            except OSError as failure:
+                reset_error = failure
+            else:
+                interaction.info(
+                    "Reset permission policy to supervised defaults; "
+                    f"archived invalid file at {backup_path}."
+                )
+                return PermissionLoadResult.DEFAULTED
+        choice = self._recover_reset_failure(interaction, reset_error, self._configuration_path)
+        if choice == "retry":
+            return PermissionLoadResult.LOADED
+        interaction.warning("Permission operations remain blocked until the policy is repaired.")
+        return PermissionLoadResult.BLOCKED
+
+    @staticmethod
+    def _recover_reset_failure(interaction: Interaction, error: OSError, path: Path | None) -> str:
+        """Report a reset failure and request a decision after releasing policy locks."""
+        trusted_messages = {
+            "Permission policy changed; reload before retrying.",
+            "Unsafe policy lock file.",
+            "Unsafe policy staging file.",
+        }
+        if str(error) in trusted_messages:
+            detail = str(error)
+        elif isinstance(error, PermissionError):
+            detail = "Permission denied while resetting the policy."
+        elif error.errno is not None:
+            detail = f"Policy reset failed: {os.strerror(error.errno)} (errno {error.errno})."
+        else:
+            detail = "Policy reset failed (I/O error; errno unavailable)."
+        problem = Problem(
+            code="permission.reset_failed",
+            title="Permission policy reset failed",
+            detail=(f"{detail} Check the policy, pending reset marker, and backups near {path}."),
+            operation="permission.reset",
+        )
+        log_problem(_LOGGER, problem, error)
+        interaction.report(problem)
+        return prompt_recovery(
+            interaction,
+            "Permission policy recovery:",
+            continue_label="Continue with permission operations blocked",
+        )
 
     def _finish_configuration_recovery(
         self,
-        choice: object,
-        *,
         interaction: Interaction,
         retain_on_failure: bool,
     ) -> PermissionLoadResult:
         """Apply a still-current policy recovery decision."""
-        if choice == "reset":
-            backup_path = self.reset_configuration("workspace")
-            interaction.info(
-                "Reset permission policy to supervised defaults; "
-                f"archived invalid file at {backup_path}."
-            )
-            return PermissionLoadResult.DEFAULTED
         if retain_on_failure:
-            interaction.warning("Keeping the current permission policy.")
-            return PermissionLoadResult.RETAINED
+            interaction.warning(
+                "Permission operations remain blocked until the policy is repaired."
+            )
+            return PermissionLoadResult.BLOCKED
         with self.policy_update():
             self._configuration = PermissionConfiguration()
             self._policy_revision += 1
-        interaction.warning("Using supervised permission defaults for this session.")
-        return PermissionLoadResult.DEFAULTED
+        interaction.warning("Permission operations remain blocked until the policy is repaired.")
+        return PermissionLoadResult.BLOCKED
 
     def _report_configuration_error(self, error: PermissionConfigurationError) -> None:
         """Report an automatically recovered configuration failure."""
@@ -5790,9 +6027,11 @@ class PermissionManager:
         log_problem(_LOGGER, problem, error)
         if self._interaction is not None:
             self._interaction.report(problem)
-            self._interaction.warning("Recovered according to the automatic permission policy.")
+            self._interaction.warning(
+                "Permission operations are blocked until the policy is repaired."
+            )
         else:
-            _LOGGER.warning("Recovered according to the automatic permission policy")
+            _LOGGER.warning("Invalid permission policy; permission operations are blocked")
 
     def _report_user_configuration_error(self, error: PermissionConfigurationError) -> None:
         """Report an invalid user approval policy while retaining fail-closed behavior."""
@@ -5808,15 +6047,73 @@ class PermissionManager:
             self._interaction.report(problem)
             self._interaction.warning("Ignoring user-wide approvals until the policy is fixed.")
         else:
-            _LOGGER.warning("Ignoring invalid user-wide approval policy")
+            _LOGGER.warning("Invalid user-wide approval policy; permission operations are blocked")
 
-    def _load_presets(self) -> tuple[PermissionPreset, ...]:
+    @staticmethod
+    async def recover_startup_async(
+        error: PermissionNamespaceError | PermissionPresetError,
+        interaction: Interaction,
+    ) -> bool:
+        """Ask how to recover from a permission artifact failure during startup.
+
+        Args:
+            error (PermissionNamespaceError | PermissionPresetError): Failed permission artifact.
+            interaction (Interaction): User interface for reporting and recovery choices.
+
+        Returns:
+            bool: Whether to exclude the reported invalid presets; False requests a retry.
+
+        Raises:
+            ShutdownRequested: If the user declines to continue.
+        """
+        if isinstance(error, PermissionPresetError):
+            for failure in error.failures:
+                interaction.report(
+                    Problem(
+                        code="permission.preset_invalid",
+                        title="Invalid permission preset",
+                        detail=f"{failure.path}: {failure.message}",
+                        operation="startup",
+                    )
+                )
+            choice = await prompt_recovery_async(
+                interaction,
+                "Permission preset recovery:",
+                operation="permission recovery",
+                continue_label="Continue without the listed invalid presets",
+            )
+            if choice == "continue":
+                return True
+        else:
+            problem = Problem.from_exception(
+                error,
+                code="permission.policy_recovery_required",
+                title="Permission policy recovery required",
+                operation="startup",
+            )
+            log_problem(_LOGGER, problem, error)
+            interaction.report(problem)
+            interaction.warning(
+                "Defaults and automatic repair are unavailable because the policy "
+                "may contain restrictions. Repair or restore it before reloading."
+            )
+            choice = await prompt_recovery_async(
+                interaction,
+                "Permission policy recovery:",
+                operation="permission recovery",
+            )
+        return False
+
+    def _load_presets(
+        self,
+        accepted_failures: tuple[PermissionLoadFailure, ...],
+    ) -> tuple[PermissionPreset, ...]:
         """Load presets and completely handle invalid catalog artifacts."""
         presets, failures = PermissionPreset.load_builtin_presets()
         if not failures:
             return presets
         error = PermissionPresetError(failures)
-        if self._load_policy is PermissionLoadPolicy.ERROR:
+        if failures != accepted_failures:
             raise error
         for failure in failures:
             message = f"Excluded invalid permission preset at {failure.path}: {failure.message}"

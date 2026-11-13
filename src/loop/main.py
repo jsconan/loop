@@ -12,6 +12,7 @@ from .application import (
     ApplicationMigration,
     ApplicationPaths,
     ApplicationRuntime,
+    RuntimeRollbackError,
 )
 from .configuration import ConfigurationManager
 from .errors import Problem, log_problem
@@ -100,7 +101,7 @@ async def run_application_async() -> None:  # pylint: disable=too-many-branches
         interaction.info(f"Hello from {constants.APP_NAME}!")
         while True:
             if runtime is None:
-                runtime = _build_runtime(workspace, paths, repository, interaction)
+                runtime = await _build_runtime_async(workspace, paths, repository, interaction)
             try:
                 await runtime.run_async()
             except WorkspaceSwitchRequested as request:
@@ -110,14 +111,20 @@ async def run_application_async() -> None:  # pylint: disable=too-many-branches
                     runtime = None
                     workspace = request.workspace
                     try:
-                        runtime = _build_runtime(workspace, paths, repository, interaction)
+                        runtime = await _build_runtime_async(
+                            workspace, paths, repository, interaction
+                        )
+                    except (ShutdownRequested, RuntimeRollbackError):
+                        raise
                     except Exception as error:  # noqa: BLE001  # pylint: disable=broad-except
                         workspace = previous
                         interaction.warning(
                             f"Workspace switch failed ({type(error).__name__}); restored "
                             f"workspace {previous.id}."
                         )
-                        runtime = _build_runtime(workspace, paths, repository, interaction)
+                        runtime = await _build_runtime_async(
+                            workspace, paths, repository, interaction
+                        )
                 finally:
                     request.complete()
                 continue
@@ -156,7 +163,7 @@ async def run_application_async() -> None:  # pylint: disable=too-many-branches
             set_telemetry(None)
 
 
-def _build_runtime(
+async def _build_runtime_async(
     workspace: Workspace,
     paths: ApplicationPaths,
     repository: WorkspaceRepository,
@@ -165,23 +172,15 @@ def _build_runtime(
     """Build every workspace-owned service for one resolved identity."""
     workspace_paths = paths.for_workspace(workspace.id, workspace.root)
     configuration = ConfigurationManager(paths.user_configuration, workspace_paths.configuration)
-    configuration.initialize()
-    settings = configuration.load()
+    settings = await configuration.load_interactively_async(interaction)
     ApplicationMigration(
         workspace,
         paths,
         workspace_paths,
         busy_timeout_ms=settings.telemetry.sqlite_busy_timeout_ms,
     ).run()
-    return ApplicationRuntime.create(
-        workspace,
-        paths,
-        workspace_paths,
-        settings,
-        configuration,
-        repository,
-        interaction,
-        main_app=True,
+    return await ApplicationRuntime.create_interactively_async(
+        workspace, paths, workspace_paths, settings, configuration, repository, interaction
     )
 
 

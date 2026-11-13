@@ -1,5 +1,6 @@
 """Tests for complete operation-policy user commands."""
 
+import asyncio
 import shlex
 import time
 from unittest.mock import Mock
@@ -12,6 +13,7 @@ from loop import (
     ApprovalChoice,
     CommandCapability,
     CommandCompletionAdapter,
+    CommandContext,
     CommandManager,
     CompletionManager,
     CompletionProviderRegistration,
@@ -25,10 +27,12 @@ from loop import (
     PermissionPreset,
     PermissionRule,
     PolicyScope,
+    SessionTarget,
 )
 from loop.execution.sandbox import SandboxRequest
 from loop.interaction import ConsoleInteraction
 from loop.permissions import PermissionCommands
+from loop.utils import ShutdownRequested
 from loop.workspace import Workspace, WorkspaceRepository
 
 
@@ -148,8 +152,9 @@ def test_explicit_policy_reset_command_uses_no_confirmation(tmp_path, scope):
 
 
 def test_user_reset_command_recovers_invalid_policy_with_an_archive(tmp_path):
-    """The trusted command can recover captured invalid user policy without a prompt."""
+    """After acknowledging the failure, reset archives the invalid user policy."""
     interaction = Mock(spec=ConsoleInteraction)
+    interaction.prompt.return_value = "continue"
     user_path = tmp_path / "user-policy.yaml"
     user_path.write_text("version: invalid\n", encoding="utf-8")
     permissions = PermissionManager(
@@ -163,7 +168,7 @@ def test_user_reset_command_recovers_invalid_policy_with_an_archive(tmp_path):
     assert next(tmp_path.glob("user-policy.yaml.*.bak")).read_text(encoding="utf-8") == (
         "version: invalid\n"
     )
-    interaction.prompt.assert_not_called()
+    interaction.prompt.assert_called_once()
     permissions.close()
 
 
@@ -594,6 +599,58 @@ def test_permissions_show_and_explain_report_the_complete_effective_policy(tmp_p
     assert "rule:" in explained
 
 
+def test_permissions_reload_can_continue_with_policy_operations_blocked(tmp_path):
+    """A pending reset requires a choice and keeps synchronous and async operations denied."""
+    interaction = Mock(spec=Interaction)
+    permissions = PermissionManager(tmp_path, interaction=interaction)
+    permissions.set_default(Action.SESSION_MUTATE, Decision.ALLOW)
+    marker = permissions.configuration_path.with_name("permissions.yaml.reset-pending")
+    marker.touch()
+
+    def continue_after_marker_disappears(*_args, **_kwargs):
+        """Simulate an external repair while the recovery prompt is open."""
+        marker.unlink()
+        return "continue"
+
+    interaction.prompt.side_effect = continue_after_marker_disappears
+    context = CommandContext(name="permissions", interaction=interaction)
+
+    PermissionCommands(permissions).permissions(context, ("reload",))
+
+    operation = Operation(
+        tool_id="example", action=Action.SESSION_MUTATE, target=SessionTarget(identifier="test")
+    )
+    assert permissions.evaluate((operation,)).decision is Decision.DENY
+    assert asyncio.run(permissions.evaluate_async((operation,))).decision is Decision.DENY
+    assert "remain blocked" in interaction.warning.call_args.args[0]
+    interaction.prompt.assert_called_once()
+
+
+@pytest.mark.parametrize("choice", ["retry", "exit", None])
+def test_permissions_reload_retries_or_halts_after_policy_failure(tmp_path, choice):
+    """Only explicit retry reloads a repaired policy; other non-continue choices halt."""
+    interaction = Mock(spec=Interaction)
+    permissions = PermissionManager(tmp_path, interaction=interaction)
+    permissions.set_default(Action.SESSION_MUTATE, Decision.DENY)
+    marker = permissions.configuration_path.with_name("permissions.yaml.reset-pending")
+    marker.touch()
+
+    def answer(*_args, **_kwargs):
+        """Remove the marker only when the user selects retry."""
+        if choice == "retry":
+            marker.unlink()
+        return choice
+
+    interaction.prompt.side_effect = answer
+    context = CommandContext(name="permissions", interaction=interaction)
+    if choice == "retry":
+        PermissionCommands(permissions).permissions(context, ("reload",))
+        assert "Reloaded" in interaction.info.call_args.args[0]
+    else:
+        with pytest.raises(ShutdownRequested):
+            PermissionCommands(permissions).permissions(context, ("reload",))
+
+
 def test_permissions_reload_and_limit_removal_report_outcomes(tmp_path):
     """Reload validates disk policy and unchanged collection operations produce warnings."""
     interaction = Mock(spec=ConsoleInteraction)
@@ -625,8 +682,7 @@ def test_permissions_reload_reports_invalid_policy_without_replacing_active_poli
 
     assert permissions.configuration.defaults[Action.FILESYSTEM_DELETE] is Decision.DENY
     interaction.report.assert_called_once()
-    assert "Keeping" in interaction.warning.call_args.args[0]
-    assert "Retained" in interaction.info.call_args.args[0]
+    assert "blocked" in interaction.warning.call_args.args[0]
 
     interaction.prompt.return_value = "reset"
     manager.call("permissions", "reload")
@@ -646,7 +702,7 @@ def test_sync_permissions_command_bridges_recovery_to_legacy_input(tmp_path):
 
     assert permissions.configuration.defaults[Action.FILESYSTEM_DELETE] is Decision.DENY
     interaction.prompt.assert_called_once()
-    assert "Keeping" in interaction.warning.call_args.args[0]
+    assert "blocked" in interaction.warning.call_args.args[0]
     manager.close()
 
 
@@ -1095,3 +1151,31 @@ def test_permission_initialize_completion_offers_exact_quoted_identity_only_when
     )
     assert "initialize" not in {item.text for item in complete(completer, "/permissions ")}
     assert complete(completer, "/permissions initialize user ") == []
+
+
+@pytest.mark.parametrize("location", ["user", "unknown", "already_blocked"])
+def test_reload_latches_unexpected_policy_failures(tmp_path, location):
+    """Reload keeps authorization blocked even when the failing artifact is not workspace YAML."""
+    from loop.permissions import PermissionConfigurationError
+
+    interaction = Mock(spec=ConsoleInteraction)
+    interaction.prompt.return_value = "continue"
+    user_path = tmp_path / "user.yaml"
+    permissions = PermissionManager(tmp_path, user_configuration_path=user_path)
+    if location == "already_blocked":
+        permissions.suspend_policy("user", "untrusted policy")
+    path = user_path if location == "user" else tmp_path / "unknown-policy"
+    permissions.reload = Mock(side_effect=PermissionConfigurationError(path, "invalid"))
+    manager = command_manager(permissions, interaction)
+    manager.call("permissions", "reload")
+    assert "blocked" in interaction.warning.call_args.args[0]
+    assert permissions._namespace_recovery_decision().decision is Decision.DENY
+
+
+def test_reload_reports_invalid_command_failure(tmp_path):
+    """Unexpected input errors from reload use the standard command diagnostic."""
+    interaction = Mock(spec=ConsoleInteraction)
+    permissions = PermissionManager(tmp_path)
+    permissions.reload = Mock(side_effect=ValueError("invalid reload"))
+    command_manager(permissions, interaction).call("permissions", "reload")
+    assert "invalid reload" in interaction.report.call_args.args[0].detail

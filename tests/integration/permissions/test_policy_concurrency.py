@@ -16,7 +16,6 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
-import yaml
 
 from loop.permissions import (
     Action,
@@ -32,6 +31,7 @@ from loop.permissions import (
     PolicyScope,
     UserPermissionConfiguration,
 )
+from loop.utils.yaml import load_yaml
 from loop.workspace import Workspace, WorkspaceRepository
 
 pytestmark = pytest.mark.integration
@@ -878,7 +878,7 @@ def test_async_persistent_approval_is_visible_with_its_saved_revision(tmp_path, 
                 if scope is ApprovalChoice.WORKSPACE
                 else UserPermissionConfiguration
             )
-            persisted = model.model_validate(yaml.safe_load(path.read_text()))
+            persisted = model.model_validate(load_yaml(path.read_text()))
             release.set()
             result = pending.result(timeout=5)
             assert initial.decision is Decision.ASK

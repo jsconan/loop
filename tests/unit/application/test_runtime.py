@@ -948,18 +948,23 @@ def test_runtime_accepts_resources_without_close_contract(dependencies, assemble
     )
 
 
-def test_rollback_preserves_primary_error_when_cleanup_fails(dependencies, assembled):
-    """Secondary close failures annotate rather than replace the startup error."""
+def test_rollback_reports_incomplete_cleanup_without_losing_the_primary_error(
+    dependencies, assembled
+):
+    """An incomplete rollback prevents another runtime from being composed."""
     workspace, paths, workspace_paths, settings = assembled
     dependencies["Loop"].create_default.side_effect = RuntimeError("startup failed")
     dependencies["Telemetry"].return_value.close.side_effect = OSError("close failed")
 
-    with pytest.raises(RuntimeError, match="startup failed") as raised:
+    with pytest.raises(RuntimeError, match="Runtime rollback failed") as raised:
         ApplicationRuntime.create(
             workspace, paths, workspace_paths, settings, Mock(), Mock(), Mock()
         )
 
-    assert raised.value.__notes__ == ["Runtime rollback also failed: OSError: close failed"]
+    assert str(raised.value.__cause__) == "startup failed"
+    assert raised.value.__cause__.__notes__ == [
+        "Runtime rollback also failed: OSError: close failed"
+    ]
 
 
 def test_close_reports_first_cleanup_error_and_notes_additional_failures():

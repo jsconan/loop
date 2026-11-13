@@ -1,6 +1,7 @@
 """Tests for layered operation-policy evaluation, approval, and persistence."""
 
 import asyncio
+import errno
 import io
 import json
 import os
@@ -17,7 +18,6 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, call
 
 import pytest
-import yaml
 from rich.console import Console
 
 from loop import (
@@ -61,7 +61,8 @@ from loop.permissions import manager as manager_module
 from loop.permissions.managed import ManagedPolicyStore
 from loop.telemetry import MemoryTelemetryAdapter, Telemetry, set_telemetry
 from loop.telemetry.policy import thaw
-from loop.utils import PathHolder
+from loop.utils import PathHolder, ShutdownRequested
+from loop.utils.yaml import dump_yaml, load_yaml
 from loop.workspace import Workspace, WorkspaceRepository
 from tests.scheduling import deliver_callbacks
 
@@ -762,7 +763,7 @@ def test_pristine_policy_namespaces_bootstrap_without_user_steps(tmp_path):
     assert manager.configuration.namespace_generation is not None
     user_path = arguments["user_configuration_path"]
     user_generation = UserPermissionConfiguration.model_validate(
-        yaml.safe_load(user_path.read_text(encoding="utf-8"))
+        load_yaml(user_path.read_text(encoding="utf-8"))
     ).namespace_generation
     assert user_generation is not None
     assert arguments["configuration_path"].is_file()
@@ -792,7 +793,7 @@ def test_pristine_policy_namespaces_bootstrap_without_user_steps(tmp_path):
     assert other.configuration.namespace_generation is not None
     assert (
         UserPermissionConfiguration.model_validate(
-            yaml.safe_load(user_path.read_text(encoding="utf-8"))
+            load_yaml(user_path.read_text(encoding="utf-8"))
         ).namespace_generation
         == user_generation
     )
@@ -804,7 +805,7 @@ def test_pristine_bootstrap_keeps_backup_and_initialized_missing_policy_closed(t
     arguments, _workspace_id, _ = durable_policy_inputs(tmp_path)
     user_path = arguments["user_configuration_path"]
     backup = user_path.with_name(user_path.name + ".bak")
-    backup.write_text(yaml.safe_dump(UserPermissionConfiguration().model_dump()), encoding="utf-8")
+    backup.write_text(dump_yaml(UserPermissionConfiguration().model_dump()), encoding="utf-8")
 
     blocked = PermissionManager(**arguments, bootstrap_pristine_policy=True)
     assert blocked.configuration.namespace_generation is not None
@@ -816,7 +817,7 @@ def test_pristine_bootstrap_keeps_backup_and_initialized_missing_policy_closed(t
     initialized = PermissionManager(**arguments, bootstrap_pristine_policy=True)
     assert (
         UserPermissionConfiguration.model_validate(
-            yaml.safe_load(user_path.read_text(encoding="utf-8"))
+            load_yaml(user_path.read_text(encoding="utf-8"))
         ).namespace_generation
         is not None
     )
@@ -835,7 +836,7 @@ def test_pristine_bootstrap_migrates_existing_user_deny_without_widening(tmp_pat
     original = UserPermissionConfiguration(
         rules=[PermissionRule(decision=Decision.DENY, action=Action.FILESYSTEM_READ)]
     )
-    user_path.write_text(yaml.safe_dump(original.model_dump(mode="json")), encoding="utf-8")
+    user_path.write_text(dump_yaml(original.model_dump(mode="json")), encoding="utf-8")
 
     manager = PermissionManager(**arguments, bootstrap_pristine_policy=True)
     read = Operation(
@@ -858,7 +859,7 @@ def test_legacy_namespace_migrates_values_and_rejects_missing_or_restored_marker
     original = PermissionConfiguration(
         limits=PolicyLimits(readable_roots=("workspace",), writable_roots=("workspace",))
     )
-    path.write_text(yaml.safe_dump(original.model_dump(mode="json")), encoding="utf-8")
+    path.write_text(dump_yaml(original.model_dump(mode="json")), encoding="utf-8")
 
     migrated = PermissionManager(**arguments)
 
@@ -870,9 +871,7 @@ def test_legacy_namespace_migrates_values_and_rejects_missing_or_restored_marker
     assert generation is not None
     backup = path.with_name(f"{path.name}.{generation}.legacy.bak")
     assert backup.is_file()
-    assert (
-        yaml.safe_load(backup.read_text())["limits"] == original.model_dump(mode="json")["limits"]
-    )
+    assert load_yaml(backup.read_text())["limits"] == original.model_dump(mode="json")["limits"]
 
     saved = path.read_bytes()
     path.unlink()
@@ -900,7 +899,7 @@ def test_markerless_legacy_policy_migrates_missing_local_limit_as_deny(tmp_path)
     payload["version"] = 1
     payload.pop("namespace_generation")
     payload["limits"].pop("deny_local_networks")
-    original = yaml.safe_dump(payload).encode("utf-8")
+    original = dump_yaml(payload).encode("utf-8")
     path.write_bytes(original)
     adapter = MemoryTelemetryAdapter()
     telemetry = Telemetry(adapter, flush_seconds=0.01)
@@ -949,7 +948,7 @@ def test_user_namespace_initialization_preserves_plain_legacy_backup(tmp_path):
     manager.initialize_policy_namespace("workspace", workspace_id, authorized=True)
     path = arguments["user_configuration_path"]
     backup = path.with_name(path.name + ".bak")
-    backup.write_text(yaml.safe_dump(UserPermissionConfiguration().model_dump()), encoding="utf-8")
+    backup.write_text(dump_yaml(UserPermissionConfiguration().model_dump()), encoding="utf-8")
 
     with pytest.raises(PermissionNamespaceError, match="Existing policy or backup data"):
         manager.initialize_policy_namespace("user", user_identity, authorized=True)
@@ -1179,9 +1178,9 @@ def test_initialized_namespace_rejects_missing_or_untrusted_state(tmp_path, fail
         innocent.write_text("secret", encoding="utf-8")
         path.symlink_to(innocent)
     elif failure == "marker":
-        payload = yaml.safe_load(path.read_text())
+        payload = load_yaml(path.read_text())
         payload["namespace_generation"] = "0" * 32
-        path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+        path.write_text(dump_yaml(payload), encoding="utf-8")
     else:
         arguments["namespace_catalog_path"].unlink()
 
@@ -1218,7 +1217,7 @@ def test_marked_policy_rejects_incomplete_persisted_schema(tmp_path, missing):
         if missing == "user-rules"
         else arguments["configuration_path"]
     )
-    payload = yaml.safe_load(path.read_text())
+    payload = load_yaml(path.read_text())
     if missing == "workspace-field":
         payload.pop("limit_classifications")
     elif missing == "limit-field":
@@ -1231,7 +1230,7 @@ def test_marked_policy_rejects_incomplete_persisted_schema(tmp_path, missing):
         payload["defaults"].pop(Action.FILESYSTEM_READ.value)
     else:
         payload.pop("rules")
-    path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+    path.write_text(dump_yaml(payload), encoding="utf-8")
 
     reloaded = PermissionManager(**arguments)
     assert "Marked policy" in reloaded.describe()
@@ -1250,7 +1249,7 @@ def test_marked_previous_workspace_schema_migrates_with_exact_backup(tmp_path, l
     manager.initialize_policy_namespace("user", user_identity, authorized=True)
     manager.close()
     path = arguments["configuration_path"]
-    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    payload = load_yaml(path.read_text(encoding="utf-8"))
     generation = payload["namespace_generation"]
     payload["version"] = 1
     if local_network is None:
@@ -1258,7 +1257,7 @@ def test_marked_previous_workspace_schema_migrates_with_exact_backup(tmp_path, l
     else:
         payload["limits"]["deny_local_networks"] = local_network
     payload["defaults"][Action.FILESYSTEM_READ.value] = Decision.DENY.value
-    original = yaml.safe_dump(payload).encode("utf-8")
+    original = dump_yaml(payload).encode("utf-8")
     path.write_bytes(original)
     adapter = MemoryTelemetryAdapter()
     telemetry = Telemetry(adapter, flush_seconds=0.01)
@@ -1276,7 +1275,7 @@ def test_marked_previous_workspace_schema_migrates_with_exact_backup(tmp_path, l
     assert migrated.authorize_sandboxed_command(
         native_request(tmp_path, "pwd", read_roots=(), local_network=False), tool_id="run_command"
     )
-    saved = yaml.safe_load(path.read_text(encoding="utf-8"))
+    saved = load_yaml(path.read_text(encoding="utf-8"))
     assert saved["version"] == 2
     assert saved["limits"]["deny_local_networks"] is (
         True if local_network is None else local_network
@@ -1300,11 +1299,11 @@ def test_marked_schema_migration_rejects_conflicting_archive(tmp_path):
     manager.initialize_policy_namespace("user", user_identity, authorized=True)
     manager.close()
     path = arguments["configuration_path"]
-    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    payload = load_yaml(path.read_text(encoding="utf-8"))
     generation = payload["namespace_generation"]
     payload["version"] = 1
     payload["limits"].pop("deny_local_networks")
-    original = yaml.safe_dump(payload).encode("utf-8")
+    original = dump_yaml(payload).encode("utf-8")
     path.write_bytes(original)
     backup = path.with_name(f"{path.name}.{generation}.schema-v1.bak")
     backup.write_text("conflict", encoding="utf-8")
@@ -1326,10 +1325,10 @@ def test_marked_schema_migration_refuses_changed_policy(tmp_path, monkeypatch, o
     manager.initialize_policy_namespace("user", user_identity, authorized=True)
     manager.close()
     path = arguments["configuration_path"]
-    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    payload = load_yaml(path.read_text(encoding="utf-8"))
     payload["version"] = 1
     payload["limits"].pop("deny_local_networks")
-    path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+    path.write_text(dump_yaml(payload), encoding="utf-8")
     original_read = PermissionManager._read_namespaced_file
     observed = 0
 
@@ -1369,10 +1368,10 @@ def test_marked_previous_schema_still_rejects_other_missing_limits(tmp_path):
     manager.initialize_policy_namespace("user", user_identity, authorized=True)
     manager.close()
     path = arguments["configuration_path"]
-    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    payload = load_yaml(path.read_text(encoding="utf-8"))
     payload["version"] = 1
     payload["limits"].pop("deny_private_networks")
-    path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+    path.write_text(dump_yaml(payload), encoding="utf-8")
 
     refused = PermissionManager(**arguments)
     assert "Marked policy limits or provenance are incomplete" in refused.describe()
@@ -1392,9 +1391,9 @@ def test_invalid_marked_policy_stops_before_model_work_with_repair_path(tmp_path
         if scope == "user"
         else arguments["configuration_path"]
     )
-    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    payload = load_yaml(path.read_text(encoding="utf-8"))
     payload["version"] = 3
-    path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+    path.write_text(dump_yaml(payload), encoding="utf-8")
 
     refused = PermissionManager(**arguments)
     with pytest.raises(PermissionNamespaceError) as raised:
@@ -1410,13 +1409,13 @@ def test_user_namespace_migrates_legacy_rules_and_disables_missing_user_policy(t
     path = arguments["user_configuration_path"]
     rule = PermissionRule(decision=Decision.DENY, action=Action.FILESYSTEM_READ)
     path.write_text(
-        yaml.safe_dump(UserPermissionConfiguration(rules=[rule]).model_dump(mode="json")),
+        dump_yaml(UserPermissionConfiguration(rules=[rule]).model_dump(mode="json")),
         encoding="utf-8",
     )
     manager = PermissionManager(**arguments)
     manager.initialize_policy_namespace("workspace", workspace_id, authorized=True)
     assert manager.user_rules == (rule,)
-    assert yaml.safe_load(path.read_text())["namespace_generation"] is not None
+    assert load_yaml(path.read_text())["namespace_generation"] is not None
     path.unlink()
     reloaded = PermissionManager(**arguments)
     assert "user namespace recovery required" in reloaded.describe()
@@ -1510,7 +1509,7 @@ def test_user_policy_reset_archives_approvals_and_keeps_namespace_generation(tmp
     manager.trust_host_command("printf private", ApprovalChoice.USER)
     path = arguments["user_configuration_path"]
     old_bytes = path.read_bytes()
-    generation = yaml.safe_load(old_bytes)["namespace_generation"]
+    generation = load_yaml(old_bytes)["namespace_generation"]
 
     archive = manager.reset_configuration("user")
 
@@ -1518,7 +1517,7 @@ def test_user_policy_reset_archives_approvals_and_keeps_namespace_generation(tmp
     assert manager.trusted_host_command_rules() == ()
     assert not path.with_name(path.name + ".reset-pending").exists()
     reloaded = PermissionManager(**arguments)
-    assert yaml.safe_load(path.read_bytes())["namespace_generation"] == generation
+    assert load_yaml(path.read_bytes())["namespace_generation"] == generation
     assert reloaded.trusted_host_command_rules() == ()
 
 
@@ -1529,7 +1528,7 @@ def test_user_reset_recovers_exact_invalid_policy_but_refuses_a_direct_edit(tmp_
     manager = PermissionManager(
         tmp_path, user_configuration_path=path, load_policy=PermissionLoadPolicy.AUTO
     )
-    assert "Ignoring invalid user-wide approval policy" in caplog.text
+    assert "Invalid user-wide approval policy" in caplog.text
     path.write_text("version: another-invalid\n", encoding="utf-8")
 
     with pytest.raises(OSError, match="changed.*reload"):
@@ -1539,7 +1538,7 @@ def test_user_reset_recovers_exact_invalid_policy_but_refuses_a_direct_edit(tmp_
     path.write_text("version: invalid\n", encoding="utf-8")
     archive = manager.reset_configuration("user")
     assert archive is not None and archive.read_text(encoding="utf-8") == "version: invalid\n"
-    assert UserPermissionConfiguration.model_validate(yaml.safe_load(path.read_bytes()))
+    assert UserPermissionConfiguration.model_validate(load_yaml(path.read_bytes()))
 
 
 @pytest.mark.parametrize("scope", ["workspace", "user"])
@@ -1552,7 +1551,7 @@ def test_reset_never_overwrites_an_existing_archive_name(tmp_path, monkeypatch, 
         path = manager.configuration_path
     else:
         user_path.write_text(
-            yaml.safe_dump(UserPermissionConfiguration().model_dump(mode="json")),
+            dump_yaml(UserPermissionConfiguration().model_dump(mode="json")),
             encoding="utf-8",
         )
         manager.reload()
@@ -1583,7 +1582,7 @@ def test_reset_preserves_archive_when_rename_reports_failure_after_effect(
         path = manager.configuration_path
     else:
         user_path.write_text(
-            yaml.safe_dump(UserPermissionConfiguration().model_dump(mode="json")),
+            dump_yaml(UserPermissionConfiguration().model_dump(mode="json")),
             encoding="utf-8",
         )
         manager.reload()
@@ -1831,9 +1830,9 @@ def test_policy_namespace_rejects_inconsistent_reservations(tmp_path, failure, e
     if failure == "reserved_legacy_missing":
         path.unlink()
     elif failure in {"reserved_new_mismatch", "reserved_legacy_mismatch"}:
-        payload = yaml.safe_load(path.read_text())
+        payload = load_yaml(path.read_text())
         payload["namespace_generation"] = "0" * 32
-        path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+        path.write_text(dump_yaml(payload), encoding="utf-8")
     assert expected in PermissionManager(**arguments).describe()
 
 
@@ -1916,8 +1915,8 @@ def test_namespace_identity_and_recovery_block_policy_writes(tmp_path):
 @pytest.mark.parametrize(
     "failure,expected",
     [
-        ("initial_stat", "stat interrupted"),
-        ("second_stat", "Policy file changed during loading"),
+        ("initial_stat", "errno 5"),
+        ("second_stat", "errno 5"),
         ("changed_inode", "Policy file changed during loading"),
         ("no_nofollow", "No-follow policy loading is unavailable"),
         ("unsafe_mode", "Policy file provenance is invalid"),
@@ -1946,10 +1945,10 @@ def test_namespace_policy_reader_rejects_storage_races(tmp_path, monkeypatch, fa
             if candidate == path:
                 calls += 1
                 if failure == "initial_stat" and calls == 1:
-                    raise OSError("stat interrupted")
+                    raise OSError(5, "stat interrupted")
                 if calls == 2:
                     if failure == "second_stat":
-                        raise OSError("stat interrupted")
+                        raise OSError(5, "stat interrupted")
                     if failure == "changed_inode":
                         return SimpleNamespace(st_dev=-1, st_ino=-1)
             return original_lstat(candidate)
@@ -2336,7 +2335,7 @@ def test_namespaced_save_rejects_same_byte_policy_symlink(tmp_path):
     path.unlink()
     path.symlink_to(same_bytes)
 
-    with pytest.raises(PermissionNamespaceError, match="Policy file changed during loading"):
+    with pytest.raises(PermissionNamespaceError, match="symbolic links are not allowed"):
         manager.set_default(Action.FILESYSTEM_READ, Decision.DENY)
     assert path.is_symlink()
     assert same_bytes.read_bytes() != b""
@@ -2362,7 +2361,7 @@ def test_namespaced_save_rechecks_final_policy_inode_after_live_validation(tmp_p
         return result
 
     monkeypatch.setattr(manager, "_namespace_recovery_decision", swap_after_validation)
-    with pytest.raises(PermissionNamespaceError, match="Policy file changed during loading"):
+    with pytest.raises(PermissionNamespaceError, match="symbolic links are not allowed"):
         manager.set_default(Action.FILESYSTEM_READ, Decision.DENY)
     assert path.is_symlink()
     assert same_bytes.read_bytes() == original_bytes
@@ -2780,17 +2779,17 @@ def test_marked_user_policy_migrates_with_exact_backup(tmp_path, missing_host_gr
     manager.initialize_policy_namespace("user", user_identity, authorized=True)
     manager.close()
     path = arguments["user_configuration_path"]
-    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    payload = load_yaml(path.read_text(encoding="utf-8"))
     generation = payload["namespace_generation"]
     payload["version"] = 1
     if missing_host_grants:
         payload.pop("trusted_host_command_rules")
-    original = yaml.safe_dump(payload).encode("utf-8")
+    original = dump_yaml(payload).encode("utf-8")
     path.write_bytes(original)
     recovered = PermissionManager(**arguments)
     assert recovered.trusted_host_command_rules() == ()
     assert "recovery required" not in recovered.describe()
-    saved = yaml.safe_load(path.read_text(encoding="utf-8"))
+    saved = load_yaml(path.read_text(encoding="utf-8"))
     assert saved["version"] == 2
     assert saved["trusted_host_command_rules"] == []
     assert saved["namespace_generation"] == generation
@@ -3622,7 +3621,7 @@ def test_fresh_command_finding_overrides_matching_remembered_rule(tmp_path):
     rule = manager.sandboxed_command_rules(ApprovalChoice.WORKSPACE)[0]
     source = "git add file && rm file"
     user_path.write_text(
-        yaml.safe_dump(
+        dump_yaml(
             {
                 "sandboxed_command_rules": [
                     rule.model_copy(update={"source": source}).model_dump(mode="json")
@@ -3755,7 +3754,7 @@ def test_broad_network_grant_respects_network_denial(tmp_path, asynchronous, pol
     user_path = tmp_path / "user.yaml"
     if policy_source == "user":
         user_path.write_text(
-            yaml.safe_dump(UserPermissionConfiguration(rules=[rule]).model_dump(mode="json")),
+            dump_yaml(UserPermissionConfiguration(rules=[rule]).model_dump(mode="json")),
             encoding="utf-8",
         )
     interaction = Mock(spec=Interaction)
@@ -4807,7 +4806,7 @@ def test_native_persistent_rules_reject_duplicate_ids_and_unsupported_authority(
         )
     user_path = tmp_path / "user.yaml"
     user_path.write_text(
-        yaml.safe_dump(
+        dump_yaml(
             {
                 "sandboxed_command_rules": [
                     first.model_dump(mode="json"),
@@ -4820,12 +4819,12 @@ def test_native_persistent_rules_reject_duplicate_ids_and_unsupported_authority(
     with pytest.raises(PermissionConfigurationError, match="identifiers must be unique"):
         PermissionManager(tmp_path, user_configuration_path=user_path)
     user_path.write_text(
-        yaml.safe_dump(
+        dump_yaml(
             {"sandboxed_command_rules": [{**first.model_dump(mode="json"), "all_sources": True}]}
         ),
         encoding="utf-8",
     )
-    with pytest.raises(PermissionConfigurationError, match="all_sources"):
+    with pytest.raises(PermissionConfigurationError, match="unrecognized field"):
         PermissionManager(tmp_path, user_configuration_path=user_path)
 
 
@@ -5159,7 +5158,7 @@ def test_legacy_process_approval_never_approves_native_sandbox_request(tmp_path)
     interaction = Mock(spec=Interaction)
     interaction.prompt.return_value = "deny"
     policy_path = tmp_path / "permissions.yaml"
-    policy_path.write_text(yaml.safe_dump(configuration.model_dump(mode="json")))
+    policy_path.write_text(dump_yaml(configuration.model_dump(mode="json")))
     user_rule = PermissionRule(
         decision=Decision.ALLOW,
         tool="run_command",
@@ -5171,9 +5170,7 @@ def test_legacy_process_approval_never_approves_native_sandbox_request(tmp_path)
         ),
     )
     user_path = tmp_path / "user-permissions.yaml"
-    user_path.write_text(
-        yaml.safe_dump({"version": 1, "rules": [user_rule.model_dump(mode="json")]})
-    )
+    user_path.write_text(dump_yaml({"version": 1, "rules": [user_rule.model_dump(mode="json")]}))
     manager = PermissionManager(
         tmp_path, configuration_path=policy_path, user_configuration_path=user_path
     )
@@ -5360,12 +5357,60 @@ def test_workspace_deny_overrides_a_matching_user_approval(tmp_path):
     assert result.sources[0].startswith("rule:workspace:")
 
 
-def test_invalid_user_policy_is_ignored_without_being_replaced(tmp_path):
-    """Invalid user approvals fail closed and remain available for manual repair."""
+@pytest.mark.parametrize("content", ["", "null\n", "false\n", "0\n", "[]\n"])
+@pytest.mark.parametrize("scope", ["workspace", "user"])
+def test_permission_policy_requires_a_mapping(tmp_path, content, scope):
+    """Existing non-mapping policy documents never become default permissions."""
+    path = tmp_path / "permissions.yaml"
+    path.write_text(content, encoding="utf-8")
+    arguments = (
+        {"configuration_path": path} if scope == "workspace" else {"user_configuration_path": path}
+    )
+
+    with pytest.raises(PermissionConfigurationError, match="Policy document must be a mapping"):
+        PermissionManager(tmp_path, **arguments)
+    assert path.read_text(encoding="utf-8") == content
+
+
+@pytest.mark.parametrize("scope", ["workspace", "user"])
+def test_permission_policy_rejects_empty_mapping(tmp_path, scope):
+    """A present but empty policy is not interpreted as a default policy."""
+    path = tmp_path / "permissions.yaml"
+    path.write_text("{}\n", encoding="utf-8")
+    arguments = (
+        {"configuration_path": path} if scope == "workspace" else {"user_configuration_path": path}
+    )
+    with pytest.raises(PermissionConfigurationError, match="must not be empty"):
+        PermissionManager(tmp_path, **arguments)
+
+
+@pytest.mark.parametrize("scope", ["workspace", "user"])
+@pytest.mark.parametrize(
+    "content",
+    [
+        "version: 1\nversion: 2\n",
+        "rules:\n  - decision: deny\n    target: {kind: file, path: /tmp/x, unknown: true}\n",
+    ],
+)
+def test_permission_policy_rejects_ambiguous_or_unknown_fields(tmp_path, scope, content):
+    """Persisted rules cannot silently lose unknown fields or duplicate keys."""
+    path = tmp_path / "permissions.yaml"
+    path.write_text(content, encoding="utf-8")
+    arguments = (
+        {"configuration_path": path} if scope == "workspace" else {"user_configuration_path": path}
+    )
+    with pytest.raises(PermissionConfigurationError):
+        PermissionManager(tmp_path, **arguments)
+    assert path.read_text(encoding="utf-8") == content
+
+
+def test_invalid_user_policy_can_continue_with_admission_blocked(tmp_path):
+    """An explicit recovery choice preserves the invalid file and blocks admission."""
     user_path = tmp_path / "user" / "permissions.yaml"
     user_path.parent.mkdir()
     user_path.write_text("version: invalid\n", encoding="utf-8")
     interaction = Mock(spec=Interaction)
+    interaction.prompt.return_value = "continue"
 
     manager = PermissionManager(
         tmp_path / "workspace", user_configuration_path=user_path, interaction=interaction
@@ -5375,7 +5420,7 @@ def test_invalid_user_policy_is_ignored_without_being_replaced(tmp_path):
     assert user_path.read_text(encoding="utf-8") == "version: invalid\n"
     interaction.report.assert_called_once()
     interaction.warning.assert_called_once_with(
-        "Ignoring user-wide approvals until the policy is fixed."
+        "Permission operations remain blocked until the policy is repaired."
     )
 
 
@@ -5398,8 +5443,9 @@ def test_user_policy_recovery_retains_restrictions_and_discards_approvals(tmp_pa
             ),
         ],
     )
-    path.write_text(yaml.safe_dump(policy.model_dump(mode="json")), encoding="utf-8")
+    path.write_text(dump_yaml(policy.model_dump(mode="json")), encoding="utf-8")
     interaction = Mock(spec=Interaction)
+    interaction.prompt.return_value = "continue"
     manager = PermissionManager(tmp_path, user_configuration_path=path, interaction=interaction)
     assert manager.explain("demo", Action.FILESYSTEM_DELETE, str(tmp_path / "file")).decision is (
         Decision.ALLOW
@@ -5417,16 +5463,18 @@ def test_user_policy_recovery_retains_restrictions_and_discards_approvals(tmp_pa
     assert manager.explain("demo", Action.FILESYSTEM_READ, str(tmp_path / "file")).decision is (
         Decision.DENY
     )
-    assert manager.explain("demo", Action.FILESYSTEM_LIST, str(tmp_path / "file")).decision is (
-        Decision.ASK
+    expected = Decision.DENY if failure == "invalid" else Decision.ASK
+    assert (
+        manager.explain("demo", Action.FILESYSTEM_LIST, str(tmp_path / "file")).decision is expected
     )
-    assert manager.explain("demo", Action.FILESYSTEM_DELETE, str(tmp_path / "file")).decision is (
-        Decision.ASK
+    assert (
+        manager.explain("demo", Action.FILESYSTEM_DELETE, str(tmp_path / "file")).decision
+        is expected
     )
     if failure == "invalid":
         interaction.report.assert_called_once()
         interaction.warning.assert_called_once_with(
-            "Ignoring user-wide approvals until the policy is fixed."
+            "Permission operations remain blocked until the policy is repaired."
         )
     else:
         interaction.report.assert_not_called()
@@ -5741,7 +5789,10 @@ def test_async_remembered_approval_writes_off_loop_and_publishes_after_save(tmp_
     assert unpublished
     assert responsive
     assert not blocked_event_loop.is_set()
-    assert worker_calls == ["_persist_configuration_candidate", "record_authorization"]
+    assert [name for name in worker_calls if name != "_namespace_recovery_decision"] == [
+        "_persist_configuration_candidate",
+        "record_authorization",
+    ]
     assert recorder_threads and recorder_threads[0] != owner_thread
     assert manager.configuration.rules
     assert policy_path.exists()
@@ -5788,7 +5839,7 @@ def test_async_remembered_approval_publishes_with_durable_write(tmp_path, scope)
                 if scope is ApprovalChoice.WORKSPACE
                 else UserPermissionConfiguration
             )
-            persisted = model.model_validate(yaml.safe_load(path.read_text()))
+            persisted = model.model_validate(load_yaml(path.read_text()))
             active = manager.configuration if scope is ApprovalChoice.WORKSPACE else None
         finally:
             release.set()
@@ -5865,7 +5916,7 @@ def test_async_remembered_approval_retries_after_concurrent_policy_update(tmp_pa
     assert manager.configuration.defaults[Action.FILESYSTEM_READ] is Decision.DENY
     assert manager.configuration.rules
     persisted = PermissionConfiguration.model_validate(
-        yaml.safe_load(policy_path.read_text(encoding="utf-8"))
+        load_yaml(policy_path.read_text(encoding="utf-8"))
     )
     assert persisted.defaults[Action.FILESYSTEM_READ] is Decision.DENY
     assert persisted.rules
@@ -5922,7 +5973,7 @@ def test_async_remembered_approvals_serialize_write_and_publication(tmp_path, po
     assert first_result.decision is second_result.decision is Decision.ALLOW
     assert writes == [True, True]
     persisted = PermissionConfiguration.model_validate(
-        yaml.safe_load(policy_path.read_text(encoding="utf-8"))
+        load_yaml(policy_path.read_text(encoding="utf-8"))
     )
     assert {rule.target.origin for rule in persisted.rules} == {
         "https://one.example",
@@ -5959,7 +6010,7 @@ def test_async_remembered_approval_preserves_policy_changes_after_write(tmp_path
     assert result.decision is Decision.ALLOW
     assert written == [True]
     persisted = PermissionConfiguration.model_validate(
-        yaml.safe_load(manager.configuration_path.read_text(encoding="utf-8"))
+        load_yaml(manager.configuration_path.read_text(encoding="utf-8"))
     )
     assert persisted.defaults[Action.FILESYSTEM_READ] is Decision.DENY
     assert len(persisted.rules) == 1
@@ -5998,7 +6049,7 @@ def test_async_remembered_approval_respects_deny_after_publication(tmp_path):
 
     assert result.decision is Decision.DENY
     assert result.source == "policy"
-    persisted = PermissionConfiguration.model_validate(yaml.safe_load(path.read_text()))
+    persisted = PermissionConfiguration.model_validate(load_yaml(path.read_text()))
     assert {rule.decision for rule in persisted.rules} == {Decision.ALLOW, Decision.DENY}
     assert persisted == manager.configuration
 
@@ -6206,7 +6257,7 @@ def test_async_remembered_approval_preserves_each_scope(scope, tmp_path):
         assert manager.user_rules
         assert user_path.exists()
         assert UserPermissionConfiguration.model_validate(
-            yaml.safe_load(user_path.read_text(encoding="utf-8"))
+            load_yaml(user_path.read_text(encoding="utf-8"))
         ).rules
 
 
@@ -6273,10 +6324,11 @@ def test_async_remembered_approval_settles_worker_before_cancellation(
 
     async def run_blocking_async(function, *args):
         """Keep persistence owned until the test cancels its caller."""
-        worker_started.set()
-        await release_worker.wait()
-        if worker_fails:
-            raise OSError("policy storage unavailable")
+        if getattr(function, "__name__", "") == "_persist_configuration_candidate":
+            worker_started.set()
+            await release_worker.wait()
+            if worker_fails:
+                raise OSError("policy storage unavailable")
         return await asyncio.to_thread(function, *args)
 
     path = tmp_path / "permissions.yaml"
@@ -6318,7 +6370,7 @@ def test_async_remembered_approval_settles_worker_before_cancellation(
             if scope is ApprovalChoice.WORKSPACE
             else UserPermissionConfiguration
         )
-        persisted = model.model_validate(yaml.safe_load(path.read_text()))
+        persisted = model.model_validate(load_yaml(path.read_text()))
         assert len(persisted.rules) == 1
         assert manager.evaluate(operation_set).decision is Decision.ALLOW
         recorder.record_authorization.assert_called_once()
@@ -6402,7 +6454,7 @@ def test_async_remembered_approval_cancels_after_publication_while_policy_is_loc
         if scope is ApprovalChoice.WORKSPACE
         else UserPermissionConfiguration
     )
-    persisted = model.model_validate(yaml.safe_load(path.read_text(encoding="utf-8")))
+    persisted = model.model_validate(load_yaml(path.read_text(encoding="utf-8")))
     assert len(persisted.rules) == 1
     assert manager.evaluate(operation_set).decision is Decision.ALLOW
     recorder.record_authorization.assert_called_once()
@@ -6479,7 +6531,7 @@ def test_async_remembered_approval_settles_cancelled_final_file_check(tmp_path):
             await pending
 
     asyncio.run(cancel_final_check())
-    persisted = PermissionConfiguration.model_validate(yaml.safe_load(path.read_text()))
+    persisted = PermissionConfiguration.model_validate(load_yaml(path.read_text()))
     recorder.record_authorization.assert_called_once()
     recorded = recorder.record_authorization.call_args.args[0]
     assert recorded.decision is Decision.DENY and recorded.source == "cancelled"
@@ -6559,7 +6611,7 @@ def test_async_cancelled_final_check_settles_audit_after_repeated_cancellation(t
             await pending
 
     asyncio.run(cancel_audit())
-    persisted = PermissionConfiguration.model_validate(yaml.safe_load(path.read_text()))
+    persisted = PermissionConfiguration.model_validate(load_yaml(path.read_text()))
     recorder.record_authorization.assert_called_once()
     recorded = recorder.record_authorization.call_args.args[0]
     assert recorded.decision is Decision.DENY and recorded.source == "cancelled"
@@ -7039,7 +7091,10 @@ def test_async_authorization_uses_bounded_audit_and_native_recorder_paths(tmp_pa
     result = asyncio.run(manager.authorize_async(operation_set, recorder=recorder))
 
     assert result.decision is Decision.ALLOW
-    assert worker_calls == ["_boundary_decision", "_audit"]
+    assert [name for name in worker_calls if name != "_namespace_recovery_decision"] == [
+        "_boundary_decision",
+        "_audit",
+    ]
     recorder.record_authorization_async.assert_awaited_once_with(result)
     recorder.record_authorization.assert_not_called()
     with closing(sqlite3.connect(audit_path)) as connection:
@@ -7759,8 +7814,9 @@ def test_evaluate_async_retries_same_owner_policy_mutation(tmp_path):
     async def run_blocking(function, *args):
         """Pause the first computed boundary before its owner receives the result."""
         result = function(*args)
-        calls.append(function.__name__)
-        if len(calls) == 1:
+        if function.__name__ == "_boundary_decision":
+            calls.append(function.__name__)
+        if calls == ["_boundary_decision"] and function.__name__ == "_boundary_decision":
             entered.set()
             await release.wait()
         return result
@@ -7796,9 +7852,10 @@ def test_async_policy_retry_observes_a_rebound_scratch_root(tmp_path):
     async def rebind_after_first_pass(function, *args):
         """Replace the referenced scratch root after evaluating the first boundary."""
         result = function(*args)
-        calls.append(function.__name__)
-        if len(calls) == 1:
-            manager.bind_temporary_directory(PathHolder(second))
+        if function.__name__ == "_boundary_decision":
+            calls.append(function.__name__)
+            if len(calls) == 1:
+                manager.bind_temporary_directory(PathHolder(second))
         return result
 
     manager.set_async_blocking_runner(rebind_after_first_pass)
@@ -7820,8 +7877,9 @@ def test_async_policy_churn_fails_closed_after_bounded_retries(tmp_path, check_b
     async def mutate_each_pass(function, *args):
         """Publish a change after each real boundary result is computed."""
         result = function(*args)
-        calls.append(function.__name__)
-        manager.set_default(Action.FILESYSTEM_READ, Decision.DENY, scope=PolicyScope.SESSION)
+        if function.__name__ == "_boundary_decision":
+            calls.append(function.__name__)
+            manager.set_default(Action.FILESYSTEM_READ, Decision.DENY, scope=PolicyScope.SESSION)
         return result
 
     manager.set_async_blocking_runner(mutate_each_pass)
@@ -8908,16 +8966,15 @@ def test_host_retry_prompt_describes_a_completed_attempt():
     assert "Retrying may repeat" in warning
 
 
-def test_empty_yaml_loads_builtin_read_review_with_legacy_source(tmp_path):
-    """A markerless empty policy keeps default reads approval-controlled after loading."""
+def test_empty_permission_mapping_requires_recovery(tmp_path):
+    """An empty policy cannot silently become built-in permissions."""
     path = tmp_path / ".loop" / "permissions.yaml"
     path.parent.mkdir()
-    path.write_text("", "utf-8")
+    path.write_text("{}\n", "utf-8")
 
-    loaded = PermissionManager(tmp_path).configuration
-    assert loaded.limits == PermissionConfiguration().limits
-    assert loaded.limit_classifications.readable_roots is LimitClassification.APPROVAL
-    assert loaded.limit_classifications.sources["readable_roots"] == "legacy"
+    with pytest.raises(PermissionConfigurationError, match="must not be empty"):
+        PermissionManager(tmp_path)
+    assert path.read_text(encoding="utf-8") == "{}\n"
 
 
 def test_error_policy_raises_configuration_errors_and_preserves_active_policy(tmp_path):
@@ -8952,16 +9009,16 @@ def test_startup_refuses_reset_started_during_missing_policy_check(tmp_path, mon
     path = tmp_path / ".loop" / "permissions.yaml"
     path.parent.mkdir()
     marker = path.with_name(path.name + ".reset-pending")
-    original = Path.exists
+    original = Path.read_bytes
 
     def start_reset(candidate):
         """Place the reset marker immediately after the first missing-policy observation."""
         if candidate == path and not marker.exists():
             marker.touch()
-            return False
+            raise FileNotFoundError(2, "missing", str(candidate))
         return original(candidate)
 
-    monkeypatch.setattr(Path, "exists", start_reset)
+    monkeypatch.setattr(Path, "read_bytes", start_reset)
     with pytest.raises(PermissionConfigurationError, match="reset is pending"):
         PermissionManager(tmp_path)
 
@@ -8970,16 +9027,16 @@ def test_user_startup_refuses_reset_started_during_missing_policy_check(tmp_path
     """A user reset racing a missing-file observation cannot load empty approvals."""
     path = tmp_path / "user.yaml"
     marker = path.with_name(path.name + ".reset-pending")
-    original = Path.exists
+    original = Path.read_bytes
 
     def start_reset(candidate):
         """Create reset evidence immediately after the first missing-file observation."""
         if candidate == path and not marker.exists():
             marker.touch()
-            return False
+            raise FileNotFoundError(2, "missing", str(candidate))
         return original(candidate)
 
-    monkeypatch.setattr(Path, "exists", start_reset)
+    monkeypatch.setattr(Path, "read_bytes", start_reset)
     with pytest.raises(PermissionConfigurationError, match="reset is pending"):
         PermissionManager(
             tmp_path, user_configuration_path=path, load_policy=PermissionLoadPolicy.AUTO
@@ -8989,7 +9046,7 @@ def test_user_startup_refuses_reset_started_during_missing_policy_check(tmp_path
 def test_user_startup_loads_policy_published_during_missing_check(tmp_path, monkeypatch):
     """A user policy published during a missing-file check is loaded on the second read."""
     path = tmp_path / "user.yaml"
-    original = Path.exists
+    original = Path.read_bytes
     saved = UserPermissionConfiguration(
         rules=[
             PermissionRule(id="deny-network", decision=Decision.DENY, action=Action.NETWORK_REQUEST)
@@ -8998,12 +9055,12 @@ def test_user_startup_loads_policy_published_during_missing_check(tmp_path, monk
 
     def publish(candidate):
         """Publish a restrictive user rule after the first missing-file observation."""
-        if candidate == path and not original(candidate):
-            path.write_text(yaml.safe_dump(saved.model_dump(mode="json")), encoding="utf-8")
-            return False
+        if candidate == path and not candidate.exists():
+            path.write_text(dump_yaml(saved.model_dump(mode="json")), encoding="utf-8")
+            raise FileNotFoundError(2, "missing", str(candidate))
         return original(candidate)
 
-    monkeypatch.setattr(Path, "exists", publish)
+    monkeypatch.setattr(Path, "read_bytes", publish)
     manager = PermissionManager(tmp_path, user_configuration_path=path)
     assert [rule.id for rule in manager.user_rules] == ["deny-network"]
 
@@ -9063,7 +9120,7 @@ def test_automatic_recovery_never_treats_a_policy_read_veto_as_malformed_data(
         return original(candidate)
 
     monkeypatch.setattr(Path, "read_bytes", refuse_read)
-    with pytest.raises(PermissionConfigurationError, match="policy read refused") as raised:
+    with pytest.raises(PermissionConfigurationError, match="Permission denied") as raised:
         PermissionManager(
             tmp_path,
             user_configuration_path=path if scope == "user" else None,
@@ -9076,16 +9133,16 @@ def test_startup_reads_policy_published_during_missing_check(tmp_path, monkeypat
     """A policy published during startup is loaded instead of replaced by first-use defaults."""
     path = tmp_path / ".loop" / "permissions.yaml"
     path.parent.mkdir()
-    original = Path.exists
+    original = Path.read_bytes
 
     def publish(candidate):
         """Publish a valid policy just after the first missing-policy observation."""
-        if candidate == path and not original(candidate):
+        if candidate == path and not candidate.exists():
             path.write_text("version: 1\ndefaults:\n  filesystem.read: deny\n", "utf-8")
-            return False
+            raise FileNotFoundError(2, "missing", str(candidate))
         return original(candidate)
 
-    monkeypatch.setattr(Path, "exists", publish)
+    monkeypatch.setattr(Path, "read_bytes", publish)
     assert (
         PermissionManager(tmp_path).configuration.defaults[Action.FILESYSTEM_READ] is Decision.DENY
     )
@@ -9118,6 +9175,21 @@ def test_interrupted_reset_requires_recovery(tmp_path, monkeypatch, load_policy)
     marker.unlink()
     recovered = PermissionManager(tmp_path, load_policy=load_policy, interaction=interaction)
     assert recovered.configuration.defaults[Action.FILESYSTEM_READ] is Decision.DENY
+
+
+def test_async_evaluation_denies_a_new_pending_reset(tmp_path):
+    """Async authorization checks a new reset marker before any operation is admitted."""
+    manager = PermissionManager(tmp_path)
+    manager.set_default(Action.SESSION_MUTATE, Decision.ALLOW)
+    operation = Operation(
+        tool_id="example", action=Action.SESSION_MUTATE, target=SessionTarget(identifier="test")
+    )
+    marker = manager.configuration_path.with_name("permissions.yaml.reset-pending")
+    marker.touch()
+
+    assert asyncio.run(manager.evaluate_async((operation,))).decision is Decision.DENY
+    assert manager.evaluate((operation,)).decision is Decision.DENY
+    assert asyncio.run(manager.evaluate_async((operation,))).decision is Decision.DENY
 
 
 def test_missing_policy_cannot_ignore_reset_marker_inspection_errors(tmp_path, monkeypatch):
@@ -9165,13 +9237,17 @@ def test_auto_policy_reports_and_uses_defaults_or_last_known_good(tmp_path, capl
     manager = PermissionManager(tmp_path, load_policy=PermissionLoadPolicy.AUTO)
 
     assert manager.configuration == PermissionConfiguration()
-    assert "automatic permission policy" in caplog.text
+    assert "permission operations are blocked" in caplog.text
+    with pytest.raises(PermissionNamespaceError):
+        manager.set_default(Action.FILESYSTEM_DELETE, Decision.DENY)
+    path.write_text("version: 1\n", "utf-8")
+    manager.reload()
     manager.set_default(Action.FILESYSTEM_DELETE, Decision.DENY)
     path.write_text("version: 3\n", "utf-8")
     interaction = Mock(spec=Interaction)
     manager.interaction = interaction
 
-    assert manager.reload() is PermissionLoadResult.RETAINED
+    assert manager.reload() is PermissionLoadResult.BLOCKED
     assert manager.configuration.defaults[Action.FILESYSTEM_DELETE] is Decision.DENY
     interaction.report.assert_called_once()
     interaction.warning.assert_called_once()
@@ -9195,8 +9271,8 @@ def test_interactive_policy_retries_a_repaired_file(tmp_path):
     interaction.report.assert_called_once()
     assert interaction.prompt.call_args.kwargs["index"] == {
         "retry": "R",
-        "continue": "S",
-        "reset": "A",
+        "continue": "C",
+        "reset": "T",
         "exit": "Q",
     }
 
@@ -9223,21 +9299,32 @@ def test_interactive_recovery_does_not_overwrite_a_later_policy_update(tmp_path)
     assert not tuple(manager.configuration_path.parent.glob("*.bak"))
 
 
-@pytest.mark.parametrize(
-    ("choice", "expected"),
-    [("continue", PermissionLoadResult.RETAINED), (None, PermissionLoadResult.RETAINED)],
-)
-def test_interactive_reload_can_retain_the_active_policy(tmp_path, choice, expected):
+def test_interactive_reload_can_retain_the_active_policy(tmp_path):
     """Interactive reload retains last-known-good state when the user continues."""
     interaction = Mock(spec=Interaction)
     manager = PermissionManager(tmp_path, interaction=interaction)
     manager.set_default(Action.FILESYSTEM_DELETE, Decision.DENY)
     manager.configuration_path.write_text("version: 3\n", "utf-8")
+    interaction.prompt.return_value = "continue"
+
+    assert manager.reload() is PermissionLoadResult.BLOCKED
+    assert manager.configuration.defaults[Action.FILESYSTEM_DELETE] is Decision.DENY
+    interaction.warning.assert_called_once_with(
+        "Permission operations remain blocked until the policy is repaired."
+    )
+
+
+@pytest.mark.parametrize("choice", [None, False, "unexpected"])
+def test_interactive_recovery_requires_an_explicit_choice(tmp_path, choice):
+    """An invalid recovery response cannot silently select a default policy."""
+    interaction = Mock(spec=Interaction)
+    manager = PermissionManager(tmp_path, interaction=interaction)
+    manager.configuration_path.parent.mkdir(exist_ok=True)
+    manager.configuration_path.write_text("version: invalid\n", encoding="utf-8")
     interaction.prompt.return_value = choice
 
-    assert manager.reload() is expected
-    assert manager.configuration.defaults[Action.FILESYSTEM_DELETE] is Decision.DENY
-    interaction.warning.assert_called_once_with("Keeping the current permission policy.")
+    with pytest.raises(ShutdownRequested):
+        manager.reload()
 
 
 def test_interactive_loading_requires_an_interaction(tmp_path):
@@ -9271,7 +9358,7 @@ def test_preset_failures_raise_strictly_and_report_during_headless_auto_recovery
         PermissionManager()
     assert raised.value.failures == (failure,)
 
-    manager = PermissionManager(load_policy=PermissionLoadPolicy.AUTO)
+    manager = PermissionManager(accepted_preset_failures=(failure,))
     assert not manager.presets
     assert "Excluded invalid permission preset" in caplog.text
 
@@ -9483,3 +9570,579 @@ def test_bound_session_owner_controls_scratch_data_scope(tmp_path):
     assert not manager.temporary_directory_allows_private_names
     manager.bind_temporary_directory(reference)
     assert not manager.temporary_directory_allows_private_names
+
+
+@pytest.mark.parametrize("scope", ["workspace", "user"])
+@pytest.mark.parametrize("choice", ["retry", "reset", "exit"])
+def test_invalid_policy_recovery_blocks_admission_during_prompt(tmp_path, scope, choice):
+    """A concurrent authorization cannot use stale grants while recovery is awaiting input."""
+    path = tmp_path / f"{scope}.yaml"
+    path.write_text("version: invalid\n", encoding="utf-8")
+    interaction = Mock(spec=Interaction)
+    manager = PermissionManager(tmp_path, interaction=interaction)
+    if scope == "workspace":
+        manager._configuration_path = path
+    else:
+        manager._user_configuration_path = path
+    operation_set = (file_operation(Action.FILESYSTEM_READ, tmp_path / "file"),)
+
+    def choose(*_args, **_kwargs):
+        assert manager.evaluate(operation_set).decision is Decision.DENY
+        assert asyncio.run(manager.evaluate_async(operation_set)).decision is Decision.DENY
+        if choice == "retry":
+            path.write_text("version: 1\n", encoding="utf-8")
+        return choice
+
+    interaction.prompt.side_effect = choose
+    if choice == "exit":
+        with pytest.raises(ShutdownRequested):
+            manager.reload()
+    else:
+        manager.reload()
+        assert manager.evaluate(operation_set).decision is not Decision.DENY
+    if choice == "reset":
+        assert list(tmp_path.glob(f"{scope}.yaml.*.bak"))
+
+
+@pytest.mark.parametrize("scope,reason", [("invalid", "reason"), ("user", "")])
+def test_suspend_policy_requires_a_scope_and_reason(scope, reason):
+    """A recovery latch cannot be installed without a meaningful scope and cause."""
+    manager = PermissionManager()
+    with pytest.raises(ValueError, match="scope and recovery reason"):
+        manager.suspend_policy(scope, reason)
+
+
+def test_namespace_empty_mapping_is_not_a_valid_policy(tmp_path):
+    """Even a reserved namespace cannot treat an empty policy as its defaults."""
+    arguments, workspace_id, _user_identity = durable_policy_inputs(tmp_path)
+    manager = PermissionManager(**arguments)
+    manager.initialize_policy_namespace("workspace", workspace_id, authorized=True)
+    arguments["configuration_path"].write_text("{}\n", encoding="utf-8")
+    manager.reload()
+    with pytest.raises(PermissionNamespaceError, match="must not be empty"):
+        manager.require_policy_ready()
+
+
+def test_user_recovery_retries_after_policy_changes_during_prompt(tmp_path):
+    """A stale recovery decision is discarded and the changed policy is reread."""
+    path = tmp_path / "user.yaml"
+    path.write_text("version: invalid\n", encoding="utf-8")
+    interaction = Mock(spec=Interaction)
+    manager = PermissionManager(tmp_path, interaction=interaction)
+    manager._user_configuration_path = path
+
+    def repair(*_args, **_kwargs):
+        path.write_text("version: 1\n", encoding="utf-8")
+        manager.set_default(Action.FILESYSTEM_READ, Decision.DENY, scope=PolicyScope.SESSION)
+        return "continue"
+
+    interaction.prompt.side_effect = repair
+    manager.reload()
+    assert interaction.prompt.call_count == 1
+    assert (
+        manager.evaluate((file_operation(Action.FILESYSTEM_READ, tmp_path / "f"),)).decision
+        is Decision.DENY
+    )
+
+
+def test_headless_user_recovery_raises_the_failure(tmp_path):
+    """A missing interaction cannot turn an invalid user policy into default approvals."""
+    path = tmp_path / "user.yaml"
+    path.write_text("version: invalid\n", encoding="utf-8")
+    interaction = Mock(spec=Interaction)
+    manager = PermissionManager(tmp_path, interaction=interaction)
+    manager._user_configuration_path = path
+    manager._interaction = None
+    with pytest.raises(PermissionConfigurationError):
+        manager._load_user_configuration()
+
+
+def test_accepted_preset_exclusion_is_reported_to_interaction(monkeypatch):
+    """An explicitly excluded malformed preset remains visible in the current session."""
+    failure = PermissionLoadFailure(source="preset", path="broken.yaml", message="invalid")
+    monkeypatch.setattr(
+        PermissionPreset, "load_builtin_presets", classmethod(lambda cls: ((), (failure,)))
+    )
+    interaction = Mock(spec=Interaction)
+    manager = PermissionManager(interaction=interaction, accepted_preset_failures=(failure,))
+    assert manager.presets == ()
+    assert "broken.yaml" in interaction.warning.call_args.args[0]
+
+
+def test_auto_user_policy_failure_reports_blocked_operations(tmp_path):
+    """Automatic policy mode reports invalid user rules and still blocks authorization."""
+    path = tmp_path / "user.yaml"
+    path.write_text("version: invalid\n", encoding="utf-8")
+    interaction = Mock(spec=Interaction)
+    manager = PermissionManager(
+        tmp_path,
+        user_configuration_path=path,
+        interaction=interaction,
+        load_policy=PermissionLoadPolicy.AUTO,
+    )
+    assert interaction.report.called
+    assert manager._namespace_recovery_decision().decision is Decision.DENY
+
+
+def test_sandbox_authorization_propagates_cancelled_audit(tmp_path):
+    """A cancelled sandbox audit never falls through to authorize a command."""
+    interaction = ConsoleInteraction(console=Console(file=io.StringIO()), markdown=False)
+    manager = PermissionManager(tmp_path, interaction=interaction)
+    request = native_request(tmp_path, "printf safe", read_roots=())
+    original = manager._run_blocking_settled_async
+
+    async def cancel_audit(function, *args, **kwargs):
+        if function == manager._audit_sandbox_scope:
+            return None, asyncio.CancelledError()
+        return await original(function, *args, **kwargs)
+
+    manager._run_blocking_settled_async = cancel_audit
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(manager.authorize_sandboxed_command_async(request, tool_id="run_command"))
+
+
+@pytest.mark.parametrize("scope", ["workspace", "user"])
+def test_boolean_policy_version_requires_explicit_recovery(tmp_path, scope):
+    """A boolean schema version is never accepted as policy version one."""
+    path = tmp_path / (".loop/permissions.yaml" if scope == "workspace" else "user.yaml")
+    path.parent.mkdir(exist_ok=True)
+    path.write_text("version: true\n", encoding="utf-8")
+    interaction = Mock(spec=Interaction)
+    interaction.prompt.return_value = "continue"
+    manager = PermissionManager(
+        tmp_path,
+        user_configuration_path=path if scope == "user" else None,
+        interaction=interaction,
+    )
+    interaction.report.assert_called_once()
+    assert "version" in interaction.report.call_args.args[0].detail
+    with pytest.raises(PermissionNamespaceError):
+        manager.require_policy_ready()
+
+
+@pytest.mark.parametrize("scope", ["workspace", "user"])
+@pytest.mark.parametrize("when", ["before", "after"])
+def test_policy_reset_failure_prompts_and_stays_blocked(tmp_path, monkeypatch, scope, when):
+    """Failed reset needs a fresh decision and never clears policy restrictions."""
+    path = tmp_path / (".loop/permissions.yaml" if scope == "workspace" else "user.yaml")
+    path.parent.mkdir(exist_ok=True)
+    path.write_text("version: 3\n", encoding="utf-8")
+    interaction = Mock(spec=Interaction)
+    interaction.prompt.side_effect = ["reset", "continue"]
+    if when == "before":
+        monkeypatch.setattr(
+            PermissionManager,
+            "reset_configuration",
+            Mock(side_effect=PermissionError("synthetic-secret")),
+        )
+    else:
+        monkeypatch.setattr(
+            PermissionManager,
+            "_persist_configuration",
+            Mock(side_effect=PermissionError("synthetic-secret")),
+        )
+    manager = PermissionManager(
+        tmp_path,
+        user_configuration_path=path if scope == "user" else None,
+        interaction=interaction,
+    )
+    assert interaction.prompt.call_count == 2
+    problem = interaction.report.call_args_list[-1].args[0]
+    assert problem.code == "permission.reset_failed"
+    assert "Permission denied while resetting" in problem.detail
+    assert "synthetic-secret" not in problem.detail
+    assert path.with_name(path.name + ".reset-pending").exists() is (when == "after")
+    if when == "after":
+        assert next(path.parent.glob(f"{path.name}.*.bak")).read_text() == "version: 3\n"
+    with pytest.raises(PermissionNamespaceError):
+        manager.require_policy_ready()
+
+
+@pytest.mark.parametrize("scope", ["workspace", "user"])
+@pytest.mark.parametrize("choice", ["retry", "exit"])
+def test_policy_reset_failure_requires_fresh_retry_or_halt(tmp_path, monkeypatch, scope, choice):
+    """A reset failure cannot silently retry or continue without another decision."""
+    from loop.utils import ShutdownRequested
+
+    path = tmp_path / (".loop/permissions.yaml" if scope == "workspace" else "user.yaml")
+    path.parent.mkdir(exist_ok=True)
+    path.write_text("version: 3\n", encoding="utf-8")
+    interaction = Mock(spec=Interaction)
+    interaction.prompt.side_effect = ["reset", choice, "exit"]
+    monkeypatch.setattr(
+        PermissionManager,
+        "reset_configuration",
+        Mock(side_effect=OSError("Permission policy changed; reload before retrying.")),
+    )
+    with pytest.raises(ShutdownRequested):
+        PermissionManager(
+            tmp_path,
+            user_configuration_path=path if scope == "user" else None,
+            interaction=interaction,
+        )
+    assert interaction.prompt.call_count == (3 if choice == "retry" else 2)
+    reports = [item.args[0] for item in interaction.report.call_args_list]
+    assert any(
+        "Permission policy changed; reload before retrying." in item.detail for item in reports
+    )
+    assert path.read_text() == "version: 3\n"
+
+
+def test_policy_reset_does_not_convert_egress_transition_failure_into_recovery(
+    tmp_path, monkeypatch
+):
+    """An uncertain egress transition remains a hard failure during policy recovery."""
+    interaction = Mock(spec=Interaction)
+    manager = PermissionManager(tmp_path, interaction=interaction)
+    path = manager.configuration_path
+    path.parent.mkdir(exist_ok=True)
+    path.write_text("version: 3\n", encoding="utf-8")
+    lease = Mock()
+    lease.pause.return_value = True
+    lease.resume.return_value = True
+    lease.revoke_revision.return_value = True
+
+    def select_reset(*_args, **_kwargs):
+        """Fail the policy lock transition after the initial recovery prompt."""
+        manager.bind_egress(manager.egress_policy_revision(), lease)
+        lease.pause.return_value = False
+        return "reset"
+
+    interaction.prompt.side_effect = select_reset
+    with pytest.raises(OSError, match="egress admission pause is uncertain"):
+        manager.reload(interaction=interaction)
+    assert interaction.prompt.call_count == 1
+    assert all(
+        item.args[0].code != "permission.reset_failed" for item in interaction.report.call_args_list
+    )
+    lease.pause.return_value = True
+    manager.unbind_egress(lease)
+    manager.close()
+
+
+@pytest.mark.parametrize(
+    "code,expected",
+    [
+        (errno.EACCES, "Permission denied"),
+        (errno.EMFILE, f"errno {errno.EMFILE}"),
+        (errno.ENOENT, "changed during loading"),
+        (errno.ELOOP, "symbolic links"),
+        (None, "errno unavailable"),
+    ],
+)
+def test_namespaced_policy_open_failure_is_reported_and_blocked(
+    tmp_path, monkeypatch, code, expected
+):
+    """Namespaced policy open errors identify their safe cause and deny admission."""
+    arguments, workspace_id, user_identity = durable_policy_inputs(tmp_path)
+    manager = PermissionManager(**arguments)
+    manager.initialize_policy_namespace("workspace", workspace_id, authorized=True)
+    manager.initialize_policy_namespace("user", user_identity, authorized=True)
+    path = arguments["configuration_path"]
+    original = os.open
+
+    def refuse(candidate, flags, *args, **kwargs):
+        """Deny only the selected policy read after its provenance check."""
+        if candidate == path and flags & os.O_NOFOLLOW:
+            raise OSError(code, "synthetic-secret")
+        return original(candidate, flags, *args, **kwargs)
+
+    monkeypatch.setattr(manager_module.os, "open", refuse)
+    manager.reload()
+    with pytest.raises(PermissionNamespaceError, match=expected) as raised:
+        manager.require_policy_ready()
+    assert "synthetic-secret" not in str(raised.value)
+
+
+@pytest.mark.parametrize("operation", ["fstat", "read"])
+def test_namespaced_policy_read_failure_requires_recovery(tmp_path, monkeypatch, operation):
+    """Descriptor inspection and content I/O failures preserve the fail-closed namespace."""
+    arguments, workspace_id, user_identity = durable_policy_inputs(tmp_path)
+    manager = PermissionManager(**arguments)
+    manager.initialize_policy_namespace("workspace", workspace_id, authorized=True)
+    manager.initialize_policy_namespace("user", user_identity, authorized=True)
+    path = arguments["configuration_path"]
+    original_open, original_fstat, original_fdopen = os.open, os.fstat, os.fdopen
+    selected = set()
+
+    def observe_open(candidate, flags, *args, **kwargs):
+        """Record the actual descriptor for the selected policy."""
+        descriptor = original_open(candidate, flags, *args, **kwargs)
+        if candidate == path and flags & os.O_NOFOLLOW:
+            selected.add(descriptor)
+        return descriptor
+
+    def inspect(descriptor):
+        """Fail inspection only for the selected policy descriptor."""
+        if descriptor in selected:
+            raise OSError(5, "synthetic-secret")
+        return original_fstat(descriptor)
+
+    def open_stream(descriptor, *args, **kwargs):
+        """Return a failing reader while preserving descriptor cleanup."""
+        stream = original_fdopen(descriptor, *args, **kwargs)
+        if descriptor not in selected:
+            return stream
+
+        class FailedReader:
+            """Close the owned stream and simulate a content read error."""
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                stream.close()
+
+            def read(self):
+                """Refuse the selected policy read."""
+                raise OSError(5, "synthetic-secret")
+
+        return FailedReader()
+
+    monkeypatch.setattr(manager_module.os, "open", observe_open)
+    if operation == "fstat":
+        monkeypatch.setattr(manager_module.os, "fstat", inspect)
+    else:
+        monkeypatch.setattr(manager_module.os, "fdopen", open_stream)
+    manager.reload()
+    with pytest.raises(PermissionNamespaceError, match="errno 5") as raised:
+        manager.require_policy_ready()
+    assert "synthetic-secret" not in str(raised.value)
+
+
+def test_user_policy_recovery_preserves_newer_revision(tmp_path, monkeypatch):
+    """A newer successful reload during a failed-reset prompt cannot be overwritten."""
+    path = tmp_path / "user.yaml"
+    path.write_text("version: 2\n", encoding="utf-8")
+    interaction = Mock(spec=Interaction)
+    manager = PermissionManager(tmp_path, user_configuration_path=path, interaction=interaction)
+    path.write_text("version: 3\n", encoding="utf-8")
+    monkeypatch.setattr(manager, "reset_configuration", Mock(side_effect=OSError(5, "refused")))
+    selections = iter(["reset", "continue"])
+
+    def prompt(*_args, **_kwargs):
+        """Publish and load a repaired policy before the blocked continuation is chosen."""
+        choice = next(selections)
+        if choice == "continue":
+            path.write_text("version: 2\n", encoding="utf-8")
+            manager.reload()
+        return choice
+
+    interaction.prompt.side_effect = prompt
+    manager.reload(interaction=interaction)
+    manager.require_policy_ready()
+    assert path.read_text() == "version: 2\n"
+
+
+@pytest.mark.parametrize("scope", ["workspace", "user"])
+def test_boolean_version_does_not_trigger_policy_migration(tmp_path, scope):
+    """A boolean version cannot be treated as version one or cause policy writes."""
+    arguments, workspace_id, user_identity = durable_policy_inputs(tmp_path)
+    manager = PermissionManager(**arguments)
+    manager.initialize_policy_namespace("workspace", workspace_id, authorized=True)
+    manager.initialize_policy_namespace("user", user_identity, authorized=True)
+    path = arguments["configuration_path" if scope == "workspace" else "user_configuration_path"]
+    payload = load_yaml(path.read_bytes())
+    payload["version"] = True
+    original = dump_yaml(payload).encode()
+    path.write_bytes(original)
+    manager.reload()
+    with pytest.raises(PermissionNamespaceError, match="version"):
+        manager.require_policy_ready()
+    assert path.read_bytes() == original
+    assert not tuple(path.parent.glob(f"{path.name}.*.schema-v1.bak"))
+
+
+@pytest.mark.parametrize(
+    "error, expected",
+    [
+        (OSError("Unsafe policy lock file."), "Unsafe policy lock file."),
+        (OSError("Unsafe policy staging file."), "Unsafe policy staging file."),
+        (OSError(5, "synthetic-secret"), "errno 5"),
+        (OSError("synthetic-secret"), "errno unavailable"),
+    ],
+)
+def test_policy_reset_failure_reports_safe_specific_cause(tmp_path, monkeypatch, error, expected):
+    """Reset failures explain trusted or operating-system causes without exception contents."""
+    path = tmp_path / ".loop" / "permissions.yaml"
+    path.parent.mkdir()
+    path.write_text("version: 3\n", encoding="utf-8")
+    interaction = Mock(spec=Interaction)
+    interaction.prompt.side_effect = ["reset", "continue"]
+    monkeypatch.setattr(PermissionManager, "reset_configuration", Mock(side_effect=error))
+    manager = PermissionManager(tmp_path, interaction=interaction)
+    problem = interaction.report.call_args.args[0]
+    assert expected in problem.detail
+    assert "synthetic-secret" not in problem.detail
+    with pytest.raises(PermissionNamespaceError):
+        manager.require_policy_ready()
+
+
+@pytest.mark.parametrize("scope", ["workspace", "user"])
+def test_policy_stat_denial_never_discards_existing_denials(tmp_path, monkeypatch, scope):
+    """A metadata lookup failure cannot make an existing policy disappear."""
+    path = tmp_path / (".loop/permissions.yaml" if scope == "workspace" else "user.yaml")
+    path.parent.mkdir(exist_ok=True)
+    if scope == "workspace":
+        path.write_text("version: 2\ndefaults:\n  filesystem.read: deny\n", encoding="utf-8")
+    else:
+        path.write_text(
+            "version: 2\nrules:\n  - id: deny-read\n    decision: deny\n    action: filesystem.read\n",
+            encoding="utf-8",
+        )
+    interaction = Mock(spec=Interaction)
+    original = os.stat
+
+    def refuse_stat(candidate, *args, **kwargs):
+        """Deny metadata access only for the selected policy."""
+        if os.fspath(candidate) == str(path):
+            raise PermissionError(13, "denied", str(path))
+        return original(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(manager_module.os, "stat", refuse_stat)
+    manager = PermissionManager(
+        tmp_path, user_configuration_path=path if scope == "user" else None, interaction=interaction
+    )
+    if scope == "workspace":
+        assert manager.configuration.defaults[Action.FILESYSTEM_READ] is Decision.DENY
+    else:
+        assert [rule.id for rule in manager.user_rules] == ["deny-read"]
+    interaction.prompt.assert_not_called()
+
+
+@pytest.mark.parametrize("scope", ["workspace", "user"])
+def test_unreadable_policy_prompts_without_permitting_reset(tmp_path, monkeypatch, scope):
+    """An unreadable policy requires explicit recovery and retains fail-closed admission."""
+    path = tmp_path / (".loop/permissions.yaml" if scope == "workspace" else "user.yaml")
+    path.parent.mkdir(exist_ok=True)
+    path.write_text("version: 2\n", encoding="utf-8")
+    interaction = Mock(spec=Interaction)
+    interaction.prompt.return_value = "continue"
+    original = Path.read_bytes
+
+    def refuse_read(candidate):
+        """Deny the selected policy read without exposing exception text."""
+        if candidate == path:
+            raise PermissionError(13, "synthetic-secret", str(path))
+        return original(candidate)
+
+    monkeypatch.setattr(Path, "read_bytes", refuse_read)
+    manager = PermissionManager(
+        tmp_path, user_configuration_path=path if scope == "user" else None, interaction=interaction
+    )
+    assert "reset" not in interaction.prompt.call_args.kwargs["choices"]
+    detail = interaction.report.call_args.args[0].detail
+    assert "Permission denied" in detail
+    assert "synthetic-secret" not in detail
+    with pytest.raises(PermissionNamespaceError):
+        manager.require_policy_ready()
+
+
+@pytest.mark.parametrize("scope", ["workspace", "user"])
+def test_dangling_policy_symlink_cannot_load_default_permissions(tmp_path, scope):
+    """A dangling policy link is not mistaken for a first-use missing file."""
+    path = tmp_path / (".loop/permissions.yaml" if scope == "workspace" else "user.yaml")
+    path.parent.mkdir(exist_ok=True)
+    path.symlink_to(tmp_path / "missing-policy.yaml")
+    interaction = Mock(spec=Interaction)
+    interaction.prompt.return_value = "continue"
+    manager = PermissionManager(
+        tmp_path, user_configuration_path=path if scope == "user" else None, interaction=interaction
+    )
+    assert "reset" not in interaction.prompt.call_args.kwargs["choices"]
+    with pytest.raises(PermissionNamespaceError):
+        manager.require_policy_ready()
+    assert path.is_symlink()
+
+
+@pytest.mark.parametrize("scope", ["workspace", "user"])
+@pytest.mark.parametrize("choice", ["retry", "continue"])
+def test_unreadable_policy_reload_preserves_denials(tmp_path, monkeypatch, scope, choice):
+    """A read failure requires a decision and cannot discard an already loaded denial."""
+    path = tmp_path / (".loop/permissions.yaml" if scope == "workspace" else "user.yaml")
+    path.parent.mkdir(exist_ok=True)
+    if scope == "workspace":
+        path.write_text("version: 2\ndefaults:\n  filesystem.read: deny\n", encoding="utf-8")
+    else:
+        path.write_text(
+            "version: 2\nrules:\n  - id: deny-read\n    decision: deny\n    action: filesystem.read\n",
+            encoding="utf-8",
+        )
+    interaction = Mock(spec=Interaction)
+    manager = PermissionManager(
+        tmp_path, user_configuration_path=path if scope == "user" else None, interaction=interaction
+    )
+    original = Path.read_bytes
+    denied = True
+
+    def refuse_read(candidate):
+        """Refuse reads only until the user explicitly selects a retry."""
+        if candidate == path and denied:
+            raise PermissionError(13, "synthetic-secret", str(path))
+        return original(candidate)
+
+    def decide(*_args, **_kwargs):
+        """Repair the read boundary only when retrying."""
+        nonlocal denied
+        if choice == "retry":
+            denied = False
+        return choice
+
+    monkeypatch.setattr(Path, "read_bytes", refuse_read)
+    interaction.prompt.side_effect = decide
+    result = manager.reload()
+    assert "reset" not in interaction.prompt.call_args.kwargs["choices"]
+    if scope == "workspace":
+        assert manager.configuration.defaults[Action.FILESYSTEM_READ] is Decision.DENY
+    else:
+        assert [rule.id for rule in manager.user_rules] == ["deny-read"]
+    if choice == "continue":
+        assert result is PermissionLoadResult.BLOCKED
+        with pytest.raises(PermissionNamespaceError):
+            manager.require_policy_ready()
+    else:
+        manager.require_policy_ready()
+
+
+@pytest.mark.parametrize("scope", ["workspace", "user"])
+def test_broken_policy_directory_symlink_requires_recovery(tmp_path, scope):
+    """A broken policy ancestor cannot be treated as an absent first-use policy."""
+    directory = tmp_path / "broken"
+    directory.symlink_to(tmp_path / "missing-directory", target_is_directory=True)
+    path = directory / "permissions.yaml"
+    interaction = Mock(spec=Interaction)
+    interaction.prompt.return_value = "continue"
+    arguments = (
+        {"configuration_path": path} if scope == "workspace" else {"user_configuration_path": path}
+    )
+    manager = PermissionManager(tmp_path, interaction=interaction, **arguments)
+    assert "reset" not in interaction.prompt.call_args.kwargs["choices"]
+    with pytest.raises(PermissionNamespaceError):
+        manager.require_policy_ready()
+    assert directory.is_symlink()
+
+
+@pytest.mark.parametrize("quote", ["", '"'])
+def test_policy_accepts_natural_boolean_strings(tmp_path, quote):
+    """Natural boolean strings resolve to their intended permission limits."""
+    path = tmp_path / ".loop" / "permissions.yaml"
+    path.parent.mkdir()
+    path.write_text(
+        f"version: 2\nlimits:\n  deny_private_networks: {quote}yes{quote}\n"
+        f"  allow_host_processes: {quote}no{quote}\n",
+        encoding="utf-8",
+    )
+    manager = PermissionManager(tmp_path)
+    assert manager.configuration.limits.deny_private_networks is True
+    assert manager.configuration.limits.allow_host_processes is False
+
+
+def test_policy_accepts_explicit_yaml_11(tmp_path):
+    """A policy declaring YAML 1.1 keeps its declared scalar interpretation."""
+    path = tmp_path / ".loop" / "permissions.yaml"
+    path.parent.mkdir()
+    path.write_text(
+        "%YAML 1.1\n---\nversion: 2\nlimits:\n  deny_private_networks: yes\n",
+        encoding="utf-8",
+    )
+    assert PermissionManager(tmp_path).configuration.limits.deny_private_networks is True

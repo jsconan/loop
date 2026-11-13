@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from contextlib import AbstractContextManager, asynccontextmanager, nullcontext
 from threading import Lock
@@ -17,13 +18,15 @@ from ..completion import (
     CompletionValue,
     SchemaCompletionProviderRegistration,
 )
-from ..interaction import require_async_interaction
+from ..errors import Problem, log_problem, safe_error_detail
+from ..interaction import prompt_recovery_async, require_async_interaction
 from ..models import CommandCapability
-from .manager import ApplicationSettings, ConfigurationManager
+from .manager import _CONFIGURATION_ERROR_POLICY, ApplicationSettings, ConfigurationManager
 
 Result = TypeVar("Result")
 Effect = TypeVar("Effect")
 _CONFIG_LOCK_POLL_SECONDS = 0.01
+_LOGGER = logging.getLogger(__name__)
 _YOLO_ACTIVATION_WARNING = (
     "Enabling YOLO: eligible requests will proceed without confirmation. "
     "The agent can request private data, change or delete files, "
@@ -31,6 +34,20 @@ _YOLO_ACTIVATION_WARNING = (
     "Host execution can alter or bypass the sandbox. "
     "Hard policy denies and unavailable enforcement still apply."
 )
+
+
+class ConfigurationReloadFailure(Exception):
+    """Carry a configuration read or validation failure to its recovery boundary.
+
+    Args:
+        error (OSError | ValueError): Original configuration loading error.
+    """
+
+    error: OSError | ValueError
+
+    def __init__(self, error: OSError | ValueError) -> None:
+        self.error = error
+        super().__init__(type(error).__name__)
 
 
 class ConfigurationGetArguments(BaseModel):
@@ -367,8 +384,7 @@ class ConfigurationCommands:
         if action == "reload":
             if path is not None or value is not None or scope is not None:
                 raise CommandArgumentError("The reload operation does not accept arguments.")
-            async with self._mutation_async():
-                await self._reload_async(context)
+            await self._reload_async(context)
             return
         if action == "secret":
             await self._set_secret_async(context, path, value, scope)
@@ -503,15 +519,62 @@ class ConfigurationCommands:
 
     async def _reload_async(self, context: CommandContext) -> None:
         """Reload disk configuration and apply only effective changes."""
-        previous = self._configuration.effective
-        try:
-            _, statuses = await self._run_blocking_with_effect_async(
-                context,
-                self._configuration.reload,
-                lambda settings: self._apply_changes_async(context, previous, settings),
-            )
-        except (OSError, ValueError, ValidationError) as error:
-            raise CommandArgumentError(str(error)) from error
+        while True:
+            try:
+                async with self._mutation_async():
+                    previous = self._configuration.effective
+                    _, statuses = await self._run_blocking_with_effect_async(
+                        context,
+                        self._load_reload,
+                        lambda settings, prior=previous: self._apply_changes_async(
+                            context, prior, settings
+                        ),
+                    )
+                break
+            except ConfigurationReloadFailure as failure:
+                error = failure.error
+                problem = Problem(
+                    code="configuration.reload_failed",
+                    title="Configuration reload failed",
+                    detail=safe_error_detail(
+                        error,
+                        ApplicationSettings,
+                        **_CONFIGURATION_ERROR_POLICY,
+                    ),
+                    operation="config.reload",
+                )
+                log_problem(_LOGGER, problem, error)
+                context.interaction.report(problem)
+                candidate = self._configuration.recovery_candidate(error)
+                choice = await prompt_recovery_async(
+                    context.interaction,
+                    "Configuration recovery:",
+                    operation="configuration recovery",
+                    continue_label="Keep the current configuration for this session",
+                    reset_label=(
+                        f"Archive {candidate.path} and reset it to defaults" if candidate else None
+                    ),
+                )
+                if choice == "retry":
+                    continue
+                if choice == "reset" and candidate is not None:
+                    try:
+                        backup = self._configuration.reset_invalid_file(candidate)
+                    except OSError as failure:
+                        choice = await self._configuration.recover_reset_failure_async(
+                            context.interaction,
+                            failure,
+                            "Keep the current configuration",
+                        )
+                        if choice == "retry":
+                            continue
+                    else:
+                        context.interaction.info(f"Archived invalid configuration at {backup}.")
+                        continue
+                context.interaction.warning("Keeping the current configuration.")
+                return
+            except (OSError, ValueError) as error:
+                raise CommandArgumentError(str(error)) from error
         paths = tuple(statuses)
         if not paths:
             context.interaction.info("Configuration reloaded: no effective changes.")
@@ -521,6 +584,13 @@ class ConfigurationCommands:
             grouped.setdefault(statuses[path], []).append(path)
         detail = "; ".join(f"{status}: {', '.join(paths)}" for status, paths in grouped.items())
         context.interaction.info(f"Configuration reloaded: {detail}.")
+
+    def _load_reload(self) -> ApplicationSettings:
+        """Distinguish failed configuration loading from failed runtime application."""
+        try:
+            return self._configuration.reload()
+        except (OSError, ValueError) as error:
+            raise ConfigurationReloadFailure(error) from error
 
     async def _apply_changes_async(
         self,
@@ -662,14 +732,17 @@ class ConfigurationCommands:
             if requested and not active:
                 source = "inactive"
             saved = self._configuration.saved_yolo
-            detail = f"YOLO active: {active}; source: {source}; saved user value: {saved}."
+            displayed_saved = "unknown" if saved is None else str(saved)
+            detail = (
+                f"YOLO active: {active}; source: {source}; saved user value: {displayed_saved}."
+            )
             if requested and not active:
                 detail += " A trusted action is required to activate it."
             elif not active and saved:
                 detail += (
                     " It will become active on restart; disable with scope=user to persist off."
                 )
-            if active and source == "session" and not saved:
+            if active and source == "session" and saved is False:
                 detail += " Disable with scope=session to stop it now."
             if active and source == "session" and saved:
                 detail += " Disable both session and user scopes to keep it off after restart."

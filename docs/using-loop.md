@@ -336,6 +336,8 @@ Tool declaration is passive: importing a tool does not register it anywhere. Com
 
 At startup, the loop discovers `SKILL.md` files under `.agents/skills` from the repository root through the working directory, followed by `~/.agents/skills`. Only each skill's YAML `name` and `description` are initially loaded and disclosed to the model. Before task work, the agent compares the request with those descriptions and calls `activate_skill` for every match. The complete Markdown instructions are then read and cached for the following model turn. Activated skill identities persist with the session and are restored only while the same canonical definition remains available. The model can deactivate one or all skills when their instructions are no longer needed.
 
+Instruction and skill frontmatter use YAML 1.2 by default, so unquoted values such as `yes` and `on` remain strings.
+
 Skill files under `references/`, `scripts/`, and `assets/` remain unloaded until requested through `manage_skills`. Resource paths are confined to the activated skill root. Text resources support line-oriented or byte-oriented continuation and return at most 16 KiB per call. Binary assets are returned as smaller base64 pages so their encoded result remains bounded; resource contents do not become permanent instructions.
 
 The complete instruction document retains a deterministic 64 KiB UTF-8 safety ceiling. Section-level sizes and stable content digests make prompt growth and cache-prefix churn observable without adding model-metadata or tokenizer requests to the backend request path. When explicitly configured, the backend context window is reported alongside context usage after each completed response.

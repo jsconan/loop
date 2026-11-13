@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import isfinite
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic_core import PydanticCustomError
 
 from .. import constants
 from ..models import (
@@ -33,14 +33,16 @@ class BackendSettings(BaseModel):
     api_key: SecretStr = SecretStr(constants.DEFAULT_API_KEY)
     context_window: int | None = Field(default=None, gt=0)
     max_retries: int = Field(default=constants.DEFAULT_MAX_RETRIES, ge=0)
-    request_timeout_seconds: float = Field(default=constants.DEFAULT_REQUEST_TIMEOUT_SECONDS, gt=0)
+    request_timeout_seconds: float = Field(
+        default=constants.DEFAULT_REQUEST_TIMEOUT_SECONDS, gt=0, allow_inf_nan=False
+    )
     max_generation_seconds: float | None = Field(
-        default=constants.DEFAULT_MAX_GENERATION_SECONDS, gt=0
+        default=constants.DEFAULT_MAX_GENERATION_SECONDS, gt=0, allow_inf_nan=False
     )
     max_response_chars: int | None = Field(default=constants.DEFAULT_MAX_RESPONSE_CHARS, gt=0)
     max_output_tokens: int | None = Field(default=None, gt=0)
     repetition_detection: RepetitionDetection = constants.DEFAULT_REPETITION_DETECTION
-    repetition_penalty: float | None = Field(default=None, gt=0)
+    repetition_penalty: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     repetition_min_pattern_size: int = Field(
         default=constants.DEFAULT_REPETITION_MIN_PATTERN_SIZE, ge=0
     )
@@ -57,19 +59,25 @@ class BackendSettings(BaseModel):
     retention_policy: RetentionPolicy | None = constants.DEFAULT_RETENTION_POLICY
 
     def model_post_init(self, __context: object, /) -> None:
-        """Validate finite durations and coherent repetition thresholds."""
-        if not all(
-            isfinite(value)
-            for value in (self.request_timeout_seconds, self.max_generation_seconds)
-            if value is not None
+        """Validate coherent repetition thresholds."""
+        partial = isinstance(__context, dict) and __context.get("partial_source") is True
+        fields = self.model_fields_set
+        if (
+            not partial or {"repetition_min_pattern_size", "repetition_max_pattern_size"} <= fields
+        ) and self.repetition_min_pattern_size > self.repetition_max_pattern_size:
+            raise PydanticCustomError(
+                "loop_repetition_pattern",
+                "Minimum repetition pattern size cannot exceed the maximum.",
+            )
+        if (
+            (not partial or {"repetition_max_pattern_size", "repetition_min_count"} <= fields)
+            and self.repetition_max_pattern_size > 0
+            and self.repetition_min_count < 2
         ):
-            raise ValueError("Backend duration settings must be finite.")
-        if self.repetition_penalty is not None and not isfinite(self.repetition_penalty):
-            raise ValueError("Repetition penalty must be finite.")
-        if self.repetition_min_pattern_size > self.repetition_max_pattern_size:
-            raise ValueError("Minimum repetition pattern size cannot exceed the maximum.")
-        if self.repetition_max_pattern_size > 0 and self.repetition_min_count < 2:
-            raise ValueError("Repetition minimum count must be at least two when enabled.")
+            raise PydanticCustomError(
+                "loop_repetition_count",
+                "Repetition minimum count must be at least two when enabled.",
+            )
 
 
 class AppSettings(BaseModel):
@@ -184,7 +192,12 @@ class ApplicationSettings(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    config_version: int = CONFIGURATION_VERSION
+    config_version: int = Field(
+        default=CONFIGURATION_VERSION,
+        ge=CONFIGURATION_VERSION,
+        le=CONFIGURATION_VERSION,
+        strict=True,
+    )
     backend: BackendSettings = BackendSettings()
     conversation: ConversationSettings = ConversationSettings()
     app: AppSettings = AppSettings()

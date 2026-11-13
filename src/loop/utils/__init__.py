@@ -30,6 +30,7 @@ __all__ = [
     "VirtualPath",
     "WorkerCapacity",
     "WorkerEntry",
+    "YAMLError",
     "as_utc",
     "await_value_async",
     "base64_decode",
@@ -47,6 +48,7 @@ __all__ = [
     "current_interaction_correlation",
     "data_url",
     "decode_content_cursor",
+    "dump_yaml",
     "encode_content_cursor",
     "ensure_private_directory",
     "filter_paths_by_globs",
@@ -67,6 +69,7 @@ __all__ = [
     "kill_process_group",
     "list_terms",
     "load_unique_json",
+    "load_yaml",
     "local_now",
     "matches_digest",
     "new_uuid",
@@ -195,3 +198,4 @@ from .value_holder import (
     ValueReference,
 )
 from .virtual_path import VirtualPath
+from .yaml import YAMLError, dump_yaml, load_yaml

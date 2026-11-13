@@ -8,11 +8,12 @@ import stat
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic_core import PydanticCustomError
 
 from .. import constants
+from ..errors import safe_error_detail
 from ..utils import has_extended_access_acl, load_unique_json, sha256_digest
 from .models import Decision, PermissionRule
 
@@ -40,14 +41,14 @@ class ManagedExpectation(BaseModel):
     """Bind a protected installation to one administrator policy identity and revision floor.
 
     Args:
-        version (Literal[1]): Expectation schema version.
+        version (int): Expectation schema version.
         identity (str): Stable administrator-selected policy identity.
         minimum_revision (int): Lowest acceptable policy revision.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    version: Literal[1]
+    version: int = Field(ge=1, le=1, strict=True)
     identity: str = Field(pattern=r"^[0-9a-f]{32}$")
     minimum_revision: int = Field(ge=1)
 
@@ -56,7 +57,7 @@ class ManagedPolicy(BaseModel):
     """Hold restrictions that user policy and automatic approval cannot relax.
 
     Args:
-        version (Literal[1]): Policy schema version.
+        version (int): Policy schema version.
         identity (str): Identity matching the protected installation expectation.
         revision (int): Monotonic administrator policy revision.
         require_sandbox (bool): Reject host process execution.
@@ -68,7 +69,7 @@ class ManagedPolicy(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    version: Literal[1]
+    version: int = Field(ge=1, le=1, strict=True)
     identity: str = Field(pattern=r"^[0-9a-f]{32}$")
     revision: int = Field(ge=1)
     require_sandbox: bool = False
@@ -94,7 +95,10 @@ class ManagedPolicy(BaseModel):
             or re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", rule.id) is None
             for rule in self.rules
         ):
-            raise ValueError("Managed rules require safe distinct IDs and deny or ask decisions.")
+            raise PydanticCustomError(
+                "loop_managed_rules",
+                "Managed rules require safe distinct IDs and deny or ask decisions.",
+            )
         return self
 
 
@@ -233,7 +237,7 @@ class ManagedPolicyStore:
             )
             if any("id" not in rule for rule in raw_policy.get("rules", ())):
                 raise ManagedPolicyError("Managed rules require explicit stable identifiers.")
-            policy = ManagedPolicy.model_validate(raw_policy)
+            policy = ManagedPolicy.model_validate(raw_policy, extra="forbid")
             if (
                 policy.identity != expectation.identity
                 or policy.revision < expectation.minimum_revision
@@ -253,7 +257,14 @@ class ManagedPolicyStore:
         except (OSError, ValueError, TypeError, AttributeError) as error:
             if isinstance(error, ManagedPolicyError):
                 raise
-            raise ManagedPolicyError(f"Administrator policy cannot be verified: {error}") from error
+            error_detail = safe_error_detail(
+                error,
+                ManagedPolicy,
+                trusted_messages=frozenset({"Duplicate administrator policy field."}),
+            )
+            raise ManagedPolicyError(
+                f"Administrator policy cannot be verified: {error_detail}"
+            ) from error
 
     def may_be_installed(self) -> bool:
         """Detect a present source without interpreting inspection failure as absence.

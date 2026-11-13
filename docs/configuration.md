@@ -82,7 +82,7 @@ sqlite_busy_timeout_ms = 2500
 
 ## Edit settings while Loop is running
 
-Loop validates settings at startup. An invalid value or unknown key stops startup without exposing secret values in logs. Changes made through `/config` preserve comments and formatting in the configuration file.
+Loop validates settings at startup. If loading fails, it reports a redacted diagnostic and asks whether to retry after repair, use built-in defaults for this session, or halt. The defaults bypass ignores saved and environment settings, turns YOLO off, and suspends writes to saved configuration until a successful reload. It uses the built-in backend settings, so check the destination before sending requests. On reload failure, Loop offers retry, continuing with the last valid settings, or halting. When a specific invalid file can be verified, recovery also offers to archive it in a private directory and reset that scope; environment and ambiguous failures require manual repair. Changes made through `/config` preserve comments and formatting in the configuration file.
 
 Use `/config` to browse, inspect, change, or reset effective settings. Completion suggests setting names and values:
 

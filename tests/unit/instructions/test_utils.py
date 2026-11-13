@@ -68,6 +68,19 @@ def test_read_instruction_frontmatter_returns_yaml_mapping(tmp_path):
     assert read_instruction_frontmatter(location) == {"name": "review"}
 
 
+def test_skill_frontmatter_preserves_yaml_12_string_values(tmp_path):
+    """Natural language scalars and keys are retained in skill metadata."""
+    location = tmp_path / "SKILL.md"
+    location.write_text(
+        "---\nname: on\ndescription: yes\nmetadata:\n  no: off\n---\nBody", encoding="utf-8"
+    )
+    assert read_instruction_frontmatter(location, required_fields=("name", "description")) == {
+        "name": "on",
+        "description": "yes",
+        "metadata": {"no": "off"},
+    }
+
+
 @pytest.mark.parametrize("field", ["description:", "description: 1", "description: '  '"])
 def test_read_instruction_frontmatter_validates_required_fields(tmp_path, field):
     """Required fields must be non-empty strings and valid values are normalized."""

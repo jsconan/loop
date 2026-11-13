@@ -558,14 +558,13 @@ def test_loop_accepts_an_explicitly_assembled_runtime(tmp_path):
         loop.set_working_directory(tmp_path / "missing")
 
 
-@pytest.mark.parametrize("choice", ["continue", None])
-def test_loop_continues_with_supervised_defaults_after_permission_load_failure(tmp_path, choice):
-    """The manager completes interactive fallback during Loop construction."""
+def test_loop_continues_with_supervised_defaults_after_permission_load_failure(tmp_path):
+    """An explicit choice enables interactive fallback during Loop construction."""
     path = tmp_path / ".loop" / "permissions.yaml"
     path.parent.mkdir()
     path.write_text("version: 3\n", "utf-8")
     interaction = output_interaction()
-    interaction.prompt.return_value = choice
+    interaction.prompt.return_value = "continue"
 
     loop = Loop.create_default(
         backend=loop_backend(),
@@ -597,7 +596,7 @@ def test_loop_resets_invalid_permission_policy_only_after_user_selection(tmp_pat
     assert list(path.parent.glob("permissions.yaml.*.bak"))
 
 
-@pytest.mark.parametrize("choice", ["exit", False])
+@pytest.mark.parametrize("choice", ["exit", False, None])
 def test_loop_can_exit_when_permission_recovery_is_declined(tmp_path, choice):
     """The recovery prompt can stop startup without changing the invalid policy file."""
     path = tmp_path / ".loop" / "permissions.yaml"
@@ -615,7 +614,9 @@ def test_loop_can_exit_when_permission_recovery_is_declined(tmp_path, choice):
 
 
 def test_loop_reports_presets_excluded_by_permission_manager(tmp_path, monkeypatch):
-    """Malformed shipped presets are reported without preventing Loop construction."""
+    """Malformed shipped presets cannot be silently excluded during Loop construction."""
+    from loop.permissions import PermissionPresetError
+
     failure = PermissionLoadFailure(
         source="preset", path="presets/broken.yaml", message="invalid schema"
     )
@@ -626,9 +627,10 @@ def test_loop_reports_presets_excluded_by_permission_manager(tmp_path, monkeypat
     )
     interaction = output_interaction()
 
-    Loop.create_default(backend=loop_backend(), interaction=interaction, working_directory=tmp_path)
-
-    assert "Excluded invalid permission preset" in interaction.warning.call_args.args[0]
+    with pytest.raises(PermissionPresetError):
+        Loop.create_default(
+            backend=loop_backend(), interaction=interaction, working_directory=tmp_path
+        )
 
 
 def test_loop_rejects_an_invalid_compaction_threshold(tmp_path):

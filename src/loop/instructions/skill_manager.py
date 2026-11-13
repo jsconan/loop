@@ -6,10 +6,8 @@ from html import escape
 from pathlib import Path
 from typing import Self
 
-import yaml
-
 from .. import constants
-from ..utils import base64_encode, read_bounded_text, sha256_digest
+from ..utils import YAMLError, base64_encode, read_bounded_text, sha256_digest
 from .models import (
     Skill,
     SkillActivationResponse,
@@ -209,7 +207,7 @@ class SkillManager:
                         location, required_fields=("name", "description")
                     )
                     skills.append(Skill(metadata["name"], metadata["description"], location))
-                except (OSError, UnicodeError, ValueError, yaml.YAMLError) as exc:
+                except (OSError, UnicodeError, ValueError, YAMLError) as exc:
                     diagnostics.append(f"Skipped '{location}': {exc}")
 
         return cls(skills, diagnostics)

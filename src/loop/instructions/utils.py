@@ -4,10 +4,8 @@ from collections.abc import Collection, Iterable
 from pathlib import Path
 from typing import Any
 
-import yaml
-
 from .. import constants
-from ..utils import find_project_root, is_path_ignored
+from ..utils import YAMLError, find_project_root, is_path_ignored, load_yaml
 from .models import (
     AgentInstructionsSource,
     InstructionBudgetExceededError,
@@ -64,7 +62,7 @@ def read_instruction_frontmatter(
         OSError: The instruction file cannot be opened or read.
         UnicodeError: The instruction file is not valid UTF-8.
         ValueError: Frontmatter is missing, unterminated, or not a mapping.
-        yaml.YAMLError: Frontmatter contains invalid YAML.
+        YAMLError: Frontmatter contains invalid YAML.
     """
     frontmatter = []
     with location.open(encoding="utf-8") as instruction_file:
@@ -77,7 +75,7 @@ def read_instruction_frontmatter(
         else:
             raise ValueError(f"{location.name} frontmatter is not terminated")
 
-    metadata = yaml.safe_load("".join(frontmatter))
+    metadata = load_yaml("".join(frontmatter))
     if not isinstance(metadata, dict):
         raise ValueError(  # noqa: TRY004 - malformed frontmatter has one validation contract.
             f"{location.name} frontmatter must be a mapping"
@@ -109,7 +107,7 @@ def read_instruction_body(
     Raises:
         ValueError: Required frontmatter is missing, or present frontmatter is unterminated or
             is not a mapping.
-        yaml.YAMLError: Present frontmatter contains invalid YAML.
+        YAMLError: Present frontmatter contains invalid YAML.
     """
     lines = content.splitlines()
     if not lines or lines[0].strip() != "---":
@@ -118,7 +116,7 @@ def read_instruction_body(
         return content.strip()
     for index, line in enumerate(lines[1:], start=1):
         if line.strip() == "---":
-            metadata = yaml.safe_load("\n".join(lines[1:index]))
+            metadata = load_yaml("\n".join(lines[1:index]))
             if not isinstance(metadata, dict):
                 raise ValueError(f"{filename} frontmatter must be a mapping")
             return "\n".join(lines[index + 1 :]).strip()
@@ -205,7 +203,7 @@ def load_agents_instructions(
             )
         except UnicodeError:
             raise
-        except (ValueError, yaml.YAMLError) as exc:
+        except (ValueError, YAMLError) as exc:
             diagnostics.append(f"Skipped '{agents_file}': {exc}")
             continue
         if content:

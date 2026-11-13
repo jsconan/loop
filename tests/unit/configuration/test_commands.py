@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import traceback
 from threading import Event, get_ident
 from unittest.mock import AsyncMock, Mock, call
 
@@ -16,6 +17,7 @@ from loop.configuration import ConfigurationCommands, ConfigurationManager
 from loop.interaction import ConsoleInteraction
 from loop.models import CommandCapability
 from loop.permissions.managed import ManagedPolicyStore
+from loop.utils import ShutdownRequested
 from tests.scheduling import deliver_callbacks
 
 
@@ -1264,6 +1266,7 @@ def test_config_reload_rejects_arguments_and_invalid_disk_content(tmp_path):
     configuration.initialize()
     configuration.load()
     interaction = Mock(spec=ConsoleInteraction)
+    interaction.prompt.return_value = "continue"
     manager = CommandManager(
         providers=(ConfigurationCommands(configuration, Mock()),), interaction=interaction
     )
@@ -1276,6 +1279,196 @@ def test_config_reload_rejects_arguments_and_invalid_disk_content(tmp_path):
     assert "does not accept arguments" in interaction.report.call_args_list[0].args[0].detail
     assert "app.debug" in interaction.report.call_args_list[1].args[0].detail
     assert configuration.effective.app.debug is False
+
+
+def test_config_reload_reports_invalid_secret_without_disclosing_it(tmp_path):
+    """Recovery reports the failing setting and preserves the last validated snapshot."""
+    configuration = ConfigurationManager(tmp_path / "config.toml")
+    configuration.initialize()
+    configuration.load({})
+    configuration.path.write_text('[backend]\napi_key = ["synthetic-secret"]\n', encoding="utf-8")
+    interaction = Mock(spec=ConsoleInteraction)
+    interaction.prompt.return_value = "continue"
+    manager = CommandManager(
+        providers=(ConfigurationCommands(configuration, Mock()),), interaction=interaction
+    )
+
+    manager.call("config", "reload")
+
+    detail = interaction.report.call_args.args[0].detail
+    assert "backend.api_key" in detail
+    assert "synthetic-secret" not in detail
+    interaction.prompt.assert_called_once()
+    assert configuration.effective.backend.api_key.get_secret_value() != "synthetic-secret"
+
+
+def test_config_reload_redacts_unknown_keys(tmp_path):
+    """An unknown setting name cannot disclose secret text through its error location."""
+    configuration = ConfigurationManager(tmp_path / "config.toml")
+    configuration.initialize()
+    configuration.load({})
+    configuration.path.write_text('[backend]\nsynthetic-secret = "value"\n', encoding="utf-8")
+    interaction = Mock(spec=ConsoleInteraction)
+    interaction.prompt.return_value = "continue"
+    manager = CommandManager(
+        providers=(ConfigurationCommands(configuration, Mock()),), interaction=interaction
+    )
+
+    manager.call("config", "reload")
+
+    detail = interaction.report.call_args.args[0].detail
+    assert "backend.<unknown>" in detail
+    assert "synthetic-secret" not in detail
+
+
+def test_config_reload_reports_toml_location_without_source_text(tmp_path):
+    """Syntax recovery identifies the file and location without displaying its contents."""
+    user = tmp_path / "user.toml"
+    workspace = tmp_path / "workspace.toml"
+    configuration = ConfigurationManager(user, workspace)
+    configuration.initialize()
+    configuration.load({})
+    workspace.write_text('[backend]\napi_key = "synthetic-secret\n', encoding="utf-8")
+    interaction = Mock(spec=ConsoleInteraction)
+    interaction.prompt.return_value = "continue"
+    manager = CommandManager(
+        providers=(ConfigurationCommands(configuration, Mock()),), interaction=interaction
+    )
+
+    manager.call("config", "reload")
+
+    detail = interaction.report.call_args.args[0].detail
+    assert str(workspace) in detail
+    assert "line" in detail and "column" in detail
+    assert "synthetic-secret" not in detail
+
+
+def test_config_reload_prompt_does_not_hold_the_mutation_lock(tmp_path):
+    """A waiting recovery prompt does not block a separate session configuration change."""
+    configuration = ConfigurationManager(tmp_path / "config.toml")
+    configuration.initialize()
+    configuration.load({})
+    configuration.path.write_text('[app]\ndebug = "invalid"\n', encoding="utf-8")
+    interaction = Mock(spec=ConsoleInteraction)
+    manager = CommandManager(
+        providers=(ConfigurationCommands(configuration, Mock(return_value="applied")),),
+        interaction=interaction,
+    )
+
+    async def scenario():
+        """Change a session setting while recovery is awaiting a user decision."""
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def prompt(*_args, **_kwargs):
+            """Hold recovery until the concurrent mutation completes."""
+            started.set()
+            await release.wait()
+            return "continue"
+
+        interaction.prompt_async.side_effect = prompt
+        pending = asyncio.create_task(manager.call_async("config", "reload"))
+        await started.wait()
+        await manager.call_async("config", "set app.debug true scope=session")
+        release.set()
+        await pending
+
+    asyncio.run(scenario())
+    assert configuration.effective.app.debug is True
+
+
+def test_cancelled_config_recovery_leaves_mutation_available(tmp_path):
+    """Cancellation while awaiting recovery cannot leave configuration locked."""
+    configuration = ConfigurationManager(tmp_path / "config.toml")
+    configuration.initialize()
+    configuration.load({})
+    configuration.path.write_text('[app]\ndebug = "invalid"\n', encoding="utf-8")
+    interaction = Mock(spec=ConsoleInteraction)
+    manager = CommandManager(
+        providers=(ConfigurationCommands(configuration, Mock(return_value="applied")),),
+        interaction=interaction,
+    )
+
+    async def scenario():
+        """Cancel a pending recovery and then change a session value."""
+        started = asyncio.Event()
+        never = asyncio.Event()
+
+        async def prompt(*_args, **_kwargs):
+            """Expose the pending prompt before cancellation."""
+            started.set()
+            await never.wait()
+
+        interaction.prompt_async.side_effect = prompt
+        pending = asyncio.create_task(manager.call_async("config", "reload"))
+        await started.wait()
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        await manager.call_async("config", "set app.debug true scope=session")
+
+    asyncio.run(scenario())
+    assert configuration.effective.app.debug is True
+
+
+def test_config_reload_retries_after_external_repair(tmp_path):
+    """An explicit retry loads and applies the repaired configuration."""
+    configuration = ConfigurationManager(tmp_path / "config.toml")
+    configuration.initialize()
+    configuration.load({})
+    configuration.path.write_text('[app]\ndebug = "invalid"\n', encoding="utf-8")
+    interaction = Mock(spec=ConsoleInteraction)
+
+    def repair(*_args, **_kwargs):
+        """Repair the saved value before selecting retry."""
+        configuration.path.write_text("[app]\ndebug = true\n", encoding="utf-8")
+        return "retry"
+
+    interaction.prompt.side_effect = repair
+    apply = Mock(return_value="applied")
+    manager = CommandManager(
+        providers=(ConfigurationCommands(configuration, apply),), interaction=interaction
+    )
+    manager.call("config", "reload")
+
+    assert configuration.effective.app.debug is True
+    apply.assert_called_once()
+    interaction.prompt.assert_called_once()
+
+
+@pytest.mark.parametrize("choice", ["exit", False, None])
+def test_config_reload_halts_without_an_explicit_recovery_choice(tmp_path, choice):
+    """Halt and invalid responses never select a fallback configuration."""
+    configuration = ConfigurationManager(tmp_path / "config.toml")
+    configuration.initialize()
+    configuration.load({})
+    configuration.path.write_text('[app]\ndebug = "invalid"\n', encoding="utf-8")
+    interaction = Mock(spec=ConsoleInteraction)
+    interaction.prompt.return_value = choice
+    manager = CommandManager(
+        providers=(ConfigurationCommands(configuration, Mock()),), interaction=interaction
+    )
+
+    with pytest.raises(ShutdownRequested):
+        manager.call("config", "reload")
+    assert configuration.effective.app.debug is False
+
+
+def test_config_reload_halt_does_not_expose_invalid_secret_in_traceback(tmp_path):
+    """Halting recovery does not chain invalid secret input into a displayed traceback."""
+    configuration = ConfigurationManager(tmp_path / "config.toml")
+    configuration.initialize()
+    configuration.load({})
+    configuration.path.write_text('[backend]\napi_key = ["synthetic-secret"]\n', encoding="utf-8")
+    interaction = Mock(spec=ConsoleInteraction)
+    interaction.prompt.return_value = "exit"
+    manager = CommandManager(
+        providers=(ConfigurationCommands(configuration, Mock()),), interaction=interaction
+    )
+
+    with pytest.raises(ShutdownRequested) as raised:
+        manager.call("config", "reload")
+    assert "synthetic-secret" not in "".join(traceback.format_exception(raised.value))
 
 
 def test_config_secret_prompts_before_selecting_scope_and_applies_value(tmp_path):
@@ -1644,3 +1837,50 @@ def test_config_completion_lists_arguments_for_selected_operation(tmp_path):
         "backend.api_key",
     }
     assert list(reload_arguments) == []
+
+
+def test_config_reload_can_archive_and_reset_invalid_file(tmp_path):
+    """An explicit reset archives the broken file and reloads the safe defaults."""
+    configuration = ConfigurationManager(tmp_path / "config.toml")
+    configuration.initialize()
+    configuration.load({})
+    configuration.path.write_text('[app]\ndebug = "bad"\n', encoding="utf-8")
+    interaction = Mock(spec=ConsoleInteraction)
+    interaction.prompt.return_value = "reset"
+    manager = CommandManager(
+        providers=(ConfigurationCommands(configuration, Mock(return_value="applied")),),
+        interaction=interaction,
+    )
+    manager.call("config", "reload")
+    assert configuration.effective.app.debug is False
+    assert next(tmp_path.glob(".config.toml.backup-*/config.toml")).read_text() == (
+        '[app]\ndebug = "bad"\n'
+    )
+
+
+@pytest.mark.parametrize("selection", ["continue", "retry"])
+def test_config_reload_reports_reset_failure_before_next_action(tmp_path, monkeypatch, selection):
+    """A failed reset preserves current settings and asks before retrying or continuing."""
+    configuration = ConfigurationManager(tmp_path / "config.toml")
+    configuration.initialize()
+    configuration.load({})
+    configuration.path.write_text('[app]\ndebug = "bad"\n', encoding="utf-8")
+    interaction = Mock(spec=ConsoleInteraction)
+    interaction.prompt.side_effect = ["reset", selection, "continue"]
+    manager = CommandManager(
+        providers=(ConfigurationCommands(configuration, Mock(return_value="applied")),),
+        interaction=interaction,
+    )
+
+    def fail_reset(_candidate):
+        """Refuse the attempted reset without changing the file."""
+        raise OSError(13, "denied")
+
+    monkeypatch.setattr(configuration, "reset_invalid_file", fail_reset)
+    manager.call("config", "reload")
+    assert interaction.prompt.call_count == (3 if selection == "retry" else 2)
+    assert configuration.effective.app.debug is False
+    assert any(
+        call.args[0].code == "configuration.reset_failed"
+        for call in interaction.report.call_args_list
+    )

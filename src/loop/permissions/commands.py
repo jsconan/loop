@@ -1,10 +1,13 @@
 """Expose scoped operation-policy management as a user command."""
 
+import logging
 import shlex
 from typing import Annotated
 
 from ..commands import CommandArgumentError, CommandContext, CommandRegistration, CommandRemainder
 from ..completion import CommandCompletion, CompletionValue
+from ..errors import Problem, log_problem
+from ..interaction import prompt_recovery
 from ..models import CommandCapability
 from .manager import PermissionManager
 from .models import (
@@ -12,7 +15,9 @@ from .models import (
     ApprovalChoice,
     Decision,
     LimitClassification,
+    PermissionConfigurationError,
     PermissionLoadResult,
+    PermissionNamespaceError,
     PermissionPreset,
     PermissionRule,
     PolicyScope,
@@ -65,6 +70,7 @@ _DISPATCH_MESSAGES = {
         "Retained the workspace policy; session overrides remain active."
     ),
 }
+_LOGGER = logging.getLogger(__name__)
 
 
 def _enum_values(enum_type: type, descriptions: dict) -> tuple[CompletionValue, ...]:
@@ -117,6 +123,11 @@ class PermissionCommands:
             OSError: If a permission policy cannot be archived or persisted.
             ShutdownRequested: If the user exits interactive policy recovery.
         """
+        if arguments == ("reload",):
+            if CommandCapability.RUN_ACTIVE in (context.capabilities or frozenset()):
+                self._ensure_run_safe(context, arguments)
+            self._reload(context)
+            return
         with self._permission_manager.policy_update():
             if CommandCapability.RUN_ACTIVE in (context.capabilities or frozenset()):
                 self._ensure_run_safe(context, arguments)
@@ -124,6 +135,55 @@ class PermissionCommands:
                 self._dispatch(context, arguments)
             except (TypeError, ValueError) as exc:
                 raise CommandArgumentError(f"{exc}\n{self._usage()}") from exc
+
+    def _reload(self, context: CommandContext) -> None:
+        """Reload policy and prompt outside the policy lock when admission remains blocked."""
+        while True:
+            try:
+                result = self._permission_manager.reload(interaction=context.interaction)
+                if result is PermissionLoadResult.BLOCKED:
+                    return
+                self._permission_manager.require_policy_ready()
+            except PermissionConfigurationError as error:
+                manager = self._permission_manager
+                if error.path == str(manager.configuration_path):
+                    manager.suspend_policy("workspace", error.message)
+                elif error.path == str(manager.user_configuration_path):
+                    manager.suspend_policy("user", error.message)
+                else:
+                    try:
+                        manager.require_policy_ready()
+                    except PermissionNamespaceError:
+                        pass
+                    else:
+                        manager.suspend_policy("workspace", error.message)
+                problem = Problem.from_exception(
+                    error,
+                    code="permission.policy_recovery_required",
+                    title="Permission policy recovery required",
+                    operation="permissions.reload",
+                )
+                log_problem(_LOGGER, problem, error)
+                context.interaction.report(problem)
+                context.interaction.warning(
+                    "Automatic repair and permissive defaults are unavailable while policy "
+                    "restrictions cannot be verified."
+                )
+                choice = prompt_recovery(
+                    context.interaction,
+                    "Permission policy recovery:",
+                    continue_label="Continue with permission operations blocked",
+                )
+                if choice == "retry":
+                    continue
+                context.interaction.warning(
+                    "Permission operations remain blocked until the policy is repaired."
+                )
+                return
+            except (TypeError, ValueError) as error:
+                raise CommandArgumentError(f"{error}\n{self._usage()}") from error
+            context.interaction.info(_DISPATCH_MESSAGES[result])
+            return
 
     @staticmethod
     def _ensure_run_safe(context: CommandContext, arguments: tuple[str, ...]) -> None:
@@ -168,10 +228,6 @@ class PermissionCommands:
             return
         if len(arguments) == 2 and arguments[0] == "show":
             context.interaction.info(manager.describe(arguments[1]))
-            return
-        if arguments == ("reload",):
-            result = manager.reload(interaction=context.interaction)
-            context.interaction.info(_DISPATCH_MESSAGES[result])
             return
         if arguments == ("help",):
             context.interaction.info(self._help())

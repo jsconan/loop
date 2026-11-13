@@ -33,6 +33,18 @@ def installed_policy(tmp_path: Path) -> tuple[ManagedPolicyStore, Path]:
     return store, directory
 
 
+def test_managed_policy_accepts_natural_boolean_strings(tmp_path):
+    """Recognized boolean strings preserve the configured administrator restrictions."""
+    store, directory = installed_policy(tmp_path)
+    path = directory / "managed-policy.json"
+    policy = json.loads(path.read_text())
+    policy.update(forbid_host="yes", deny_local_networks="no")
+    path.write_text(json.dumps(policy))
+    loaded = store.load().policy
+    assert loaded.forbid_host is True
+    assert loaded.deny_local_networks is False
+
+
 def test_absent_installation_is_unmanaged_but_missing_expected_file_is_invalid(tmp_path):
     """A missing installation is optional; an existing installation needs both files."""
     directory = tmp_path / "etc" / "loop"
@@ -534,4 +546,20 @@ def test_expectation_parent_disappearance_during_load_is_rejected(tmp_path, monk
 
     monkeypatch.setattr(managed.os, "open", removing_open)
     with pytest.raises(ManagedPolicyError, match="expectation parent disappeared"):
+        store.load()
+
+
+@pytest.mark.parametrize("scope", ["expectation", "policy"])
+def test_managed_policy_rejects_boolean_version(tmp_path, scope):
+    """Administrator document schema versions require integer values."""
+    store, directory = installed_policy(tmp_path)
+    path = (
+        directory.parent / "loop.managed.expect.json"
+        if scope == "expectation"
+        else directory / "managed-policy.json"
+    )
+    data = json.loads(path.read_text())
+    data["version"] = True
+    path.write_text(json.dumps(data))
+    with pytest.raises(ManagedPolicyError, match="cannot be verified"):
         store.load()

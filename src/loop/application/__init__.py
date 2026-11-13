@@ -4,9 +4,10 @@ __all__ = [
     "ApplicationMigration",
     "ApplicationPaths",
     "ApplicationRuntime",
+    "RuntimeRollbackError",
     "WorkspacePaths",
 ]
 
 from .migration import ApplicationMigration
 from .paths import ApplicationPaths, WorkspacePaths
-from .runtime import ApplicationRuntime
+from .runtime import ApplicationRuntime, RuntimeRollbackError

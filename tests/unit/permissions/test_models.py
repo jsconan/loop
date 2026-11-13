@@ -51,6 +51,59 @@ def test_limit_classification_requires_complete_known_provenance():
         )
 
 
+@pytest.mark.parametrize(
+    "target",
+    [
+        {"kind": "file", "path": "/tmp/file", "unknown": True},
+        {
+            "kind": "network",
+            "url": "https://example.test",
+            "origin": "https://example.test",
+            "unknown": True,
+        },
+        {"kind": "process", "argv": ["true"], "cwd": "/tmp", "unknown": True},
+        {"kind": "session", "identifier": "state", "unknown": True},
+        {
+            "kind": "file",
+            "path": "/tmp/file",
+            "manifest": [
+                {
+                    "relative_path": ".",
+                    "kind": "file",
+                    "device": 1,
+                    "inode": 1,
+                    "size": 1,
+                    "mtime_ns": 1,
+                    "mode": 0,
+                    "unknown": True,
+                }
+            ],
+        },
+    ],
+)
+def test_policy_rejects_unknown_fields_in_exact_targets(target):
+    """Unknown target restrictions cannot disappear during policy validation."""
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        PermissionConfiguration.model_validate(
+            {"rules": [{"decision": "deny", "target": target}]}, extra="forbid"
+        )
+
+
+def test_policy_rejects_unknown_preset_source_fields():
+    """Unknown provenance metadata cannot be silently discarded."""
+    source = {
+        "preset_id": "x",
+        "revision": "1",
+        "content_hash": "hash",
+        "rule_id": "r",
+        "unknown": True,
+    }
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        PermissionConfiguration.model_validate(
+            {"rules": [{"decision": "deny", "source": source}]}, extra="forbid"
+        )
+
+
 def test_operations_expose_stable_resource_representations():
     """Typed targets derive canonical strings only for rule matching and display."""
     operations = (
@@ -263,3 +316,37 @@ def test_builtin_permission_presets_reject_duplicates_but_retains_one_for_recove
 
     assert [preset.metadata.id for preset in presets] == ["duplicate"]
     assert failures[0].message == "Built-in permission preset identifiers must be unique."
+
+
+@pytest.mark.parametrize("missing", [False, True])
+def test_preset_directory_failure_is_reported(monkeypatch, tmp_path, missing):
+    """A missing or empty shipped catalog requires explicit recovery."""
+
+    class ResourcePackage:
+        """Expose the test directory as a package resource."""
+
+        def joinpath(self, name):
+            """Return the requested preset directory."""
+            return tmp_path / "missing" if missing else tmp_path
+
+    monkeypatch.setattr("loop.permissions.models.files", lambda package: ResourcePackage())
+    presets, failures = PermissionPreset.load_builtin_presets()
+    assert presets == ()
+    assert len(failures) == 1
+    assert "Cannot read" in failures[0].message if missing else "empty" in failures[0].message
+
+
+@pytest.mark.parametrize("model", [PermissionConfiguration, UserPermissionConfiguration])
+@pytest.mark.parametrize("version", [0, 3, "2", True, False, 1.0])
+def test_permission_policy_rejects_unsupported_schema_versions(model, version):
+    """Both persisted policy scopes reject unknown or malformed schema versions."""
+    with pytest.raises(ValidationError):
+        model.model_validate({"version": version})
+
+
+def test_permission_preset_rejects_boolean_version():
+    """Preset versions require an actual integer even when the value equals one."""
+    values = PermissionPreset.builtin_presets()[0].model_dump()
+    values["version"] = True
+    with pytest.raises(ValidationError, match="version"):
+        PermissionPreset.model_validate(values)

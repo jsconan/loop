@@ -18,7 +18,6 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
-import yaml
 
 from loop import (
     Action,
@@ -50,6 +49,7 @@ from loop.tools.system import control_command_terminal, resolve_executable, run_
 from loop.tools.web import read_cached_content
 from loop.utils import VirtualPath
 from loop.utils import path as path_module
+from loop.utils.yaml import load_yaml
 from tests.scheduling import receive_fifo_byte
 
 pytestmark = [pytest.mark.integration, pytest.mark.e2e, pytest.mark.macos]
@@ -2310,7 +2310,7 @@ def test_make_prepares_a_literal_indirect_tool_in_one_call(
         2 if policy_case == "custom_saved" else 1
     )
     if policy_case == "custom_saved":
-        policy = yaml.safe_load(
+        policy = load_yaml(
             (native_workspace / ".loop/permissions.yaml").read_text(encoding="utf-8")
         )
         assert policy["limit_classifications"]["readable_roots"] == "approval"
