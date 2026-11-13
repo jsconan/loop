@@ -1117,6 +1117,8 @@ class Tool:
         direct_cancellation = None
         settled_interruption = None
         started = perf_counter()
+        caller = asyncio.current_task()
+        prior_cancellations = caller.cancelling() if caller is not None else 0
         invocation = object()
         context_token = _TOOL_INVOCATION.set(invocation)
 
@@ -1223,6 +1225,13 @@ class Tool:
                         raise
                     raise RuntimeError("Final tool work failed after it was admitted.") from error
                 except asyncio.CancelledError as cancellation:
+                    if (
+                        caller is not None
+                        and caller.cancelling() > prior_cancellations
+                        and context is not None
+                        and context.cancellation_event is not None
+                    ):
+                        context.cancellation_event.set()
                     if owned is not None:
                         owned.cancel()
                     if borrowed_wrapper is not None:

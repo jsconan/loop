@@ -1900,6 +1900,146 @@ def test_cancellation_settles_sync_work_without_a_run_signal():
     assert settled.is_set()
 
 
+def test_async_dispatch_supplies_local_cancellation_signal():
+    """Standalone async dispatch signals a context-aware worker when cancelled."""
+    started = Event()
+    observed = Event()
+
+    @declare_tool
+    def wait_for_cancellation(context: ToolContext) -> str:
+        """Wait until the dispatch-local cancellation signal is set."""
+        started.set()
+        if context.cancellation_event.wait(timeout=5):
+            observed.set()
+        return "finished"
+
+    registry = ToolRegistry([wait_for_cancellation])
+
+    async def dispatch():
+        """Cancel after the worker starts and await its settled result."""
+        task = asyncio.create_task(registry.call_async("wait_for_cancellation", "{}"))
+        await asyncio.to_thread(started.wait)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    try:
+        asyncio.run(dispatch())
+    finally:
+        registry.close()
+    assert observed.is_set()
+
+
+def test_async_tool_observes_dispatch_cancellation_during_cleanup():
+    """A cancelled async tool sees its signal before settling its cleanup."""
+    observed = []
+
+    async def scenario():
+        """Cancel a running tool and inspect the signal in its cancellation handler."""
+        started = asyncio.Event()
+
+        @declare_tool
+        async def wait_for_cancellation(context: ToolContext) -> str:
+            """Record whether the dispatch signal was set before cancellation cleanup."""
+            try:
+                started.set()
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                observed.append(context.cancellation_event.is_set())
+                raise
+
+        registry = ToolRegistry([wait_for_cancellation])
+        try:
+            task = asyncio.create_task(registry.call_async("wait_for_cancellation", "{}"))
+            await started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            await asyncio.to_thread(registry.close)
+
+    asyncio.run(scenario())
+    assert observed == [True]
+
+
+def test_async_tool_self_cancellation_does_not_cancel_run():
+    """A tool that cancels itself does not set the caller's shared run signal."""
+    cancellation = Event()
+
+    @declare_tool
+    async def cancel_itself() -> str:
+        """Stop the tool without requesting run cancellation."""
+        raise asyncio.CancelledError
+
+    async def scenario():
+        """Observe the tool's cancellation and the independent run signal."""
+        registry = ToolRegistry([cancel_itself])
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await registry.call_async("cancel_itself", "{}", cancellation_event=cancellation)
+        finally:
+            await asyncio.to_thread(registry.close)
+
+    asyncio.run(scenario())
+    assert not cancellation.is_set()
+
+
+def test_prior_handled_cancellation_does_not_cancel_next_tool_run():
+    """A previously handled task cancellation is not a new run interruption."""
+    cancellation = Event()
+
+    @declare_tool
+    async def cancel_itself() -> str:
+        """Cancel only this tool's operation."""
+        raise asyncio.CancelledError
+
+    async def scenario():
+        """Handle an earlier cancellation before dispatching a self-cancelling tool."""
+        current = asyncio.current_task()
+        current.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.sleep(0)
+        registry = ToolRegistry([cancel_itself])
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await registry.call_async("cancel_itself", "{}", cancellation_event=cancellation)
+        finally:
+            await asyncio.to_thread(registry.close)
+
+    asyncio.run(scenario())
+    assert not cancellation.is_set()
+
+
+@pytest.mark.parametrize("prior_cancellation", [False, True])
+def test_cancelled_sync_tool_future_does_not_cancel_run(prior_cancellation):
+    """A cancelled tool-returned future does not set the caller's run signal."""
+    cancellation = Event()
+
+    async def scenario():
+        """Return an independently cancelled future from a synchronous tool."""
+        if prior_cancellation:
+            asyncio.current_task().cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.sleep(0)
+        future = asyncio.get_running_loop().create_future()
+        future.cancel()
+
+        @declare_tool
+        def cancelled_future():
+            """Return a cancelled result without requesting run cancellation."""
+            return future
+
+        registry = ToolRegistry([cancelled_future])
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await registry.call_async("cancelled_future", "{}", cancellation_event=cancellation)
+        finally:
+            await asyncio.to_thread(registry.close)
+
+    asyncio.run(scenario())
+    assert not cancellation.is_set()
+
+
 @pytest.mark.parametrize("during_start", [False, True])
 def test_cancelled_worker_does_not_start_or_await_additional_execution(during_start):
     """Cancellation before execution or before an awaitable result never launches more work."""

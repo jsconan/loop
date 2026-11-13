@@ -1241,7 +1241,7 @@ class ToolRegistry:
             file_observations (FileObservations | None): Frozen view supplied to this generation,
                 or ``None`` for standalone dispatch without model context.
             cancellation_event (Event | None): Run cancellation signal passed to context-aware
-                tools, or ``None`` for standalone dispatch.
+                tools, or ``None`` to create a dispatch-local signal.
 
         Returns:
             str: The serialized tool result or a model-readable error.
@@ -1298,7 +1298,7 @@ class ToolRegistry:
             file_observations (FileObservations | None): Frozen view supplied to this generation,
                 or ``None`` for standalone dispatch without model context.
             cancellation_event (Event | None): Run cancellation signal passed to context-aware
-                tools, or ``None`` for standalone dispatch.
+                tools, or ``None`` to create a dispatch-local signal.
 
         Returns:
             tuple[str, float]: Serialized result and tool-function duration in seconds. Validation
@@ -1347,6 +1347,7 @@ class ToolRegistry:
                 virtual_paths=virtual_paths,
                 redaction_roots=redaction_roots,
             ), 0
+        dispatch_cancellation = cancellation_event if cancellation_event is not None else Event()
         context = self._context_for(
             tool,
             interaction=interaction,
@@ -1355,7 +1356,7 @@ class ToolRegistry:
             prerequisite_operations=plan.prerequisite_operations,
             call_id=call_id,
             permission_manager=active_permissions,
-            cancellation_event=cancellation_event,
+            cancellation_event=dispatch_cancellation,
             file_observations=file_observations,
         )
         if execution_started is not None:
@@ -1394,6 +1395,8 @@ class ToolRegistry:
         try:
 
             async def dispatch_sync_async(invoke: Callable[[], Any]) -> Any:
+                caller = asyncio.current_task()
+                prior_cancellations = caller.cancelling() if caller is not None else 0
                 value = await self._run_worker_async(
                     invoke,
                     cancellation_event=active_context.cancellation_event,
@@ -1423,8 +1426,8 @@ class ToolRegistry:
                     try:
                         return await self._await_owned_future_async(value)
                     except asyncio.CancelledError as error:
-                        if active_context.cancellation_event is not None:
-                            active_context.cancellation_event.set()
+                        if caller is not None and caller.cancelling() > prior_cancellations:
+                            dispatch_cancellation.set()
                         await self._settle_returned_future_async(value, owned)
                         if value.cancelled():
                             raise

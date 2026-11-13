@@ -70,8 +70,8 @@ class ToolContext:
             complete inspected source versions, including the source of a committed edit, or
             ``None`` for observed absence; cache handles map to
             ``None`` and retain their existing immutable reference identity.
-        cancellation_event (Event | None): Run-scoped signal set when shutdown or interruption
-            requests cancellation, or ``None`` for standalone tool dispatch.
+        cancellation_event (Event | None): Run or async-dispatch signal set on interruption,
+            or ``None`` when no signal is supplied to a synchronous dispatch.
         execution_mode (Literal["sync", "async"]): Callback mode selected by the owning registry.
             Defaults to ``"sync"`` for contexts assembled outside registry dispatch.
     """
