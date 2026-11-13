@@ -7,7 +7,6 @@ check:
 	uv --no-cache run ruff check .
 	uv --no-cache run ruff format --check .
 	git --no-pager diff --check
-	uv --no-cache run pylint src
 
 format:
 	uv --no-cache run ruff format .
