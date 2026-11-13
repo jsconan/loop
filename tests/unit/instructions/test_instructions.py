@@ -924,6 +924,24 @@ def test_activation_is_idempotent_and_unknown_skills_remain_errors(tmp_path):
     assert " root=" not in instructions
 
 
+def test_command_skill_admission_uses_current_activation_identity(tmp_path):
+    """Admission preserves unrelated changes and refuses a directly reactivated skill."""
+    first = write_skill(tmp_path / "first", "first")
+    other = write_skill(tmp_path / "other", "other")
+    manager = configured_manager(skill_manager=SkillManager([first, other]))
+    manager.activate_skill("first")
+    manager.activate_skill("other")
+    snapshot = manager.command_skill_snapshot((("first", first.location.parent),))
+    assert snapshot is not None
+    manager.deactivate_skill("other")
+    committed = []
+    assert manager.admit_command_skills(snapshot, lambda: committed.append(True))
+    manager.skill_manager.deactivate("first")
+    manager.skill_manager.activate("first")
+    assert not manager.admit_command_skills(snapshot, lambda: committed.append(False))
+    assert committed == [True]
+
+
 def test_activation_rolls_back_when_complete_instructions_exceed_budget(tmp_path):
     """An oversized skill is rejected atomically without partially changing instructions."""
     skill = write_skill(tmp_path / "large", "large", "x" * 100)

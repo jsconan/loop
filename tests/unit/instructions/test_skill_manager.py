@@ -1,7 +1,9 @@
 """Tests for progressive Agent Skill discovery and activation."""
 
 from pathlib import Path
+from threading import Event, Thread
 from typing import get_args, get_origin, get_type_hints
+from unittest.mock import Mock
 
 import pytest
 
@@ -18,6 +20,221 @@ def write_skill(directory: Path, name: str, description: str, body: str = "Instr
         encoding="utf-8",
     )
     return location
+
+
+def test_command_skill_snapshot_requires_matching_current_activation(tmp_path):
+    """Admission rejects missing, rebound, and reactivated skills while unrelated changes pass."""
+    first = Skill("first", "First", write_skill(tmp_path / "first", "first", "First"))
+    other = Skill("other", "Other", write_skill(tmp_path / "other", "other", "Other"))
+    manager = SkillManager([first, other])
+    assert manager.command_skill_snapshot(()) == ()
+    assert manager.admit_command_skills((), lambda: None)
+    expected = (("first", first.location.parent),)
+    assert manager.command_skill_snapshot((("missing", tmp_path),)) is None
+    assert manager.command_skill_snapshot((("first", tmp_path),)) is None
+    assert manager.command_skill_snapshot(expected) is None
+    manager.activate("first")
+    manager.activate("other")
+    snapshot = manager.command_skill_snapshot(expected)
+    assert snapshot is not None
+    callback = Mock()
+    assert not manager.admit_command_skills((("missing", tmp_path, "invalid"),), callback)
+    assert not manager.admit_command_skills((("first", tmp_path, "invalid"),), callback)
+    assert not manager.admit_command_skills(
+        (("first", first.location.parent, "invalid"),), callback
+    )
+    manager.deactivate("other")
+    assert manager.admit_command_skills(snapshot, callback)
+    callback.assert_called_once_with()
+    manager.deactivate("first")
+    manager.activate("first")
+    assert not manager.admit_command_skills(snapshot, callback)
+    manager.deactivate_all()
+    assert manager.command_skill_snapshot(expected) is None
+
+
+def test_command_skill_admission_serializes_direct_revocation(tmp_path):
+    """A direct skill-manager revocation cannot interleave with admission commit."""
+    skill = Skill("first", "First", write_skill(tmp_path / "first", "first", "First"))
+    manager = SkillManager([skill])
+    manager.activate("first")
+    snapshot = manager.command_skill_snapshot((("first", skill.location.parent),))
+    assert snapshot is not None
+    attempting, finished = Event(), Event()
+
+    def deactivate():
+        """Attempt revocation while admission holds the activation lock."""
+        attempting.set()
+        manager.deactivate("first")
+        finished.set()
+
+    worker = Thread(target=deactivate)
+
+    def commit():
+        """Check that revocation remains blocked at the admission boundary."""
+        worker.start()
+        assert attempting.wait(5)
+        assert not finished.is_set()
+
+    try:
+        assert manager.admit_command_skills(snapshot, commit)
+        worker.join(5)
+        assert finished.is_set()
+    finally:
+        worker.join(5)
+
+
+def test_unrelated_stalled_skill_read_does_not_block_revocation(tmp_path, monkeypatch):
+    """A blocked direct activation does not delay another skill's revocation or admission."""
+    first = Skill("first", "First", write_skill(tmp_path / "first", "first", "First"))
+    other = Skill("other", "Other", write_skill(tmp_path / "other", "other", "Other"))
+    manager = SkillManager([first, other])
+    manager.activate("first")
+    snapshot = manager.command_skill_snapshot((("first", first.location.parent),))
+    assert snapshot is not None
+    entered, release = Event(), Event()
+    results = []
+
+    def stalled_read(_path):
+        """Pause one independent skill's instruction read until the check settles."""
+        entered.set()
+        if not release.wait(5):
+            raise TimeoutError("Skill read was not released.")
+        return "Other body"
+
+    monkeypatch.setattr("loop.instructions.skill_manager._read_skill_instructions", stalled_read)
+    worker = Thread(target=lambda: results.append(manager.activate("other")))
+    worker.start()
+    try:
+        assert entered.wait(5)
+        manager.deactivate("first")
+        manager.deactivate("other")
+        assert not manager.admit_command_skills(snapshot, lambda: None)
+    finally:
+        release.set()
+        worker.join(5)
+    assert not worker.is_alive()
+    assert results[0].code == "skill.activation_stale"
+    assert not manager.is_active("other")
+
+
+def test_simultaneous_activation_returns_existing_commit(tmp_path, monkeypatch):
+    """An activation that finishes after a concurrent commit remains idempotent."""
+    skill = Skill("first", "First", write_skill(tmp_path / "first", "first", "First"))
+    manager = SkillManager([skill])
+    entered, release = Event(), Event()
+    results = []
+
+    def stalled_read(_path):
+        """Pause the first read while the second activation commits."""
+        entered.set()
+        if not release.wait(5):
+            raise TimeoutError("Skill read was not released.")
+        return "Stale body"
+
+    monkeypatch.setattr("loop.instructions.skill_manager._read_skill_instructions", stalled_read)
+    worker = Thread(target=lambda: results.append(manager.activate("first")))
+    worker.start()
+    try:
+        assert entered.wait(5)
+        assert manager.activate("first", content="Committed body")["instructions_updated"]
+    finally:
+        release.set()
+        worker.join(5)
+    assert not worker.is_alive()
+    assert not results[0]["instructions_updated"]
+    assert manager.activated_instructions == ((skill, "Committed body"),)
+
+
+def test_refresh_transfers_only_still_active_matching_skill_tokens(tmp_path):
+    """A refresh keeps matching tokens while removing revoked or replaced candidates."""
+    same_path = write_skill(tmp_path / "same", "same", "Same")
+    other_path = write_skill(tmp_path / "old", "moved", "Old")
+    new_path = write_skill(tmp_path / "new", "moved", "New")
+    missing_path = write_skill(tmp_path / "missing", "missing", "Missing")
+    revoked_path = write_skill(tmp_path / "revoked", "revoked", "Revoked")
+    late_path = write_skill(tmp_path / "late", "late", "Late")
+    old_only_path = write_skill(tmp_path / "old-only", "old-only", "Old only")
+    failed_path = write_skill(tmp_path / "failed", "failed", "Failed")
+    old = SkillManager(
+        [
+            Skill("same", "Same", same_path),
+            Skill("moved", "Old", other_path),
+            Skill("revoked", "Revoked", revoked_path),
+            Skill("late", "Late", late_path),
+            Skill("old-only", "Old only", old_only_path),
+            Skill("failed", "Failed", failed_path),
+        ]
+    )
+    refreshed = SkillManager(
+        [
+            Skill("same", "Same", same_path),
+            Skill("moved", "New", new_path),
+            Skill("missing", "Missing", missing_path),
+            Skill("revoked", "Revoked", revoked_path),
+            Skill("late", "Late", late_path),
+            Skill("failed", "Failed", failed_path),
+        ]
+    )
+    for manager, names in (
+        (old, ("same", "moved", "old-only", "failed")),
+        (refreshed, ("same", "moved", "missing", "revoked")),
+    ):
+        for name in names:
+            manager.activate(name)
+    candidate_ready, activated = Event(), Event()
+
+    def activate_after_discovery():
+        """Activate a skill after the replacement candidate has been constructed."""
+        if not candidate_ready.wait(5):
+            raise TimeoutError("Refresh candidate was not released.")
+        old.activate("late")
+        activated.set()
+
+    worker = Thread(target=activate_after_discovery)
+    worker.start()
+    candidate_ready.set()
+    assert activated.wait(5)
+    worker.join(5)
+    assert not worker.is_alive()
+    snapshot = old.command_skill_snapshot((("same", same_path.parent),))
+    assert snapshot is not None
+    late_snapshot = old.command_skill_snapshot((("late", late_path.parent),))
+    assert late_snapshot is not None
+    captured = tuple(
+        (name, str(old_path))
+        for name, old_path in (
+            ("same", same_path),
+            ("moved", other_path),
+            ("old-only", old_only_path),
+            ("failed", failed_path),
+        )
+    )
+    with old.transfer_command_skill_tokens(refreshed, captured):
+        assert refreshed.admit_command_skills(snapshot, lambda: None)
+        assert not refreshed.is_active("moved")
+        assert not refreshed.is_active("missing")
+        assert not refreshed.is_active("revoked")
+        assert not refreshed.is_active("failed")
+        assert refreshed.admit_command_skills(late_snapshot, lambda: None)
+
+
+def test_refresh_changed_skill_body_invalidates_pending_admission(tmp_path):
+    """Reloaded instructions create a fresh approval identity even at the same root."""
+    location = write_skill(tmp_path / "guide", "guide", "Guide")
+    skill = Skill("guide", "Guide", location)
+    current, refreshed = SkillManager([skill]), SkillManager([skill])
+    current.activate("guide", content="original")
+    refreshed.activate("guide", content="changed")
+    expected = (("guide", location.parent),)
+    snapshot = current.command_skill_snapshot(expected)
+    assert snapshot is not None
+
+    with current.transfer_command_skill_tokens(refreshed, (("guide", str(location)),)):
+        assert not refreshed.admit_command_skills(snapshot, lambda: None)
+        refreshed_snapshot = refreshed.command_skill_snapshot(expected)
+        assert refreshed_snapshot is not None
+        assert refreshed.admit_command_skills(refreshed_snapshot, lambda: None)
 
 
 def test_skills_and_names_resolve_precedence_and_return_sorted_snapshots(tmp_path):

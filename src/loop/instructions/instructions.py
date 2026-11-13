@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import replace
 from functools import partial
 from html import escape
@@ -236,10 +236,43 @@ class InstructionsManager:
                 or ``None``.
 
         """
-        if self._runtime_environment != environment:
-            self._runtime_environment = environment
-            self._context_instructions = self._build_instructions()
-            self._generation += 1
+        with self._lock:
+            if self._runtime_environment != environment:
+                self._runtime_environment = environment
+                self._context_instructions = self._build_instructions()
+                self._generation += 1
+
+    def command_skill_snapshot(
+        self, expected: tuple[tuple[str, Path], ...]
+    ) -> tuple[tuple[str, Path, str], ...] | None:
+        """Capture active skill identities for a prospective command.
+
+        Args:
+            expected (tuple[tuple[str, Path], ...]): Skill names and roots used by the command.
+
+        Returns:
+            tuple[tuple[str, Path, str], ...] | None: Captured activation tokens, or None if
+                a skill is inactive or no longer names the expected root.
+        """
+        with self._lock:
+            return self._skill_manager.command_skill_snapshot(expected)
+
+    def admit_command_skills(
+        self,
+        snapshot: tuple[tuple[str, Path, str], ...],
+        on_admitted: Callable[[], None],
+    ) -> bool:
+        """Commit command admission atomically with a final active-skill check.
+
+        Args:
+            snapshot (tuple[tuple[str, Path, str], ...]): Previously captured activations.
+            on_admitted (Callable[[], None]): Short callback committing command admission.
+
+        Returns:
+            bool: True if each captured skill remains active and admission was committed.
+        """
+        with self._lock:
+            return self._skill_manager.admit_command_skills(snapshot, on_admitted)
 
     def set_skill_catalog_priorities(
         self,
@@ -325,22 +358,23 @@ class InstructionsManager:
             VirtualPath: Workspace, temporary, and active-skill roots reconstructed from local
                 state.
         """
-        environment = self._runtime_environment
-        if environment is None:
-            workspace = None
-            temporary_directory = None
-        else:
-            workspace = environment.working_directory
-            temporary_directory = (
-                Path(environment.temporary_directory)
-                if environment.temporary_directory is not None
-                else None
+        with self._lock:
+            environment = self._runtime_environment
+            if environment is None:
+                workspace = None
+                temporary_directory = None
+            else:
+                workspace = environment.working_directory
+                temporary_directory = (
+                    Path(environment.temporary_directory)
+                    if environment.temporary_directory is not None
+                    else None
+                )
+            return VirtualPath(
+                workspace=workspace,
+                temporary_directory=temporary_directory,
+                skill_roots=self._skill_manager.activated_locations,
             )
-        return VirtualPath(
-            workspace=workspace,
-            temporary_directory=temporary_directory,
-            skill_roots=self._skill_manager.activated_locations,
-        )
 
     @property
     def agents_filenames(self) -> tuple[str, ...]:
@@ -628,7 +662,13 @@ class InstructionsManager:
                     continue
                 if loaded is None:
                     return False
-                return self._apply_refresh(working_directory, signature, loaded, skill_manager)
+                return self._apply_refresh(
+                    working_directory,
+                    signature,
+                    loaded,
+                    skill_manager,
+                    captured_active,
+                )
 
     def refresh(self) -> bool:
         """Refresh changed contextual instruction sources.
@@ -884,7 +924,13 @@ class InstructionsManager:
             if self._skill_discovery_enabled
             else None
         )
-        return self._apply_refresh(working_directory, signature, loaded, skill_manager)
+        return self._apply_refresh(
+            working_directory,
+            signature,
+            loaded,
+            skill_manager,
+            tuple(active),
+        )
 
     def _load_refresh_candidate(
         self,
@@ -915,6 +961,7 @@ class InstructionsManager:
         signature: tuple,
         loaded: LoadedAgentInstructions,
         refreshed_skills: SkillManager | None,
+        captured_active: tuple[tuple[str, str], ...],
     ) -> bool:
         """Publish a detached refresh candidate after rechecking its owner revision."""
         previous_target = self._signature[0] if self._signature else None
@@ -933,35 +980,38 @@ class InstructionsManager:
 
         if refreshed_skills is None:
             raise RuntimeError("A refreshed skill manager is required for discovered skills.")
-        skill_manager = refreshed_skills
-        diagnostics = self._load_diagnostics(loaded)
+        with self._skill_manager.transfer_command_skill_tokens(refreshed_skills, captured_active):
+            skill_manager = refreshed_skills
+            diagnostics = self._load_diagnostics(loaded)
 
-        for skill in skill_manager.activated_skills:
+            for skill in skill_manager.activated_skills:
+                instructions = self._compose(
+                    None, project_instructions, skill_manager, self._runtime_environment
+                )
+                if self._encoded_size(instructions) > self._max_bytes:
+                    skill_manager.deactivate(skill.name)
+                    diagnostics.append(
+                        f"Deactivated '{skill.name}' during refresh: instruction budget exceeded."
+                    )
+
             instructions = self._compose(
                 None, project_instructions, skill_manager, self._runtime_environment
             )
-            if self._encoded_size(instructions) > self._max_bytes:
-                skill_manager.deactivate(skill.name)
-                diagnostics.append(
-                    f"Deactivated '{skill.name}' during refresh: instruction budget exceeded."
-                )
 
-        instructions = self._compose(
-            None, project_instructions, skill_manager, self._runtime_environment
-        )
-
-        changed = previous_target != str(working_directory) or previous_instructions != instructions
-        self._project_instructions = project_instructions
-        self._project_sources = loaded.sources
-        self._skill_manager = skill_manager
-        self._context_instructions = instructions
-        self._signature = signature
-        self._refresh_diagnostics = diagnostics
-        self._refresh_changes = refresh_changes
-        self._dirty = False
-        if changed:
-            self._generation += 1
-        return changed
+            changed = (
+                previous_target != str(working_directory) or previous_instructions != instructions
+            )
+            self._project_instructions = project_instructions
+            self._project_sources = loaded.sources
+            self._skill_manager = skill_manager
+            self._context_instructions = instructions
+            self._signature = signature
+            self._refresh_diagnostics = diagnostics
+            self._refresh_changes = refresh_changes
+            self._dirty = False
+            if changed:
+                self._generation += 1
+            return changed
 
     def _refresh_static(
         self,

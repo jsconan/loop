@@ -1,10 +1,15 @@
 """Discover and progressively load Agent Skills."""
 
+from __future__ import annotations
+
 import builtins
-from collections.abc import Iterable
+from collections.abc import Callable, Generator, Iterable
+from contextlib import contextmanager
 from html import escape
 from pathlib import Path
+from threading import RLock
 from typing import Self
+from uuid import uuid4
 
 from .. import constants
 from ..utils import YAMLError, base64_encode, read_bounded_text, sha256_digest
@@ -50,6 +55,9 @@ class SkillManager:
     _diagnostics: list[str]
     _lifecycle_diagnostics: list[str]
     _activated: dict[Path, str]
+    _activation_tokens: dict[Path, str]
+    _activation_revisions: dict[Path, int]
+    _lock: RLock
 
     def __init__(
         self,
@@ -71,6 +79,9 @@ class SkillManager:
             self._skills.append(skill)
             self._skills_by_name[skill.name] = skill
         self._activated = {}
+        self._activation_tokens = {}
+        self._activation_revisions = {}
+        self._lock = RLock()
 
     @property
     def skills(self) -> list[Skill]:
@@ -115,7 +126,8 @@ class SkillManager:
         Returns:
             tuple[Skill, ...]: An immutable snapshot of the activated skills.
         """
-        return tuple(skill for skill in self._skills if skill.location in self._activated)
+        with self._lock:
+            return tuple(skill for skill in self._skills if skill.location in self._activated)
 
     @property
     def activated_locations(self) -> dict[str, Path]:
@@ -124,11 +136,12 @@ class SkillManager:
         Returns:
             dict[str, Path]: Mapping of skill name to its canonical location in discovery order.
         """
-        return {
-            skill.name: skill.location.parent
-            for skill in self._skills
-            if skill.location in self._activated
-        }
+        with self._lock:
+            return {
+                skill.name: skill.location.parent
+                for skill in self._skills
+                if skill.location in self._activated
+            }
 
     @property
     def activated_instructions(self) -> tuple[tuple[Skill, str], ...]:
@@ -138,11 +151,12 @@ class SkillManager:
             tuple[tuple[Skill, str], ...]: Immutable skill and instruction pairs for every
                 activated skill.
         """
-        return tuple(
-            (skill, self._activated[skill.location])
-            for skill in self._skills
-            if skill.location in self._activated
-        )
+        with self._lock:
+            return tuple(
+                (skill, self._activated[skill.location])
+                for skill in self._skills
+                if skill.location in self._activated
+            )
 
     @property
     def count(self) -> int:
@@ -160,7 +174,8 @@ class SkillManager:
         Returns:
             int: The number of skills whose instructions are loaded.
         """
-        return len(self._activated)
+        with self._lock:
+            return len(self._activated)
 
     @property
     def active_identities(self) -> tuple[tuple[str, str], ...]:
@@ -170,7 +185,8 @@ class SkillManager:
             tuple[tuple[str, str], ...]: Skill names paired with canonical instruction locations
                 in discovery order.
         """
-        return tuple((skill.name, str(skill.location)) for skill in self.activated_skills)
+        with self._lock:
+            return tuple((skill.name, str(skill.location)) for skill in self.activated_skills)
 
     @classmethod
     def discover(
@@ -292,24 +308,46 @@ class SkillManager:
             UnicodeError: The skill instruction file is not valid UTF-8.
             ValueError: The skill instruction file has malformed required frontmatter.
         """
-        skill = self._skills_by_name.get(name)
-        if skill is None:
-            return SkillOperationError(
-                code="skill.unknown",
-                title="Skill unavailable",
-                detail=f"Skill '{name}' is not available.",
-                operation="activate_skill",
+        with self._lock:
+            skill = self._skills_by_name.get(name)
+            if skill is None:
+                return SkillOperationError(
+                    code="skill.unknown",
+                    title="Skill unavailable",
+                    detail=f"Skill '{name}' is not available.",
+                    operation="activate_skill",
+                )
+            if skill.location in self._activated:
+                return SkillActivationResult(
+                    **self._summary(skill),
+                    skill_root=str(skill.location.parent),
+                    status="activated",
+                    instructions_updated=False,
+                )
+            revision = self._activation_revisions.get(skill.location, 0)
+        instructions = _read_skill_instructions(skill.location) if content is None else content
+        with self._lock:
+            instructions_updated = skill.location not in self._activated
+            if (
+                instructions_updated
+                and self._activation_revisions.get(skill.location, 0) != revision
+            ):
+                return SkillOperationError(
+                    code="skill.activation_stale",
+                    title="Skill activation interrupted",
+                    detail=f"Skill '{name}' changed while its instructions were loading.",
+                    operation="activate_skill",
+                )
+            if instructions_updated:
+                self._activated[skill.location] = instructions
+                self._activation_tokens[skill.location] = uuid4().hex
+                self._activation_revisions[skill.location] = revision + 1
+            return SkillActivationResult(
+                **self._summary(skill),
+                skill_root=str(skill.location.parent),
+                status="activated",
+                instructions_updated=instructions_updated,
             )
-        instructions_updated = skill.location not in self._activated
-        if instructions_updated:
-            instructions = _read_skill_instructions(skill.location) if content is None else content
-            self._activated[skill.location] = instructions
-        return SkillActivationResult(
-            **self._summary(skill),
-            skill_root=str(skill.location.parent),
-            status="activated",
-            instructions_updated=instructions_updated,
-        )
 
     def read_instructions(self, name: str) -> str | SkillOperationError:
         """Read and validate one skill body without changing activation state.
@@ -344,21 +382,26 @@ class SkillManager:
         Returns:
             SkillDeactivationResponse: Deactivated skill metadata or a structured missing result.
         """
-        skill = self._skills_by_name.get(name)
-        if skill is None:
-            return SkillOperationError(
-                code="skill.unknown",
-                title="Skill unavailable",
-                detail=f"Skill '{name}' is not available.",
-                operation="deactivate_skill",
+        with self._lock:
+            skill = self._skills_by_name.get(name)
+            if skill is None:
+                return SkillOperationError(
+                    code="skill.unknown",
+                    title="Skill unavailable",
+                    detail=f"Skill '{name}' is not available.",
+                    operation="deactivate_skill",
+                )
+            instructions_updated = skill.location in self._activated
+            self._activated.pop(skill.location, None)
+            self._activation_tokens.pop(skill.location, None)
+            self._activation_revisions[skill.location] = (
+                self._activation_revisions.get(skill.location, 0) + 1
             )
-        instructions_updated = skill.location in self._activated
-        self._activated.pop(skill.location, None)
-        return SkillDeactivationResult(
-            **self._summary(skill),
-            status="deactivated",
-            instructions_updated=instructions_updated,
-        )
+            return SkillDeactivationResult(
+                **self._summary(skill),
+                status="deactivated",
+                instructions_updated=instructions_updated,
+            )
 
     def deactivate_all(self) -> int:
         """Deactivate all skills and release their instructions.
@@ -366,9 +409,15 @@ class SkillManager:
         Returns:
             int: Number of skills that were active.
         """
-        count = len(self._activated)
-        self._activated.clear()
-        return count
+        with self._lock:
+            count = len(self._activated)
+            self._activated.clear()
+            self._activation_tokens.clear()
+            for skill in self._skills:
+                self._activation_revisions[skill.location] = (
+                    self._activation_revisions.get(skill.location, 0) + 1
+                )
+            return count
 
     def is_active(self, name: str) -> bool:
         """Return whether an available skill is active.
@@ -379,8 +428,96 @@ class SkillManager:
         Returns:
             bool: Whether the named skill has loaded instructions.
         """
-        skill = self._skills_by_name.get(name)
-        return skill is not None and skill.location in self._activated
+        with self._lock:
+            skill = self._skills_by_name.get(name)
+            return skill is not None and skill.location in self._activated
+
+    def command_skill_snapshot(
+        self,
+        expected: tuple[tuple[str, Path], ...],
+    ) -> tuple[tuple[str, Path, str], ...] | None:
+        """Capture the active identities used by a command without granting new skills.
+
+        Args:
+            expected (tuple[tuple[str, Path], ...]): Skill names and roots used by the command.
+
+        Returns:
+            tuple[tuple[str, Path, str], ...] | None: Activation tokens, or None when a
+                referenced skill is no longer active at its expected root.
+        """
+        with self._lock:
+            snapshot = []
+            for name, root in expected:
+                skill = self._skills_by_name.get(name)
+                if (
+                    skill is None
+                    or skill.location.parent.absolute() != root.absolute()
+                    or skill.location not in self._activation_tokens
+                ):
+                    return None
+                snapshot.append((name, root, self._activation_tokens[skill.location]))
+            return tuple(snapshot)
+
+    @contextmanager
+    def transfer_command_skill_tokens(
+        self,
+        target: SkillManager,
+        captured: tuple[tuple[str, str], ...],
+    ) -> Generator[None, None, None]:
+        """Keep unchanged skill activations stable while a refreshed manager is published.
+
+        Args:
+            target (SkillManager): Refreshed candidate to receive still-current tokens.
+            captured (tuple[tuple[str, str], ...]): Active skill identities used to build it.
+
+        Yields:
+            None: Control while both activation sets remain locked for publication.
+        """
+        with self._lock, target._lock:
+            for skill in target.activated_skills:
+                previous = self._skills_by_name.get(skill.name)
+                token = self._activation_tokens.get(skill.location)
+                if previous is None or previous.location != skill.location or token is None:
+                    target.deactivate(skill.name)
+            for skill in self.activated_skills:
+                candidate = target._skills_by_name.get(skill.name)
+                if candidate is None or candidate.location != skill.location:
+                    continue
+                if not target.is_active(skill.name):
+                    if (skill.name, str(skill.location)) in captured:
+                        continue
+                    target.activate(skill.name, content=self._activated[skill.location])
+                if target._activated[skill.location] == self._activated[skill.location]:
+                    target._activation_tokens[skill.location] = self._activation_tokens[
+                        skill.location
+                    ]
+            yield
+
+    def admit_command_skills(
+        self,
+        snapshot: tuple[tuple[str, Path, str], ...],
+        on_admitted: Callable[[], None],
+    ) -> bool:
+        """Admit one command only while its captured skill activations remain current.
+
+        Args:
+            snapshot (tuple[tuple[str, Path, str], ...]): Previously captured activations.
+            on_admitted (Callable[[], None]): Short callback committing command admission.
+
+        Returns:
+            bool: True if all captured activations remain current and admission was committed.
+        """
+        with self._lock:
+            for name, root, token in snapshot:
+                skill = self._skills_by_name.get(name)
+                if (
+                    skill is None
+                    or skill.location.parent.absolute() != root.absolute()
+                    or self._activation_tokens.get(skill.location) != token
+                ):
+                    return False
+            on_admitted()
+            return True
 
     def restore(
         self,
