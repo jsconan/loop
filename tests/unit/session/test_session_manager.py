@@ -787,13 +787,39 @@ def test_manager_projects_retry_and_continue_from_durable_run_events():
     manager.record_run_failure()
 
     assert manager.retry_pending is True
-    assert manager.continuable is False
+    assert manager.continuable is True
 
     manager.begin_run_retry()
 
     assert manager.retry_pending is False
     assert manager.continuable is True
     assert manager.session.active_run_id == run.run_id
+
+
+@pytest.mark.parametrize(
+    ("reason", "allowed"),
+    [("cancelled", True), ("steered", True), ("completed", False), ("max_turns", False)],
+)
+def test_manager_allows_queued_input_after_interruption(reason, allowed):
+    """Queued input resumes interrupted or steered runs, but stays parked at other boundaries."""
+    manager = SessionManager()
+    assert manager.queued_input_can_resume is False
+    run = manager.begin_run()
+    assert manager.queued_input_can_resume is False
+    manager.record_run(
+        reason,
+        run.started_at,
+        RunMetrics(
+            active_duration_seconds=0,
+            model_duration_seconds=0,
+            tool_duration_seconds=0,
+            message_count=0,
+            item_count=0,
+        ),
+    )
+    assert manager.queued_input_can_resume is allowed
+    manager.begin_run()
+    assert manager.queued_input_can_resume is False
 
 
 def test_manager_persists_retry_transitions_asynchronously():

@@ -333,8 +333,8 @@ def test_recovery_preserves_superseding_input_across_serialization(has_call):
     assert restored.recovery_state().action == "finalize_run"
 
 
-def test_session_treats_presented_legacy_calls_as_uncertain_and_completed_runs_as_clean():
-    """Legacy execution markers remain conservative while terminal runs need no recovery."""
+def test_session_treats_cancelled_legacy_calls_as_uncertain():
+    """Cancelled runs preserve conservative treatment of legacy tool calls."""
     call = ToolCall(call_id="call", name="demo", arguments="{}")
     session = Session(messages=[Message(role="user", content="question"), call])
 
@@ -356,7 +356,8 @@ def test_session_treats_presented_legacy_calls_as_uncertain_and_completed_runs_a
         )
     )
 
-    assert session.recovery_state() is None
+    assert session.recovery_state().action == "resolve_uncertain_tools"
+    assert session.recovery_state().pending_calls[0].status == "outcome_unknown"
 
 
 def test_max_turn_completion_remains_continuable_from_its_last_checkpoint():
@@ -391,6 +392,52 @@ def test_max_turn_completion_remains_continuable_from_its_last_checkpoint():
     assert session.active_run_id is None
     assert session.recovery_state() is not None
     assert session.recovery_state().action == "query_model"
+
+
+@pytest.mark.parametrize("stop_reason", ["cancelled", "max_turns", "steered"])
+def test_incomplete_run_remains_recoverable_after_serialization(stop_reason):
+    """An incomplete historical run remains recoverable until a later run completes."""
+    session = Session()
+    session.add_message(Message(role="user", content="question"))
+    created_at = datetime(2026, 10, 21, tzinfo=UTC)
+    metrics = RunMetrics(
+        active_duration_seconds=0,
+        model_duration_seconds=0,
+        tool_duration_seconds=0,
+        message_count=1,
+        item_count=1,
+    )
+    session.events.extend(
+        [
+            RunStartedEvent(id="start", created_at=created_at, run_id="run", started_at=created_at),
+            RunCompletedEvent(
+                id="cancel",
+                created_at=created_at,
+                run_id="run",
+                started_at=created_at,
+                stop_reason=stop_reason,
+                metrics=metrics,
+            ),
+        ]
+    )
+    restored = Session.deserialize(session.serialize())
+    assert restored.recovery_state().action == "query_model"
+    restored.events.extend(
+        [
+            RunStartedEvent(
+                id="start-2", created_at=created_at, run_id="run-2", started_at=created_at
+            ),
+            RunCompletedEvent(
+                id="complete",
+                created_at=created_at,
+                run_id="run-2",
+                started_at=created_at,
+                stop_reason="completed",
+                metrics=metrics,
+            ),
+        ]
+    )
+    assert Session.deserialize(restored.serialize()).recovery_state() is None
 
 
 def test_session_retry_state_follows_failure_and_retry_events():

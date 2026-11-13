@@ -337,12 +337,13 @@ class Session:
         last_completion = None
         for event in self.events:
             if isinstance(event, RunCompletedEvent):
-                completed_items = event.metrics.item_count
+                if event.stop_reason == AgentRunStopReason.COMPLETED:
+                    completed_items = event.metrics.item_count
                 last_completion = event
         if completed_items >= len(self.messages):
             if self.active_run is not None or (
                 last_completion is not None
-                and last_completion.stop_reason == AgentRunStopReason.MAX_TURNS
+                and last_completion.stop_reason != AgentRunStopReason.COMPLETED
             ):
                 return SessionRecoveryState(action="query_model")
             return None
@@ -710,7 +711,9 @@ class Session:
                 started.add(event.call_id)
             elif isinstance(event, ToolExecutionCompletedEvent):
                 started.discard(event.call_id)
-            elif isinstance(event, RunCompletedEvent):
+            elif isinstance(event, RunCompletedEvent) and (
+                event.stop_reason == AgentRunStopReason.COMPLETED
+            ):
                 started.clear()
         return started
 

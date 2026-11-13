@@ -318,10 +318,10 @@ class SessionController:
             and self._session_manager.continuable
         ):
             capabilities.add(CommandCapability.RUN_CONTINUABLE)
-        if (
+        if self._control.paused or (
             not self._control.active
             and self._session_manager is not None
-            and self._session_manager.retry_pending
+            and self._session_manager.recovery_pending
         ):
             capabilities.add(CommandCapability.RUN_RETRYABLE)
         if not self._control.active and self._pending is None:
@@ -1124,7 +1124,9 @@ class SessionController:
         try:
             self._send(RunStateChanged(completer))
             commands_only = (
-                self._session_manager is not None and self._session_manager.recovery_pending
+                self._session_manager is not None
+                and self._session_manager.recovery_pending
+                and not self._session_manager.queued_input_can_resume
             )
             while True:
                 with self._mailbox_access():
@@ -1552,6 +1554,7 @@ class SessionController:
                         commands_only=(
                             self._session_manager is not None
                             and self._session_manager.recovery_pending
+                            and not self._session_manager.queued_input_can_resume
                         )
                     )
                 except Empty:
@@ -1706,7 +1709,10 @@ class SessionController:
         if (
             self._session_manager is None
             or self._stopping
-            or self._session_manager.recovery_pending
+            or (
+                self._session_manager.recovery_pending
+                and not self._session_manager.queued_input_can_resume
+            )
         ):
             return
         await self._acquire_mailbox_lock_async()

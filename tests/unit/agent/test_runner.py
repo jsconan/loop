@@ -2239,6 +2239,22 @@ def test_runner_recovers_a_model_boundary_without_adding_user_input():
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("reason", ["completed", "cancelled", "max_turns", "steered"])
+def test_recovery_status_tracks_noncompleted_runs(asynchronous, reason):
+    """Recovery reports every noncompleted run as still pending."""
+    runner, sessions, _ = agent_runner()
+    sessions.recovery_state = SessionRecoveryState(action="query_model")
+    result = AgentRunResult(final_response=None, turns=0, stop_reason=reason)
+    runner._recover = Mock(return_value=result)
+    runner._recover_async = AsyncMock(return_value=result)
+    if asynchronous:
+        recovery = asyncio.run(runner.recover_session_async(confirmed=True))
+    else:
+        recovery = runner.recover_session(confirmed=True)
+    assert recovery.pending is (reason != "completed")
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
 def test_invalid_run_recovery_confirmation_preserves_pending_state(asynchronous):
     """A truthy non-boolean cannot authorize recovery or issue a model request."""
     runner, sessions, interaction = agent_runner()
@@ -4000,6 +4016,30 @@ def test_runner_run_async_continues_below_turn_safety_limit():
     interaction.warning.assert_not_called()
 
 
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_shutdown_at_interruption_boundary_preserves_pending_tools(asynchronous):
+    """Shutdown leaves uncertain tool outcomes unresolved for a later recovery decision."""
+    control = Mock(spec=RunControl)
+    control.stopped = True
+    control.execution.return_value = nullcontext()
+    runner, sessions, _ = agent_runner(run_control=control)
+    call = ToolCall(call_id="uncertain", name="effect", arguments="{}")
+    sessions.recovery_state = SessionRecoveryState(
+        action="resolve_uncertain_tools",
+        pending_calls=(PendingToolCall(call=call, status="outcome_unknown"),),
+    )
+    if asynchronous:
+        runner.query_async = AsyncMock(side_effect=RunInterrupted())
+        result = asyncio.run(runner.run_async())
+        sessions.add_tool_call_async.assert_not_awaited()
+    else:
+        runner.query = Mock(side_effect=RunInterrupted())
+        result = runner.run()
+        sessions.add_tool_call.assert_not_called()
+    assert result.stop_reason == "stopped"
+    sessions.record_run.assert_not_called()
+
+
 def test_runner_run_async_records_interruption_as_cancelled():
     """A cooperative async interruption settles pending calls and records a cancelled run."""
     runner, sessions, interaction = agent_runner()
@@ -4813,7 +4853,7 @@ def test_controlled_async_run_cancels_stream_without_persisting_partial_response
         assert not any(isinstance(event, RunCompletedEvent) for event in sessions.session.events)
     else:
         assert result is not None
-        assert result.stop_reason == "cancelled"
+        assert result.stop_reason == ("stopped" if mode == "stop" else "cancelled")
         assert result.final_response is None
         assert result.turns == 0
         assert control.cancelled is True
@@ -4821,7 +4861,8 @@ def test_controlled_async_run_cancels_stream_without_persisting_partial_response
             event.stop_reason
             for event in sessions.session.events
             if isinstance(event, RunCompletedEvent)
-        ] == ["cancelled"]
+        ] == ([] if mode == "stop" else ["cancelled"])
+        assert sessions.recovery_state.action == "query_model"
         if mode == "interrupt":
             runner.interaction.info.assert_called_once_with(
                 "Run interrupted; the conversation remains open."
@@ -5032,7 +5073,7 @@ def test_async_cancellation_persists_a_settled_sync_tool_receipt(
     )
     assert ran == []
     if result is not None:
-        assert result.stop_reason == "cancelled"
+        assert result.stop_reason == ("stopped" if mode == "stop" else "cancelled")
         expected_names = (["previous_effect"] if previous_batch else []) + [
             "first_effect",
             "save_receipt",
@@ -5040,7 +5081,10 @@ def test_async_cancellation_persists_a_settled_sync_tool_receipt(
         assert [metric.name for metric in result.metrics.tools] == expected_names
         assert result.metrics.tools[-1].succeeded is successful
         assert all(metric.duration_seconds >= 0 for metric in result.metrics.tools)
-        assert "cancelled before execution" in outcomes[-1].output
+        if mode == "stop":
+            assert saved.recovery_state().action == "execute_tools"
+        else:
+            assert "cancelled before execution" in outcomes[-1].output
     else:
         assert saved.recovery_state().action == "execute_tools"
 
@@ -5213,7 +5257,7 @@ def test_cancellation_settles_returned_owner_loop_work_before_the_run_ends(
             )
             == 1
         )
-    elif mode == "external":
+    elif mode in {"external", "stop"}:
         assert output is None
         assert saved.recovery_state().action == "resolve_uncertain_tools"
     else:
@@ -5224,7 +5268,7 @@ def test_cancellation_settles_returned_owner_loop_work_before_the_run_ends(
         assert [metric.name for metric in result.metrics.tools] == (
             ["returned_work"] if known_result else []
         )
-        assert result.stop_reason == "cancelled"
+        assert result.stop_reason == ("stopped" if mode == "stop" else "cancelled")
 
 
 def test_async_interruption_preserves_completed_unknown_and_unstarted_tool_outcomes(tmp_path):
@@ -5416,8 +5460,8 @@ def test_controlled_retry_wait_is_cancellable(caplog):
     assert "private failure" not in caplog.text
 
 
-def test_interrupted_stream_is_closed_cancelled_and_ready_for_another_run(tmp_path):
-    """A scoped interruption discards partial output and leaves a clean durable continuation."""
+def test_interrupted_stream_is_closed_and_ready_for_recovery(tmp_path):
+    """A scoped interruption discards partial output and leaves a durable continuation."""
     control = RunControl()
     closed = Mock()
 
@@ -5442,12 +5486,12 @@ def test_interrupted_stream_is_closed_cancelled_and_ready_for_another_run(tmp_pa
     assert result.stop_reason == "cancelled"
     assert result.turns == 0
     assert result.final_response is None
-    assert sessions.recovery_state is None
+    assert sessions.recovery_state.action == "query_model"
     assert [item.content for item in sessions.messages] == ["question"]
     assert control.active is False
     assert control.stopped is False
     sessions.add_user_message("correction")
-    assert runner.run().stop_reason == "completed"
+    assert runner.recover_session(confirmed=True).result.stop_reason == "completed"
     assert backend.get_response.call_count == 2
 
 
@@ -5622,7 +5666,7 @@ def test_interruption_preserves_settled_tool_results_and_cancels_remaining_calls
     assert [item.call_id for item in results] == ["first", "second"]
     assert json.loads(results[0].output)["ok"] is True
     assert "cancelled before execution" in results[1].output
-    assert runner.session_manager.recovery_state is None
+    assert runner.session_manager.recovery_state.action == "query_model"
     assert target.read_text(encoding="utf-8") == "original"
 
 
@@ -5659,8 +5703,8 @@ def test_run_interruption_after_authorization_never_starts_the_tool(standalone):
     sessions.record_tool_execution_started.assert_not_called()
 
 
-def test_interrupting_an_empty_library_run_needs_no_recovery_plan(tmp_path):
-    """A direct runner can be interrupted before any conversation item exists."""
+def test_interrupting_an_empty_library_run_remains_recoverable(tmp_path):
+    """A direct runner interrupted before any conversation item remains recoverable."""
     control = RunControl()
 
     def events():
@@ -5674,7 +5718,7 @@ def test_interrupting_an_empty_library_run_needs_no_recovery_plan(tmp_path):
 
     assert runner.run().stop_reason == "cancelled"
     assert runner.session_manager.messages == []
-    assert runner.session_manager.recovery_state is None
+    assert runner.session_manager.recovery_state.action == "query_model"
 
 
 def test_interrupting_approved_recovery_never_retries_an_uncertain_effect(tmp_path):
@@ -5700,14 +5744,14 @@ def test_interrupting_approved_recovery_never_retries_an_uncertain_effect(tmp_pa
 
     recovery = runner.recover_session()
 
-    assert recovery.pending is False
+    assert recovery.pending is True
     assert recovery.result.stop_reason == "cancelled"
     assert len(approvals) == 2
     backend.get_response.assert_not_called()
     results = [item for item in sessions.messages if isinstance(item, ToolResult)]
     assert len(results) == 1
     assert "outcome is unknown" in results[0].output
-    assert sessions.recovery_state is None
+    assert sessions.recovery_state.action == "query_model"
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])

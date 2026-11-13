@@ -2956,16 +2956,16 @@ def test_recovery_command_visibility_follows_run_events_and_live_pause(ui):
 
     active_names = {command.name for command in commands.active_commands}
     assert "continue" in active_names
-    assert "retry" not in active_names
+    assert "retry" in active_names
 
     session_manager.record_run_failure()
     retry_names = {command.name for command in commands.active_commands}
     assert "retry" in retry_names
-    assert "continue" not in retry_names
+    assert "continue" in retry_names
     completion = CompletionManager((commands.completion_adapter,))
     suggestions = {item.text for item in completion.get_completions(Document("/"), CompleteEvent())}
     assert "/retry" in suggestions
-    assert "/continue" not in suggestions
+    assert "/continue" in suggestions
 
     session_manager.begin_run_retry()
     with controller.control.execution():
@@ -2974,7 +2974,7 @@ def test_recovery_command_visibility_follows_run_events_and_live_pause(ui):
         assert {"continue", "pause", "stop"} <= active_names
         assert controller.status_snapshot().state == "Paused"
 
-    assert "retry" not in {command.name for command in commands.active_commands}
+    assert "retry" in {command.name for command in commands.active_commands}
     session_manager.record_run(
         "completed",
         run.started_at,

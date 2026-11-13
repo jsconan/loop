@@ -573,12 +573,12 @@ class Loop:
 
     @property
     def retry_pending(self) -> bool:
-        """Return whether a failed event authorizes an explicit retry.
+        """Return whether a paused or incomplete run can be retried.
 
         Returns:
             bool: Whether ``/retry`` is available for the active session.
         """
-        return self._session_manager.retry_pending
+        return self.continuable
 
     def recover_pending(self, *, retry: bool = False) -> bool:
         """Recover a durable boundary on the synchronous conversation owner.
@@ -596,12 +596,10 @@ class Loop:
         """
         if has_running_event_loop():
             raise RuntimeError("Await Loop.recover_pending_async() inside an event loop.")
-        if not retry and self._run_control is not None and self._run_control.continue_run():
+        if self._run_control is not None and self._run_control.continue_run():
             return False
         with self._session_manager.execution():
-            if retry:
-                if not self._session_manager.retry_pending:
-                    return False
+            if retry and self._session_manager.retry_pending:
                 self._session_manager.begin_run_retry()
             elif not self._session_manager.continuable:
                 return False
@@ -623,12 +621,10 @@ class Loop:
         """
         if self._sync_command_thread == get_ident():
             raise SyncRecoveryRequested(retry)
-        if not retry and self._run_control is not None and self._run_control.continue_run():
+        if self._run_control is not None and self._run_control.continue_run():
             return False
         with self._session_manager.execution():
-            if retry:
-                if not self._session_manager.retry_pending:
-                    return False
+            if retry and self._session_manager.retry_pending:
                 await self._session_manager.begin_run_retry_async()
             elif not self._session_manager.continuable:
                 return False

@@ -95,6 +95,47 @@ print(json.dumps({
     assert resumed == created
 
 
+def test_killed_run_remains_recoverable_after_resume(tmp_path):
+    """A killed owner leaves its committed run available for recovery on restart."""
+    database = tmp_path / "sessions.db"
+    source = """
+import sys
+from loop import SessionManager, SQLiteSessionStore
+
+manager = SessionManager(session_store=SQLiteSessionStore(sys.argv[1], workspace_id="workspace"),
+                         workspace_id="workspace")
+with manager.execution():
+    manager.add_user_message("question")
+    manager.begin_run()
+    print(manager.session.id, flush=True)
+    sys.stdin.read()
+"""
+    owner = subprocess.Popen(
+        [sys.executable, "-B", "-c", source, str(database)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        session_id = owner.stdout.readline().strip()
+        assert session_id
+        owner.kill()
+        owner.wait(timeout=10)
+        restored = SessionManager(
+            session=session_id,
+            session_store=SQLiteSessionStore(database, workspace_id="workspace"),
+            workspace_id="workspace",
+        )
+        with restored.execution():
+            assert restored.continuable
+            assert restored.recovery_state.action == "query_model"
+    finally:
+        if owner.poll() is None:
+            owner.kill()
+        owner.communicate(timeout=10)
+
+
 def test_native_ownership_serializes_one_session_and_releases_after_owner_death(tmp_path):
     """Cooperating processes exclude shared-session execution while independent sessions overlap."""
     database = tmp_path / "sessions.db"

@@ -861,9 +861,27 @@ class SessionManager:
         """Return whether a durable run boundary can be resumed with ``/continue``.
 
         Returns:
-            bool: Whether recovery is pending without a failed event requiring retry.
+            bool: Whether recovery is pending.
         """
-        return self.recovery_pending and not self.retry_pending
+        return self.recovery_pending
+
+    @property
+    def queued_input_can_resume(self) -> bool:
+        """Return whether queued input may resume an interrupted or steered run.
+
+        Returns:
+            bool: Whether the latest run ended through interruption or steering.
+        """
+        if self._session.active_run is not None:
+            return False
+        return next(
+            (
+                event.stop_reason in {AgentRunStopReason.CANCELLED, AgentRunStopReason.STEERED}
+                for event in reversed(self._session.events)
+                if isinstance(event, RunCompletedEvent)
+            ),
+            False,
+        )
 
     def record_run_failure(self) -> None:
         """Persist a recoverable failure marker for the current run.

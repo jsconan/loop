@@ -160,7 +160,7 @@ class ConversationRecoveryControl(Protocol):
 
     @property
     def retry_pending(self) -> bool:
-        """Return whether a durable failure event authorizes retry.
+        """Return whether an incomplete run can be retried.
 
         Returns:
             bool: Whether ``/retry`` is available.
@@ -455,7 +455,7 @@ class ConversationRecoveryCommands:
             context.interaction.info("Run continued.")
 
     async def retry_async(self, context: CommandContext) -> None:
-        """Retry recovery for a durable run with a recorded failure.
+        """Retry a paused or incomplete run.
 
         Args:
             context (CommandContext): Interaction used to report recovery status.

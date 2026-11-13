@@ -441,7 +441,7 @@ class AgentRunner:
                     self._session_manager.begin_run()
                 result = self._recover(state)
                 return AgentRecoveryStatus(
-                    pending=result.stop_reason is AgentRunStopReason.RECOVERY_REQUIRED,
+                    pending=result.stop_reason is not AgentRunStopReason.COMPLETED,
                     result=result,
                 )
 
@@ -498,7 +498,7 @@ class AgentRunner:
                     await self._session_manager.begin_run_async()
                 result = await self._recover_async(state)
                 return AgentRecoveryStatus(
-                    pending=result.stop_reason is AgentRunStopReason.RECOVERY_REQUIRED,
+                    pending=result.stop_reason is not AgentRunStopReason.COMPLETED,
                     result=result,
                 )
 
@@ -762,7 +762,8 @@ class AgentRunner:
                     tools=tools,
                 )
             except RunInterrupted:
-                self._cancel_pending_tools()
+                if self._run_control is None or not self._run_control.stopped:
+                    self._cancel_pending_tools()
                 stop_reason = self._interruption_stop_reason()
                 self._interaction.info(
                     "Run paused; its durable state is ready to continue."
@@ -880,7 +881,8 @@ class AgentRunner:
                     tools=tools,
                 )
             except RunInterrupted:
-                await self._cancel_pending_tools_async()
+                if self._run_control is None or not self._run_control.stopped:
+                    await self._cancel_pending_tools_async()
                 stop_reason = self._interruption_stop_reason()
                 self._interaction.info(
                     "Run paused; its durable state is ready to continue."
@@ -922,7 +924,8 @@ class AgentRunner:
                     self._run_control.stopped or self._run_control.interrupted
                 ):
                     raise
-                await self._cancel_pending_tools_async()
+                if not self._run_control.stopped:
+                    await self._cancel_pending_tools_async()
                 stop_reason = self._interruption_stop_reason()
                 if self._run_control.interrupted and not self._run_control.stopped:
                     self._interaction.info(
@@ -1647,7 +1650,9 @@ class AgentRunner:
         )
 
     def _interruption_stop_reason(self) -> AgentRunStopReason:
-        """Preserve an incomplete run when its active control requested a pause."""
+        """Preserve an incomplete run on pause or application shutdown."""
+        if self._run_control is not None and self._run_control.stopped:
+            return AgentRunStopReason.STOPPED
         if self._steering_pending() and not self._run_control.interrupted:
             return AgentRunStopReason.STEERED
         return (

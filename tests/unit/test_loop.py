@@ -2444,8 +2444,10 @@ def test_recover_pending_async_releases_a_live_pause_without_session_recovery(tm
     loop.agent_runner.recover_session_async.assert_not_awaited()
 
 
-def test_continue_resumes_startup_recovery_after_the_prompt_was_declined(tmp_path):
-    """Startup recovery decline exposes continue, while retry still requires a failure event."""
+@pytest.mark.parametrize("command", ["/continue", "/retry"])
+@pytest.mark.parametrize("failed", [False, True])
+def test_commands_resume_startup_recovery_after_the_prompt_was_declined(tmp_path, command, failed):
+    """Either recovery command continues a run after startup recovery was declined."""
     interaction = output_interaction()
     loop = Loop.create_default(
         backend=loop_backend(),
@@ -2455,12 +2457,17 @@ def test_continue_resumes_startup_recovery_after_the_prompt_was_declined(tmp_pat
     )
     loop._skill_hints_enabled = False
     loop.register_command_provider(ConversationRecoveryCommands(loop))
+    if failed:
+        loop._session_manager.begin_run()
+        loop._session_manager.record_run_failure()
 
     async def recover_session(*, confirmed=False):
         """Leave startup recovery pending, then durably finish explicit continuation."""
         if not confirmed:
             return SimpleNamespace(pending=True, result=None)
-        run = await loop._session_manager.begin_run_async()
+        if loop._session_manager.retry_pending:
+            await loop._session_manager.begin_run_retry_async()
+        run = loop.session.active_run or await loop._session_manager.begin_run_async()
         await loop._session_manager.record_run_async(
             "completed",
             run.started_at,
@@ -2476,8 +2483,8 @@ def test_continue_resumes_startup_recovery_after_the_prompt_was_declined(tmp_pat
 
     loop.agent_runner.recover_session_async = AsyncMock(side_effect=recover_session)
     assert loop.continuable is True
-    assert loop.retry_pending is False
-    values = iter(("/continue", False))
+    assert loop.retry_pending is True
+    values = iter((command, False))
 
     async def read_input(_completer):
         """Continue the declined recovery and then exit the conversation."""
