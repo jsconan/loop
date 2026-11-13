@@ -75,7 +75,7 @@ def public_call(workspace, source, *, read_only=True, seconds=5):
         [run_command],
         permission_manager=PermissionManager(workspace),
         execution_service=CommandExecutionService(backend, RefusingHost()),
-        settings=ToolRuntimeSettings(command_timeout=seconds),
+        settings=ToolRuntimeSettings(command_timeout=seconds, command_hard_timeout=seconds),
     )
     try:
         result = json.loads(

@@ -186,8 +186,8 @@ def public_command(backend, native_workspace, native_execution_clock, request):
             else "version: 1\n"
         )
         (policy_directory / "permissions.yaml").write_text(payload, encoding="utf-8")
-    scratch = native_workspace.parent / "instruction-scratch"
-    scratch.mkdir(mode=0o700)
+    manager = PermissionManager(native_workspace)
+    scratch = manager.temporary_directory
     skill_root = native_workspace.parent / "fixture-skill"
     skill_root.mkdir()
     skill_file = skill_root / "SKILL.md"
@@ -199,7 +199,6 @@ def public_command(backend, native_workspace, native_execution_clock, request):
         skill_manager=SkillManager([Skill("fixture", "Native fixture.", skill_file)]),
         agents_filenames=("AGENTS.md", "POLICY+.md", 'POLICY"name.md', "POLICY\nname.md"),
     )
-    manager = PermissionManager(native_workspace)
     registry = ToolRegistry(
         [
             run_command,
@@ -238,6 +237,7 @@ def public_command(backend, native_workspace, native_execution_clock, request):
         )
     finally:
         registry.close()
+        manager.close()
 
 
 @pytest.fixture

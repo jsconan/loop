@@ -127,8 +127,11 @@ class CountingHostCommandExecutor:
         )
         self.requests = []
 
-    def run_host_command(self, request: HostCommandRequest) -> CommandProcessResult:
+    def run_host_command(
+        self, request: HostCommandRequest, *, cancellation_event=None
+    ) -> CommandProcessResult:
         """Record one approved host request and return the configured process result."""
+        assert cancellation_event is None or not cancellation_event.is_set()
         self.requests.append(request)
         return self._executor.run_host_command(request)
 
@@ -189,6 +192,17 @@ def call(registry, command, cwd=".", interaction=None, instructions_manager=None
     )
     payload = json.loads(output)
     return payload.get("result"), payload.get("problem")
+
+
+def test_command_rejects_removed_background_argument():
+    """The retired background argument cannot launch a command through public dispatch."""
+    service = MagicMock()
+    registry = ToolRegistry([run_command_tool], execution_service=service)
+    result = json.loads(
+        registry.call("run_command", json.dumps({"command": ":", "background": True}))
+    )
+    assert not result["ok"]
+    service.run_command.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -999,8 +1013,10 @@ def test_external_lookup_reference_round_trips_through_public_virtual_boundary(
     """Request a bound tool grant while preserving command output without a host retry."""
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    scratch = tmp_path / "scratch"
-    scratch.mkdir(mode=0o700)
+    permissions = PermissionManager(
+        workspace, audit_path=tmp_path / "audit.db", workspace_id="workspace"
+    )
+    scratch = permissions.temporary_directory
     installation = tmp_path / "installation"
     installation.mkdir()
     executable = installation / "sampletool"
@@ -1020,9 +1036,7 @@ def test_external_lookup_reference_round_trips_through_public_virtual_boundary(
     interaction.prompt.return_value = "approve"
     registry = ToolRegistry(
         BUILTIN_TOOLS,
-        permission_manager=PermissionManager(
-            workspace, audit_path=tmp_path / "audit.db", workspace_id="workspace"
-        ),
+        permission_manager=permissions,
         execution_service=service,
     )
 
@@ -1328,8 +1342,8 @@ def test_external_reference_requires_approval_even_for_unrelated_command(tmp_pat
     workspace.mkdir()
     installation = tmp_path / "installation"
     installation.mkdir()
-    scratch = tmp_path / "scratch"
-    scratch.mkdir(mode=0o700)
+    permissions = PermissionManager(workspace)
+    scratch = permissions.temporary_directory
     executable = installation / "reviewtool"
     executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     executable.chmod(0o755)
@@ -1341,7 +1355,7 @@ def test_external_reference_requires_approval_even_for_unrelated_command(tmp_pat
     backend.run.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
     registry = ToolRegistry(
         BUILTIN_TOOLS,
-        permission_manager=PermissionManager(workspace),
+        permission_manager=permissions,
         execution_service=CommandExecutionService(backend, MagicMock()),
     )
     result = json.loads(
@@ -1452,17 +1466,21 @@ def test_platform_command_capabilities_shape_live_model_definitions(monkeypatch)
 
     unavailable = {item.name: item for item in registry.definitions()}
     properties = unavailable["sandbox_shell"].parameters["properties"]
+    assert "background" not in properties
+    assert "wait_seconds" in properties
     assert "interactive" not in properties
     assert "egress_origins" not in properties
     assert "interactive" not in unavailable["sandbox_shell"].parameters["required"]
     assert "egress_origins" not in unavailable["sandbox_shell"].parameters["required"]
     assert "terminal_control" not in unavailable
     assert "read_command_job" in unavailable
-    assert "until result is non-null, then stop" in unavailable["read_command_job"].description
+    assert "until result is non-null, even if status is complete" in (
+        unavailable["read_command_job"].description
+    )
     cursor = unavailable["read_command_job"].parameters["properties"]["cursor"]
     assert "previous response's next_cursor" in cursor["description"]
     wait = unavailable["read_command_job"].parameters["properties"]["wait_seconds"]
-    assert "Capped below tools.command_timeout" in wait["description"]
+    assert "Platform wait limits apply" in wait["description"]
     assert "configured default" in wait["description"]
     assert {item["type"] for item in wait["anyOf"]} == {"number", "null"}
     assert "terminal_control" in registry.names
@@ -1682,7 +1700,7 @@ def test_command_working_files_survive_success_interruption_and_timeout(
     """Finishing or interrupting an execution preserves its working files for the next command."""
     directories = []
 
-    def execute(request):
+    def execute(request, **_kwargs):
         """Write through the bound TMPDIR and return the requested process outcome."""
         directory = Path(request.shell_environment()["TMPDIR"])
         directories.append(directory)
@@ -2114,8 +2132,8 @@ def test_relative_one_character_tool_requires_explicit_external_read(tmp_path, m
     executable = installation / "x"
     executable.write_text("#!/bin/sh\nprintf external-ok\n", encoding="utf-8")
     executable.chmod(0o755)
-    scratch = tmp_path / "scratch"
-    scratch.mkdir(mode=0o700)
+    permissions = PermissionManager(workspace)
+    scratch = permissions.temporary_directory
     monkeypatch.setenv("PATH", "../../external-bin:/usr/bin:/bin")
     instructions = InstructionsManager(runtime_environment=RuntimeEnvironment(workspace, scratch))
     backend = MagicMock()
@@ -2127,7 +2145,7 @@ def test_relative_one_character_tool_requires_explicit_external_read(tmp_path, m
     interaction.prompt.return_value = "approve"
     registry = ToolRegistry(
         BUILTIN_TOOLS,
-        permission_manager=PermissionManager(workspace),
+        permission_manager=permissions,
         execution_service=CommandExecutionService(backend, host),
     )
 
@@ -2218,8 +2236,8 @@ def test_request_binding_error_redacts_external_paths_without_instructions(
 
 def test_run_command_preserves_system_path_in_redacted_output(tmp_path):
     """Approved system tool text stays readable while external roots remain redacted."""
-    scratch = tmp_path / "scratch"
-    scratch.mkdir(mode=0o700)
+    permissions = PermissionManager(tmp_path)
+    scratch = permissions.temporary_directory
     instructions = InstructionsManager(runtime_environment=RuntimeEnvironment(tmp_path, scratch))
     backend = MagicMock(
         run=MagicMock(
@@ -2231,7 +2249,7 @@ def test_run_command_preserves_system_path_in_redacted_output(tmp_path):
     backend.system_read_roots = (Path("/usr/bin"),)
     registry = ToolRegistry(
         BUILTIN_TOOLS,
-        permission_manager=PermissionManager(tmp_path),
+        permission_manager=permissions,
         execution_service=CommandExecutionService(backend, MagicMock()),
     )
     payload = json.loads(
@@ -2614,7 +2632,8 @@ def test_run_command_requires_bound_target_and_permission_manager(tmp_path):
 
 def test_run_command_fails_when_request_paths_are_invalid(tmp_path):
     """A missing working directory fails before approval or launch."""
-    manager = MagicMock()
+    manager = PermissionManager(tmp_path)
+    manager.authorize_sandboxed_command = MagicMock()
     context = ToolContext(
         ApprovingInteraction(),
         "run_command",
@@ -2760,12 +2779,14 @@ def test_linux_integrity_failure_never_uses_host_offer_or_session_rule(
         execution_service=CommandExecutionService(native, host),
     )
 
-    def unavailable(_record, payload, _deadline, *, observer):
+    def unavailable(_record, payload, _deadline, *, observer, cancellation_event, output_observer):
         """Allow an explicit host session decision before introducing integrity drift."""
         from loop.execution.sandbox import SandboxRequest
 
         assert observer is not None
+        assert cancellation_event is not None and output_observer is not None
         request = SandboxRequest.from_wire(payload)
+        assert request.stream_output
         return CommandProcessResult(SandboxOutcome.UNAVAILABLE).to_wire(request.attempt_id)
 
     exchanged.side_effect = unavailable
@@ -2814,12 +2835,14 @@ def test_linux_public_timeout_retains_capture_or_reports_unknown_loss(
     monkeypatch.setattr(linux.LinuxNativeBackend, "file_creation_mask", 0o022)
     monkeypatch.setattr(linux.LinuxNativeBackend, "managed_tool_root", lambda *_: False)
 
-    def exchange(_record, payload, _deadline, *, observer):
+    def exchange(_record, payload, _deadline, *, observer, cancellation_event, output_observer):
         """Return timeout output after native cleanup or a failed result-delivery budget."""
         assert observer is not None
+        assert cancellation_event is not None and output_observer is not None
         if not delivered:
             raise TimeoutError("delivery expired")
         request = SandboxRequest.from_wire(payload)
+        assert request.stream_output
         return CommandProcessResult(
             SandboxOutcome.TIMED_OUT,
             stdout="distinct-out",

@@ -320,7 +320,7 @@ def test_explicit_host_timeout_reports_effects_without_replay(tmp_path, monkeypa
         BUILTIN_TOOLS,
         permission_manager=manager,
         execution_service=CommandExecutionService(backend, LocalHostCommandExecutor()),
-        settings=ToolRuntimeSettings(command_timeout=2),
+        settings=ToolRuntimeSettings(command_timeout=2, command_hard_timeout=2),
     )
     try:
         result = json.loads(

@@ -41,11 +41,17 @@ from loop.execution import CommandExecutionService
 from loop.execution.sandbox import SandboxOutcome, SandboxRequest
 from loop.execution.sandbox.constants import TMPDIR_ENVIRONMENT_VARIABLE
 from loop.execution.sandbox.macos import backend as macos_backend
+from loop.instructions import InstructionsManager, RuntimeEnvironment
 from loop.permissions.managed import ManagedPolicyStore
 from loop.permissions.models import SessionTarget
 from loop.tooling import ToolRuntimeSettings
 from loop.tools.files import read_text_file, write_text_file
-from loop.tools.system import control_command_terminal, resolve_executable, run_command
+from loop.tools.system import (
+    control_command_terminal,
+    read_command_job,
+    resolve_executable,
+    run_command,
+)
 from loop.tools.web import read_cached_content
 from loop.utils import VirtualPath
 from loop.utils import path as path_module
@@ -397,7 +403,7 @@ def test_public_command_and_file_tool_preserve_path_like_content(
     logical = f"{VirtualPath.WORKSPACE}/{source.name}"
     registry = ToolRegistry(
         [run_command, read_text_file],
-        permission_manager=PermissionManager(native_workspace),
+        permission_manager=public_command.manager,
         execution_service=CommandExecutionService(public_command.backend, public_command.host),
     )
 
@@ -553,7 +559,7 @@ def test_timeout_warns_about_effects_without_replay(backend, native_workspace, m
         [run_command],
         permission_manager=PermissionManager(native_workspace),
         execution_service=CommandExecutionService(backend, host),
-        settings=ToolRuntimeSettings(command_timeout=2),
+        settings=ToolRuntimeSettings(command_timeout=2, command_hard_timeout=2),
     )
     try:
         result = json.loads(
@@ -2768,10 +2774,10 @@ def test_public_session_runs_pytest_from_private_unusual_scratch(
     interaction = Mock()
     interaction.prompt.return_value = "approve"
     registry = ToolRegistry(
-        [run_command, resolve_executable, read_cached_content],
+        [run_command, read_command_job, resolve_executable, read_cached_content],
         permission_manager=permissions,
         execution_service=CommandExecutionService(backend, host),
-        settings=ToolRuntimeSettings(command_timeout=120),
+        settings=ToolRuntimeSettings(command_timeout=60, command_hard_timeout=600),
     )
     loop = Loop.create_default(
         backend=SimpleNamespace(default_model="test", get_context_window=lambda _: None),
@@ -2861,12 +2867,44 @@ def test_public_session_runs_pytest_from_private_unusual_scratch(
                     instructions_manager=loop.instructions_manager,
                 )
             )
+            content = ""
+            if result["ok"] and "handle" in result["result"]:
+                page = result["result"]
+                handle = page["handle"]
+                while True:
+                    content += "".join(
+                        event["content"] for event in page["events"] if event["stream"] == "stdout"
+                    )
+                    if page["result"] is not None:
+                        final = page["result"]
+                        result = (
+                            {"ok": False, "problem": final}
+                            if "code" in final
+                            else {"ok": True, "result": final}
+                        )
+                        break
+                    response = json.loads(
+                        loop.tool_registry.call(
+                            "read_command_job",
+                            json.dumps(
+                                {
+                                    "handle": handle,
+                                    "cursor": page["next_cursor"],
+                                    "wait_seconds": 30,
+                                }
+                            ),
+                            interaction=interaction,
+                            instructions_manager=loop.instructions_manager,
+                        )
+                    )
+                    assert response["ok"], response
+                    page = response["result"]
             if result["ok"]:
                 assert result["result"]["boundary"] == "sandbox"
                 stream = result["result"]["stdout"]
             else:
                 stream = result["problem"].get("metadata", {}).get("stdout", {})
-            content = stream.get("content", "")
+            content += stream.get("content", "")
             cursor = stream.get("next_cursor")
             while cursor and (not result["ok"] or expected not in content):
                 continuation = json.loads(
@@ -3139,6 +3177,9 @@ def test_managed_local_network_deny_removes_macos_socket_authority(
             directory, trust_anchor=native_workspace.parent, owner_uid=os.getuid()
         ),
     )
+    instructions = InstructionsManager(
+        runtime_environment=RuntimeEnvironment(native_workspace, manager.temporary_directory)
+    )
     registry = ToolRegistry(
         [run_command],
         permission_manager=manager,
@@ -3155,7 +3196,7 @@ def test_managed_local_network_deny_removes_macos_socket_authority(
                 "run_command",
                 json.dumps({"command": source, "cwd": "$WORKSPACE_ROOT", "read_only": True}),
                 interaction=public_command.interaction,
-                instructions_manager=public_command.instructions,
+                instructions_manager=instructions,
             )
         )
         assert result["ok"], result
@@ -3164,6 +3205,7 @@ def test_managed_local_network_deny_removes_macos_socket_authority(
         public_command.host.run_host_command.assert_not_called()
     finally:
         registry.close()
+        manager.close()
 
 
 @pytest.mark.skipif(

@@ -21,7 +21,7 @@ The platform integration suites are organized by behavior:
 | `macos/test_sandbox.py` | Native execution, exit status, authority binding, filesystem confinement, aliases, protected paths, grants, relocation, detached children, network/IPC and descriptors |
 | `macos/test_writers.py` | Detached fork/spawn confinement, retained mmap and SQLite WAL resources, native ACL rejection and distinct-account access controls |
 | `macos/test_system.py` | Public command dispatch, canonical paths across scripts/subprocesses/file tools, destination-aware redirection and Git authorization, host recovery, scratch authority, output bounds and registration aliases |
-| `macos/test_command_jobs.py` | Public supervised continuation, live ordered output, session ownership, cancellation, interactive PTY controls, inner and foreign terminal isolation, descriptor receipt, and finite long-running foreground work |
+| `macos/test_command_jobs.py` | Public supervised continuation, live ordered output, session ownership, cancellation, interactive PTY controls, inner and foreign terminal isolation, descriptor receipt, and finite long-running commands |
 | `macos/test_mediated_egress.py` | Public macOS Unix-SOCKS mediation, cross-attempt confinement, routed HTTP(S) and Git clients, and client compatibility |
 | `macos/test_search.py` | Public search, Unicode columns, regex, binary handling, result bounds, executable lookup and outside symlinks |
 | `linux/test_host.py` | Trusted host and installed-tool discovery |
@@ -66,7 +66,7 @@ The detached-writer checks compile a disposable native helper using `/usr/bin/cl
 
 The distinct-account ACL check requires existing noninteractive `sudo -n -u nobody` authority. It verifies that account's identity and a public read control before testing private access and ACL rejection. Without that authority the case skips; the suite does not change accounts, configure sudo, or request a password. A separate native ACL case runs without account switching and verifies that extended access lists are rejected even when mode bits remain `0700`.
 
-The extended quiet and noisy foreground controls, plus the interactive terminal duration controls, in `macos/test_command_jobs.py` and `linux/test_installed_execution.py` require `LOOP_NATIVE_LONG_COMMAND_TEST=extended-native-check`. Run them explicitly on a host with its qualified native sandbox; each public call or terminal handle retains its original command without replay.
+The extended quiet and noisy command controls, plus the interactive terminal duration controls, in `macos/test_command_jobs.py` and `linux/test_installed_execution.py` require `LOOP_NATIVE_LONG_COMMAND_TEST=extended-native-check`. Run them explicitly on a host with its qualified native sandbox; each continuation or terminal handle retains its original command without replay.
 
 The macOS public test-workflow case uses a small owned project during routine integration. Set `LOOP_NATIVE_FULL_PROJECT_TEST=extended-native-check` together with `LOOP_NATIVE_MACOS_TEST=owned-volume` to additionally run the copied real `make test` target through public sandbox dispatch; it checks the full project recipe without modifying the checkout.
 

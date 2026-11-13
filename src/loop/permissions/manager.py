@@ -34,6 +34,7 @@ from uuid import uuid4
 from weakref import WeakSet
 
 from .. import constants
+from ..command_authorities import CommandAuthorityConflict, command_authorities
 from ..errors import Problem, log_problem, safe_error_detail
 from ..interaction import (
     Interaction,
@@ -289,6 +290,10 @@ class PermissionManager:
     _temporary_directory: tempfile.TemporaryDirectory[str]
     _temporary_path: Path | PathReference
     _temporary_ordinary_names: Callable[[], bool] | None
+    _temporary_bound: bool
+    _standalone_leases: int
+    _closing: bool
+    _closed: bool
     _presets: dict[str, PermissionPreset]
     _audit_store: SQLitePermissionAudit | None
     _protected_read_roots: tuple[Path, ...]
@@ -344,6 +349,10 @@ class PermissionManager:
         managed_policy_store: ManagedPolicyStore | None = None,
     ) -> None:
         self._policy_lock = RLock()
+        self._temporary_bound = False
+        self._standalone_leases = 0
+        self._closing = False
+        self._closed = False
         self._async_policy_write_lock = Lock()
         self._host_rules_lock = Lock()
         self._host_rules_revision = 0
@@ -490,13 +499,24 @@ class PermissionManager:
             raise
 
     def close(self) -> None:
-        """Release the manager-owned temporary directory."""
+        """Release the manager-owned temporary directory.
+
+        Raises:
+            OSError: A standalone command retains the directory, cleanup fails, or mediated
+                egress closure could not be confirmed. Failed cleanup can be retried.
+        """
         with self._policy_lock:
+            if self._closed:
+                return
+            if self._standalone_leases:
+                raise OSError("Standalone command execution still owns temporary storage.")
+            self._closing = True
             confirmations = self._revoke_egress_leases(self._policy_revision + 1)
-            self._egress_revokers.clear()
-        self._temporary_directory.cleanup()
-        if not all(confirmations):
-            raise OSError("Mediated egress closure could not be confirmed.")
+            self._temporary_directory.cleanup()
+            if not all(confirmations):
+                raise OSError("Mediated egress closure could not be confirmed.")
+            self._closed = True
+            self._closing = False
 
     def bind_egress(self, revision: int, lease: EgressRevocationLease) -> None:
         """Bind one live mediated attempt to the exact approving active revision.
@@ -506,11 +526,14 @@ class PermissionManager:
             lease (EgressRevocationLease): Attempt-owned pause, resume, and revocation channel.
 
         Raises:
-            OSError: Policy changed or managed authority became unavailable before activation.
+            OSError: The manager is closing or closed, policy changed, or managed authority
+                became unavailable before activation.
         """
         with self._policy_lock:
             if (
-                self._egress_updating
+                self._closing
+                or self._closed
+                or self._egress_updating
                 or revision != self._policy_revision
                 or self._managed_current_error() is not None
             ):
@@ -942,11 +965,48 @@ class PermissionManager:
             directory (PathReference): Private storage reference following session selection.
             ordinary_names (Callable[[], bool] | None): Trusted session-owner query for fresh
                 agent-data authority. None retains private-name restrictions.
+
+        Raises:
+            OSError: The manager is closing or closed, or a standalone command owns temporary
+                storage.
         """
-        with self.policy_update():
-            self._temporary_path = directory
-            self._temporary_ordinary_names = ordinary_names
-            self._policy_revision += 1
+        try:
+            with command_authorities.composition((self,)), self._policy_lock:
+                if self._closed or self._closing:
+                    raise OSError("Permission manager is closed or closing.")
+                if self._standalone_leases:
+                    raise OSError("Standalone command execution still owns temporary storage.")
+                with self.policy_update():
+                    self._temporary_path = directory
+                    self._temporary_ordinary_names = ordinary_names
+                    self._temporary_bound = True
+                    self._policy_revision += 1
+        except CommandAuthorityConflict as error:
+            raise OSError("Command execution still owns temporary storage.") from error
+
+    @contextmanager
+    def standalone_execution(self) -> Iterator[Path]:
+        """Retain manager-owned scratch while one standalone command runs.
+
+        Yields:
+            Path: The manager-owned temporary directory held until this lease exits.
+
+        Raises:
+            OSError: The manager is closing or closed, or its temporary directory belongs to a
+                session.
+        """
+        with self._policy_lock:
+            if self._closed or self._closing:
+                raise OSError("Permission manager is closed or closing.")
+            if self._temporary_bound:
+                raise OSError("Session-bound temporary storage requires its session owner.")
+            self._standalone_leases += 1
+            directory = Path(self._temporary_path)
+        try:
+            yield directory
+        finally:
+            with self._policy_lock:
+                self._standalone_leases -= 1
 
     @property
     def temporary_directory_allows_private_names(self) -> bool:

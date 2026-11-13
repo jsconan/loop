@@ -3,6 +3,7 @@
 import json
 import os
 import shlex
+import tempfile
 from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
@@ -73,12 +74,24 @@ def shebang_policy_root(tmp_path, shebang_root, monkeypatch):
 
 
 @pytest.fixture
-def background_session(tmp_path):
+def command_session(tmp_path):
     """Bind one real selected session to permission scratch for detached job checks."""
     sessions = SessionManager()
     permissions = PermissionManager(tmp_path)
     permissions.bind_temporary_directory(sessions.temporary_directory)
     return sessions, permissions
+
+
+@pytest.fixture
+def command_operation(tmp_path):
+    """Provide a bound sandbox target for continuation admission checks."""
+    return Operation(
+        tool_id="run_command",
+        action=Action.PROCESS_EXECUTE,
+        target=ProcessTarget(
+            argv=("/bin/sh", "-c", ":"), cwd=str(tmp_path), boundary=ProcessBoundary.SANDBOXED
+        ),
+    )
 
 
 def test_executable_lookup_resolves_project_selected_tools_independently(tmp_path, monkeypatch):
@@ -346,6 +359,21 @@ def test_execution_requires_a_bound_sandbox_target():
     assert result.code == "sandbox.unavailable"
     assert result.detail == "Bound sandbox request is missing."
     backend.run.assert_not_called()
+
+
+def test_command_rejects_unrepresentable_configured_runtime_before_admission():
+    """An unrepresentable runtime produces actionable guidance without starting a job."""
+    backend = Mock()
+    service = CommandExecutionService(backend, Mock())
+    context = ToolContext(None, "run_command")
+    context.settings.command_hard_timeout = 1e20
+
+    result = service.run_command(context, "pwd")
+
+    assert result.code == "command_job.invalid_runtime"
+    assert "Reduce tools.command_hard_timeout" in result.detail
+    backend.run.assert_not_called()
+    assert not service.has_active_jobs()
 
 
 def test_qualified_mediator_reports_unenforceable_stronger_origin_rule(tmp_path, monkeypatch):
@@ -4308,7 +4336,6 @@ def test_public_command_budget_starts_after_sandbox_approval(tmp_path, monkeypat
     now = [100.0]
     monkeypatch.setattr("loop.execution.facade.time.monotonic", lambda: now[0])
     backend = Mock()
-    backend.run.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
     interaction = Mock()
 
     def approve(*_args, **_kwargs):
@@ -4335,11 +4362,20 @@ def test_public_command_budget_starts_after_sandbox_approval(tmp_path, monkeypat
         permission_manager=PermissionManager(tmp_path),
         cancellation_event=Event(),
     )
+
+    def execute(_request, *, cancellation_event, **_kwargs):
+        """The original cancellation signal remains active until ownership transfers."""
+        assert not cancellation_event.is_set()
+        context.cancellation_event.set()
+        assert cancellation_event.is_set()
+        context.cancellation_event.clear()
+        return CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
+
+    backend.run.side_effect = execute
     result = service.run_command(context, "printf text >victim")
     assert result["boundary"] == "sandbox"
     assert backend.run.call_args.args[0].deadline == 4203.0
     assert backend.run.call_args.args[0].runtime_timeout == 3600.0
-    assert backend.run.call_args.kwargs["cancellation_event"] is context.cancellation_event
     host.run_host_command.assert_not_called()
 
 
@@ -4569,7 +4605,7 @@ def test_refresh_waits_before_admitting_a_new_terminal_command(monkeypatch):
     command.join(timeout=5)
 
     assert not refresher.is_alive() and not command.is_alive()
-    assert len(results) == 1 and results[0].code == "command_job.unavailable"
+    assert len(results) == 1 and results[0].code == "sandbox.unavailable"
     old.close.assert_called_once_with()
     service.close()
 
@@ -5192,8 +5228,12 @@ def test_command_output_is_preserved_in_preview_and_continuation_storage(
     """Command streams preserve path-like text in previews and cached continuations."""
     workspace = tmp_path / "work"
     workspace.mkdir()
-    scratch = tmp_path / "Library/Application Support/synthetic é ;$'"
-    scratch.mkdir(parents=True, mode=0o700)
+    scratch_parent = tmp_path / "Library/Application Support/synthetic é ;$'"
+    scratch_parent.mkdir(parents=True, mode=0o700)
+    with monkeypatch.context() as patch:
+        patch.setattr(tempfile, "tempdir", str(scratch_parent))
+        permissions = PermissionManager(workspace)
+    scratch = permissions.temporary_directory
     instructions = InstructionsManager(runtime_environment=RuntimeEnvironment(workspace, scratch))
     variants = [
         str(scratch),
@@ -5234,7 +5274,7 @@ def test_command_output_is_preserved_in_preview_and_continuation_storage(
             "run_command",
             instructions_manager=instructions,
             operations=(operation,),
-            permission_manager=PermissionManager(workspace),
+            permission_manager=permissions,
         ),
         command,
     )
@@ -5245,6 +5285,36 @@ def test_command_output_is_preserved_in_preview_and_continuation_storage(
         assert stream["decoding_loss"] == "none"
         cached = cached_path(stream["handle"])[0].read_bytes().decode("utf-8")
         assert cached == raw
+
+
+def test_unmanaged_scratch_is_refused_before_command_launch(tmp_path):
+    """A caller-owned scratch path without a session lease cannot back a continuation."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    scratch = tmp_path / "unmanaged"
+    scratch.mkdir(mode=0o700)
+    permissions = PermissionManager(workspace)
+    instructions = InstructionsManager(runtime_environment=RuntimeEnvironment(workspace, scratch))
+    operation = Operation(
+        tool_id="run_command",
+        action=Action.PROCESS_EXECUTE,
+        target=ProcessTarget(
+            argv=("/bin/sh", "-c", ":"), cwd=str(workspace), boundary=ProcessBoundary.SANDBOXED
+        ),
+    )
+    backend = Mock()
+    result = CommandExecutionService(backend, Mock()).run_command(
+        ToolContext(
+            None,
+            "run_command",
+            operations=(operation,),
+            instructions_manager=instructions,
+            permission_manager=permissions,
+        ),
+        ":",
+    )
+    assert result.code == "command_job.unavailable"
+    backend.run.assert_not_called()
 
 
 @pytest.mark.parametrize("discarded", [0, 1, None])
@@ -5434,11 +5504,11 @@ def test_command_result_reports_only_verified_descendant_cleanup(tmp_path, clean
 def test_scratch_data_classification_cannot_transfer_to_a_different_runtime_root(
     tmp_path, same_root
 ):
-    """The trusted generation flag grants ordinary names only to its exact bound root."""
+    """A command rejects a permission scratch root that differs from its session."""
     workspace = tmp_path / "work"
     workspace.mkdir()
-    scratch = tmp_path / "session"
-    scratch.mkdir(mode=0o700)
+    sessions = SessionManager()
+    scratch = Path(sessions.temporary_directory)
     permissions = PermissionManager(workspace)
     permissions.bind_temporary_directory(
         PathHolder(scratch if same_root else permissions.temporary_directory),
@@ -5462,19 +5532,24 @@ def test_scratch_data_classification_cannot_transfer_to_a_different_runtime_root
             operations=(operation,),
             instructions_manager=instructions,
             permission_manager=permissions,
+            session_manager=sessions,
         ),
         ":",
     )
-    assert result["exit_code"] == 0
-    approved = backend.run.call_args.args[0]
-    assert approved.scratch_root == scratch
-    assert approved.scratch_data is same_root
+    if same_root:
+        assert result["exit_code"] == 0
+        approved = backend.run.call_args.args[0]
+        assert approved.scratch_root == scratch
+        assert approved.scratch_data is True
+    else:
+        assert result.code == "command_job.unavailable"
+        backend.run.assert_not_called()
 
 
 def test_workspace_environment_keeps_its_mounted_path_beneath_restricted_scratch(tmp_path):
     """Workspace paths are not remapped as generated temporary-file environment values."""
-    scratch = tmp_path / "scratch"
-    scratch.mkdir(mode=0o700)
+    sessions = SessionManager()
+    scratch = Path(sessions.temporary_directory)
     workspace = scratch / "project"
     workspace.mkdir()
     permissions = PermissionManager(workspace)
@@ -5496,6 +5571,7 @@ def test_workspace_environment_keeps_its_mounted_path_beneath_restricted_scratch
             operations=(operation,),
             instructions_manager=instructions,
             permission_manager=permissions,
+            session_manager=sessions,
         ),
         ":",
     )
@@ -5556,6 +5632,134 @@ def test_only_referenced_active_skill_roots_enter_command_authority(tmp_path, re
         interaction.prompt.assert_not_called()
 
 
+@pytest.mark.parametrize("revoked", [False, True])
+def test_host_fallback_rechecks_used_skill_at_authorization(tmp_path, monkeypatch, revoked):
+    """A host retry launches only when the referenced skill survives its approval prompt."""
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+    root = tmp_path / "guide"
+    root.mkdir()
+    location = root / "SKILL.md"
+    location.write_text("---\nname: guide\ndescription: Guide\n---\nGuide instructions")
+    permissions = PermissionManager(workspace)
+    permissions.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    instructions = InstructionsManager(
+        runtime_environment=RuntimeEnvironment(workspace, permissions.temporary_directory),
+        skill_manager=SkillManager([Skill("guide", "Guide", location)]),
+    )
+    instructions.activate_skill("guide")
+    source = "cat " + shlex.quote(str(root / "data"))
+    operation = Operation(
+        tool_id="run_command",
+        action=Action.PROCESS_EXECUTE,
+        target=ProcessTarget(
+            argv=("/bin/sh", "-c", source), cwd=str(workspace), boundary=ProcessBoundary.SANDBOXED
+        ),
+    )
+    backend, host = Mock(), Mock()
+    backend.run.return_value = CommandProcessResult(
+        SandboxOutcome.UNAVAILABLE, detail="unavailable"
+    )
+    host.run_host_command.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
+    interaction = Mock(supports_fresh_host_approval=True)
+
+    def approve(message, **_kwargs):
+        """Optionally revoke the skill during the explicit host approval."""
+        if revoked and "without the OS sandbox" in message:
+            instructions.deactivate_skill("guide")
+        return "approve"
+
+    interaction.prompt.side_effect = approve
+
+    class Worker:
+        """Settle the synthetic attempt before ownership can be handed off."""
+
+        def __init__(self, target, daemon):
+            self.target = target
+
+        def start(self):
+            """Run the bound attempt in the caller's thread."""
+            self.target()
+
+        def join(self, timeout):
+            """The synthetic attempt has already settled."""
+
+    monkeypatch.setattr(command_jobs.threading, "Thread", Worker)
+    service = CommandExecutionService(backend, host)
+    try:
+        result = service.run_command(
+            ToolContext(
+                interaction,
+                "run_command",
+                operations=(operation,),
+                instructions_manager=instructions,
+                permission_manager=permissions,
+            ),
+            source,
+        )
+        assert backend.run.call_count == 1
+        if revoked:
+            assert result.code == "sandbox.unavailable"
+            host.run_host_command.assert_not_called()
+        else:
+            assert result["exit_code"] == 0
+            host.run_host_command.assert_called_once()
+    finally:
+        service.close()
+        permissions.close()
+
+
+@pytest.mark.parametrize("referenced", [False, True])
+def test_deactivated_skill_cannot_be_granted_from_captured_command_paths(tmp_path, referenced):
+    """Removing a captured skill blocks its use without affecting unrelated commands."""
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+    skill_root = tmp_path / "guide"
+    skill_root.mkdir()
+    location = skill_root / "SKILL.md"
+    location.write_text("---\nname: guide\ndescription: Guide\n---\nGuide instructions")
+    permissions = PermissionManager(workspace)
+    instructions = InstructionsManager(
+        runtime_environment=RuntimeEnvironment(workspace, permissions.temporary_directory),
+        skill_manager=SkillManager([Skill("guide", "Guide", location)]),
+    )
+    instructions.activate_skill("guide")
+    captured = instructions.virtual_paths
+    instructions.deactivate_skill("guide")
+    source = "cat " + shlex.quote(str(skill_root / "data")) if referenced else ":"
+    operation = Operation(
+        tool_id="run_command",
+        action=Action.PROCESS_EXECUTE,
+        target=ProcessTarget(
+            argv=("/bin/sh", "-c", source), cwd=str(workspace), boundary=ProcessBoundary.SANDBOXED
+        ),
+    )
+    backend = Mock()
+    backend.run.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
+    service = CommandExecutionService(backend, Mock())
+    try:
+        result = service.run_command(
+            ToolContext(
+                None,
+                "run_command",
+                operations=(operation,),
+                instructions_manager=instructions,
+                permission_manager=permissions,
+                command_paths=captured,
+            ),
+            source,
+        )
+        if referenced:
+            assert result.code == "sandbox.unavailable"
+            backend.run.assert_not_called()
+        else:
+            assert result["exit_code"] == 0
+            assert backend.run.call_args.args[0].read_roots == ()
+    finally:
+        service.close()
+        permissions.close()
+
+
 def test_command_job_service_binds_reads_and_cancellation_to_session(tmp_path):
     """Only a matching scratch identity can inspect, read, and cancel a retained job."""
     first = tmp_path / "first"
@@ -5570,7 +5774,7 @@ def test_command_job_service_binds_reads_and_cancellation_to_session(tmp_path):
         None, "read_command_job", permission_manager=PermissionManager(second)
     )
     owner = service._job_owner(first_context)
-    job = CommandJob(owner, None)
+    job = CommandJob(owner, 3600)
     service._jobs._jobs[job.handle] = job
     job.publish("stdout", "ready")
 
@@ -5594,8 +5798,8 @@ def test_command_job_service_binds_reads_and_cancellation_to_session(tmp_path):
     }
 
 
-def test_command_job_read_wait_tracks_current_command_timeout(tmp_path):
-    """Default, explicit, and immediate waits respect the current runtime budget."""
+def test_command_job_read_wait_is_independent_of_command_timeout(tmp_path):
+    """Default, explicit, and immediate waits use a separate bounded read budget."""
     service = CommandExecutionService(Mock(), Mock())
     context = ToolContext(None, "read_command_job", permission_manager=PermissionManager(tmp_path))
     job = Mock(spec=CommandJob)
@@ -5608,14 +5812,14 @@ def test_command_job_read_wait_tracks_current_command_timeout(tmp_path):
     job.read.assert_called_with(0, 20, include_output=False, cancellation_event=None)
     context.settings.command_timeout = 10
     service.read_command_job(context, "handle")
-    job.read.assert_called_with(0, 9, include_output=False, cancellation_event=None)
+    job.read.assert_called_with(0, 20, include_output=False, cancellation_event=None)
     service.read_command_job(context, "handle", wait_seconds=0)
     job.read.assert_called_with(0, 0, include_output=False, cancellation_event=None)
     context.settings.command_timeout = 100
     service.read_command_job(context, "handle", wait_seconds=50)
     job.read.assert_called_with(0, 50, include_output=False, cancellation_event=None)
     service.read_command_job(context, "handle", wait_seconds=100)
-    job.read.assert_called_with(0, 90, include_output=False, cancellation_event=None)
+    job.read.assert_called_with(0, 100, include_output=False, cancellation_event=None)
     interrupted = Event()
     context = replace(context, cancellation_event=interrupted)
     service.read_command_job(context, "handle", wait_seconds=0)
@@ -5627,20 +5831,24 @@ def test_command_job_service_rejects_invalid_waits(tmp_path, wait):
     """Capping waits does not turn invalid values into valid reads."""
     service = CommandExecutionService(Mock(), Mock())
     context = ToolContext(None, "read_command_job", permission_manager=PermissionManager(tmp_path))
-    job = CommandJob("owner", None)
+    job = CommandJob("owner", 3600)
     service._jobs.get = Mock(return_value=job)
     result = service.read_command_job(context, "handle", wait_seconds=wait)
     assert result.code == "command_job.invalid_read"
 
 
-def test_command_job_service_rejects_missing_session_scratch_identity(tmp_path):
+def test_command_job_service_rejects_missing_session_scratch_identity(tmp_path, command_operation):
     """Job tools and launch refuse absent scratch authority without leaking handles."""
     service = CommandExecutionService(Mock(), Mock())
-    context = ToolContext(None, "run_command")
+    permissions = PermissionManager(tmp_path)
+    permissions.close()
+    context = ToolContext(
+        None, "run_command", operations=(command_operation,), permission_manager=permissions
+    )
     assert service.inspect_command_jobs(context).code == "command_job.unavailable"
     assert service.read_command_job(context, "unknown").code == "command_job.unavailable"
     assert service.cancel_command_job(context, "unknown").code == "command_job.unavailable"
-    assert service.run_command(context, ":", background=True).code == "command_job.unavailable"
+    assert service.run_command(context, ":", wait_seconds=0).code == "command_job.unavailable"
 
 
 def test_terminal_controls_require_the_original_session_and_live_terminal(tmp_path):
@@ -5656,8 +5864,8 @@ def test_terminal_controls_require_the_original_session_and_live_terminal(tmp_pa
         None, "control_command_terminal", permission_manager=PermissionManager(second)
     )
     owner = service._job_owner(owner_context)
-    ordinary = CommandJob(owner, None)
-    terminal = CommandJob(owner, None, terminal=True)
+    ordinary = CommandJob(owner, 3600)
+    terminal = CommandJob(owner, 3600, terminal=True)
     service._jobs._jobs[ordinary.handle] = ordinary
     service._jobs._jobs[terminal.handle] = terminal
 
@@ -5726,63 +5934,231 @@ def test_interactive_command_refuses_unsupported_backend_and_egress(tmp_path):
     backend.run.assert_not_called()
 
 
-def test_background_command_refuses_a_stopped_origin_before_reserving_a_worker(background_session):
+def test_command_refuses_a_stopped_origin_before_reserving_a_worker(
+    command_session, command_operation
+):
     """A stopped model run cannot create a late detached attempt or consume capacity."""
-    sessions, permissions = background_session
+    sessions, permissions = command_session
     stopped = Event()
     stopped.set()
     service = CommandExecutionService(Mock(), Mock())
     context = ToolContext(
         None,
         "run_command",
+        operations=(command_operation,),
         permission_manager=permissions,
         session_manager=sessions,
         cancellation_event=stopped,
     )
 
-    assert service.run_command(context, ":", background=True).code == "sandbox.cancelled"
+    assert service.run_command(context, ":", wait_seconds=0).code == "sandbox.cancelled"
     assert not service._jobs.has_active()
 
 
-def test_background_command_refuses_a_scratch_owner_mismatch(tmp_path, background_session):
+@pytest.mark.parametrize("wait", [True, -1, float("inf"), float("nan"), "1"])
+def test_command_rejects_invalid_initial_wait_before_launch(
+    command_session, command_operation, wait
+):
+    """Malformed or unbounded initial waits cannot reserve or execute a command."""
+    sessions, permissions = command_session
+    backend = Mock()
+    service = CommandExecutionService(backend, Mock())
+    context = ToolContext(
+        None,
+        "run_command",
+        operations=(command_operation,),
+        permission_manager=permissions,
+        session_manager=sessions,
+    )
+    result = service.run_command(context, ":", wait_seconds=wait)
+    assert result.code == "command_job.invalid_wait"
+    backend.run.assert_not_called()
+    assert not service._jobs.has_active()
+
+
+def test_origin_stop_during_initial_wait_cancels_the_owned_command(
+    monkeypatch, command_session, command_operation
+):
+    """A stop seen before handoff is carried to the admitted job."""
+    sessions, permissions = command_session
+    stopped = Event()
+    service = CommandExecutionService(Mock(), Mock())
+    context = ToolContext(
+        None,
+        "run_command",
+        operations=(command_operation,),
+        permission_manager=permissions,
+        session_manager=sessions,
+        cancellation_event=stopped,
+    )
+    job = CommandJob("owner", 3600)
+    job.admitted()
+    monkeypatch.setattr(service._jobs, "start", lambda *_args, **_kwargs: job)
+    monkeypatch.setattr(job, "wait", lambda *_args: stopped.set())
+
+    result = service.run_command(context, ":")
+
+    assert result["handle"] == job.handle
+    assert result["cancel_requested"]
+    assert job.cancellation_event.is_set()
+
+
+def test_sandbox_failure_after_handoff_does_not_request_host_approval(
+    monkeypatch, command_session, command_operation
+):
+    """An eligible failure after handoff remains a separate host offer, without a prompt."""
+    sessions, permissions = command_session
+    permissions.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    backend, host = Mock(), Mock()
+    backend.run.return_value = CommandProcessResult(SandboxOutcome.UNAVAILABLE, detail="no sandbox")
+    interaction = Mock(supports_fresh_host_approval=True)
+    interaction.prompt.return_value = "approve"
+    service = CommandExecutionService(backend, host)
+    context = ToolContext(
+        interaction,
+        "run_command",
+        operations=(command_operation,),
+        permission_manager=permissions,
+        session_manager=sessions,
+    )
+    workers = []
+
+    class Worker:
+        """Defer native work until after the initial call transfers ownership."""
+
+        def __init__(self, target, daemon):
+            self.target = target
+            workers.append(self)
+
+        def start(self):
+            """Keep the command under explicit test control."""
+
+        def join(self, timeout):
+            """A deferred worker has no native thread to join."""
+
+    monkeypatch.setattr(command_jobs.threading, "Thread", Worker)
+    start = service._jobs.start
+
+    def reserve(*args, **kwargs):
+        """Publish the admitted handle before the worker reports its boundary failure."""
+        job = start(*args, **kwargs)
+        job.admitted()
+        return job
+
+    monkeypatch.setattr(service._jobs, "start", reserve)
+    first = service.run_command(context, ":", wait_seconds=0)
+    workers[0].target()
+    page = service.read_command_job(context, first["handle"], wait_seconds=0)
+
+    assert page["result"]["code"] == "sandbox.unavailable"
+    assert "host_offer" in page["result"]["metadata"]
+    assert all(
+        "without the OS sandbox" not in call.args[0] for call in interaction.prompt.call_args_list
+    )
+    host.run_host_command.assert_not_called()
+
+
+def test_origin_stop_at_host_admission_prevents_the_host_launch(
+    monkeypatch, command_session, command_operation
+):
+    """A stop at the final approved host boundary settles as cancelled without effects."""
+    sessions, permissions = command_session
+    permissions.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    stopped = Event()
+    backend, host = Mock(), Mock()
+    backend.run.return_value = CommandProcessResult(SandboxOutcome.UNAVAILABLE, detail="no sandbox")
+    interaction = Mock(supports_fresh_host_approval=True)
+    interaction.prompt.return_value = "approve"
+    service = CommandExecutionService(backend, host)
+    context = ToolContext(
+        interaction,
+        "run_command",
+        operations=(command_operation,),
+        permission_manager=permissions,
+        session_manager=sessions,
+        cancellation_event=stopped,
+    )
+    record = execution_facade.CommandExecutionCoordinator._record_host_boundary
+
+    def stop_at_approval(coordinator, event_name, *args, **kwargs):
+        """Signal the origin after the host decision but before the launch callback."""
+        record(coordinator, event_name, *args, **kwargs)
+        if event_name == "host_command.approved":
+            stopped.set()
+
+    class Worker:
+        """Finish this synthetic execution synchronously for deterministic ordering."""
+
+        def __init__(self, target, daemon):
+            self.target = target
+
+        def start(self):
+            """Run exactly one approved attempt."""
+            self.target()
+
+        def join(self, timeout):
+            """A synchronous worker has already settled."""
+
+    monkeypatch.setattr(
+        execution_facade.CommandExecutionCoordinator, "_record_host_boundary", stop_at_approval
+    )
+    monkeypatch.setattr(command_jobs.threading, "Thread", Worker)
+    result = service.run_command(context, ":")
+
+    assert result.code == "sandbox.cancelled"
+    host.run_host_command.assert_not_called()
+    backend.run.assert_called_once()
+
+
+def test_command_refuses_a_scratch_owner_mismatch(tmp_path, command_session, command_operation):
     """A direct registry call cannot substitute a different scratch identity for its session."""
-    sessions, permissions = background_session
+    sessions, permissions = command_session
     other = tmp_path / "other-session-scratch"
     other.mkdir(mode=0o700)
     permissions.bind_temporary_directory(PathHolder(other))
     service = CommandExecutionService(Mock(), Mock())
     context = ToolContext(
-        None, "run_command", permission_manager=permissions, session_manager=sessions
+        None,
+        "run_command",
+        operations=(command_operation,),
+        permission_manager=permissions,
+        session_manager=sessions,
     )
 
-    assert service.run_command(context, ":", background=True).code == "command_job.unavailable"
+    assert service.run_command(context, ":", wait_seconds=0).code == "command_job.unavailable"
     assert not service._jobs.has_active()
 
 
-def test_background_command_propagates_interrupted_lease_entry(monkeypatch, background_session):
+def test_command_propagates_interrupted_lease_entry(
+    monkeypatch, command_session, command_operation
+):
     """An interrupted parent lease before reservation creates no detached attempt."""
-    sessions, permissions = background_session
+    sessions, permissions = command_session
     monkeypatch.setattr(sessions, "interaction_execution", Mock(side_effect=KeyboardInterrupt))
     service = CommandExecutionService(Mock(), Mock())
     context = ToolContext(
-        None, "run_command", permission_manager=permissions, session_manager=sessions
+        None,
+        "run_command",
+        operations=(command_operation,),
+        permission_manager=permissions,
+        session_manager=sessions,
     )
 
     with pytest.raises(KeyboardInterrupt):
-        service.run_command(context, ":", background=True)
+        service.run_command(context, ":", wait_seconds=0)
     assert not service._jobs.has_active()
 
 
-def test_background_command_resumes_one_authorized_attempt_without_replay(
-    tmp_path, monkeypatch, background_session
+def test_each_command_call_launches_a_new_authorized_attempt(
+    tmp_path, monkeypatch, command_session
 ):
-    """Recovery reuses a call while later calls with the same provider ID run separately."""
+    """Distinct command calls run independently even when their provider IDs are reused."""
     backend = Mock()
     backend.run.return_value = CommandProcessResult(
         SandboxOutcome.COMPLETED, exit_code=0, stdout="done"
     )
     service = CommandExecutionService(backend, Mock())
-    sessions, permissions = background_session
+    sessions, permissions = command_session
     operation = Operation(
         tool_id="run_command",
         action=Action.PROCESS_EXECUTE,
@@ -5814,18 +6190,10 @@ def test_background_command_resumes_one_authorized_attempt_without_replay(
 
     monkeypatch.setattr(command_jobs.threading, "Thread", Worker)
     sessions.add_message(ToolCall(call_id="one-call", name="run_command", arguments="{}"))
-    handle = service.run_command(context, ":", background=True)
-    assert handle["status"] == "complete"
-    assert "content" not in handle["result"]["stdout"]
-    again = service.run_command(context, ":", background=True)
-    assert again["handle"] == handle["handle"]
-    result = service.read_command_job(context, handle["handle"], include_output=True)
-    assert result["result"]["stdout"]["content"] == "done"
-    assert backend.run.call_count == 1
-    sessions.add_message(ToolCall(call_id="one-call", name="run_command", arguments="{}"))
-    later = service.run_command(context, ":", background=True)
-    assert later["handle"] != handle["handle"]
-    assert service.run_command(context, ":", background=True)["handle"] == later["handle"]
+    first = service.run_command(context, ":", wait_seconds=0)
+    second = service.run_command(context, ":", wait_seconds=0)
+    assert first["stdout"]["content"] == "done"
+    assert second["stdout"]["content"] == "done"
     assert backend.run.call_count == 2
     assert backend.run.call_args.args[0].cleanup_proof is True
     assert callable(backend.run.call_args.kwargs["output_observer"])
@@ -5833,7 +6201,7 @@ def test_background_command_resumes_one_authorized_attempt_without_replay(
 
 
 def test_interactive_command_uses_one_owned_job_and_escapes_terminal_output(
-    tmp_path, monkeypatch, background_session
+    tmp_path, monkeypatch, command_session
 ):
     """The original approved run yields a terminal handle with inert control text."""
     backend = Mock(capabilities=frozenset({SandboxCapability.TERMINAL}))
@@ -5841,7 +6209,7 @@ def test_interactive_command_uses_one_owned_job_and_escapes_terminal_output(
         SandboxOutcome.COMPLETED, exit_code=0, stdout="\x1b]52;c;bad\x07done"
     )
     service = CommandExecutionService(backend, Mock())
-    sessions, permissions = background_session
+    sessions, permissions = command_session
     operation = Operation(
         tool_id="run_command",
         action=Action.PROCESS_EXECUTE,
@@ -5896,67 +6264,131 @@ def test_command_jobs_keep_backend_authority_until_workers_settle(monkeypatch):
     backend.close.assert_called_once()
 
 
-def test_background_command_reports_capacity_refusal(monkeypatch, background_session):
+def test_command_reports_capacity_refusal(monkeypatch, command_session, command_operation):
     """A full job registry refuses the request before another shell can launch."""
     service = CommandExecutionService(Mock(), Mock())
     refusal = execution_facade.Problem(code="command_job.unavailable", title="Full", detail="Full")
     monkeypatch.setattr(service._jobs, "start", lambda *_args, **_kwargs: refusal)
-    sessions, permissions = background_session
+    sessions, permissions = command_session
     context = ToolContext(
-        None, "run_command", permission_manager=permissions, session_manager=sessions
+        None,
+        "run_command",
+        operations=(command_operation,),
+        permission_manager=permissions,
+        session_manager=sessions,
     )
-    assert service.run_command(context, ":", background=True) is refusal
+    assert service.run_command(context, ":", wait_seconds=0) is refusal
 
 
 @pytest.mark.parametrize("settled", [False, True])
-def test_background_handle_returns_without_requiring_a_second_result_turn(
-    monkeypatch, settled, background_session
+def test_command_returns_handle_or_settled_result_without_an_extra_turn(
+    monkeypatch, settled, command_session, command_operation
 ):
-    """A live handle returns promptly, while an already-settled one includes its result."""
+    """A live job returns its handle, while an already-settled job returns its result."""
     service = CommandExecutionService(Mock(), Mock())
-    sessions, permissions = background_session
+    sessions, permissions = command_session
     context = ToolContext(
-        None, "run_command", permission_manager=permissions, session_manager=sessions
+        None,
+        "run_command",
+        operations=(command_operation,),
+        permission_manager=permissions,
+        session_manager=sessions,
     )
-    job = CommandJob("owner", None)
+    job = CommandJob("owner", 3600)
     if settled:
         job.complete({"exit_code": 0})
-        monkeypatch.setattr(
-            job,
-            "read",
-            lambda _cursor: execution_facade.Problem(
-                code="command_job.cursor_expired", title="Expired", detail="Expired"
-            ),
-        )
     else:
         job.admitted()
     monkeypatch.setattr(service._jobs, "start", lambda *_args, **_kwargs: job)
 
-    result = service.run_command(context, ":", background=True)
+    result = service.run_command(context, ":", wait_seconds=0)
 
-    assert result["handle"] == job.handle
-    assert result["status"] == ("complete" if settled else "running")
-    assert "result" not in result
+    if settled:
+        assert result == {"exit_code": 0}
+    else:
+        assert result["handle"] == job.handle
+        assert result["status"] == "running"
+        assert result["result"] is None
+
+
+def test_initial_page_expiration_preserves_recoverable_handle(
+    monkeypatch, command_session, command_operation
+):
+    """Output lost during handoff reports its handle and the oldest recoverable cursor."""
+    service = CommandExecutionService(Mock(), Mock())
+    sessions, permissions = command_session
+    context = ToolContext(
+        None,
+        "run_command",
+        operations=(command_operation,),
+        permission_manager=permissions,
+        session_manager=sessions,
+    )
+
+    class Worker:
+        """Keep the synthetic native job active under explicit test control."""
+
+        def __init__(self, target, daemon):
+            self.target = target
+
+        def start(self):
+            """Reserve the worker without running its target."""
+
+        def join(self, timeout):
+            """A synthetic worker requires no thread join."""
+
+    monkeypatch.setattr(command_jobs.threading, "Thread", Worker)
+    monkeypatch.setattr(command_jobs, "MAX_JOB_OUTPUT_EVENTS", 1)
+    owner = service._job_owner(context)
+    job = service._jobs.start(owner, lambda _job: {}, runtime_limit_seconds=3600)
+    job.admitted()
+    monkeypatch.setattr(service._jobs, "start", lambda *_args, **_kwargs: job)
+    inspect = job.inspect
+    raced = []
+
+    def inspect_before_output_rollover():
+        """Publish enough output after the initial snapshot to expire its cursor."""
+        snapshot = inspect()
+        if not raced:
+            raced.append(True)
+            job.publish("stdout", "discarded")
+            job.publish("stderr", "retained")
+        return snapshot
+
+    monkeypatch.setattr(job, "inspect", inspect_before_output_rollover)
+    result = service.run_command(context, ":", wait_seconds=0)
+
+    assert result.code == "command_job.cursor_expired"
+    assert result.metadata == {"handle": job.handle, "oldest_cursor": 1}
+    page = service.read_command_job(context, result.metadata["handle"], cursor=1, wait_seconds=0)
+    assert page["events"] == [{"cursor": 1, "stream": "stderr", "content": "retained"}]
+    assert page["status"] == "running"
+    assert service.cancel_command_job(context, job.handle)["cancel_requested"]
+    job.complete({"exit_code": 0})
 
 
 @pytest.mark.parametrize("failure", [KeyboardInterrupt, ValueError])
-def test_interrupted_background_handoff_cancels_its_unreturned_job(
-    monkeypatch, background_session, failure
+def test_interrupted_command_handoff_cancels_its_unreturned_job(
+    monkeypatch, command_session, command_operation, failure
 ):
     """An interrupted wait cannot leave an active command without a usable handle."""
-    sessions, permissions = background_session
+    sessions, permissions = command_session
     service = CommandExecutionService(Mock(), Mock())
     context = ToolContext(
-        None, "run_command", permission_manager=permissions, session_manager=sessions
+        None,
+        "run_command",
+        operations=(command_operation,),
+        permission_manager=permissions,
+        session_manager=sessions,
     )
-    job = CommandJob("owner", None)
+    job = CommandJob("owner", 3600)
     monkeypatch.setattr(service._jobs, "start", lambda *_args, **_kwargs: job)
     monkeypatch.setattr(job.ready, "wait", Mock(side_effect=failure))
 
     if failure is KeyboardInterrupt:
         with pytest.raises(KeyboardInterrupt):
-            service.run_command(context, ":", background=True)
+            service.run_command(context, ":", wait_seconds=0)
     else:
-        assert service.run_command(context, ":", background=True).code == "command_job.unavailable"
+        assert service.run_command(context, ":", wait_seconds=0).code == "command_job.unavailable"
 
     assert job.cancellation_event.is_set()

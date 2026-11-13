@@ -107,6 +107,36 @@ def output_interaction() -> MagicMock:
     return interaction
 
 
+@pytest.mark.parametrize("same_session", [False, True])
+def test_rejected_session_rebind_preserves_active_command_authority(tmp_path, same_session):
+    """A failed Loop construction leaves an active command's permission authority untouched."""
+    permissions = PermissionManager(tmp_path)
+    first = SessionManager()
+    second = first if same_session else SessionManager()
+    permissions.bind_temporary_directory(first.temporary_directory)
+    permissions.recorder = first
+    revision = permissions.try_egress_policy_revision()
+    service = Mock()
+    service.has_active_jobs.return_value = True
+    registry = ToolRegistry(
+        [], permission_manager=permissions, execution_service=service, session_manager=first
+    )
+
+    with pytest.raises(RuntimeError, match="active"):
+        Loop.create_default(
+            loop_backend(),
+            working_directory=tmp_path,
+            permission_manager=permissions,
+            session_manager=second,
+            tool_registry=registry,
+        )
+
+    assert permissions.temporary_directory == first.temporary_directory
+    assert permissions.recorder is first
+    assert permissions.try_egress_policy_revision() == revision
+    registry.close()
+
+
 def test_default_loop_routes_runner_confirmations_through_yolo(tmp_path):
     """The direct factory honors current permission state without hiding the user interface."""
     interaction = output_interaction()
@@ -441,7 +471,11 @@ def test_loop_applies_live_settings_through_owning_components(tmp_path):
                 "reasoning_effort": "medium",
             },
             "web": {"user_agent": "updated"},
-            "tools": {"command_timeout": 0.25, "command_job_wait_seconds": 0.1},
+            "tools": {
+                "command_timeout": 0.25,
+                "command_job_wait_seconds": 0.1,
+                "command_hard_timeout": 42,
+            },
         }
     )
 
@@ -457,6 +491,7 @@ def test_loop_applies_live_settings_through_owning_components(tmp_path):
         "app.reasoning_effort",
         "web.user_agent",
         "tools.command_timeout",
+        "tools.command_hard_timeout",
         "tools.command_job_wait_seconds",
     ):
         assert loop.apply_runtime_settings(path, settings) == "applied now"
@@ -472,6 +507,7 @@ def test_loop_applies_live_settings_through_owning_components(tmp_path):
     assert loop.agent.hyperparameters.reasoning_effort == "medium"
     assert loop.tool_registry.settings.user_agent == "updated"
     assert loop.tool_registry.settings.command_timeout == 0.25
+    assert loop.tool_registry.settings.command_hard_timeout == 42
     assert loop.tool_registry.settings.command_job_wait_seconds == 0.1
 
 
@@ -4056,6 +4092,7 @@ def test_run_exit_commands_end_the_conversation(command, tmp_path):
 def test_handle_tool_calls_delegates_session_updates(tmp_path):
     """Tool results and instruction state are delegated to the session manager."""
     registry = Mock()
+    registry.compose_session.return_value = nullcontext()
     registry.call_with_timing.return_value = ("tool result", 0.25)
     backend = loop_backend(get_response=Mock(return_value=[ResponseCompleted()]))
     session_manager = Mock(spec=SessionManager)

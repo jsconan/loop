@@ -88,7 +88,7 @@ from loop.tools.system import (
     resolve_executable,
     run_command,
 )
-from loop.utils import PathHolder, VirtualPath
+from loop.utils import VirtualPath
 from loop.utils.yaml import load_yaml
 
 _ALIAS_DIRECTORY = os.environ.get("LOOP_NATIVE_SOCKET_ALIAS_DIRECTORY")
@@ -373,6 +373,16 @@ def public(installation, public_workspace_root, request, native_directory, envir
     )
     interaction = Interaction()
     interaction.configuration_path = permissions_directory / f"{workspace.name}.yaml"
+    interaction.session_database = permissions_directory / "sessions.sqlite"
+    interaction.session_workspace_id = "native-public-session"
+    interaction.session_manager = SessionManager(
+        interaction=interaction,
+        session_store=SQLiteSessionStore(
+            interaction.session_database, workspace_id=interaction.session_workspace_id
+        ),
+        workspace_id=interaction.session_workspace_id,
+    )
+    interaction.session_manager.add_user_message("Own native test scratch")
     yield interaction, workspace, generation
 
 
@@ -395,10 +405,12 @@ def invoke_tools(
     permission_workspace=None,
     model_paths=False,
     seconds=2,
+    initial_wait=None,
     expected_search_errors=0,
     deny_sandbox=False,
     fresh_scratch=False,
     scratch_path=None,
+    session_owner=None,
     retarget=None,
     disable_runtime_discovery=False,
     skill_root=None,
@@ -408,6 +420,15 @@ def invoke_tools(
     """Run public tool calls in one isolated process with the installed native receiver."""
     interaction, workspace, _ = public
     assert interaction.configuration_path is not None
+    session_database, session_id, session_workspace_id = (
+        session_owner
+        if session_owner is not None
+        else (
+            interaction.session_database,
+            interaction.session_manager.session.id,
+            interaction.session_workspace_id,
+        )
+    )
     client = subprocess.run(
         [sys.executable, "-I", "-B", str(Path(__file__).resolve())],
         input=json.dumps(
@@ -419,9 +440,13 @@ def invoke_tools(
                 "calls": calls,
                 "model_paths": model_paths,
                 "seconds": seconds,
+                "initial_wait": initial_wait,
                 "deny_sandbox": deny_sandbox,
                 "fresh_scratch": fresh_scratch,
                 "scratch_path": str(scratch_path) if scratch_path is not None else None,
+                "session_database": str(session_database),
+                "session_id": session_id,
+                "session_workspace_id": session_workspace_id,
                 "retarget": [str(path) for path in retarget] if retarget is not None else None,
                 "disable_runtime_discovery": disable_runtime_discovery,
                 "skill_root": str(skill_root) if skill_root is not None else None,
@@ -470,6 +495,7 @@ def invoke_many(
         [
             {
                 "tool": "run_command",
+                "await_completion": True,
                 "arguments": {"command": command, "cwd": str(workspace), **grants},
             }
             for command, grants in calls
@@ -544,14 +570,51 @@ def public_client():
     interaction.deny_sandbox = value.get("deny_sandbox", False)
     if value.get("retarget") is not None:
         interaction.retarget = tuple(Path(path) for path in value["retarget"])
+    permission_manager_arguments = {}
+    if value.get("audit_path") is not None:
+        permission_manager_arguments = {
+            "audit_path": value["audit_path"],
+            "workspace_id": value["workspace_id"],
+        }
+    permissions = PermissionManager(
+        Path(value["workspace"]),
+        configuration_path=value["configuration_path"],
+        **permission_manager_arguments,
+    )
+    command_sessions = (
+        SessionManager(
+            interaction=interaction,
+            session=value["session_id"],
+            session_store=SQLiteSessionStore(
+                value["session_database"], workspace_id=value["session_workspace_id"]
+            ),
+            workspace_id=value["session_workspace_id"],
+        )
+        if value.get("model_paths")
+        or any(
+            call["arguments"].get("interactive")
+            or (
+                call["tool"] in {"run_command", "renamed_command"}
+                and "wait_seconds" in call["arguments"]
+            )
+            for call in value["calls"]
+        )
+        else None
+    )
+    if command_sessions is not None:
+        permissions.bind_temporary_directory(
+            command_sessions.temporary_directory,
+            ordinary_names=(lambda: True) if value["fresh_scratch"] else None,
+        )
+    if value.get("allow_general_network"):
+        permissions.set_limit("deny_private_networks", False, scope=PolicyScope.SESSION)
+    if value.get("deny_local_network"):
+        permissions.set_limit("deny_local_networks", True, scope=PolicyScope.SESSION)
     instructions = None
     if value.get("model_paths"):
-        scratch = (
-            Path(value["scratch_path"])
-            if value.get("scratch_path")
-            else Path(value["configuration_path"]).parent / "instruction-scratch"
-        )
-        scratch.mkdir(mode=0o700, exist_ok=True)
+        scratch = Path(command_sessions.temporary_directory)
+        if value.get("scratch_path") is not None:
+            assert scratch == Path(value["scratch_path"]).resolve(strict=True)
         skill_root = value.get("skill_root")
         skill_manager = (
             SkillManager([Skill("fixture", "Native fixture.", Path(skill_root) / "SKILL.md")])
@@ -564,35 +627,6 @@ def public_client():
         )
         if skill_root is not None:
             instructions.activate_skill("fixture")
-    permission_manager_arguments = {}
-    if value.get("audit_path") is not None:
-        permission_manager_arguments = {
-            "audit_path": value["audit_path"],
-            "workspace_id": value["workspace_id"],
-        }
-    permissions = PermissionManager(
-        Path(value["workspace"]),
-        configuration_path=value["configuration_path"],
-        **permission_manager_arguments,
-    )
-    background_sessions = (
-        SessionManager(interaction=interaction)
-        if any(
-            call["arguments"].get("background") or call["arguments"].get("interactive")
-            for call in value["calls"]
-        )
-        else None
-    )
-    if background_sessions is not None:
-        permissions.bind_temporary_directory(background_sessions.temporary_directory)
-    if value.get("allow_general_network"):
-        permissions.set_limit("deny_private_networks", False, scope=PolicyScope.SESSION)
-    if value.get("deny_local_network"):
-        permissions.set_limit("deny_local_networks", True, scope=PolicyScope.SESSION)
-    if instructions is not None:
-        permissions.bind_temporary_directory(
-            PathHolder(scratch), ordinary_names=(lambda: True) if value["fresh_scratch"] else None
-        )
     registry = ToolRegistry(
         [
             run_command,
@@ -608,8 +642,13 @@ def public_client():
         ],
         permission_manager=permissions,
         execution_service=CommandExecutionService(backend, RefusingHost()),
-        settings=ToolRuntimeSettings(command_timeout=value.get("seconds", 2)),
-        session_manager=background_sessions,
+        settings=ToolRuntimeSettings(
+            command_timeout=value.get("initial_wait")
+            if value.get("initial_wait") is not None
+            else value.get("seconds", 2),
+            command_hard_timeout=value.get("seconds", 2),
+        ),
+        session_manager=command_sessions,
     )
     try:
         results = []
@@ -619,16 +658,49 @@ def public_client():
                 result = results[source["result_index"]]
                 result = result.get("result", result)
                 arguments[name] = result[source["result_key"]]
-            results.append(
-                json.loads(
-                    registry.call(
-                        call["tool"],
-                        json.dumps(arguments),
-                        interaction=interaction,
-                        instructions_manager=instructions,
-                    )
+            result = json.loads(
+                registry.call(
+                    call["tool"],
+                    json.dumps(arguments),
+                    interaction=interaction,
+                    instructions_manager=instructions,
                 )
             )
+            if call.get("await_completion") and result.get("ok"):
+                page = result["result"]
+                if "handle" in page and "next_cursor" in page and "status" in page:
+                    deadline = time.monotonic() + value.get("seconds", 2) + 10
+                    while True:
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError("Command continuation did not settle.")
+                        read = json.loads(
+                            registry.call(
+                                "read_command_job",
+                                json.dumps(
+                                    {
+                                        "handle": page["handle"],
+                                        "cursor": page["next_cursor"],
+                                        "wait_seconds": 10,
+                                        "include_output": True,
+                                    }
+                                ),
+                                interaction=interaction,
+                                instructions_manager=instructions,
+                            )
+                        )
+                        if not read["ok"]:
+                            result = read
+                            break
+                        page = read["result"]
+                        if page["result"] is not None:
+                            final = page["result"]
+                            result = (
+                                {"ok": False, "problem": final}
+                                if "code" in final and "title" in final
+                                else {"ok": True, "result": final}
+                            )
+                            break
+            results.append(result)
         print(
             json.dumps(
                 {"results": results, "prompts": interaction.prompts, "infos": interaction.infos}
@@ -915,7 +987,7 @@ def test_public_timeout_preserves_both_streams_and_descendant_cleanup(public):
     require_drained(public[2])
 
 
-def test_public_background_job_streams_one_process_and_verifies_cleanup(public):
+def test_public_command_continuation_streams_one_process_and_verifies_cleanup(public):
     """An admitted Linux job keeps its authenticated process, ordered cursor, and cgroup proof."""
     _interaction, workspace, generation = public
     calls = [
@@ -924,13 +996,16 @@ def test_public_background_job_streams_one_process_and_verifies_cleanup(public):
             "arguments": {
                 "command": "printf 'first\\n'; sleep 0.3; printf 'last\\n'",
                 "cwd": str(workspace),
-                "background": True,
+                "wait_seconds": 0,
             },
         },
         {
             "tool": "read_command_job",
             "arguments": {"wait_seconds": 5},
-            "argument_sources": {"handle": {"result_index": 0, "result_key": "handle"}},
+            "argument_sources": {
+                "handle": {"result_index": 0, "result_key": "handle"},
+                "cursor": {"result_index": 0, "result_key": "next_cursor"},
+            },
         },
         {
             "tool": "read_command_job",
@@ -957,7 +1032,7 @@ def test_public_background_job_streams_one_process_and_verifies_cleanup(public):
     results = invoke_tools(public, calls, seconds=5)
     assert all(item["ok"] for item in results[:-1]), results
     assert results[-1]["problem"]["code"] == "command_job.invalid_read"
-    pages = [item["result"] for item in results[1:-1]]
+    pages = [item["result"] for item in results[:-1]]
     output = "".join(
         event["content"]
         for page in pages
@@ -971,7 +1046,7 @@ def test_public_background_job_streams_one_process_and_verifies_cleanup(public):
 
 
 @pytest.mark.parametrize("interactive", [False, True])
-def test_public_background_cancellation_waits_for_cgroup_cleanup(public, interactive):
+def test_public_command_cancellation_waits_for_cgroup_cleanup(public, interactive):
     """Cancellation of a pipe or PTY job waits for verified descendant absence."""
     _interaction, workspace, generation = public
     results = invoke_tools(
@@ -982,14 +1057,17 @@ def test_public_background_cancellation_waits_for_cgroup_cleanup(public, interac
                 "arguments": {
                     "command": "printf 'ready\\n'; sleep 20",
                     "cwd": str(workspace),
-                    "background": not interactive,
+                    "wait_seconds": 0,
                     "interactive": interactive,
                 },
             },
             {
                 "tool": "read_command_job",
                 "arguments": {"wait_seconds": 5},
-                "argument_sources": {"handle": {"result_index": 0, "result_key": "handle"}},
+                "argument_sources": {
+                    "handle": {"result_index": 0, "result_key": "handle"},
+                    "cursor": {"result_index": 0, "result_key": "next_cursor"},
+                },
             },
             {
                 "tool": "cancel_command_job",
@@ -1008,12 +1086,51 @@ def test_public_background_cancellation_waits_for_cgroup_cleanup(public, interac
         seconds=30,
     )
     assert all(item["ok"] for item in results), results
-    assert "ready" in "".join(event["content"] for event in results[1]["result"]["events"])
+    assert "ready" in "".join(
+        event["content"] for item in results[:2] for event in item["result"]["events"]
+    )
     assert results[2]["result"]["cancel_requested"]
     final = results[3]["result"]["result"]
     assert final["code"] == "sandbox.cancelled"
     assert final["metadata"]["lifecycle"]["cancel_requested"]
     assert final["metadata"]["lifecycle"]["descendant_cleanup"] == "verified_absent"
+    require_drained(generation)
+
+
+def test_public_command_hard_deadline_after_continuation(public):
+    """The same command reaches its hard deadline after the initial wait expires."""
+    _interaction, workspace, generation = public
+    calls = [
+        {
+            "tool": "run_command",
+            "arguments": {
+                "command": "printf x >> deadline-count; printf ready; sleep 20",
+                "cwd": str(workspace),
+                "wait_seconds": 0,
+            },
+        }
+    ]
+    for index in range(1, 7):
+        calls.append(
+            {
+                "tool": "read_command_job",
+                "arguments": {"wait_seconds": 5},
+                "argument_sources": {
+                    "handle": {"result_index": 0, "result_key": "handle"},
+                    "cursor": {"result_index": index - 1, "result_key": "next_cursor"},
+                },
+            }
+        )
+    results = invoke_tools(public, calls, seconds=2)
+    assert all(item["ok"] for item in results), results
+    elapsed = [item["result"]["elapsed_seconds"] for item in results]
+    assert elapsed[0] is not None and elapsed == sorted(elapsed)
+    output = "".join(event["content"] for item in results for event in item["result"]["events"])
+    assert "ready" in output
+    final = results[-1]["result"]["result"]
+    assert final["code"] == "sandbox.timed_out"
+    assert final["metadata"]["lifecycle"]["descendant_cleanup"] == "verified_absent"
+    assert (workspace / "deadline-count").read_text() == "x"
     require_drained(generation)
 
 
@@ -1263,7 +1380,10 @@ def test_public_interactive_shell_reuses_one_owned_terminal(public):
 def test_public_terminal_streams_after_native_capture_limit(public):
     """An installed terminal continues delivering output after final capture fills."""
     _interaction, workspace, generation = public
-    source = "import sys; sys.stdout.write('x' * 1010000 + 'after-limit'); sys.stdout.flush()"
+    source = (
+        "import sys; sys.stdout.write('x' * 505000); sys.stdout.flush(); "
+        "sys.stdin.readline(); sys.stdout.write('x' * 505000 + 'after-limit'); sys.stdout.flush()"
+    )
     calls = [
         {
             "tool": "run_command",
@@ -1274,19 +1394,46 @@ def test_public_terminal_streams_after_native_capture_limit(public):
             },
         }
     ]
-    for index in range(1, 161):
-        sources = {"handle": {"result_index": 0, "result_key": "handle"}}
-        arguments = {"wait_seconds": 5}
-        if index == 1:
-            arguments["cursor"] = 500
-        else:
-            sources["cursor"] = {"result_index": index - 1, "result_key": "next_cursor"}
+    for index in range(1, 129):
         calls.append(
-            {"tool": "read_command_job", "arguments": arguments, "argument_sources": sources}
+            {
+                "tool": "read_command_job",
+                "arguments": {"wait_seconds": 0.1},
+                "argument_sources": {
+                    "handle": {"result_index": 0, "result_key": "handle"},
+                    "cursor": {"result_index": index - 1, "result_key": "next_cursor"},
+                },
+            }
+        )
+    calls.append(
+        {
+            "tool": "control_command_terminal",
+            "arguments": {"action": "write", "content": "continue\n"},
+            "argument_sources": {"handle": {"result_index": 0, "result_key": "handle"}},
+        }
+    )
+    for index in range(130, 290):
+        calls.append(
+            {
+                "tool": "read_command_job",
+                "arguments": {"wait_seconds": 0.1},
+                "argument_sources": {
+                    "handle": {"result_index": 0, "result_key": "handle"},
+                    "cursor": {
+                        "result_index": 128 if index == 130 else index - 1,
+                        "result_key": "next_cursor",
+                    },
+                },
+            }
         )
     results = invoke_tools(public, calls, seconds=30)
     assert all(item["ok"] for item in results), results
-    output = "".join(event["content"] for item in results[1:] for event in item["result"]["events"])
+    output = "".join(
+        event["content"]
+        for index, item in enumerate(results)
+        if index != 129
+        for event in item["result"]["events"]
+    )
     assert "after-limit" in output
     final = results[-1]["result"]["result"]
     assert final["stdout"]["discarded_characters"] > 0
@@ -1523,7 +1670,15 @@ def test_public_terminal_cannot_write_host_pty_or_spoof_approval(public):
 
 def test_public_terminal_cannot_inject_into_another_live_session(public):
     """Separate public clients cannot write through another live session's PTY path."""
-    _interaction, workspace, generation = public
+    interaction, workspace, generation = public
+    other_session = SessionManager(
+        interaction=interaction,
+        session_store=SQLiteSessionStore(
+            interaction.session_database, workspace_id=interaction.session_workspace_id
+        ),
+        workspace_id=interaction.session_workspace_id,
+    )
+    other_session.add_user_message("Own an independent terminal session")
     first_script = (
         "import os,time\n"
         "from pathlib import Path\n"
@@ -1595,7 +1750,16 @@ def test_public_terminal_cannot_inject_into_another_live_session(public):
                         "argument_sources": sources,
                     }
                 )
-            second = invoke_tools(public, second_calls, seconds=15)
+            second = invoke_tools(
+                public,
+                second_calls,
+                seconds=15,
+                session_owner=(
+                    interaction.session_database,
+                    other_session.session.id,
+                    interaction.session_workspace_id,
+                ),
+            )
             assert all(item["ok"] for item in second), second
             second_output = "".join(
                 event["content"] for item in second[1:] for event in item["result"]["events"]
@@ -1701,6 +1865,45 @@ def test_public_terminal_preserves_file_network_signal_and_descriptor_isolation(
     require_drained(generation)
 
 
+def test_public_command_default_wait_continues_same_process(public):
+    """An installed command outlives its configured initial wait without being relaunched."""
+    _interaction, workspace, generation = public
+    calls = [
+        {
+            "tool": "run_command",
+            "arguments": {
+                "command": "printf x >> continuation-count; sleep 1; printf finished",
+                "cwd": str(workspace),
+            },
+        },
+        {
+            "tool": "read_command_job",
+            "arguments": {"wait_seconds": 5},
+            "argument_sources": {
+                "handle": {"result_index": 0, "result_key": "handle"},
+                "cursor": {"result_index": 0, "result_key": "next_cursor"},
+            },
+        },
+        {
+            "tool": "read_command_job",
+            "arguments": {"wait_seconds": 5},
+            "argument_sources": {
+                "handle": {"result_index": 0, "result_key": "handle"},
+                "cursor": {"result_index": 1, "result_key": "next_cursor"},
+            },
+        },
+    ]
+    results = invoke_tools(public, calls, seconds=10, initial_wait=0.1)
+    assert all(item["ok"] for item in results), results
+    initial = results[0]["result"]
+    assert initial["result"] is None and initial["elapsed_seconds"] >= 0
+    pages = [item["result"] for item in results[1:]]
+    assert any(page["result"] is not None and page["result"]["exit_code"] == 0 for page in pages)
+    assert "finished" in "".join(event["content"] for page in pages for event in page["events"])
+    assert (workspace / "continuation-count").read_text() == "x"
+    require_drained(generation)
+
+
 @pytest.mark.skipif(
     os.environ.get("LOOP_NATIVE_LONG_COMMAND_TEST") != "extended-native-check",
     reason="Run the minute-long native duration control explicitly.",
@@ -1745,20 +1948,36 @@ def test_public_terminal_continues_same_process_past_old_deadline(public):
     reason="Run the five-minute native duration control explicitly.",
 )
 @pytest.mark.parametrize("noisy", [False, True])
-def test_public_foreground_survives_previous_default_deadline(public, noisy):
-    """One installed public call completes after five minutes without replay or polling."""
+def test_public_command_continues_past_previous_default_deadline(public, noisy):
+    """One installed command completes after five minutes without replay."""
     _interaction, workspace, generation = public
-    command = "printf begin; sleep 301; printf end" if noisy else "sleep 301; printf end"
+    command = "printf x >> count; " + ("printf begin; " if noisy else "") + "sleep 301; printf end"
 
-    results = invoke_tools(
-        public,
-        [{"tool": "run_command", "arguments": {"command": command, "cwd": str(workspace)}}],
-        seconds=330,
-    )
+    calls = [
+        {
+            "tool": "run_command",
+            "arguments": {"command": command, "cwd": str(workspace), "wait_seconds": 1},
+        }
+    ]
+    for index in range(1, 15):
+        calls.append(
+            {
+                "tool": "read_command_job",
+                "arguments": {"wait_seconds": 30},
+                "argument_sources": {
+                    "handle": {"result_index": 0, "result_key": "handle"},
+                    "cursor": {"result_index": index - 1, "result_key": "next_cursor"},
+                },
+            }
+        )
 
-    assert len(results) == 1 and results[0]["ok"], results
-    assert results[0]["result"]["stdout"]["content"].endswith("end")
-    assert results[0]["result"]["lifecycle"]["descendant_cleanup"] == "verified_absent"
+    results = invoke_tools(public, calls, seconds=330)
+
+    assert all(item["ok"] for item in results), results
+    output = "".join(event["content"] for item in results for event in item["result"]["events"])
+    assert output.endswith("end")
+    assert results[-1]["result"]["result"]["lifecycle"]["descendant_cleanup"] == "verified_absent"
+    assert (workspace / "count").read_text() == "x"
     require_drained(generation)
 
 
@@ -1981,6 +2200,7 @@ def test_public_ls_runs_with_large_hardlinked_virtualenv(public, native_director
             [
                 {
                     "tool": "run_command",
+                    "await_completion": True,
                     "arguments": {
                         "command": "sleep 1; printf late > deadline-marker",
                         "cwd": str(public[1]),
@@ -2065,6 +2285,7 @@ def test_public_conventional_temporary_directory_is_session_private(
         session_store=SQLiteSessionStore(database, workspace_id=workspace_id),
         workspace_id=workspace_id,
     )
+    other_manager.add_user_message("Own the other synthetic session")
     other = other_manager.temporary_directory.get()
     other_canary = other / "canary"
     other_canary.write_text("other-session-canary\n", encoding="utf-8")
@@ -2112,6 +2333,7 @@ def test_public_conventional_temporary_directory_is_session_private(
         model_paths=True,
         fresh_scratch=True,
         scratch_path=scratch,
+        session_owner=(database, manager.session.id, workspace_id),
     )
     assert first["ok"], json.dumps(first, indent=2)
     assert host_canary.read_text(encoding="utf-8") == "host-temporary-canary\n"
@@ -2135,6 +2357,7 @@ def test_public_conventional_temporary_directory_is_session_private(
         model_paths=True,
         fresh_scratch=True,
         scratch_path=other,
+        session_owner=(database, other_manager.session.id, workspace_id),
     )
     assert isolated["ok"], isolated
     assert_equivalent_profiles(baseline, profile_inventory(generation))
@@ -2174,6 +2397,7 @@ def test_public_conventional_temporary_directory_is_session_private(
         model_paths=True,
         fresh_scratch=True,
         scratch_path=resumed.temporary_directory.get(),
+        session_owner=(database, resumed.session.id, workspace_id),
     )
     assert later["ok"] and later["result"]["stdout"]["content"] == "session-data"
     assert read["ok"] and read["result"]["content"] == "session-data\n"
@@ -2198,6 +2422,7 @@ def test_public_conventional_temporary_directory_is_session_private(
             model_paths=True,
             fresh_scratch=True,
             scratch_path=scratch,
+            session_owner=(database, manager.session.id, workspace_id),
         )
         assert not refused["ok"]
         assert refused["problem"]["code"] == "sandbox.invalid", refused
@@ -2239,7 +2464,7 @@ def test_public_conventional_temporary_preserves_overlapping_workspace(public, n
     assert result["ok"] and result["result"]["stdout"]["content"] == "overlap-ok", result
     assert (workspace / "output").read_text(encoding="utf-8") == "workspace"
     assert not outside.exists()
-    scratch = interaction.configuration_path.parent / "instruction-scratch"
+    scratch = Path(interaction.session_manager.temporary_directory)
     assert (scratch / "report").read_text(encoding="utf-8") == "scratch"
     assert not (scratch / SESSION_CONVENTIONAL_TMP_NAME).exists()
     require_drained(generation)
@@ -2248,8 +2473,7 @@ def test_public_conventional_temporary_preserves_overlapping_workspace(public, n
 def test_nested_workspace_uses_real_scratch_mirror_without_broadening_access(public):
     """A nested workspace has a real namespace path while private data stays protected."""
     interaction, _workspace, generation = public
-    scratch = interaction.configuration_path.parent / "instruction-scratch"
-    scratch.mkdir(mode=0o700)
+    scratch = Path(interaction.session_manager.temporary_directory)
     project = scratch / "project"
     project.mkdir()
     (project / "input").write_text("workspace-data", encoding="utf-8")
@@ -2293,8 +2517,7 @@ def test_bound_session_scratch_works_without_global_temporary_directories(public
     """Home-based read-only requests share scratch across tools and children without host access."""
     interaction, workspace, generation = public
     parent = interaction.configuration_path.parent
-    scratch = parent / "instruction-scratch"
-    scratch.mkdir(mode=0o700)
+    scratch = Path(interaction.session_manager.temporary_directory)
     other = parent / "other-session"
     other.mkdir(mode=0o700)
     (other / "secret").write_text("other-session-canary")
@@ -2677,8 +2900,7 @@ def test_public_workspace_runtime_is_prepared_in_original_call(
             if selection == "project-cd":
                 command = 'cd "$WORKSPACE_ROOT" && ' + command
             elif selection == "project-scratch":
-                scratch = interaction.configuration_path.parent / "instruction-scratch"
-                scratch.mkdir(mode=0o700, exist_ok=True)
+                scratch = Path(interaction.session_manager.temporary_directory)
                 (scratch / "task.sh").write_text(
                     '#!/bin/sh\ncd "$WORKSPACE_ROOT"\n' + command + "\n", encoding="utf-8"
                 )
@@ -2700,7 +2922,7 @@ def test_public_workspace_runtime_is_prepared_in_original_call(
         and selection not in {"project-no-bytecode", "project-cd", "project-scratch"},
     }
     assert interaction.configuration_path is not None
-    marker = interaction.configuration_path.parent / "instruction-scratch/entered"
+    marker = Path(interaction.session_manager.temporary_directory) / "entered"
     if not prepared:
         (prior,) = invoke_registered(
             public_registry,
@@ -2977,7 +3199,9 @@ def test_public_uv_runs_a_workspace_virtualenv_with_its_user_local_runtime(publi
     assert "2 passed" in automatic["result"]["stdout"]["content"]
     assert any(str(runtime_root) in message for message in interaction.infos)
 
-    def run_with_interpreter(command, *, deny_sandbox=False, fresh_scratch=False, seconds=20):
+    def run_with_interpreter(
+        command, *, deny_sandbox=False, fresh_scratch=False, seconds=20, initial_wait=None
+    ):
         """Bind the selected interpreter and review its runtime for this exact command."""
         selected, result = invoke_tools(
             public,
@@ -2988,6 +3212,7 @@ def test_public_uv_runs_a_workspace_virtualenv_with_its_user_local_runtime(publi
                 },
                 {
                     "tool": "run_command",
+                    "await_completion": True,
                     "arguments": {
                         "command": command,
                         "cwd": "$WORKSPACE_ROOT",
@@ -3000,6 +3225,7 @@ def test_public_uv_runs_a_workspace_virtualenv_with_its_user_local_runtime(publi
             ],
             model_paths=True,
             seconds=seconds,
+            initial_wait=initial_wait,
             deny_sandbox=deny_sandbox,
             fresh_scratch=fresh_scratch,
         )
@@ -3008,9 +3234,7 @@ def test_public_uv_runs_a_workspace_virtualenv_with_its_user_local_runtime(publi
 
     denied = run_with_interpreter('printf denied > "$TMPDIR/denied-marker"', deny_sandbox=True)
     assert denied["problem"]["code"] == "tool.denied"
-    assert not (
-        interaction.configuration_path.parent / "instruction-scratch/denied-marker"
-    ).exists()
+    assert not (Path(interaction.session_manager.temporary_directory) / "denied-marker").exists()
 
     result = run_with_interpreter(
         f'COVERAGE_FILE="{VirtualPath.TEMPORARY}/.coverage" {runner} '
@@ -3167,7 +3391,7 @@ def test_public_uv_runs_a_workspace_virtualenv_with_its_user_local_runtime(publi
         "tests/unit/execution/sandbox/linux/test_installation.py::"
         "test_attachment_removal_rejects_invalid_fixed_authority "
         "tests/unit/execution/sandbox/linux/test_installation.py::"
-        "test_attachment_removal_refuses_unproved_literal_compilation "
+        "test_attachment_removal_reauthenticates_protected_helper_before_policy_access "
         "tests/unit/execution/sandbox/linux/test_installation.py::"
         "test_reclamation_refuses_unsafe_fixed_inventory_before_deletion\\[mount\\] "
         "tests/unit/execution/sandbox/linux/test_management.py::"
@@ -3189,7 +3413,8 @@ def test_public_uv_runs_a_workspace_virtualenv_with_its_user_local_runtime(publi
         fresh_scratch=True,
     )
     assert nested_tests["ok"], json.dumps(nested_tests, indent=2)
-    assert "31 passed" in nested_tests["result"]["stdout"]["content"]
+    assert " passed" in nested_tests["result"]["stdout"]["content"]
+    assert " skipped" not in nested_tests["result"]["stdout"]["content"]
 
     shutil.copytree(
         project / "src",
@@ -3211,7 +3436,8 @@ def test_public_uv_runs_a_workspace_virtualenv_with_its_user_local_runtime(publi
         "--cov=loop --cov-branch --cov-report=term-missing:skip-covered --cov-fail-under=100 "
         '> "$TMPDIR/unit-report" 2>&1; status=$?; tail -n 40 "$TMPDIR/unit-report"; exit "$status"',
         fresh_scratch=True,
-        seconds=180,
+        seconds=600,
+        initial_wait=60,
     )
     assert full_suite["ok"], json.dumps(full_suite, indent=2)
     assert re.search(

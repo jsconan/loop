@@ -414,6 +414,8 @@ def test_yolo_rollback_failure_disables_automatic_approval(tmp_path, monkeypatch
     lease.revoke_revision.assert_called()
     with pytest.raises(OSError, match="egress closure could not be confirmed"):
         permissions.close()
+    lease.revoke_revision.return_value = True
+    permissions.close()
     manager.close()
 
 
@@ -673,9 +675,11 @@ def test_safe_config_changes_apply_during_runs_and_hide_unsafe_values(tmp_path):
     assert {item.text for item in action_values} == {"get", "set"}
     assert "app.max_agent_turns" in {item.text for item in setting_values}
     assert not any(item.text.startswith("backend.") for item in setting_values)
-    assert "tools.command_timeout" in {
-        item.text for item in completion.get_completions(Document("/config set tools."), Mock())
-    }
+    assert {
+        "tools.command_timeout",
+        "tools.command_hard_timeout",
+        "tools.command_job_wait_seconds",
+    } <= {item.text for item in completion.get_completions(Document("/config set tools."), Mock())}
 
     manager.handle_user_command("/config set backend.base_url https://new.example scope=session")
     assert "cannot be changed while the agent is working" in (

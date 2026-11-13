@@ -8,6 +8,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable
+from contextvars import copy_context
 from itertools import islice
 from typing import NamedTuple
 from uuid import uuid4
@@ -18,7 +19,6 @@ from ..utils.process import render_terminal_text
 _LOGGER = logging.getLogger(__name__)
 MAX_ACTIVE_JOBS = 4
 MAX_RETAINED_JOBS = 8
-MAX_REMEMBERED_CALL_IDS = 4096
 MAX_JOB_OUTPUT_BYTES = 1_000_000
 MAX_OUTPUT_EVENT_CHARS = 1_024
 MAX_JOB_OUTPUT_EVENTS = 16_384
@@ -45,17 +45,78 @@ class CommandOutputEvent(NamedTuple):
     content: str
 
 
+class CommandCancellation(threading.Event):
+    """Combine job cancellation with the originating run until handoff.
+
+    Args:
+        job (threading.Event): Job-owned cancellation signal.
+        origin (threading.Event | None): Original run cancellation signal.
+        handed_off (threading.Event): Signal that ownership has transferred to the job.
+        lock (threading.Lock): Synchronize signal reads with the ownership transfer.
+    """
+
+    _job: threading.Event
+    _origin: threading.Event | None
+    _handed_off: threading.Event
+    _lock: threading.Lock
+
+    def __init__(
+        self,
+        job: threading.Event,
+        origin: threading.Event | None,
+        handed_off: threading.Event,
+        lock: threading.Lock,
+    ) -> None:
+        super().__init__()
+        self._job = job
+        self._origin = origin
+        self._handed_off = handed_off
+        self._lock = lock
+
+    def is_set(self) -> bool:
+        """Return whether either active cancellation source has been signalled.
+
+        Returns:
+            bool: Whether cancellation has been requested.
+        """
+        with self._lock:
+            return self._job.is_set() or (
+                not self._handed_off.is_set() and self._origin is not None and self._origin.is_set()
+            )
+
+    def wait(self, timeout: float | None = None) -> bool:
+        """Wait for either active cancellation source.
+
+        Args:
+            timeout (float | None): Maximum wait, or None to wait indefinitely.
+
+        Returns:
+            bool: Whether cancellation was requested before the wait ended.
+        """
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while not self.is_set():
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                return False
+            self._job.wait(
+                JOB_READ_CANCELLATION_CHECK_SECONDS
+                if remaining is None
+                else min(remaining, JOB_READ_CANCELLATION_CHECK_SECONDS)
+            )
+        return True
+
+
 class CommandJob:
     """Own one admitted attempt, its bounded output, and its cancellation signal.
 
     Args:
         owner (str): Stable session scratch identity allowed to inspect this job.
-        call_id (str | None): Model call identity used to avoid duplicate in-process launch.
+        runtime_limit_seconds (float): Hard execution limit captured when the job starts.
         terminal (bool): Whether this job owns a native interactive terminal.
     """
 
     owner: str
-    call_id: str | None
+    runtime_limit_seconds: float
     terminal: bool
     handle: str
     cancellation_event: threading.Event
@@ -63,6 +124,7 @@ class CommandJob:
     finished: threading.Event
     thread: threading.Thread | None
     completed_at: float | None
+    admitted_at: float | None
     _condition: threading.Condition
     _events: deque[CommandOutputEvent]
     _event_bytes: int
@@ -71,13 +133,18 @@ class CommandJob:
     _exposed_cursor: int
     _status: str
     _result: dict | Problem | None
+    _error: BaseException | None
     _dropped_characters: int
     _terminal_frames: deque[bytes]
     _terminal_pending_bytes: int
+    _handoff_lock: threading.Lock
+    _handed_off: bool
+    _handoff_complete: threading.Event
+    _cancellation_lock: threading.Lock
 
-    def __init__(self, owner: str, call_id: str | None, terminal: bool = False) -> None:
+    def __init__(self, owner: str, runtime_limit_seconds: float, terminal: bool = False) -> None:
         self.owner = owner
-        self.call_id = call_id
+        self.runtime_limit_seconds = runtime_limit_seconds
         self.terminal = terminal
         self.handle = uuid4().hex
         self.cancellation_event = threading.Event()
@@ -85,6 +152,7 @@ class CommandJob:
         self.finished = threading.Event()
         self.thread = None
         self.completed_at = None
+        self.admitted_at = None
         self._condition = threading.Condition()
         self._events = deque()
         self._event_bytes = 0
@@ -93,15 +161,72 @@ class CommandJob:
         self._exposed_cursor = 0
         self._status = "preparing"
         self._result = None
+        self._error = None
         self._dropped_characters = 0
         self._terminal_frames = deque()
         self._terminal_pending_bytes = 0
+        self._handoff_lock = threading.Lock()
+        self._handed_off = False
+        self._handoff_complete = threading.Event()
+        self._cancellation_lock = threading.Lock()
+
+    def handoff(self, cancellation_event: threading.Event | None = None) -> None:
+        """Prevent further prompts and carry cancellation through the handoff boundary.
+
+        Args:
+            cancellation_event (threading.Event | None): Originating run's stop signal.
+        """
+        error = None
+        result = None
+        with self._handoff_lock:
+            with self._cancellation_lock:
+                if cancellation_event is not None and cancellation_event.is_set():
+                    self.cancel()
+                self._handed_off = True
+                self._handoff_complete.set()
+                if cancellation_event is not None and cancellation_event.is_set():
+                    self.cancel()
+            with self._condition:
+                error, self._error = self._error, None
+                result = self._result
+        if error is not None and isinstance(result, Problem):
+            log_problem(_LOGGER, result, error)
+
+    def begin_interaction(self) -> bool:
+        """Reserve the original interaction while an approval is being evaluated.
+
+        Returns:
+            bool: Whether the caller must release the reservation.
+        """
+        self._handoff_lock.acquire()
+        if self._handed_off:
+            self._handoff_lock.release()
+            return False
+        return True
+
+    def cancellation_signal(self, origin: threading.Event | None) -> CommandCancellation:
+        """Combine the origin and job signals until ownership is handed off.
+
+        Args:
+            origin (threading.Event | None): Original run's cancellation signal.
+
+        Returns:
+            CommandCancellation: Signal for the native supervisor.
+        """
+        return CommandCancellation(
+            self.cancellation_event, origin, self._handoff_complete, self._cancellation_lock
+        )
+
+    def end_interaction(self) -> None:
+        """Release a previously reserved interaction."""
+        self._handoff_lock.release()
 
     def admitted(self) -> None:
         """Mark authorization complete before native preparation starts."""
         with self._condition:
-            if self.finished.is_set():
+            if self.finished.is_set() or self.admitted_at is not None:
                 return
+            self.admitted_at = time.monotonic()
             self._status = "running"
             self.ready.set()
             self._condition.notify_all()
@@ -152,23 +277,29 @@ class CommandJob:
                     self._oldest_cursor = dropped.cursor + 1
             self._condition.notify_all()
 
-    def complete(self, result: dict | Problem) -> None:
+    def complete(self, result: dict | Problem, error: BaseException | None = None) -> None:
         """Publish the final result once and wake any blocked readers.
 
         Args:
             result (dict | Problem): Rendered command outcome or structured failure.
+            error (BaseException | None): Unexpected failure to propagate to the initial caller.
         """
-        with self._condition:
-            if self.finished.is_set():
-                return
-            self._result = result
-            self._terminal_frames.clear()
-            self._terminal_pending_bytes = 0
-            self._status = "complete"
-            self.completed_at = time.monotonic()
-            self.ready.set()
-            self.finished.set()
-            self._condition.notify_all()
+        with self._handoff_lock:
+            with self._condition:
+                if self.finished.is_set():
+                    return
+                self._result = result
+                self._error = error if not self._handed_off else None
+                self._terminal_frames.clear()
+                self._terminal_pending_bytes = 0
+                self._status = "complete"
+                self.completed_at = time.monotonic()
+                self.ready.set()
+                self.finished.set()
+                self._condition.notify_all()
+            report = self._handed_off and error is not None and isinstance(result, Problem)
+        if report:
+            log_problem(_LOGGER, result, error)
 
     def cancel(self) -> None:
         """Request cancellation without claiming that descendants have exited."""
@@ -178,6 +309,39 @@ class CommandJob:
                 self._terminal_frames.clear()
                 self._terminal_pending_bytes = 0
                 self._condition.notify_all()
+
+    def result(self) -> dict | Problem | None:
+        """Return the settled result, or None while the command is active.
+
+        Returns:
+            dict | Problem | None: Original result after settlement, otherwise None.
+
+        Raises:
+            BaseException: Unexpected worker failure that settled before handoff.
+        """
+        with self._condition:
+            error, self._error = self._error, None
+            result = self._result
+        if error is not None:
+            raise error
+        return result
+
+    def wait(self, seconds: float, cancellation_event: threading.Event | None) -> None:
+        """Wait for settlement or an originating run cancellation.
+
+        Args:
+            seconds (float): Maximum time to wait.
+            cancellation_event (threading.Event | None): Signal interrupting the initial wait.
+        """
+        if cancellation_event is None:
+            self.finished.wait(seconds)
+            return
+        deadline = time.monotonic() + seconds
+        while not self.finished.is_set() and not cancellation_event.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            self.finished.wait(min(remaining, JOB_READ_CANCELLATION_CHECK_SECONDS))
 
     def _enqueue_terminal(self, frame: bytes) -> None:
         """Retain one bounded control frame only until the native worker sends it."""
@@ -259,15 +423,27 @@ class CommandJob:
         """Return the lifecycle state without command source or output content.
 
         Returns:
-            dict: Handle, status, cancellation flag, cursors, and output loss count.
+            dict: Handle, status, elapsed time since admission, hard execution limit,
+                cancellation flag, cursors, and output loss count.
         """
         with self._condition:
             outcome = self._result.metadata if isinstance(self._result, Problem) else self._result
             lifecycle = outcome.get("lifecycle", {}) if isinstance(outcome, dict) else {}
+            elapsed = (
+                max(
+                    0.0,
+                    (self.completed_at if self.completed_at is not None else time.monotonic())
+                    - self.admitted_at,
+                )
+                if self.admitted_at is not None
+                else None
+            )
             return {
                 "handle": self.handle,
                 "terminal": self.terminal,
                 "status": self._status,
+                "elapsed_seconds": elapsed,
+                "runtime_limit_seconds": self.runtime_limit_seconds,
                 "cancel_requested": self.cancellation_event.is_set(),
                 "main_process": lifecycle.get("main_process", "unknown"),
                 "descendant_cleanup": lifecycle.get("descendant_cleanup", "uncertain"),
@@ -361,7 +537,7 @@ class CommandJob:
             if isinstance(result, dict) and not include_output:
                 result = dict(result)
                 container = result.get("metadata") if "metadata" in result else result
-                if isinstance(container, dict):
+                if isinstance(container, dict) and container.get("boundary") != "host":
                     container = dict(container)
                     for stream in ("stdout", "stderr"):
                         value = container.get(stream)
@@ -379,9 +555,15 @@ class CommandJob:
                 **self.inspect(),
                 "events": events,
                 "next_cursor": next_cursor,
+                "output_remaining": next_cursor < self._next_cursor,
                 "result": result,
             }
-            if replayed and result is None:
+            if self.finished.is_set() and page["output_remaining"]:
+                page["continuation"] = (
+                    "The command has completed. Pass next_cursor to read remaining output "
+                    "and its final result."
+                )
+            elif replayed and result is None:
                 page["continuation"] = (
                     "This page includes previously read output. Pass this page's next_cursor "
                     "to read subsequent output and wait for changes."
@@ -394,32 +576,30 @@ class CommandJobs:
 
     _lock: threading.RLock
     _jobs: dict[str, CommandJob]
-    _calls: dict[tuple[str, str, int | None], str]
     _closed: bool
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self._jobs = {}
-        self._calls = {}
         self._closed = False
 
     def start(
         self,
         owner: str,
-        call_id: str | None,
         runner: Callable[[CommandJob], dict | Problem],
         *,
+        runtime_limit_seconds: float,
         terminal: bool = False,
-        occurrence: int | None = None,
+        on_settled: Callable[[], None] | None = None,
     ) -> CommandJob | Problem:
-        """Start one bounded job or reuse the same in-process model call.
+        """Start one bounded, independently owned job.
 
         Args:
             owner (str): Stable session scratch identity.
-            call_id (str | None): Model call identity, if one exists.
             runner (Callable[[CommandJob], dict | Problem]): Authorized execution workflow.
+            runtime_limit_seconds (float): Hard execution limit captured for the job.
             terminal (bool): Whether the worker owns one interactive terminal.
-            occurrence (int | None): Stable session-history index of this call, if available.
+            on_settled (Callable[[], None] | None): Release worker-owned resources once settled.
 
         Returns:
             CommandJob | Problem: Owned job or a capacity or shutdown refusal.
@@ -427,42 +607,29 @@ class CommandJobs:
 
         def execute() -> None:
             """Settle one owned worker even when execution raises unexpectedly."""
-            with self._lock:
-                if self._jobs.get(job.handle) is not job:
-                    return
             try:
-                result = runner(job)
-            except BaseException as error:  # noqa: BLE001 - settle every worker failure.
-                problem = Problem(
-                    code="command_job.failed",
-                    title="Command job failed",
-                    detail="Command execution failed; prior effects may have occurred.",
-                    operation="run_command",
-                )
-                log_problem(_LOGGER, problem, error)
-                result = problem
-            job.complete(result)
+                with self._lock:
+                    if self._jobs.get(job.handle) is not job:
+                        return
+                error = None
+                try:
+                    result = runner(job)
+                except BaseException as caught:  # noqa: BLE001 - settle every worker failure.
+                    error = caught
+                    result = Problem(
+                        code="command_job.failed",
+                        title="Command job failed",
+                        detail="Command execution failed; prior effects may have occurred.",
+                        operation="run_command",
+                    )
+                job.complete(result, error)
+            finally:
+                if on_settled is not None:
+                    on_settled()
 
         with self._lock:
             if self._closed:
                 return self._problem("Command execution service is closing.")
-            key = (owner, call_id, occurrence) if call_id is not None else None
-            if key is not None and (handle := self._calls.get(key)) is not None:
-                previous = self._jobs.get(handle)
-                if previous is None:
-                    return self._problem(
-                        "Command job handle was evicted; source will not be replayed."
-                    )
-                if (
-                    previous.completed_at is not None
-                    and time.monotonic() - previous.completed_at >= JOB_RETENTION_SECONDS
-                ):
-                    return self._problem(
-                        "Command job handle has expired; source will not be replayed."
-                    )
-                return previous
-            if key is not None and len(self._calls) >= MAX_REMEMBERED_CALL_IDS:
-                return self._problem("The remembered model call limit has been reached.")
             if sum(not job.finished.is_set() for job in self._jobs.values()) >= MAX_ACTIVE_JOBS:
                 return self._problem("The active command job limit has been reached.")
             completed = sorted(
@@ -472,18 +639,15 @@ class CommandJobs:
             while len(self._jobs) >= MAX_RETAINED_JOBS and completed:
                 old = completed.pop(0)
                 del self._jobs[old.handle]
-            job = CommandJob(owner, call_id, terminal)
+            job = CommandJob(owner, runtime_limit_seconds, terminal)
             self._jobs[job.handle] = job
-            if key is not None:
-                self._calls[key] = job.handle
-            thread = threading.Thread(target=execute, daemon=True)
+            execution_context = copy_context()
+            thread = threading.Thread(target=lambda: execution_context.run(execute), daemon=True)
             job.thread = thread
             try:
                 thread.start()
             except BaseException as error:  # noqa: BLE001 - release a failed reservation.
                 del self._jobs[job.handle]
-                if key is not None:
-                    self._calls.pop(key, None)
                 problem = self._problem("Command job worker could not start.")
                 log_problem(_LOGGER, problem, error)
                 return problem

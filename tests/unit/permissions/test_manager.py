@@ -45,6 +45,7 @@ from loop import (
     ProcessTarget,
     SessionTarget,
 )
+from loop.command_authorities import command_authorities
 from loop.execution.sandbox import SandboxRequest
 from loop.interaction import ConsoleInteraction
 from loop.permissions import (
@@ -127,6 +128,86 @@ def test_uncertain_retry_generation_requires_current_human_decisions(tmp_path):
     assert not manager.recovery_retry_current(generation)
     assert manager.recovery_retry_current(manager.recovery_retry_generation())
     manager.close()
+
+
+def test_standalone_execution_retains_scratch_until_all_leases_settle(tmp_path):
+    """A live standalone lease prevents scratch cleanup and rebinding, including nested leases."""
+    manager = PermissionManager(tmp_path)
+    scratch = manager.temporary_directory
+    replacement = PathHolder(tmp_path)
+    with manager.standalone_execution() as first:
+        assert first == scratch and first.is_dir()
+        with manager.standalone_execution() as second:
+            assert second == first
+            with pytest.raises(OSError, match="still owns temporary storage"):
+                manager.close()
+            with pytest.raises(OSError, match="still owns temporary storage"):
+                manager.bind_temporary_directory(replacement)
+        with pytest.raises(OSError, match="still owns temporary storage"):
+            manager.close()
+        assert scratch.is_dir()
+    manager.bind_temporary_directory(replacement)
+    with pytest.raises(OSError, match="requires its session owner"), manager.standalone_execution():
+        pass
+    manager.close()
+    assert not scratch.exists()
+
+
+def test_bind_rejects_an_active_shared_command_authority(tmp_path):
+    """Session rebinding cannot change a permission manager while a command owns it."""
+    manager = PermissionManager(tmp_path)
+    original = manager.temporary_directory
+    lease = command_authorities.reserve((manager,))
+    try:
+        with pytest.raises(OSError, match="Command execution still owns temporary storage"):
+            manager.bind_temporary_directory(PathHolder(tmp_path))
+        assert manager.temporary_directory == original
+    finally:
+        lease.release()
+    manager.bind_temporary_directory(PathHolder(tmp_path))
+    manager.close()
+
+
+def test_standalone_execution_releases_on_exception_and_rejects_closed_manager(tmp_path):
+    """Exceptional lease exits release storage, and a closed owner cannot grant new leases."""
+    manager = PermissionManager(tmp_path)
+    with pytest.raises(ValueError, match="failure"), manager.standalone_execution():
+        raise ValueError("failure")
+    manager.close()
+    manager.close()
+    with pytest.raises(OSError, match="manager is closed"), manager.standalone_execution():
+        pass
+    with pytest.raises(OSError, match="manager is closed"):
+        manager.bind_temporary_directory(PathHolder(tmp_path))
+
+
+def test_failed_scratch_cleanup_blocks_admission_and_can_be_retried(tmp_path, monkeypatch):
+    """A failed cleanup remains retryable and never reopens standalone scratch admission."""
+    manager = PermissionManager(tmp_path)
+    scratch = manager.temporary_directory
+    cleanup = manager._temporary_directory.cleanup
+    attempts = []
+
+    def clean():
+        """Fail the first cleanup before allowing the real cleanup to finish."""
+        attempts.append(None)
+        if len(attempts) == 1:
+            raise OSError("temporary cleanup failed")
+        cleanup()
+
+    monkeypatch.setattr(manager._temporary_directory, "cleanup", clean)
+    with pytest.raises(OSError, match="temporary cleanup failed"):
+        manager.close()
+    assert scratch.exists()
+    with pytest.raises(OSError, match="closed or closing"), manager.standalone_execution():
+        pass
+    with pytest.raises(OSError, match="closed or closing"):
+        manager.bind_temporary_directory(PathHolder(tmp_path))
+    with pytest.raises(OSError, match="policy changed"):
+        manager.bind_egress(manager.egress_policy_revision(), Mock())
+    manager.close()
+    assert not scratch.exists()
+    assert len(attempts) == 2
 
 
 def test_yolo_publication_preserves_only_preexisting_authority(tmp_path):
@@ -3995,12 +4076,14 @@ def test_mediated_lease_binding_unbinds_and_close_reports_uncertain_cleanup(tmp_
     """A manager releases settled leases and reports an unconfirmed active closure."""
     manager = PermissionManager(tmp_path)
     lease = Mock()
-    lease.revoke_revision.return_value = False
+    lease.revoke_revision.side_effect = [False, True]
     manager.bind_egress(manager.egress_policy_revision(), lease)
     with pytest.raises(OSError, match="closure could not be confirmed"):
         manager.close()
-    assert lease not in manager._egress_revokers
+    with pytest.raises(OSError, match="closed or closing"), manager.standalone_execution():
+        pass
     manager.close()
+    assert lease.revoke_revision.call_count == 2
 
     next_manager = PermissionManager(tmp_path)
     next_lease = Mock()

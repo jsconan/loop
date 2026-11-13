@@ -8,8 +8,9 @@ import copy
 import inspect
 import json
 import logging
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Generator, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import is_dataclass
 from enum import Enum
 from functools import partial
@@ -20,6 +21,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from pydantic import BaseModel, ValidationError
 
+from ..command_authorities import command_authorities
 from ..commands.models import CommandArgumentError
 from ..commands.utils import parse_model_arguments
 from ..constants import (
@@ -58,7 +60,7 @@ from ..utils import (
     is_async_callable,
     settle_future_async,
 )
-from .context import ToolContext
+from .context import CommandEgressAuthority, ToolContext
 from .file_observations import FileObservations
 from .models import (
     ToolExecutionAdmissionRejected,
@@ -388,8 +390,61 @@ class ToolRegistry:
 
         Args:
             session_manager (SessionManager): Owner whose native lease protects detached jobs.
+
+        Raises:
+            RuntimeError: A different session cannot be bound while a command is active.
         """
-        self._session_manager = session_manager
+        with self._runner_lock:
+            if self._session_manager is session_manager:
+                return
+            if (
+                self._execution_service is not None
+                and self._execution_service.has_active_jobs() is True
+            ):
+                raise RuntimeError("Cannot rebind the session while commands are active.")
+            self._session_manager = session_manager
+
+    @contextmanager
+    def compose_session(
+        self,
+        session_manager: SessionManager,
+        *,
+        permission_manager: PermissionManager | None = None,
+        instructions_manager: InstructionsManager | None = None,
+    ) -> Iterator[None]:
+        """Reserve session composition against command admission and active jobs.
+
+        Bind the supplied session only when the caller finishes composition successfully.
+
+        Args:
+            session_manager (SessionManager): Session whose authorities are being composed.
+            permission_manager (PermissionManager | None): Actual permission authority, or None
+                to use the registry authority.
+            instructions_manager (InstructionsManager | None): Shared instructions, if any.
+
+        Yields:
+            None: Control while command admission and rebinding are excluded.
+
+        Raises:
+            RuntimeError: If an active command still owns the existing authorities.
+        """
+        with (
+            self._runner_lock,
+            command_authorities.composition(
+                (
+                    self._execution_service,
+                    permission_manager or self._permission_manager,
+                    instructions_manager,
+                )
+            ),
+        ):
+            if (
+                self._execution_service is not None
+                and self._execution_service.has_active_jobs() is True
+            ):
+                raise RuntimeError("Cannot compose the session while commands are active.")
+            yield
+            self._session_manager = session_manager
 
     def _sync_runner(self) -> asyncio.Runner | None:
         """Return the registry-owned runner only to its synchronous owner thread."""
@@ -1142,6 +1197,19 @@ class ToolRegistry:
         if is_async_callable(tool.function) and sync_runner is None:
             return serialize_tool_problem(self._async_required(tool).problem), 0
         active_permissions = permission_manager or self._permission_manager
+        try:
+            command_paths = (
+                instructions_manager.virtual_paths
+                if tool.execution_authorization and instructions_manager is not None
+                else None
+            )
+        except (OSError, ValueError):
+            return self._problem(
+                "tool.planning_failed",
+                "Tool planning failed",
+                "Command path context is unavailable.",
+                tool.name or "tool",
+            ), 0
         plan, planning_error = self._authorized_plan(
             tool,
             validated,
@@ -1149,6 +1217,7 @@ class ToolRegistry:
             active_permissions,
             instructions_manager,
             file_observations,
+            command_paths=command_paths,
         )
         if planning_error is not None:
             return self._model_result(planning_error, instructions_manager, tool), 0
@@ -1162,6 +1231,7 @@ class ToolRegistry:
             permission_manager=active_permissions,
             cancellation_event=cancellation_event,
             file_observations=file_observations,
+            command_paths=command_paths,
         )
         if sync_runner is not None:
             try:
@@ -1320,7 +1390,17 @@ class ToolRegistry:
         validated, error = tool.validate_arguments(arguments)
         if error is not None:
             return error, 0
-        virtual_paths = getattr(instructions_manager, "virtual_paths", None)
+        try:
+            virtual_paths = getattr(instructions_manager, "virtual_paths", None)
+        except (OSError, ValueError):
+            if not tool.execution_authorization:
+                raise
+            return self._problem(
+                "tool.planning_failed",
+                "Tool planning failed",
+                "Command path context is unavailable.",
+                tool.name or "tool",
+            ), 0
         redaction_roots = None
         if virtual_paths is not None:
             try:
@@ -1331,6 +1411,7 @@ class ToolRegistry:
             except ProblemException as exc:
                 return serialize_tool_problem(exc.problem), 0
         active_permissions = permission_manager or self._permission_manager
+        command_paths = virtual_paths if tool.execution_authorization else None
         plan, planning_error = await self._authorized_plan_async(
             tool,
             validated,
@@ -1338,6 +1419,7 @@ class ToolRegistry:
             active_permissions,
             instructions_manager,
             file_observations,
+            command_paths=command_paths,
         )
         if planning_error is not None:
             return self._model_result(
@@ -1358,6 +1440,7 @@ class ToolRegistry:
             permission_manager=active_permissions,
             cancellation_event=dispatch_cancellation,
             file_observations=file_observations,
+            command_paths=command_paths,
         )
         if execution_started is not None:
             await self._invoke_async(
@@ -1389,6 +1472,10 @@ class ToolRegistry:
                     active_permissions,
                     instructions_manager,
                     file_observations,
+                ),
+                command=(
+                    getattr(tool.function, "__module__", None) == "loop.tools.system"
+                    and getattr(tool.function, "__name__", None) == "run_command"
                 ),
             )
             active_context = worker_context
@@ -1516,7 +1603,24 @@ class ToolRegistry:
                     )
                 )
             )
-        plan, planning_error = self._command_plan(tool, validated, instructions_manager)
+        try:
+            command_paths = (
+                instructions_manager.virtual_paths
+                if tool.execution_authorization and instructions_manager is not None
+                else None
+            )
+        except (OSError, ValueError):
+            return ToolExecutionResult(
+                self._problem(
+                    "tool.planning_failed",
+                    "Tool planning failed",
+                    "Command path context is unavailable.",
+                    tool.name or "tool",
+                )
+            )
+        plan, planning_error = self._command_plan(
+            tool, validated, instructions_manager, command_paths=command_paths
+        )
         if planning_error is not None:
             return ToolExecutionResult(planning_error)
         context = self._context_for(
@@ -1526,6 +1630,7 @@ class ToolRegistry:
             operations=plan.operations,
             prerequisite_operations=plan.prerequisite_operations,
             permission_manager=(self._permission_manager if tool.execution_authorization else None),
+            command_paths=command_paths,
         )
         result = tool.execute(
             plan.arguments,
@@ -1611,11 +1716,18 @@ class ToolRegistry:
         permission_manager: PermissionManager,
         instructions_manager: InstructionsManager | None = None,
         file_observations: FileObservations | None = None,
+        *,
+        command_paths: VirtualPath | None = None,
     ) -> tuple[OperationPlan | None, str | None]:
         """Resolve and authorize every phase of one operation plan."""
         try:
             if instructions_manager is not None:
-                arguments = self._resolve_model_paths(tool, arguments, instructions_manager)
+                arguments = self._resolve_model_paths(
+                    tool,
+                    arguments,
+                    instructions_manager,
+                    command_paths=command_paths,
+                )
             plan = self._plan(tool, arguments)
             prerequisites = ()
             while True:
@@ -1671,11 +1783,18 @@ class ToolRegistry:
         permission_manager: PermissionManager,
         instructions_manager: InstructionsManager | None = None,
         file_observations: FileObservations | None = None,
+        *,
+        command_paths: VirtualPath | None = None,
     ) -> tuple[OperationPlan | None, str | None]:
         """Resolve and authorize every phase of one operation plan asynchronously."""
         try:
             if instructions_manager is not None:
-                arguments = self._resolve_model_paths(tool, arguments, instructions_manager)
+                arguments = self._resolve_model_paths(
+                    tool,
+                    arguments,
+                    instructions_manager,
+                    command_paths=command_paths,
+                )
             plan = await self._plan_async(tool, arguments)
             prerequisites = ()
             while True:
@@ -1740,13 +1859,17 @@ class ToolRegistry:
         tool: Tool,
         arguments: dict[str, object],
         instructions_manager: InstructionsManager,
+        *,
+        command_paths: VirtualPath | None = None,
     ) -> dict[str, object]:
         """Resolve typed model paths through the virtual-path boundary."""
         resolved = {}
         for name, value in arguments.items():
             metadata = tool.arguments_model.model_fields[name].metadata
             if VirtualPath.METADATA_KEY in metadata:
-                resolved[name] = instructions_manager.virtual_paths.resolve(str(value))
+                resolved[name] = (command_paths or instructions_manager.virtual_paths).resolve(
+                    str(value)
+                )
             else:
                 resolved[name] = value
         return resolved
@@ -1756,11 +1879,18 @@ class ToolRegistry:
         tool: Tool,
         arguments: dict[str, object],
         instructions_manager: InstructionsManager | None = None,
+        *,
+        command_paths: VirtualPath | None = None,
     ) -> tuple[OperationPlan | None, str | None]:
         """Resolve every planning phase for a direct user command."""
         try:
             if instructions_manager is not None:
-                arguments = self._resolve_model_paths(tool, arguments, instructions_manager)
+                arguments = self._resolve_model_paths(
+                    tool,
+                    arguments,
+                    instructions_manager,
+                    command_paths=command_paths,
+                )
             plan = self._plan(tool, arguments)
             prerequisites = ()
             while plan.continuation is not None:
@@ -1844,6 +1974,8 @@ class ToolRegistry:
         context: ToolContext,
         portal: ToolExecutionPortal,
         additional_authorizer: (Callable[[dict[str, object]], Awaitable[OperationPlan]] | None),
+        *,
+        command: bool = False,
     ) -> ToolContext:
         """Give a worker detached values and owner-thread proxies for session services."""
         return ToolContext(
@@ -1876,6 +2008,40 @@ class ToolRegistry:
             ),
             execution_service=context.execution_service,
             session_manager=context.session_manager,
+            standalone_execution=(
+                context.permission_manager.standalone_execution
+                if command and context.permission_manager is not None
+                else None
+            ),
+            invalidate_detached=(
+                partial(context.instructions_manager.invalidate, None)
+                if command and context.instructions_manager is not None
+                else None
+            ),
+            egress_authority=(
+                CommandEgressAuthority(
+                    context.permission_manager.bind_egress,
+                    context.permission_manager.unbind_egress,
+                    context.permission_manager.try_egress_policy_revision,
+                )
+                if command and context.permission_manager is not None
+                else None
+            ),
+            audit_host_detached=(
+                context.permission_manager.record_host_boundary
+                if command and context.permission_manager is not None
+                else None
+            ),
+            command_admission=context.command_admission,
+            command_authorities=(context.permission_manager, context.instructions_manager)
+            if command
+            else None,
+            command_paths=context.command_paths,
+            admit_skills_detached=(
+                context.instructions_manager.admit_command_skills
+                if command and context.instructions_manager is not None
+                else None
+            ),
             file_versions={},
             read_versions={},
             cancellation_event=context.cancellation_event,
@@ -2208,8 +2374,19 @@ class ToolRegistry:
         permission_manager: PermissionManager | None = None,
         cancellation_event: Event | None = None,
         file_observations: FileObservations | None = None,
+        command_paths: VirtualPath | None = None,
     ) -> ToolContext | None:
         """Build a tool context from the invocation override or registry default."""
+        selected_session = self._session_manager
+
+        @contextmanager
+        def command_admission() -> Generator[None, None, None]:
+            """Keep session rebinding out of command reservation."""
+            with self._runner_lock:
+                if self._session_manager is not selected_session:
+                    raise ValueError("Command session changed before admission.")
+                yield
+
         if interaction is None:
             interaction = self._interaction
 
@@ -2252,7 +2429,9 @@ class ToolRegistry:
             execution_service=self._execution_service
             if tool.execution_authorization or tool.requires_execution_service
             else None,
-            session_manager=self._session_manager,
+            session_manager=selected_session,
+            command_admission=command_admission,
+            command_paths=command_paths,
             cancellation_event=cancellation_event,
             additional_authorizer_async=(
                 authorize_additional_async if permission_manager is not None else None
@@ -2364,6 +2543,9 @@ class ToolRegistryView:
 
         Raises:
             ToolExecutionAdmissionRejected: If final admission is refused.
+            ToolExecutionInterrupted: If Ctrl+C settles the tool with a known result.
+            ToolExecutionOutcomeUnknown: If an entered invocation has no authoritative result.
+            ValueError: If the tool requires a context but none is provided.
         """
         return self._registry.call_with_timing(
             name,
@@ -2413,10 +2595,13 @@ class ToolRegistryView:
 
         Returns:
             tuple[str, float]: Serialized result and tool-function duration in seconds.
+
         Raises:
             ToolExecutionAdmissionRejected: If final admission is refused.
             ToolExecutionCancelled: If a cancelled synchronous invocation has a known result.
+            ToolExecutionOutcomeUnknown: If an entered invocation has no authoritative result.
             asyncio.CancelledError: If dispatch is cancelled without an authoritative result.
+            ValueError: If the tool requires a context but none is provided.
         """
         return await self._registry.call_with_timing_async(
             name,

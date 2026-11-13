@@ -155,6 +155,12 @@ class ToolSettings(BaseModel):
 
     command_timeout: float = Field(
         default=constants.DEFAULT_COMMAND_TIMEOUT,
+        ge=0,
+        allow_inf_nan=False,
+        json_schema_extra={"required_capabilities": [CommandCapability.CONTEXT_UPDATE.value]},
+    )
+    command_hard_timeout: float = Field(
+        default=constants.DEFAULT_COMMAND_HARD_TIMEOUT,
         gt=0,
         allow_inf_nan=False,
         json_schema_extra={"required_capabilities": [CommandCapability.CONTEXT_UPDATE.value]},

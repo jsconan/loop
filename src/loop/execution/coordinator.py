@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
+from time import get_clock_info
 from typing import Protocol
 from uuid import uuid4
 
@@ -43,15 +45,37 @@ def _check_command_deadlines(request: SandboxRequest, timeout: float | None) -> 
         raise ValueError("Command deadline must be finite and execution timeout positive.")
 
 
+def command_deadline(timeout: float, preparation_seconds: float = 0) -> float:
+    """Calculate a runtime deadline while retaining the native preparation budget.
+
+    Args:
+        timeout (float): Positive finite runtime budget in seconds.
+        preparation_seconds (float): Separate preparation budget, or zero for none.
+
+    Returns:
+        float: Absolute monotonic deadline for the combined budgets.
+
+    Raises:
+        ValueError: The deadline is not finite or loses the preparation budget to rounding.
+    """
+    preparation_deadline = time.monotonic() + preparation_seconds
+    deadline = preparation_deadline + timeout
+    if not is_finite_deadline(deadline):
+        raise ValueError("Renewed command deadline must be finite.")
+    if preparation_seconds and abs((deadline - timeout) - preparation_deadline) > max(
+        math.ulp(preparation_deadline), get_clock_info("monotonic").resolution
+    ):
+        raise ValueError("Renewed command deadline cannot represent the preparation budget.")
+    return deadline
+
+
 def _renew_command_deadline(
     request: SandboxRequest, timeout: float | None, *, preparation_seconds: float = 0
 ) -> SandboxRequest:
     """Renew an approved request's budget without admitting an overflowed deadline."""
     if timeout is None:
         return request
-    deadline = time.monotonic() + preparation_seconds + timeout
-    if not is_finite_deadline(deadline):
-        raise ValueError("Renewed command deadline must be finite.")
+    deadline = command_deadline(timeout, preparation_seconds)
     return replace(
         request,
         deadline=deadline,
@@ -236,6 +260,8 @@ class CommandExecutionCoordinator:
         interaction (Interaction | None): Actual user prompt surface, or None in headless mode.
         auto_approval (bool): Whether ordinary prompts use automatic input. This does not
             authorize host execution; trusted YOLO is a distinct permission-manager decision.
+        host_audit (Callable[..., None] | None): Thread-safe host audit callback, or None to use
+            the permission manager.
     """
 
     _backend: SandboxBackend
@@ -244,6 +270,7 @@ class CommandExecutionCoordinator:
     _interaction: Interaction | None
     _auto_approval: bool
     _offers: dict[str, HostCommandOffer]
+    _host_audit: Callable[..., None]
 
     def __init__(
         self,
@@ -253,6 +280,7 @@ class CommandExecutionCoordinator:
         interaction: Interaction | None,
         *,
         auto_approval: bool = False,
+        host_audit: Callable[..., None] | None = None,
     ) -> None:
         self._backend = backend
         self._host_executor = host_executor
@@ -260,6 +288,7 @@ class CommandExecutionCoordinator:
         self._interaction = interaction
         self._auto_approval = auto_approval
         self._offers = {}
+        self._host_audit = host_audit or permissions.record_host_boundary
 
     def run_sandboxed(
         self,
@@ -271,9 +300,10 @@ class CommandExecutionCoordinator:
         execution_timeout: float | None = None,
         cancellation_event: threading.Event | None = None,
         admission_cancellation_event: threading.Event | None = None,
-        on_admitted: Callable[[], None] | None = None,
+        on_admitted: Callable[[], bool | None] | None = None,
         output_observer: Callable[[str, str], None] | None = None,
         terminal_input: Callable[[], bytes | None] | None = None,
+        egress_authority: object | None = None,
     ) -> CommandAttempt:
         """Run an authorized request or offer retry for a no-effects boundary failure.
 
@@ -289,17 +319,19 @@ class CommandExecutionCoordinator:
             cancellation_event (threading.Event | None): Optional run cancellation signal.
             admission_cancellation_event (threading.Event | None): Original run stop signal
                 checked until a detached job is admitted; later signals do not cancel that job.
-            on_admitted (Callable[[], None] | None): Callback after approval and final prelaunch
-                validation, before the native backend owns the attempt.
+            on_admitted (Callable[[], bool | None] | None): Callback after approval and final
+                prelaunch validation. Returning False refuses native admission.
             output_observer (Callable[[str, str], None] | None): Bounded native output sink.
             terminal_input (Callable[[], bytes | None] | None): Transient control frames for an
                 approved receiver-owned terminal.
+            egress_authority (object | None): Thread-safe restricted egress authority, or None
+                to use the permission manager.
 
         Returns:
             CommandAttempt: Sandboxed result and optional unexecuted host offer.
 
         Raises:
-            ValueError: The request deadline or renewed execution deadline is not finite.
+            ValueError: A deadline is not finite or cannot preserve the preparation budget.
         """
         _check_command_deadlines(request, execution_timeout)
         if admission_cancellation_event is not None and admission_cancellation_event.is_set():
@@ -346,27 +378,34 @@ class CommandExecutionCoordinator:
                 SandboxOutcome.STALE, detail="Permission policy changed before launch."
             )
         else:
-            if on_admitted is not None:
-                on_admitted()
-            output_argument = (
-                {"output_observer": output_observer} if output_observer is not None else {}
-            )
-            if terminal_input is not None:
-                output_argument["terminal_input"] = terminal_input
-            if request.egress_origins:
-                result = self._backend.run(
-                    request,
-                    policy_authority=self._permissions,
-                    approved_revision=approved_revision[0],
-                    **({"cancellation_event": cancellation_event} if cancellation_event else {}),
-                    **output_argument,
+            if on_admitted is not None and on_admitted() is False:
+                result = CommandProcessResult(
+                    SandboxOutcome.STALE, detail="Command authority changed before launch."
                 )
             else:
-                result = self._backend.run(
-                    request,
-                    **({"cancellation_event": cancellation_event} if cancellation_event else {}),
-                    **output_argument,
+                output_argument = (
+                    {"output_observer": output_observer} if output_observer is not None else {}
                 )
+                if terminal_input is not None:
+                    output_argument["terminal_input"] = terminal_input
+                if request.egress_origins:
+                    result = self._backend.run(
+                        request,
+                        policy_authority=egress_authority or self._permissions,
+                        approved_revision=approved_revision[0],
+                        **(
+                            {"cancellation_event": cancellation_event} if cancellation_event else {}
+                        ),
+                        **output_argument,
+                    )
+                else:
+                    result = self._backend.run(
+                        request,
+                        **(
+                            {"cancellation_event": cancellation_event} if cancellation_event else {}
+                        ),
+                        **output_argument,
+                    )
         telemetry_audit(
             "sandbox.completed",
             workspace_id=request.workspace_id,
@@ -379,7 +418,7 @@ class CommandExecutionCoordinator:
             or request.egress_origins
         ):
             return CommandAttempt(result, None)
-        warning = self._permissions.host_retry_prompt(
+        warning = PermissionManager.host_retry_prompt(
             request.source,
             result.outcome.value,
             result.exit_code,
@@ -455,6 +494,8 @@ class CommandExecutionCoordinator:
         *,
         execution_timeout: float | None = None,
         cancellation_event: threading.Event | None = None,
+        on_authorized: Callable[[], bool] | None = None,
+        on_admitted: Callable[[], None] | None = None,
     ) -> CommandProcessResult | None:
         """Approve an unchanged offer and launch at most one host process.
 
@@ -464,6 +505,9 @@ class CommandExecutionCoordinator:
             execution_timeout (float | None): Execution budget in seconds to start after host
                 approval. Defaults to preserving the caller's absolute deadline.
             cancellation_event (threading.Event | None): Optional run cancellation signal.
+            on_authorized (Callable[[], bool] | None): Final authority gate before recording
+                approval; False refuses the host attempt.
+            on_admitted (Callable[[], None] | None): Notify the owner before host execution.
 
         Returns:
             CommandProcessResult | None: Host result after approval, or None when no launch occurs.
@@ -644,6 +688,18 @@ class CommandExecutionCoordinator:
             )
             self._record_host_boundary("host_command.stale", offer)
             return None
+        if on_authorized is not None and not on_authorized():
+            telemetry_audit(
+                "host_command.stale",
+                workspace_id=offer.request.workspace_id,
+                attempt_id=offer.request.attempt_id,
+                offer_id=offer.token,
+            )
+            self._record_host_boundary("host_command.stale", offer)
+            return None
+        if cancellation_event is not None and cancellation_event.is_set():
+            self._record_host_boundary("host_command.cancelled", offer)
+            return None
         if answer == "session":
             rule = self._permissions.remember_host_command_rule_if_current(
                 current_request, policy_revision
@@ -707,6 +763,11 @@ class CommandExecutionCoordinator:
         )
         try:
             host_request = HostCommandRequest.from_sandbox(current_request)
+            if on_admitted is not None:
+                on_admitted()
+            if cancellation_event is not None and cancellation_event.is_set():
+                self._record_host_boundary("host_command.cancelled", offer)
+                return None
             result = (
                 self._host_executor.run_host_command(
                     host_request,
@@ -747,7 +808,7 @@ class CommandExecutionCoordinator:
         outcome: str | None = None,
     ) -> None:
         """Write a minimized durable record for one host offer or execution boundary."""
-        self._permissions.record_host_boundary(
+        self._host_audit(
             event_name,
             offer.request.execution_source,
             attempt_id=offer.request.attempt_id,

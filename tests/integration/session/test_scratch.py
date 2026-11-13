@@ -601,7 +601,8 @@ with patch("loop.execution.sandbox.macos.backend.SeatbeltDiagnosticService.monit
     host.run_host_command.side_effect = AssertionError("unapproved host retry")
     registry = ToolRegistry([run_command, read_text_file, edit_text_file, write_text_file,
         read_cached_content],
-        permission_manager=permissions, execution_service=CommandExecutionService(backend, host))
+        permission_manager=permissions, execution_service=CommandExecutionService(backend, host),
+        session_manager=manager)
     def sqlite_command(query, *, select=False):
         '''Use the installed Linux runtime's Python SQLite module or the macOS system CLI.'''
         if sys.platform != "linux":

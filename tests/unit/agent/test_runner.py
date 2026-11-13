@@ -257,9 +257,14 @@ def file_runner(tmp_path, backend, *, registry=None, sessions=None, run_control=
     sessions = sessions or SessionManager(interaction=interaction)
     instructions = InstructionsManager()
     instructions.set_runtime_environment(
-        RuntimeEnvironment(working_directory=tmp_path, temporary_directory=tmp_path.parent)
+        RuntimeEnvironment(
+            working_directory=tmp_path, temporary_directory=sessions.temporary_directory
+        )
     )
     permissions = PermissionManager(tmp_path, interaction=interaction)
+    permissions.bind_temporary_directory(sessions.temporary_directory)
+    if registry is not None:
+        registry.bind_session_manager(sessions)
     agent = Agent("Assistant", tools=registry or ToolRegistry(BUILTIN_TOOLS))
     selection = Mock()
     selection.effective = "local-model"
@@ -524,6 +529,7 @@ def test_renamed_terminal_tool_executes_input_without_saving_it(tmp_path):
     model = Mock()
     model.get_response.side_effect = [model_calls(call), [ResponseCompleted(answer="done")]]
     service = Mock()
+    service.has_active_jobs.return_value = False
     service.control_command_terminal.return_value = {"terminal": True}
     registry = ToolRegistry(
         [ToolRegistration(control_command_terminal, name="renamed_terminal")],
@@ -664,7 +670,7 @@ def test_runner_executes_reused_provider_id_in_distinct_responses(tmp_path, monk
             arguments=json.dumps(
                 {
                     "command": command,
-                    "background": True,
+                    "wait_seconds": 1,
                 }
             ),
         )
@@ -705,7 +711,7 @@ def test_runner_executes_reused_provider_id_in_distinct_responses(tmp_path, monk
     ]
     assert outcome.turns == 3
     assert len(results) == 2 and all(result["ok"] for result in results)
-    assert results[0]["result"]["handle"] != results[1]["result"]["handle"]
+    assert [result["result"]["exit_code"] for result in results] == [0, 0]
     assert [call.args[0].source for call in native.run.call_args_list] == [
         "printf first",
         "printf second",
@@ -1215,7 +1221,7 @@ def test_runner_waits_for_one_configured_command_without_an_extra_turn(tmp_path,
     native.system_read_roots = (Path("/bin"), Path("/usr/bin"))
     clock = [100.0]
 
-    def complete_after_virtual_runtime(request):
+    def complete_after_virtual_runtime(request, **_kwargs):
         """Complete one simulated command after advancing beyond the old default."""
         assert request.deadline == 235
         clock[0] += 65
@@ -1233,7 +1239,7 @@ def test_runner_waits_for_one_configured_command_without_an_extra_turn(tmp_path,
         [run_command],
         permission_manager=PermissionManager(tmp_path),
         execution_service=CommandExecutionService(native, Mock()),
-        settings=ToolRuntimeSettings(command_timeout=75),
+        settings=ToolRuntimeSettings(command_timeout=75, command_hard_timeout=75),
     )
     runner = file_runner(tmp_path, model, registry=registry)
     runner.session_manager.add_user_message("Run the task")
@@ -2255,11 +2261,12 @@ def test_invalid_run_recovery_confirmation_preserves_pending_state(asynchronous)
     runner.backend.get_response.assert_not_called()
 
 
-def test_runner_recovers_unstarted_tools_before_requerying():
+@pytest.mark.parametrize("name", ["echo", "run_command"])
+def test_runner_recovers_unstarted_tools_before_requerying(name):
     """Definitely unstarted calls execute once with their stable call identifier."""
     final = Response(answer="done", reasoning="")
     runner, sessions, interaction = agent_runner(responses=[final])
-    call = ToolCall(call_id="call", name="echo", arguments="{}")
+    call = ToolCall(call_id="call", name=name, arguments="{}")
     runner.agent.tools.call_with_timing.return_value = (
         '{"ok": true, "result": "done"}',
         0.5,
@@ -2275,7 +2282,7 @@ def test_runner_recovers_unstarted_tools_before_requerying():
 
     sessions.add_tool_call_event.assert_called_once_with("call")
     runner.agent.tools.call_with_timing.assert_called_once_with(
-        "echo",
+        name,
         "{}",
         interaction=interaction,
         instructions_manager=runner.instructions_manager,
@@ -2583,7 +2590,7 @@ def test_runner_skips_completed_calls_in_a_partially_recovered_batch():
     final = Response(answer="done", reasoning="")
     runner, sessions, interaction = agent_runner(responses=[final])
     runner.agent.tools.call_with_timing.return_value = ('{"ok": true}', 0.1)
-    completed = ToolCall(call_id="completed", name="read", arguments="{}")
+    completed = ToolCall(call_id="completed", name="run_command", arguments="{}")
     pending = ToolCall(call_id="pending", name="write", arguments="{}")
 
     sessions.recovery_state = SessionRecoveryState(
@@ -2597,6 +2604,8 @@ def test_runner_skips_completed_calls_in_a_partially_recovered_batch():
 
     runner.recover_session()
 
+    runner.agent.tools.call_with_timing.assert_called_once()
+    assert runner.agent.tools.call_with_timing.call_args.args[0] == "write"
     callback = runner.agent.tools.call_with_timing.call_args.kwargs["execution_started"]
     callback()
     sessions.record_tool_execution_started.assert_called_once_with("pending")
@@ -2664,7 +2673,8 @@ def test_runner_resolves_uncertain_tools_without_retry_by_default():
     )
 
 
-def test_runner_retries_an_uncertain_tool_only_after_explicit_approval():
+@pytest.mark.parametrize("name", ["mutate", "run_command"])
+def test_runner_retries_an_uncertain_tool_only_after_explicit_approval(name):
     """Explicit approval retries an uncertain call without duplicating its presentation event."""
     final = Response(answer="done", reasoning="")
     runner, sessions, interaction = agent_runner(responses=[final])
@@ -2677,7 +2687,7 @@ def test_runner_retries_an_uncertain_tool_only_after_explicit_approval():
         return '{"ok": false}', 0.1
 
     runner.agent.tools.call_with_timing.side_effect = execute
-    call = ToolCall(call_id="call", name="mutate", arguments="{}")
+    call = ToolCall(call_id="call", name=name, arguments="{}")
 
     sessions.recovery_state = SessionRecoveryState(
         action="resolve_uncertain_tools",
@@ -2685,6 +2695,11 @@ def test_runner_retries_an_uncertain_tool_only_after_explicit_approval():
     )
     runner.recover_session()
 
+    runner.agent.tools.call_with_timing.assert_called_once()
+    assert runner.agent.tools.call_with_timing.call_args.args[0] == name
+    assert interaction.confirm.call_args_list[-1].args == (
+        f"Tool '{name}' may already have run. Retry it?",
+    )
     sessions.add_tool_call_event.assert_not_called()
     sessions.record_tool_execution_started.assert_called_once_with("call")
 
@@ -4266,12 +4281,13 @@ def test_runner_run_async_resolves_recovery_before_querying():
         ("not_started", None, True, True, False),
     ],
 )
+@pytest.mark.parametrize("name", ["effect", "run_command"])
 def test_async_recovery_preserves_unknown_outcome_and_pending_boundaries(
-    monkeypatch, status, approval, expected_execution, expected_present, expected_skip
+    monkeypatch, status, approval, expected_execution, expected_present, expected_skip, name
 ):
     """Async recovery retries only after approval and preserves already available results."""
     runner, _sessions, _interaction = agent_runner()
-    call = ToolCall(call_id="call", name="effect", arguments="{}")
+    call = ToolCall(call_id="call", name=name, arguments="{}")
     recovery = SessionRecoveryState(
         action="resolve_uncertain_tools",
         pending_calls=(PendingToolCall(call=call, status=status),),

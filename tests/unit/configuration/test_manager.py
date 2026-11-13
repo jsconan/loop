@@ -564,7 +564,8 @@ def test_initialize_creates_private_commented_defaults(tmp_path):
     assert 'api_key = "local-api-key"' in content
     assert "# context_window = <unset>" in content
     assert "[tools]" in content
-    assert "command_timeout = 3600.0" in content
+    assert "command_timeout = 10.0" in content
+    assert "command_hard_timeout = 3600.0" in content
     assert "command_job_wait_seconds = 30.0" in content
     assert path.stat().st_mode & 0o777 == 0o600
     assert manager.load().backend.api_key.get_secret_value() == "local-api-key"
@@ -593,6 +594,7 @@ def test_environment_overrides_persisted_values(tmp_path):
         {
             "DEFAULT_MODEL": "environment-model",
             "LOOP_COMMAND_TIMEOUT": "0.25",
+            "LOOP_COMMAND_HARD_TIMEOUT": "120.5",
             "LOOP_COMMAND_JOB_WAIT_SECONDS": "0.1",
             "LOOP_TEMPERATURE": "0.7",
             "LOOP_REASONING_EFFORT": "low",
@@ -602,15 +604,16 @@ def test_environment_overrides_persisted_values(tmp_path):
 
     assert settings.backend.default_model == "environment-model"
     assert settings.tools.command_timeout == 0.25
+    assert settings.tools.command_hard_timeout == 120.5
     assert settings.tools.command_job_wait_seconds == 0.1
     assert settings.app.temperature == 0.7
     assert settings.app.reasoning_effort == "low"
     assert settings.backend.hyperparameter_policy == "fallback"
 
 
-@pytest.mark.parametrize("value", [0, float("inf"), float("-inf"), float("nan")])
-def test_command_timeout_requires_a_positive_duration(tmp_path, value):
-    """Configuration rejects non-positive and non-finite command lifecycle timeouts."""
+@pytest.mark.parametrize("value", [-1, float("inf"), float("-inf"), float("nan")])
+def test_command_timeout_requires_a_nonnegative_finite_duration(tmp_path, value):
+    """Configuration rejects invalid initial command waits."""
     manager = ConfigurationManager(tmp_path / ".loop" / "config.toml")
     manager.initialize()
     manager.load()
@@ -618,7 +621,33 @@ def test_command_timeout_requires_a_positive_duration(tmp_path, value):
     with pytest.raises(ValidationError):
         manager.set_session("tools.command_timeout", value)
 
-    assert manager.effective.tools.command_timeout == 3600.0
+    assert manager.effective.tools.command_timeout == 10.0
+
+
+@pytest.mark.parametrize("value", [0, -1, float("inf"), float("-inf"), float("nan")])
+def test_command_hard_timeout_requires_a_positive_finite_duration(tmp_path, value):
+    """Configuration rejects invalid hard execution limits."""
+    manager = ConfigurationManager(tmp_path / ".loop" / "config.toml")
+    manager.initialize()
+    manager.load()
+
+    with pytest.raises(ValidationError):
+        manager.set_session("tools.command_hard_timeout", value)
+
+    assert manager.effective.tools.command_hard_timeout == 3600.0
+
+
+@pytest.mark.parametrize("setting", ["command_timeout", "command_job_wait_seconds"])
+@pytest.mark.parametrize("value", [0, 120])
+def test_command_waits_allow_zero_and_long_durations(tmp_path, setting, value):
+    """Initial and polling waits permit immediate or longer waits."""
+    manager = ConfigurationManager(tmp_path / ".loop" / "config.toml")
+    manager.initialize()
+    manager.load()
+
+    manager.set_session(f"tools.{setting}", value)
+
+    assert getattr(manager.effective.tools, setting) == value
 
 
 @pytest.mark.parametrize("value", [-1, float("inf"), float("-inf"), float("nan")])

@@ -222,6 +222,61 @@ def test_classified_failure_only_offers_host_retry(tmp_path):
     assert interaction.prompt.call_count == 1
 
 
+@pytest.mark.parametrize("mediated", [False, True])
+def test_sandbox_refuses_final_admission_without_starting_backend(tmp_path, mediated):
+    """A revoked authority at the final admission boundary prevents native execution."""
+    service, backend, host, _interaction = coordinator(
+        tmp_path, CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
+    )
+    if mediated:
+        service._permissions.set_yolo(True)
+    approved = request(
+        tmp_path,
+        **({"egress_origins": ("http://example.com",)} if mediated else {}),
+    )
+    attempt = service.run_sandboxed(approved, "run_command", on_admitted=lambda: False)
+    assert attempt.result.outcome is SandboxOutcome.STALE
+    assert attempt.offer is None
+    backend.run.assert_not_called()
+    host.run_host_command.assert_not_called()
+
+
+def test_host_refuses_final_admission_without_starting_process(tmp_path):
+    """A revoked authority at host admission prevents the approved host launch."""
+    service, _backend, host, _interaction = coordinator(
+        tmp_path, CommandProcessResult(SandboxOutcome.UNAVAILABLE)
+    )
+    approved = request(tmp_path)
+    offer = service.run_sandboxed(approved, "run_command").offer
+    assert offer is not None
+    assert service.retry_host_command(offer, approved, on_authorized=lambda: False) is None
+    host.run_host_command.assert_not_called()
+
+
+def test_host_cancellation_during_authority_check_prevents_launch(tmp_path):
+    """Cancellation during final authority validation prevents a host attempt."""
+    service, _backend, host, _interaction = coordinator(
+        tmp_path, CommandProcessResult(SandboxOutcome.UNAVAILABLE)
+    )
+    approved = request(tmp_path)
+    offer = service.run_sandboxed(approved, "run_command").offer
+    stopped = Event()
+
+    def authorize():
+        """Cancel exactly as the final authority check completes."""
+        stopped.set()
+        return True
+
+    assert offer is not None
+    assert (
+        service.retry_host_command(
+            offer, approved, cancellation_event=stopped, on_authorized=authorize
+        )
+        is None
+    )
+    host.run_host_command.assert_not_called()
+
+
 def test_host_retry_refuses_automatic_interaction_after_sandbox_failure(tmp_path):
     """An automatic answer cannot turn a sandbox failure into a host launch."""
     service, _backend, host, interaction = coordinator(
@@ -316,6 +371,34 @@ def test_overflowed_renewed_deadline_never_reaches_execution(tmp_path, monkeypat
     host.run_host_command.assert_not_called()
 
 
+def test_sandbox_rejects_unrepresentable_preparation_budget(tmp_path, monkeypatch):
+    """A finite runtime cannot erase the separately bounded native preparation deadline."""
+    monkeypatch.setattr("loop.execution.coordinator.time.monotonic", lambda: 100.0)
+    service, backend, _, _ = coordinator(
+        tmp_path, CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
+    )
+    approved = request(tmp_path, deadline=130.0)
+
+    with pytest.raises(ValueError, match="cannot represent the preparation budget"):
+        service.run_sandboxed(approved, "run_command", execution_timeout=1e20)
+
+    backend.run.assert_not_called()
+
+
+def test_sandbox_accepts_large_representable_runtime(tmp_path, monkeypatch):
+    """A large runtime remains valid when its preparation deadline is representable."""
+    monkeypatch.setattr("loop.execution.coordinator.time.monotonic", lambda: 100.0)
+    service, backend, _, _ = coordinator(
+        tmp_path, CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
+    )
+    approved = request(tmp_path, deadline=130.0)
+
+    service.run_sandboxed(approved, "run_command", execution_timeout=1e9)
+
+    launched = backend.run.call_args.args[0]
+    assert launched.deadline - launched.runtime_timeout == 160.0
+
+
 def test_sandbox_authorization_receives_model_explanation(tmp_path):
     """The coordinator forwards the explanation into the sandbox permission prompt."""
     outcome = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
@@ -354,6 +437,29 @@ def test_sandbox_denied_during_approval_never_starts_backend(tmp_path):
     assert attempt.result is None and attempt.offer is None
     backend.run.assert_not_called()
     host.run_host_command.assert_not_called()
+
+
+def test_host_cancellation_at_admission_prevents_launch(tmp_path):
+    """Cancellation at the final host boundary prevents execution after approval."""
+    service, backend, host, interaction = coordinator(
+        tmp_path, CommandProcessResult(SandboxOutcome.UNAVAILABLE, detail="no sandbox")
+    )
+    approved = request(tmp_path)
+    offer = service.run_sandboxed(approved, "run_command").offer
+    assert offer is not None
+    stopped = Event()
+
+    result = service.retry_host_command(
+        offer, approved, cancellation_event=stopped, on_admitted=stopped.set
+    )
+
+    assert result is None
+    assert stopped.is_set()
+    backend.run.assert_called_once()
+    host.run_host_command.assert_not_called()
+    assert any(
+        "without the OS sandbox" in item.args[0] for item in interaction.prompt.call_args_list
+    )
 
 
 def test_session_host_approval_is_reused_and_revocable(tmp_path):

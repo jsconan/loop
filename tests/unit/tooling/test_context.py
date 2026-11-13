@@ -7,6 +7,22 @@ import pytest
 
 from loop import InstructionsManager, OperationPlan, ProblemException, ToolContext
 from loop.interaction import Interaction
+from loop.tooling.context import CommandEgressAuthority
+
+
+def test_command_egress_authority_preserves_narrow_policy_operations():
+    """An owned mediator binds, reads, and unbinds through its supplied policy authority."""
+    bind, unbind, revision = Mock(), Mock(), Mock(return_value=7)
+    authority = CommandEgressAuthority(bind, unbind, revision)
+    lease = Mock()
+
+    authority.bind_egress(7, lease)
+    assert authority.try_egress_policy_revision() == 7
+    authority.unbind_egress(lease)
+
+    bind.assert_called_once_with(7, lease)
+    unbind.assert_called_once_with(lease)
+    revision.assert_called_once_with()
 
 
 def test_confirm_delegates_to_the_interaction():

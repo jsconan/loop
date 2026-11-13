@@ -36,7 +36,7 @@ def workers(monkeypatch):
 
 def test_command_job_pages_ordered_output_and_exposes_settled_result():
     """A cursor advances over bounded events without reusing earlier output."""
-    job = jobs.CommandJob("session", "call")
+    job = jobs.CommandJob("session", 3600.0)
     job.admitted()
     job.publish("stdout", "a" * (jobs.MAX_OUTPUT_EVENT_CHARS + 1))
     job.publish("stderr", "err")
@@ -58,9 +58,199 @@ def test_command_job_pages_ordered_output_and_exposes_settled_result():
     assert settled["result"] == {"exit_code": 0}
 
 
+def test_completed_job_identifies_remaining_output_and_execution_limit():
+    """A completed job distinguishes unread pages from a still-running process."""
+    job = jobs.CommandJob("session", 7200.0)
+    job.admitted()
+    job.publish("stdout", "a" * (jobs.MAX_OUTPUT_EVENT_CHARS * (jobs.MAX_READ_EVENTS + 1)))
+    job.complete({"exit_code": 0})
+
+    first = job.read(0)
+    assert first["status"] == "complete"
+    assert first["runtime_limit_seconds"] == 7200.0
+    assert first["output_remaining"] is True
+    assert first["result"] is None
+    assert "command has completed" in first["continuation"]
+
+    final = job.read(first["next_cursor"])
+    assert final["runtime_limit_seconds"] == 7200.0
+    assert final["output_remaining"] is False
+    assert final["result"] == {"exit_code": 0}
+
+
+def test_command_job_elapsed_time_stops_at_completion(monkeypatch):
+    """Report time since admission and freeze it when the job settles."""
+    now = [10.0]
+    monkeypatch.setattr(jobs.time, "monotonic", lambda: now[0])
+    job = jobs.CommandJob("session", 3600.0)
+    assert job.inspect()["elapsed_seconds"] is None
+    job.admitted()
+    now[0] = 12.0
+    assert job.read(0)["elapsed_seconds"] == 2.0
+    now[0] = 15.0
+    job.complete({"exit_code": 0})
+    now[0] = 20.0
+    assert job.inspect()["elapsed_seconds"] == 5.0
+
+
+def test_cancellation_signal_transfers_origin_at_handoff():
+    """Cancellation follows the origin before handoff and remains owned afterward."""
+    origin = Event()
+    job = jobs.CommandJob("session", 3600.0)
+    signal = job.cancellation_signal(origin)
+    assert not signal.is_set()
+    origin.set()
+    assert signal.is_set()
+    job.handoff(origin)
+    origin.clear()
+    assert signal.is_set()
+    assert job.cancellation_event.is_set()
+
+
+def test_cancellation_arriving_during_handoff_is_retained():
+    """A stop arriving between the origin check and transfer reaches the owned job."""
+    origin = Mock()
+    origin.is_set.side_effect = [False, True]
+    job = jobs.CommandJob("session", 3600.0)
+    signal = job.cancellation_signal(origin)
+
+    job.handoff(origin)
+
+    assert origin.is_set.call_count == 2
+    assert job.cancellation_event.is_set()
+    assert signal.is_set()
+
+
+def test_cancellation_signal_ignores_later_origin_but_honors_job_cancellation():
+    """After handoff, a later origin stop cannot cancel an independently owned job."""
+    origin = Event()
+    job = jobs.CommandJob("session", 3600.0)
+    signal = job.cancellation_signal(origin)
+    job.handoff(origin)
+    origin.set()
+    assert not signal.is_set()
+    job.cancel()
+    assert signal.is_set()
+    assert signal.wait(0)
+
+
+def test_cancellation_signal_wait_bounds_and_observes_origin(monkeypatch):
+    """A timed wait expires without cancellation; an unbounded wait observes the origin."""
+    now = [0.0]
+    monkeypatch.setattr(jobs.time, "monotonic", lambda: now[0])
+    origin = Event()
+    job = jobs.CommandJob("session", 3600.0)
+    signal = job.cancellation_signal(origin)
+    waits = []
+
+    def wait_for_signal(seconds):
+        """Advance a controlled clock and expose each bounded wait interval."""
+        waits.append(seconds)
+        now[0] += seconds
+        if len(waits) == 3:
+            origin.set()
+        return False
+
+    monkeypatch.setattr(job.cancellation_event, "wait", wait_for_signal)
+    assert not signal.wait(0)
+    assert not signal.wait(jobs.JOB_READ_CANCELLATION_CHECK_SECONDS * 2)
+    assert signal.wait()
+    assert waits == pytest.approx([jobs.JOB_READ_CANCELLATION_CHECK_SECONDS] * 3)
+
+
+def test_approval_interaction_cannot_start_after_handoff():
+    """A transferred command cannot start another interaction on the old caller."""
+    job = jobs.CommandJob("session", 3600.0)
+    assert job.begin_interaction()
+    job.end_interaction()
+    job.handoff()
+    assert not job.begin_interaction()
+
+
+def test_job_delivers_unexpected_error_to_the_initial_caller_once(monkeypatch):
+    """A settled failure reaches its initial caller and is not logged again on handoff."""
+    logged = Mock()
+    monkeypatch.setattr(jobs, "log_problem", logged)
+    job = jobs.CommandJob("session", 3600.0)
+    assert job.result() is None
+    error = RuntimeError("synthetic failure")
+    problem = Problem(code="command_job.failed", title="Failed", detail="Safe failure")
+    job.complete(problem, error)
+    with pytest.raises(RuntimeError, match="synthetic failure") as caught:
+        job.result()
+    assert caught.value is error
+    assert job.result() is problem
+    job.handoff()
+    logged.assert_not_called()
+
+
+def test_detached_job_reports_an_unexpected_failure_once(monkeypatch):
+    """A failure after handoff is logged once and remains inspectable as a safe result."""
+    logged = Mock()
+    monkeypatch.setattr(jobs, "log_problem", logged)
+    job = jobs.CommandJob("session", 3600.0)
+    job.handoff()
+    error = RuntimeError("synthetic failure")
+    problem = Problem(code="command_job.failed", title="Failed", detail="Safe failure")
+    job.complete(problem, error)
+    assert job.result() is problem
+    assert job.read(0)["result"] == problem.model_dump()
+    logged.assert_called_once()
+    assert logged.call_args.args[1:] == (problem, error)
+
+
+def test_initial_job_wait_stops_at_deadline_or_origin_cancellation(monkeypatch):
+    """Initial waits stop at their deadline or cancellation without stopping the job."""
+    job = jobs.CommandJob("session", 3600.0)
+    now = [0.0]
+    monkeypatch.setattr(jobs.time, "monotonic", lambda: now[0])
+    origin = Event()
+    waits = []
+
+    def wait_for_completion(seconds):
+        """Advance time and make cancellation observable during the second wait."""
+        waits.append(seconds)
+        now[0] += seconds
+        if len(waits) == 3:
+            origin.set()
+        return False
+
+    monkeypatch.setattr(job.finished, "wait", wait_for_completion)
+    job.wait(0, None)
+    assert waits == [0]
+    job.wait(jobs.JOB_READ_CANCELLATION_CHECK_SECONDS, origin)
+    assert waits[-1] == jobs.JOB_READ_CANCELLATION_CHECK_SECONDS
+    job.wait(10, origin)
+    assert origin.is_set()
+    assert len(waits) == 3
+    assert not job.cancellation_event.is_set()
+
+
+def test_job_read_wait_expiry_keeps_the_admitted_job_running(monkeypatch):
+    """A read wait can expire without cancelling or completing the owned command."""
+    now = [4.0]
+    monkeypatch.setattr(jobs.time, "monotonic", lambda: now[0])
+    job = jobs.CommandJob("session", 3600.0)
+    job.admitted()
+
+    def expire(_condition, _predicate, timeout):
+        """Advance the controlled clock through the requested wait."""
+        now[0] += timeout
+        return False
+
+    monkeypatch.setattr(jobs.threading.Condition, "wait_for", expire)
+    page = job.read(0, wait_seconds=3)
+    assert page["status"] == "running"
+    assert page["elapsed_seconds"] == 3.0
+    assert page["events"] == []
+    assert page["result"] is None
+    assert not page["cancel_requested"]
+    assert not job.cancellation_event.is_set()
+
+
 def test_replayed_cursor_returns_immediately_and_next_cursor_waits(monkeypatch):
     """Replayed events explain how to advance, while a current cursor waits for changes."""
-    job = jobs.CommandJob("session", None)
+    job = jobs.CommandJob("session", 3600.0)
     job.admitted()
     job.publish("stderr", "first")
     first = job.read(0)
@@ -85,7 +275,7 @@ def test_replayed_cursor_returns_immediately_and_next_cursor_waits(monkeypatch):
 
 def test_interrupting_job_read_leaves_command_running(monkeypatch):
     """A run interruption ends the read promptly without cancelling the underlying job."""
-    job = jobs.CommandJob("session", None)
+    job = jobs.CommandJob("session", 3600.0)
     job.admitted()
     interrupted = Event()
     waits = []
@@ -108,7 +298,7 @@ def test_interrupting_job_read_leaves_command_running(monkeypatch):
 
 def test_job_read_with_cancellation_signal_honors_wait_deadline(monkeypatch):
     """A quiet read returns at its deadline even when a cancellation signal is present."""
-    job = jobs.CommandJob("session", None)
+    job = jobs.CommandJob("session", 3600.0)
     clock = iter([1.0, 1.0, 2.0])
     monkeypatch.setattr(jobs.time, "monotonic", lambda: next(clock))
     wait = Mock(return_value=False)
@@ -123,7 +313,7 @@ def test_job_read_with_cancellation_signal_honors_wait_deadline(monkeypatch):
 
 def test_completed_job_ignores_late_output():
     """A completed job cannot acquire events from a late pipe reader."""
-    job = jobs.CommandJob("session", "call")
+    job = jobs.CommandJob("session", 3600.0)
     job.publish("stdout", "before")
     job.complete({"exit_code": 0})
     before = job.read(0)
@@ -134,7 +324,7 @@ def test_completed_job_ignores_late_output():
 
 def test_fragmented_output_coalesces_without_changing_delivered_events():
     """Small writes remain bounded and a cursor never skips later appended output."""
-    job = jobs.CommandJob("session", None)
+    job = jobs.CommandJob("session", 3600.0)
     for _ in range(10_000):
         job.publish("stdout", "x")
     first = job.read(0)
@@ -156,7 +346,7 @@ def test_fragmented_output_coalesces_without_changing_delivered_events():
 def test_alternating_output_bounds_events_and_reports_loss(monkeypatch):
     """Alternating streams cannot bypass the event limit or silently lose output."""
     monkeypatch.setattr(jobs, "MAX_JOB_OUTPUT_EVENTS", 2)
-    job = jobs.CommandJob("session", None)
+    job = jobs.CommandJob("session", 3600.0)
     job.publish("stdout", "a")
     job.publish("stderr", "b")
     job.publish("stdout", "c")
@@ -170,7 +360,7 @@ def test_alternating_output_bounds_events_and_reports_loss(monkeypatch):
 @pytest.mark.parametrize("completed", [False, True])
 def test_future_cursor_is_rejected_without_skipping_output(completed):
     """A future cursor cannot hide retained or subsequently published output."""
-    job = jobs.CommandJob("session", None)
+    job = jobs.CommandJob("session", 3600.0)
     job.publish("stdout", "first")
     if completed:
         job.complete({"exit_code": 0})
@@ -186,7 +376,7 @@ def test_future_cursor_is_rejected_without_skipping_output(completed):
 
 def test_settled_result_waits_until_all_retained_pages_are_delivered():
     """A completed job does not signal a final result before its output is paged."""
-    job = jobs.CommandJob("session", None)
+    job = jobs.CommandJob("session", 3600.0)
     for index in range(jobs.MAX_READ_EVENTS + 1):
         job.publish("stdout" if index % 2 == 0 else "stderr", str(index))
     job.complete({"exit_code": 0})
@@ -201,7 +391,7 @@ def test_settled_result_waits_until_all_retained_pages_are_delivered():
 @pytest.mark.parametrize("failure", [False, True])
 def test_settled_output_previews_are_available_only_on_request(failure):
     """Pages avoid repeating captured output while retaining explicit full-result access."""
-    job = jobs.CommandJob("session", None)
+    job = jobs.CommandJob("session", 3600.0)
     job.publish("stdout", "visible")
     output = {"stdout": {"content": "visible", "captured_bytes": 7, "tail": {"content": "e"}}}
     result = (
@@ -220,14 +410,14 @@ def test_settled_output_previews_are_available_only_on_request(failure):
 
 def test_settled_result_preserves_non_mapping_metadata():
     """Results with no stream metadata remain available without transformation."""
-    job = jobs.CommandJob("session", None)
+    job = jobs.CommandJob("session", 3600.0)
     job.complete({"metadata": None})
     assert job.read(0)["result"] == {"metadata": None}
 
 
 def test_terminal_job_bounds_transient_controls_and_escapes_output():
     """An owned terminal queues exact controls and renders unsafe output without retaining input."""
-    job = jobs.CommandJob("session", "call", terminal=True)
+    job = jobs.CommandJob("session", 3600.0, terminal=True)
     job.admitted()
     job.write_terminal("é\n")
     job.resize_terminal(30, 100)
@@ -253,7 +443,7 @@ def test_terminal_job_bounds_transient_controls_and_escapes_output():
 @pytest.mark.parametrize("content", [None, "", "x" * 4097])
 def test_terminal_job_refuses_invalid_input(content):
     """Only nonempty bounded UTF-8 text can enter a native terminal queue."""
-    job = jobs.CommandJob("session", None, terminal=True)
+    job = jobs.CommandJob("session", 3600.0, terminal=True)
     with pytest.raises((TypeError, ValueError), match="input"):
         job.write_terminal(content)
 
@@ -261,17 +451,17 @@ def test_terminal_job_refuses_invalid_input(content):
 @pytest.mark.parametrize(("rows", "columns"), [(0, 80), (24, 501), (True, 80), (24, "80")])
 def test_terminal_job_refuses_invalid_window_sizes(rows, columns):
     """Malformed dimensions cannot reach a native terminal ioctl."""
-    job = jobs.CommandJob("session", None, terminal=True)
+    job = jobs.CommandJob("session", 3600.0, terminal=True)
     with pytest.raises(ValueError, match="rows and columns"):
         job.resize_terminal(rows, columns)
 
 
 def test_terminal_job_refuses_nonterminal_control_and_queue_overflow(monkeypatch):
     """Normal jobs have no control channel and terminal input applies bounded backpressure."""
-    ordinary = jobs.CommandJob("session", None)
+    ordinary = jobs.CommandJob("session", 3600.0)
     with pytest.raises(ValueError, match="unavailable"):
         ordinary.terminal_interrupt()
-    terminal = jobs.CommandJob("session", None, terminal=True)
+    terminal = jobs.CommandJob("session", 3600.0, terminal=True)
     monkeypatch.setattr(jobs, "MAX_TERMINAL_PENDING_BYTES", 4)
     with pytest.raises(ValueError, match="backed up"):
         terminal.write_terminal("ab")
@@ -283,7 +473,7 @@ def test_terminal_job_refuses_nonterminal_control_and_queue_overflow(monkeypatch
 
 def test_settled_job_rejects_late_admission_completion_and_cancel():
     """A finished job cannot be relabeled or cancelled by a late callback."""
-    job = jobs.CommandJob("session", None)
+    job = jobs.CommandJob("session", 3600.0)
     job.complete({"exit_code": 0})
     job.admitted()
     job.complete({"exit_code": 7})
@@ -296,7 +486,7 @@ def test_settled_job_rejects_late_admission_completion_and_cancel():
 def test_command_job_expired_cursor_and_structured_failure(monkeypatch):
     """A bounded ring reports lost earlier events and keeps a safe final failure."""
     monkeypatch.setattr(jobs, "MAX_JOB_OUTPUT_BYTES", 4)
-    job = jobs.CommandJob("session", None)
+    job = jobs.CommandJob("session", 3600.0)
     job.publish("stdout", "abcd")
     job.publish("stderr", "ef")
     expired = job.read(0)
@@ -314,50 +504,53 @@ def test_command_job_expired_cursor_and_structured_failure(monkeypatch):
 def test_command_job_rejects_unknown_output_stream(stream):
     """Only the two authenticated process streams may enter a job page."""
     with pytest.raises(ValueError, match="output stream"):
-        jobs.CommandJob("session", None).publish(stream, "x")
+        jobs.CommandJob("session", 3600.0).publish(stream, "x")
 
 
 @pytest.mark.parametrize("cursor", [-1, True, "0"])
 def test_command_job_rejects_invalid_cursor(cursor):
     """Malformed cursors cannot silently restart output from zero."""
     with pytest.raises(ValueError, match="cursor"):
-        jobs.CommandJob("session", None).read(cursor)
+        jobs.CommandJob("session", 3600.0).read(cursor)
 
 
 @pytest.mark.parametrize("wait", [True, -1, float("inf"), float("nan"), "1"])
 def test_command_job_rejects_unbounded_wait(wait):
     """A caller cannot request an invalid or unsupported wait."""
     with pytest.raises(ValueError, match="wait"):
-        jobs.CommandJob("session", None).read(0, wait)
+        jobs.CommandJob("session", 3600.0).read(0, wait)
 
 
-def test_command_jobs_bind_handles_and_model_calls_to_one_session(workers):
-    """A duplicate call reuses one worker while another session cannot inspect it."""
+def test_command_jobs_create_distinct_workers_and_bind_handles_to_one_session(workers):
+    """Each invocation owns a fresh handle and other sessions cannot inspect either job."""
     registry = jobs.CommandJobs()
     runner = Mock(return_value={"exit_code": 0})
-    job = registry.start("session-a", "call-1", runner)
+    job = registry.start("session-a", runner, runtime_limit_seconds=3600.0)
     assert isinstance(job, jobs.CommandJob)
-    assert registry.start("session-a", "call-1", runner) is job
-    assert len(workers) == 1
+    second = registry.start("session-a", runner, runtime_limit_seconds=3600.0)
+    assert isinstance(second, jobs.CommandJob)
+    assert second.handle != job.handle
+    assert len(workers) == 2
     assert isinstance(registry.get("session-b", job.handle), Problem)
     assert isinstance(registry.get("session-a", "unknown"), Problem)
     assert registry.inspect("session-b") == []
 
     job.admitted()
     workers[0].target()
-    assert runner.call_count == 1
+    workers[1].target()
+    assert runner.call_count == 2
     assert registry.get("session-a", job.handle) is job
     assert registry.inspect("session-a")[0]["status"] == "complete"
     assert registry.close()
     assert workers[0].joined
-    assert isinstance(registry.start("session-a", None, runner), Problem)
+    assert isinstance(registry.start("session-a", runner, runtime_limit_seconds=3600.0), Problem)
 
 
 def test_close_terminal_keeps_pending_cleanup_and_forgets_only_settled_owner(workers, monkeypatch):
     """Closing a terminal cancels first and preserves an unsettled handle for inspection."""
     registry = jobs.CommandJobs()
-    ordinary = registry.start("owner", None, lambda _job: {})
-    terminal = registry.start("owner", "call", lambda _job: {}, terminal=True)
+    ordinary = registry.start("owner", lambda _job: {}, runtime_limit_seconds=3600.0)
+    terminal = registry.start("owner", lambda _job: {}, terminal=True, runtime_limit_seconds=3600.0)
     assert isinstance(registry.close_terminal("other", terminal.handle), Problem)
     assert isinstance(registry.close_terminal("owner", ordinary.handle), Problem)
     monkeypatch.setattr(terminal.finished, "wait", lambda _seconds: False)
@@ -371,21 +564,27 @@ def test_close_terminal_keeps_pending_cleanup_and_forgets_only_settled_owner(wor
     closed = registry.close_terminal("owner", terminal.handle)
     assert closed["closed"] is True
     assert isinstance(registry.get("owner", terminal.handle), Problem)
-    assert isinstance(registry.start("owner", "call", lambda _job: {}), Problem)
+    replacement = registry.start("owner", lambda _job: {}, runtime_limit_seconds=3600.0)
+    assert isinstance(replacement, jobs.CommandJob)
+    assert replacement.handle != terminal.handle
 
 
 def test_command_jobs_cap_active_and_retained_work(workers):
     """A bounded registry refuses a fifth active process and evicts settled history first."""
     registry = jobs.CommandJobs()
-    active = [registry.start("owner", None, lambda _job: {}) for _ in range(4)]
+    active = [
+        registry.start("owner", lambda _job: {}, runtime_limit_seconds=3600.0) for _ in range(4)
+    ]
     assert all(isinstance(job, jobs.CommandJob) for job in active)
-    assert isinstance(registry.start("owner", None, lambda _job: {}), Problem)
+    assert isinstance(
+        registry.start("owner", lambda _job: {}, runtime_limit_seconds=3600.0), Problem
+    )
     for index, job in enumerate(active):
         job.complete({"index": index})
     for _ in range(4):
-        job = registry.start("owner", None, lambda _job: {})
+        job = registry.start("owner", lambda _job: {}, runtime_limit_seconds=3600.0)
         job.complete({})
-    newest = registry.start("owner", None, lambda _job: {})
+    newest = registry.start("owner", lambda _job: {}, runtime_limit_seconds=3600.0)
     assert isinstance(newest, jobs.CommandJob)
     assert isinstance(registry.get("owner", active[0].handle), Problem)
     assert len(registry.inspect("owner")) == 8
@@ -393,25 +592,27 @@ def test_command_jobs_cap_active_and_retained_work(workers):
     assert newest.cancellation_event.is_set()
 
 
-def test_command_jobs_expire_without_replaying_a_model_call(workers, monkeypatch):
-    """An expired handle or repeated model call cannot launch source again."""
+def test_command_jobs_expire_without_resolving_old_handles(workers, monkeypatch):
+    """Expired handles are unavailable while a new invocation receives a new handle."""
     clock = [0.0]
     monkeypatch.setattr(jobs.time, "monotonic", lambda: clock[0])
     registry = jobs.CommandJobs()
-    job = registry.start("owner", "call", lambda _job: {})
+    job = registry.start("owner", lambda _job: {}, runtime_limit_seconds=3600.0)
     job.complete({})
     clock[0] = jobs.JOB_RETENTION_SECONDS
 
     assert isinstance(registry.get("owner", job.handle), Problem)
-    assert isinstance(registry.start("owner", "call", lambda _job: {}), Problem)
     assert registry.inspect("owner") == []
-    assert len(workers) == 1
+    replacement = registry.start("owner", lambda _job: {}, runtime_limit_seconds=3600.0)
+    assert isinstance(replacement, jobs.CommandJob)
+    assert replacement.handle != job.handle
+    assert len(workers) == 2
 
 
 def test_process_restart_invalidates_old_job_handles(workers):
     """A fresh registry cannot claim an old process's command or replay its output."""
     original = jobs.CommandJobs()
-    job = original.start("owner", "call", lambda _job: {})
+    job = original.start("owner", lambda _job: {}, runtime_limit_seconds=3600.0)
     job.complete({"exit_code": 0})
 
     restarted = jobs.CommandJobs()
@@ -424,26 +625,26 @@ def test_registry_eviction_handles_completion_at_zero_clock(workers, monkeypatch
     """A zero-valued monotonic completion time remains a valid eviction priority."""
     monkeypatch.setattr(jobs.time, "monotonic", lambda: 0.0)
     registry = jobs.CommandJobs()
-    original = registry.start("owner", "old", lambda _job: {})
+    original = registry.start("owner", lambda _job: {}, runtime_limit_seconds=3600.0)
     original.complete({})
     for _ in range(jobs.MAX_RETAINED_JOBS):
-        current = registry.start("owner", None, lambda _job: {})
+        current = registry.start("owner", lambda _job: {}, runtime_limit_seconds=3600.0)
         current.complete({})
     assert isinstance(registry.get("owner", original.handle), Problem)
-    assert isinstance(registry.start("owner", "old", lambda _job: {}), Problem)
-    assert len(workers) == jobs.MAX_RETAINED_JOBS + 1
+    replacement = registry.start("owner", lambda _job: {}, runtime_limit_seconds=3600.0)
+    assert isinstance(replacement, jobs.CommandJob)
+    assert replacement.handle != original.handle
+    assert len(workers) == jobs.MAX_RETAINED_JOBS + 2
 
 
-def test_command_jobs_bound_remembered_model_calls(workers, monkeypatch):
-    """A bounded identity ledger refuses new calls without permitting old replay."""
-    monkeypatch.setattr(jobs, "MAX_REMEMBERED_CALL_IDS", 1)
+def test_registry_reports_active_jobs(workers):
+    """A completed job no longer counts as active even while its handle is retained."""
     registry = jobs.CommandJobs()
-    original = registry.start("owner", "first", lambda _job: {})
-    original.complete({})
-
-    assert registry.start("owner", "first", lambda _job: {}) is original
-    assert isinstance(registry.start("owner", "second", lambda _job: {}), Problem)
-    assert len(workers) == 1
+    assert not registry.has_active()
+    job = registry.start("session", lambda _job: {}, runtime_limit_seconds=3600.0)
+    assert registry.has_active()
+    job.complete({"exit_code": 0})
+    assert not registry.has_active()
 
 
 def test_command_jobs_report_worker_failure_and_start_failure(workers, monkeypatch):
@@ -456,8 +657,9 @@ def test_command_jobs_report_worker_failure_and_start_failure(workers, monkeypat
         """Raise after the job has been reserved."""
         raise RuntimeError("sensitive detail")
 
-    job = registry.start("owner", None, fail)
+    job = registry.start("owner", fail, runtime_limit_seconds=3600.0)
     workers[0].target()
+    job.handoff()
     assert job.read(0)["result"]["code"] == "command_job.failed"
     assert "sensitive detail" not in job.read(0)["result"]["detail"]
 
@@ -466,7 +668,7 @@ def test_command_jobs_report_worker_failure_and_start_failure(workers, monkeypat
         raise RuntimeError("worker unavailable")
 
     monkeypatch.setattr(type(workers[0]), "start", refused_start)
-    rejected = registry.start("owner", "refused", lambda _job: {})
+    rejected = registry.start("owner", lambda _job: {}, runtime_limit_seconds=3600.0)
     assert isinstance(rejected, Problem)
     assert registry.inspect("owner") == [job.inspect()]
     assert logged.call_count == 2
@@ -483,13 +685,17 @@ def test_interrupted_worker_start_cannot_execute_after_reservation_is_removed(wo
 
     monkeypatch.setattr(jobs.threading.Thread, "start", interrupted_start)
     monkeypatch.setattr(jobs, "log_problem", Mock())
-    failed = registry.start("owner", "call", lambda _job: effects.append("effect") or {})
+    failed = registry.start(
+        "owner", lambda _job: effects.append("effect") or {}, runtime_limit_seconds=3600.0
+    )
     assert isinstance(failed, Problem)
     workers[0].target()
     assert effects == []
 
     monkeypatch.setattr(jobs.threading.Thread, "start", lambda _worker: None)
-    retried = registry.start("owner", "call", lambda _job: effects.append("effect") or {})
+    retried = registry.start(
+        "owner", lambda _job: effects.append("effect") or {}, runtime_limit_seconds=3600.0
+    )
     assert isinstance(retried, jobs.CommandJob)
     workers[1].target()
     assert effects == ["effect"]
@@ -510,15 +716,17 @@ def test_native_worker_cannot_enter_after_interrupted_start(monkeypatch):
 
     monkeypatch.setattr(jobs.threading.Thread, "start", interrupt_after_start)
     monkeypatch.setattr(jobs, "log_problem", Mock())
-    failed = registry.start("owner", "call", lambda _job: effects.append("effect") or {})
+    failed = registry.start(
+        "owner", lambda _job: effects.append("effect") or {}, runtime_limit_seconds=3600.0
+    )
     assert isinstance(failed, Problem)
     started[0].join(timeout=5)
     assert not started[0].is_alive()
     assert effects == []
 
 
-def test_start_failure_without_call_id_and_close_during_thread_handoff(workers, monkeypatch):
-    """Anonymous startup failure releases capacity and close tolerates a handoff race."""
+def test_start_failure_and_close_during_thread_handoff(workers, monkeypatch):
+    """Startup failure releases capacity and close tolerates a handoff race."""
     registry = jobs.CommandJobs()
 
     def refused_start(_self):
@@ -529,10 +737,12 @@ def test_start_failure_without_call_id_and_close_during_thread_handoff(workers, 
         type(workers[0]) if workers else jobs.threading.Thread, "start", refused_start
     )
     monkeypatch.setattr(jobs, "log_problem", Mock())
-    assert isinstance(registry.start("owner", None, lambda _job: {}), Problem)
+    assert isinstance(
+        registry.start("owner", lambda _job: {}, runtime_limit_seconds=3600.0), Problem
+    )
     assert registry.inspect("owner") == []
     monkeypatch.setattr(type(workers[0]), "start", lambda _self: None)
-    active = registry.start("owner", None, lambda _job: {})
+    active = registry.start("owner", lambda _job: {}, runtime_limit_seconds=3600.0)
     active.thread = None
     assert not registry.close()
     assert active.cancellation_event.is_set()
@@ -558,7 +768,7 @@ def test_worker_starts_before_shutdown_can_snapshot_it(workers, monkeypatch):
         checker.join()
 
     monkeypatch.setattr(type(workers[0]) if workers else jobs.threading.Thread, "start", start)
-    job = registry.start("owner", None, lambda _job: {})
+    job = registry.start("owner", lambda _job: {}, runtime_limit_seconds=3600.0)
 
     assert isinstance(job, jobs.CommandJob)
     assert observed == [True]

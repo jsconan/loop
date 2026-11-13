@@ -24,6 +24,7 @@ from loop.execution.sandbox.macos import backend as macos_backend
 from loop.execution.sandbox.macos.backend import MacOSSeatbeltBackend
 from loop.execution.sandbox.selection import select_sandbox_backend
 from loop.instructions import InstructionsManager, RuntimeEnvironment
+from loop.tooling import ToolRuntimeSettings
 from loop.tools.system import (
     cancel_command_job,
     control_command_terminal,
@@ -36,7 +37,11 @@ pytestmark = [pytest.mark.integration, pytest.mark.e2e, pytest.mark.macos]
 
 
 def _registry(
-    workspace: Path, *, terminal: bool = False
+    workspace: Path,
+    *,
+    terminal: bool = False,
+    command_timeout: float = 10,
+    command_hard_timeout: float = 3600,
 ) -> tuple[ToolRegistry, Mock, SessionManager]:
     """Compose public command tools with one real native backend and approval surface."""
     interaction = Mock()
@@ -57,6 +62,9 @@ def _registry(
         ],
         permission_manager=permissions,
         execution_service=CommandExecutionService(backend, LocalHostCommandExecutor()),
+        settings=ToolRuntimeSettings(
+            command_timeout=command_timeout, command_hard_timeout=command_hard_timeout
+        ),
         session_manager=sessions,
     )
     return registry, interaction, sessions
@@ -150,7 +158,7 @@ def test_native_terminal_keeps_streaming_after_final_capture_limit(native_worksp
         registry.close()
 
 
-def test_native_background_job_retains_ordered_output_and_session_ownership(native_workspace):
+def test_native_command_continuation_retains_ordered_output_and_session_ownership(native_workspace):
     """The same native process supplies a live handle, final result, and isolated cursors."""
     registry, interaction, sessions = _registry(native_workspace)
     other = native_workspace / "other-session"
@@ -163,7 +171,7 @@ def test_native_background_job_retains_ordered_output_and_session_ownership(nati
             "run_command",
             command="printf 'first\\n'; sleep 2; printf 'last\\n'",
             cwd=str(native_workspace),
-            background=True,
+            wait_seconds=0,
         )
         assert started["ok"], started
         handle = started["result"]["handle"]
@@ -181,8 +189,8 @@ def test_native_background_job_retains_ordered_output_and_session_ownership(nati
         )
         assert denied["problem"]["code"] == "command_job.unavailable"
         assert _call(registry, interaction, "inspect_command_jobs")["result"]["jobs"]
-        cursor = 0
-        observed = []
+        cursor = started["result"]["next_cursor"]
+        observed = list(started["result"]["events"])
         final = None
         for _ in range(8):
             page = _call(
@@ -218,7 +226,7 @@ def test_native_background_job_retains_ordered_output_and_session_ownership(nati
         registry.close()
 
 
-def test_native_background_cancel_reports_uncertain_detached_cleanup(native_workspace):
+def test_native_command_cancel_reports_uncertain_detached_cleanup(native_workspace):
     """Cancellation stops the owned command without claiming detached-child proof."""
     registry, interaction, _sessions = _registry(native_workspace)
     try:
@@ -228,13 +236,15 @@ def test_native_background_cancel_reports_uncertain_detached_cleanup(native_work
             "run_command",
             command="printf 'ready\\n'; sleep 20",
             cwd=str(native_workspace),
-            background=True,
+            wait_seconds=0,
         )
         assert started["ok"], started
         handle = started["result"]["handle"]
-        ready = False
-        cursor = 0
+        ready = any("ready" in event["content"] for event in started["result"]["events"])
+        cursor = started["result"]["next_cursor"]
         for _ in range(4):
+            if ready:
+                break
             page = _call(
                 registry,
                 interaction,
@@ -272,6 +282,76 @@ def test_native_background_cancel_reports_uncertain_detached_cleanup(native_work
         registry.close()
 
 
+def test_native_command_default_wait_continues_same_process(native_workspace):
+    """The configured initial wait yields a cursor while the original process continues."""
+    registry, interaction, _sessions = _registry(
+        native_workspace, command_timeout=0.1, command_hard_timeout=10
+    )
+    try:
+        started = _call(
+            registry,
+            interaction,
+            "run_command",
+            command="printf x >> continuation-count; sleep 1; printf finished",
+            cwd=str(native_workspace),
+        )
+        assert started["ok"], started
+        job = started["result"]
+        assert job["result"] is None and job["elapsed_seconds"] >= 0
+        result, output = _terminal_result(registry, interaction, job["handle"])
+        assert result["exit_code"] == 0
+        assert "finished" in output
+        assert (native_workspace / "continuation-count").read_text() == "x"
+    finally:
+        registry.close()
+
+
+def test_native_command_hard_deadline_after_continuation(native_workspace):
+    """A short wait preserves one command until its separate hard deadline stops it."""
+    registry, interaction, _sessions = _registry(
+        native_workspace, command_timeout=0.1, command_hard_timeout=2
+    )
+    marker = native_workspace / "deadline-count"
+    try:
+        started = _call(
+            registry,
+            interaction,
+            "run_command",
+            command="printf x >> deadline-count; printf ready; sleep 20",
+            cwd=str(native_workspace),
+        )
+        assert started["ok"], started
+        handle = started["result"]["handle"]
+        initial_elapsed = started["result"]["elapsed_seconds"]
+        assert initial_elapsed is not None and initial_elapsed >= 0
+        cursor = started["result"]["next_cursor"]
+        events = list(started["result"]["events"])
+        final = None
+        for _ in range(8):
+            page = _call(
+                registry,
+                interaction,
+                "read_command_job",
+                handle=handle,
+                cursor=cursor,
+                wait_seconds=5,
+            )
+            assert page["ok"], page
+            body = page["result"]
+            assert body["elapsed_seconds"] >= initial_elapsed
+            events.extend(body["events"])
+            cursor = body["next_cursor"]
+            if body["result"] is not None:
+                final = body["result"]
+                break
+        assert final is not None and final["code"] == "sandbox.timed_out"
+        assert final["metadata"]["lifecycle"]["descendant_cleanup"] == "uncertain"
+        assert "ready" in "".join(event["content"] for event in events)
+        assert marker.read_text() == "x"
+    finally:
+        registry.close()
+
+
 def test_native_async_public_dispatch_retains_job_owner(native_workspace):
     """The asynchronous registry passes its selected session lease into a detached worker."""
     registry, interaction, _sessions = _registry(native_workspace)
@@ -285,7 +365,7 @@ def test_native_async_public_dispatch_retains_job_owner(native_workspace):
                     {
                         "command": "printf async; sleep 0.3; printf done",
                         "cwd": str(native_workspace),
-                        "background": True,
+                        "wait_seconds": 0,
                     }
                 ),
                 interaction=interaction,
@@ -821,16 +901,44 @@ def test_native_terminal_host_peer_can_transfer_owned_pty_descriptor(native_work
     reason="Run the five-minute native duration control explicitly.",
 )
 @pytest.mark.parametrize("noisy", [False, True])
-def test_native_foreground_survives_previous_default_deadline(native_workspace, noisy):
-    """One public call completes after five minutes with no model retry or polling."""
+def test_native_command_continues_past_previous_default_deadline(native_workspace, noisy):
+    """One retained command completes after five minutes without replay."""
     registry, interaction, _sessions = _registry(native_workspace)
-    command = "printf begin; sleep 301; printf end" if noisy else "sleep 301; printf end"
+    command = "printf x >> count; " + ("printf begin; " if noisy else "") + "sleep 301; printf end"
     try:
-        result = _call(
-            registry, interaction, "run_command", command=command, cwd=str(native_workspace)
+        started = _call(
+            registry,
+            interaction,
+            "run_command",
+            command=command,
+            cwd=str(native_workspace),
+            wait_seconds=1,
         )
-        assert result["ok"], result
-        assert result["result"]["stdout"]["content"].endswith("end")
+        assert started["ok"], started
+        handle = started["result"]["handle"]
+        cursor = started["result"]["next_cursor"]
+        events = list(started["result"]["events"])
+        deadline = time.monotonic() + 330
+        final = None
+        while time.monotonic() < deadline:
+            page = _call(
+                registry,
+                interaction,
+                "read_command_job",
+                handle=handle,
+                cursor=cursor,
+                wait_seconds=30,
+            )
+            assert page["ok"], page
+            body = page["result"]
+            events.extend(body["events"])
+            cursor = body["next_cursor"]
+            if body["result"] is not None:
+                final = body["result"]
+                break
+        assert final is not None and final["exit_code"] == 0, final
+        assert "".join(event["content"] for event in events).endswith("end")
+        assert (native_workspace / "count").read_text() == "x"
     finally:
         registry.close()
 

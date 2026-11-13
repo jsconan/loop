@@ -14,13 +14,14 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable, Generator, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 from uuid import uuid4
 
 from .. import constants
+from ..command_authorities import command_authorities
 from ..errors import Problem, log_problem
 from ..permissions import Action, ProcessBoundary, ProcessTarget
 from ..permissions.protection import is_protected_external_read
@@ -35,14 +36,18 @@ from ..utils import (
     store_content,
 )
 from ..utils.process import render_terminal_text
-from .coordinator import CommandExecutionCoordinator, HostCommandExecutor, LocalHostCommandExecutor
+from .coordinator import (
+    CommandExecutionCoordinator,
+    HostCommandExecutor,
+    LocalHostCommandExecutor,
+    command_deadline,
+)
 from .jobs import (
     JOB_CLOSE_SECONDS,
     JOB_RETENTION_SECONDS,
     MAX_ACTIVE_JOBS,
     MAX_JOB_OUTPUT_BYTES,
     MAX_JOB_OUTPUT_EVENTS,
-    MAX_REMEMBERED_CALL_IDS,
     MAX_RETAINED_JOBS,
     CommandJob,
     CommandJobs,
@@ -83,7 +88,11 @@ from .sandbox.constants import (
 from .sandbox.contracts import resolve_selected_executable as _selected_executable
 
 _LOGGER = logging.getLogger(__name__)
-JOB_READ_TIMEOUT_FRACTION = 0.9
+
+
+def _command_paths(context: ToolContext) -> VirtualPath:
+    """Use captured command roots when available, otherwise read the current roots."""
+    return context.command_paths or context.instructions_manager.virtual_paths
 
 
 class WorkspaceExecutableLink(NamedTuple):
@@ -864,9 +873,7 @@ class CommandExecutionService:
                 raise RuntimeError("Native execution service is closed.")
             path_value = os.environ.get(PATH_ENVIRONMENT_VARIABLE, MINIMAL_SYSTEM_PATH)
             workspace = (
-                Path(
-                    context.instructions_manager.virtual_paths.resolve(VirtualPath.WORKSPACE)
-                ).resolve()
+                Path(_command_paths(context).resolve(VirtualPath.WORKSPACE)).resolve()
                 if context.instructions_manager is not None
                 else None
             )
@@ -877,7 +884,7 @@ class CommandExecutionService:
                     or cwd == VirtualPath.WORKSPACE
                     or cwd.startswith(f"{VirtualPath.WORKSPACE}/")
                 ):
-                    candidate = Path(context.instructions_manager.virtual_paths.resolve(cwd))
+                    candidate = Path(_command_paths(context).resolve(cwd))
                 try:
                     lookup_cwd = candidate.resolve(strict=True)
                 except (OSError, RuntimeError) as exc:
@@ -1129,14 +1136,12 @@ class CommandExecutionService:
     def _job_owner(context: ToolContext) -> str:
         """Bind a continuation to the selected session's live scratch directory."""
         root = (
-            dict(context.instructions_manager.virtual_paths.command_roots()).get(
-                VirtualPath.TEMPORARY
-            )
+            dict(_command_paths(context).command_roots()).get(VirtualPath.TEMPORARY)
             if context.instructions_manager is not None
-            else context.permission_manager.temporary_directory
-            if context.permission_manager is not None
             else None
         )
+        if root is None and context.permission_manager is not None:
+            root = context.permission_manager.temporary_directory
         if root is None:
             raise ValueError("Session scratch identity is unavailable.")
         path = Path(root).resolve(strict=True)
@@ -1146,6 +1151,14 @@ class CommandExecutionService:
             raise ValueError("Session scratch identity differs from its owner.")
         details = path.stat()
         return f"{path}:{details.st_dev}:{details.st_ino}"
+
+    def has_active_jobs(self) -> bool:
+        """Check whether any command worker is still active.
+
+        Returns:
+            bool: Whether an active worker still owns a command.
+        """
+        return self._jobs.has_active()
 
     def inspect_command_jobs(self, context: ToolContext) -> dict | Problem:
         """List only the selected session's retained command handles.
@@ -1173,7 +1186,6 @@ class CommandExecutionService:
                 "output_bytes_per_job": MAX_JOB_OUTPUT_BYTES,
                 "output_events_per_job": MAX_JOB_OUTPUT_EVENTS,
                 "retention_seconds": JOB_RETENTION_SECONDS,
-                "remembered_model_calls": MAX_REMEMBERED_CALL_IDS,
             },
         }
 
@@ -1192,7 +1204,7 @@ class CommandExecutionService:
             handle (str): Opaque handle returned by the original command call.
             cursor (int): Next output event cursor.
             wait_seconds (float | None): Maximum wait for output or completion, or None for the
-                configured default; capped below the configured command timeout.
+                configured default; capped at the supported job-read limit.
             include_output (bool): Include final captured stream previews explicitly.
 
         Returns:
@@ -1220,7 +1232,6 @@ class CommandExecutionService:
         ):
             wait_seconds = min(
                 wait_seconds,
-                context.settings.command_timeout * JOB_READ_TIMEOUT_FRACTION,
                 threading.TIMEOUT_MAX,
             )
         try:
@@ -1389,34 +1400,52 @@ class CommandExecutionService:
         context: ToolContext,
         request: SandboxRequest,
         redact: Callable[[str], str],
+        display_path: Callable[[str], str],
         *,
+        job: CommandJob,
+        skill_snapshot: tuple[tuple[str, Path, str], ...] = (),
         prelaunch_failure: CommandProcessResult | None = None,
         reason: str | None = None,
-        job: CommandJob | None = None,
         admission_cancellation_event: threading.Event | None = None,
     ) -> dict | Problem:
         """Execute one bound request and render its output and diagnostics."""
         coordinator = CommandExecutionCoordinator(
-            self._backend, self._host_executor, context.permission_manager, context.interaction
+            self._backend,
+            self._host_executor,
+            context.permission_manager,
+            context.interaction,
+            **({"host_audit": context.audit_host_detached} if context.audit_host_detached else {}),
         )
         reason_argument = {"reason": reason} if reason is not None else {}
         invalidated = False
+        invalidate = context.invalidate_detached or context.invalidate_instructions
+        admit_skills = (
+            context.admit_skills_detached or context.instructions_manager.admit_command_skills
+            if skill_snapshot
+            else None
+        )
+
+        def sandbox_admitted() -> bool | None:
+            """Commit job admission only while its used skills remain active."""
+            if admit_skills is not None:
+                return admit_skills(skill_snapshot, job.admitted)
+            job.admitted()
+            return None
+
         try:
             attempt = coordinator.run_sandboxed(
                 request,
                 context.tool_name,
                 prelaunch_failure=prelaunch_failure,
-                execution_timeout=context.settings.command_timeout,
+                execution_timeout=context.settings.command_hard_timeout,
                 cancellation_event=context.cancellation_event,
                 admission_cancellation_event=admission_cancellation_event,
+                on_admitted=sandbox_admitted,
+                output_observer=job.publish,
+                **({"terminal_input": job.next_terminal_frame} if job.terminal else {}),
                 **(
-                    {"on_admitted": job.admitted, "output_observer": job.publish}
-                    if job is not None
-                    else {}
-                ),
-                **(
-                    {"terminal_input": job.next_terminal_frame}
-                    if job is not None and job.terminal
+                    {"egress_authority": context.egress_authority}
+                    if context.egress_authority is not None and request.egress_origins
                     else {}
                 ),
                 **reason_argument,
@@ -1425,26 +1454,49 @@ class CommandExecutionService:
                 attempt.result.outcome is SandboxOutcome.COMPLETED
                 or attempt.result.possible_effects
             )
-            retry = (
-                coordinator.retry_host_command(
-                    attempt.offer,
-                    request,
-                    execution_timeout=context.settings.command_timeout,
-                    cancellation_event=context.cancellation_event,
-                )
-                if job is None and attempt.result is not None and attempt.offer is not None
-                else None
-            )
+            retry = None
+            if attempt.result is not None and attempt.offer is not None:
+                reserved_interaction = job.begin_interaction()
+                if reserved_interaction:
+
+                    def complete_host_admission() -> None:
+                        """Release the approval interaction before host supervision."""
+                        nonlocal reserved_interaction
+                        if (
+                            admission_cancellation_event is not None
+                            and admission_cancellation_event.is_set()
+                        ):
+                            job.cancel()
+                        job.admitted()
+                        job.end_interaction()
+                        reserved_interaction = False
+
+                    def host_authorized() -> bool:
+                        """Commit skill authority after approval without releasing the owner."""
+                        return admit_skills(skill_snapshot, lambda: None)
+
+                    try:
+                        retry = coordinator.retry_host_command(
+                            attempt.offer,
+                            request,
+                            execution_timeout=context.settings.command_hard_timeout,
+                            cancellation_event=context.cancellation_event,
+                            on_admitted=complete_host_admission,
+                            **({"on_authorized": host_authorized} if admit_skills else {}),
+                        )
+                    finally:
+                        if reserved_interaction:
+                            job.end_interaction()
             if possible_effects or (
                 retry is not None
                 and (retry.outcome is SandboxOutcome.COMPLETED or retry.possible_effects)
             ):
                 invalidated = True
-                context.invalidate_instructions()
+                invalidate()
         except BaseException as exc:
             if not invalidated:
                 try:
-                    context.invalidate_instructions()
+                    invalidate()
                 except BaseException as invalidation_error:
                     raise exc from invalidation_error
             raise
@@ -1457,6 +1509,13 @@ class CommandExecutionService:
             )
         result = attempt.result
         boundary = "sandbox"
+        if (
+            retry is None
+            and attempt.offer is not None
+            and context.cancellation_event is not None
+            and context.cancellation_event.is_set()
+        ):
+            result = replace(result, outcome=SandboxOutcome.CANCELLED)
         if retry is not None:
             result = retry
             boundary = "host"
@@ -1482,7 +1541,7 @@ class CommandExecutionService:
                 startup_baseline = "unavailable"
             rendered_records = tuple(
                 (
-                    _redact_denial_observation(record, redact, context.display_path),
+                    _redact_denial_observation(record, redact, display_path),
                     startup_match,
                     record.endswith("…"),
                 )
@@ -1715,14 +1774,12 @@ class CommandExecutionService:
         try:
             command_cwd = Path(cwd).resolve(strict=True)
             workspace = (
-                Path(
-                    context.instructions_manager.virtual_paths.resolve(VirtualPath.WORKSPACE)
-                ).resolve(strict=True)
+                Path(_command_paths(context).resolve(VirtualPath.WORKSPACE)).resolve(strict=True)
                 if context.instructions_manager is not None
                 else command_cwd
             )
             paths = (
-                context.instructions_manager.virtual_paths
+                _command_paths(context)
                 if context.instructions_manager is not None
                 else VirtualPath(
                     workspace=workspace,
@@ -1752,7 +1809,7 @@ class CommandExecutionService:
                 network=False,
                 environment=environment,
                 policy_version="host-request-v1",
-                deadline=time.monotonic() + context.settings.command_timeout,
+                deadline=time.monotonic() + context.settings.command_hard_timeout,
                 workspace_id=str(workspace),
                 scratch_root=scratch,
             )
@@ -1771,7 +1828,7 @@ class CommandExecutionService:
                 request,
                 context.tool_name,
                 reason,
-                execution_timeout=context.settings.command_timeout,
+                execution_timeout=context.settings.command_hard_timeout,
                 cancellation_event=context.cancellation_event,
             )
         except BaseException as exc:
@@ -1831,8 +1888,8 @@ class CommandExecutionService:
         git_write: bool = False,
         reason: str | None = None,
         egress_origins: list[str] | None = None,
-        background: bool = False,
         interactive: bool = False,
+        wait_seconds: float | None = None,
         job: CommandJob | None = None,
         admission_cancellation_event: threading.Event | None = None,
     ) -> dict | Problem:
@@ -1850,16 +1907,16 @@ class CommandExecutionService:
             egress_origins (list[str] | None): Canonical HTTP(S) origins for a qualified mediator.
             git_write (bool): Request Git metadata write authority.
             reason (str | None): Explanation shown to the user for additional sandbox authority.
-            background (bool): Return an owned continuation after approval instead of waiting for
-                final command output.
             interactive (bool): Return an owned terminal handle after approval where qualified.
-            job (CommandJob | None): Internal owner of a previously reserved background attempt.
+            wait_seconds (float | None): Initial wait after admission, or None for the configured
+                default.
+            job (CommandJob | None): Internal owner of a previously reserved command attempt.
             admission_cancellation_event (threading.Event | None): Original run stop signal
                 retained only until the detached attempt enters native admission.
 
         Returns:
-            dict | Problem: Bounded output or typed failure,
-                which may include a separate host offer.
+            dict | Problem: Final bounded output, an owned continuation, or a typed failure that
+                may include a separate host offer.
         """
         with self._backend_lease() as available:
             if not available:
@@ -1881,8 +1938,8 @@ class CommandExecutionService:
                 git_write=git_write,
                 reason=reason,
                 egress_origins=egress_origins,
-                background=background,
                 interactive=interactive,
+                wait_seconds=wait_seconds,
                 job=job,
                 admission_cancellation_event=admission_cancellation_event,
             )
@@ -1900,12 +1957,23 @@ class CommandExecutionService:
         git_write: bool = False,
         reason: str | None = None,
         egress_origins: list[str] | None = None,
-        background: bool = False,
         interactive: bool = False,
+        wait_seconds: float | None = None,
         job: CommandJob | None = None,
         admission_cancellation_event: threading.Event | None = None,
     ) -> dict | Problem:
         """Bind and execute a command while its selected backend lease remains active."""
+        try:
+            command_deadline(
+                context.settings.command_hard_timeout, constants.COMMAND_PREPARATION_SECONDS
+            )
+        except ValueError:
+            return Problem(
+                code="command_job.invalid_runtime",
+                title="Command runtime limit is not representable",
+                detail="Reduce tools.command_hard_timeout to a value supported by this clock.",
+                operation=context.tool_name,
+            )
         if interactive and SandboxCapability.TERMINAL not in self.backend_capabilities:
             return Problem(
                 code="command_terminal.unavailable",
@@ -1920,89 +1988,6 @@ class CommandExecutionService:
                 detail="Mediated egress cannot share the interactive terminal control path.",
                 operation=context.tool_name,
             )
-        if interactive and job is None:
-            background = True
-        if background:
-            if context.cancellation_event is not None and context.cancellation_event.is_set():
-                return Problem(
-                    code="sandbox.cancelled",
-                    title="Command cancelled",
-                    detail="The originating run was cancelled before command admission.",
-                    operation=context.tool_name,
-                )
-            manager = context.session_manager
-            if manager is None:
-                return Problem(
-                    code="command_job.unavailable",
-                    title="Command job unavailable",
-                    detail="Session ownership is unavailable for a detached command.",
-                    operation=context.tool_name,
-                )
-            reserved: CommandJob | Problem | None = None
-            try:
-                with manager.interaction_execution():
-                    session_id = manager.session.id
-                    owner = self._job_owner(context)
-
-                    def execute(owned: CommandJob) -> dict | Problem:
-                        """Run the exact planned command once under a job-owned cancel signal."""
-                        with manager.interaction_execution(session_id):
-                            return self.run_command(
-                                replace(context, cancellation_event=owned.cancellation_event),
-                                command,
-                                cwd,
-                                read_only,
-                                read_roots,
-                                write_roots,
-                                executable_grant,
-                                network,
-                                git_write,
-                                reason,
-                                egress_origins,
-                                interactive=interactive,
-                                job=owned,
-                                admission_cancellation_event=context.cancellation_event,
-                            )
-
-                    reserved = self._jobs.start(
-                        owner,
-                        context.call_id,
-                        execute,
-                        occurrence=(
-                            manager.session.tool_call_index(context.call_id)
-                            if context.call_id is not None
-                            else None
-                        ),
-                        **({"terminal": True} if interactive else {}),
-                    )
-                    if isinstance(reserved, Problem):
-                        return reserved
-                    reserved.ready.wait()
-                    response = {
-                        **reserved.inspect(),
-                        "continuation": (
-                            "Use read_command_job with this handle and its next cursor."
-                        ),
-                    }
-                    if reserved.finished.is_set():
-                        page = reserved.read(response["oldest_cursor"])
-                        if isinstance(page, dict):
-                            response.update(page)
-                    return response
-            except (OSError, ValueError, SessionExecutionConflictError):
-                if isinstance(reserved, CommandJob):
-                    reserved.cancel()
-                return Problem(
-                    code="command_job.unavailable",
-                    title="Command job unavailable",
-                    detail="Session scratch ownership is unavailable.",
-                    operation=context.tool_name,
-                )
-            except BaseException:
-                if isinstance(reserved, CommandJob):
-                    reserved.cancel()
-                raise
-
         operation = context.operations[0] if context.operations else None
         target = operation.target if operation is not None else None
         if (
@@ -2022,6 +2007,159 @@ class CommandExecutionService:
                 detail="Native command authorization is unavailable.",
                 operation=context.tool_name,
             )
+        if job is None:
+            runtime_settings = replace(context.settings)
+            if wait_seconds is None:
+                wait_seconds = runtime_settings.command_timeout
+            if (
+                isinstance(wait_seconds, bool)
+                or not isinstance(wait_seconds, (int, float))
+                or isinstance(wait_seconds, float)
+                and not math.isfinite(wait_seconds)
+                or wait_seconds < 0
+            ):
+                return Problem(
+                    code="command_job.invalid_wait",
+                    title="Invalid command wait",
+                    detail="The initial wait must be a finite nonnegative number of seconds.",
+                    operation=context.tool_name,
+                )
+            if context.cancellation_event is not None and context.cancellation_event.is_set():
+                return Problem(
+                    code="sandbox.cancelled",
+                    title="Command cancelled",
+                    detail="The originating run was cancelled before command admission.",
+                    operation=context.tool_name,
+                )
+            manager = context.session_manager
+            permissions = context.permission_manager
+            reserved: CommandJob | Problem | None = None
+            authority_lease = None
+            retrieving_result = False
+            try:
+                standalone = (
+                    context.standalone_execution or permissions.standalone_execution
+                    if manager is None
+                    else None
+                )
+                with (
+                    manager.interaction_execution()
+                    if manager is not None
+                    else standalone() as lease
+                ):
+                    session_id = manager.session.id if manager is not None else None
+                    authorities = (
+                        context.command_authorities
+                        if context.command_authorities is not None
+                        else (permissions, context.instructions_manager)
+                    )
+                    authority_lease = command_authorities.reserve((self, *authorities))
+                    if context.instructions_manager is not None:
+                        context = replace(context, command_paths=_command_paths(context))
+                    owner = self._job_owner(context)
+                    if manager is not None and Path(permissions.temporary_directory).resolve(
+                        strict=True
+                    ) != Path(manager.temporary_directory).resolve(strict=True):
+                        raise ValueError("Permission scratch identity differs from its session.")
+                    if manager is None and Path(lease).resolve(strict=True) != Path(
+                        owner.rsplit(":", 2)[0]
+                    ):
+                        raise ValueError("Standalone scratch identity differs from its owner.")
+
+                    def execute(owned: CommandJob) -> dict | Problem:
+                        """Run the exact planned command once under a job-owned cancel signal."""
+                        with (
+                            manager.interaction_execution(session_id)
+                            if manager is not None
+                            else standalone()
+                        ):
+                            return self.run_command(
+                                replace(
+                                    context,
+                                    settings=runtime_settings,
+                                    cancellation_event=owned.cancellation_signal(
+                                        context.cancellation_event
+                                    ),
+                                ),
+                                command,
+                                cwd,
+                                read_only,
+                                read_roots,
+                                write_roots,
+                                executable_grant,
+                                network,
+                                git_write,
+                                reason,
+                                egress_origins,
+                                interactive=interactive,
+                                job=owned,
+                                admission_cancellation_event=context.cancellation_event,
+                            )
+
+                    with (
+                        context.command_admission()
+                        if context.command_admission is not None
+                        else nullcontext()
+                    ):
+                        reserved = self._jobs.start(
+                            owner,
+                            execute,
+                            runtime_limit_seconds=runtime_settings.command_hard_timeout,
+                            on_settled=authority_lease.release,
+                            **({"terminal": True} if interactive else {}),
+                        )
+                    if isinstance(reserved, Problem):
+                        return reserved
+                    reserved.ready.wait()
+                    if not interactive:
+                        reserved.wait(
+                            min(wait_seconds, threading.TIMEOUT_MAX), context.cancellation_event
+                        )
+                    if (
+                        context.cancellation_event is not None
+                        and context.cancellation_event.is_set()
+                    ):
+                        reserved.cancel()
+                    retrieving_result = True
+                    result = reserved.result() if not interactive else None
+                    retrieving_result = False
+                    reserved.handoff(context.cancellation_event)
+                    if result is not None:
+                        return result
+                    response = {
+                        **reserved.inspect(),
+                        "continuation": (
+                            "Use read_command_job with this handle and its next cursor."
+                        ),
+                    }
+                    page = reserved.read(response["oldest_cursor"])
+                    if isinstance(page, Problem):
+                        return page.model_copy(
+                            update={"metadata": {**page.metadata, "handle": reserved.handle}}
+                        )
+                    response.update(page)
+                    return response
+            except (OSError, ValueError, SessionExecutionConflictError):
+                if isinstance(reserved, CommandJob):
+                    reserved.cancel()
+                    reserved.handoff()
+                if retrieving_result:
+                    raise
+                return Problem(
+                    code="command_job.unavailable",
+                    title="Command job unavailable",
+                    detail="Session scratch ownership is unavailable.",
+                    operation=context.tool_name,
+                )
+            except BaseException:
+                if isinstance(reserved, CommandJob):
+                    reserved.cancel()
+                    reserved.handoff()
+                raise
+            finally:
+                if authority_lease is not None and not isinstance(reserved, CommandJob):
+                    authority_lease.release()
+
         if network and (
             network_limit := context.permission_manager.sandbox_network_limit(context.tool_name)
         ):
@@ -2070,9 +2208,7 @@ class CommandExecutionService:
         try:
             command_cwd = Path(target.cwd).resolve(strict=True)
             workspace = (
-                Path(
-                    context.instructions_manager.virtual_paths.resolve(VirtualPath.WORKSPACE)
-                ).resolve(strict=True)
+                Path(_command_paths(context).resolve(VirtualPath.WORKSPACE)).resolve(strict=True)
                 if context.instructions_manager is not None
                 else command_cwd
             )
@@ -2086,7 +2222,7 @@ class CommandExecutionService:
             )
             absolute_path = all(Path(entry).is_absolute() for entry in path_value.split(os.pathsep))
             scratch = (
-                dict(context.instructions_manager.virtual_paths.command_roots()).get(
+                dict(_command_paths(context).command_roots()).get(
                     VirtualPath.TEMPORARY, context.permission_manager.temporary_directory
                 )
                 if context.instructions_manager is not None
@@ -2228,14 +2364,22 @@ class CommandExecutionService:
                         "than the sandbox can bind."
                     ),
                 )
-            paths = (
-                context.instructions_manager.virtual_paths
-                if context.instructions_manager is not None
-                else VirtualPath(
+            if context.instructions_manager is not None:
+                roots = dict(_command_paths(context).command_roots())
+                paths = VirtualPath(
+                    workspace=roots.get(VirtualPath.WORKSPACE),
+                    temporary_directory=roots.get(VirtualPath.TEMPORARY),
+                    skill_roots={
+                        name.removeprefix(f"{VirtualPath.SKILLS}/"): root
+                        for name, root in roots.items()
+                        if name.startswith(f"{VirtualPath.SKILLS}/")
+                    },
+                )
+            else:
+                paths = VirtualPath(
                     workspace=workspace,
                     temporary_directory=context.permission_manager.temporary_directory,
                 )
-            )
             manual_reads = tuple(
                 Path(
                     paths.resolve(root)
@@ -2733,11 +2877,29 @@ class CommandExecutionService:
                     )
                 )
             )
-            skill_reads = tuple(
-                root
+            used_skills = tuple(
+                (name, root)
                 for name, root in paths.command_roots()
-                if name.startswith(f"{VirtualPath.SKILLS}/") and str(root) in command
+                if name.startswith(f"{VirtualPath.SKILLS}/")
+                and (
+                    str(root) in command
+                    or any(
+                        requested == name or requested.startswith(f"{name}/")
+                        for requested in (*(read_roots or ()), *(write_roots or ()))
+                    )
+                )
             )
+            skill_snapshot = ()
+            if used_skills and context.instructions_manager is not None:
+                skill_snapshot = context.instructions_manager.command_skill_snapshot(
+                    tuple(
+                        (name.removeprefix(f"{VirtualPath.SKILLS}/"), root)
+                        for name, root in used_skills
+                    )
+                )
+                if skill_snapshot is None:
+                    raise ValueError("Command skill roots changed before execution.")
+            skill_reads = tuple(root for _, root in used_skills if str(root) in command)
             extra_reads = tuple(
                 root
                 for root in dict.fromkeys(
@@ -2803,7 +2965,7 @@ class CommandExecutionService:
             advertised_roots = {root for _, root in paths.command_roots()}
             native_output_roots = ()
 
-            def redact(value: str) -> str:
+            def render_command_output(value: str) -> str:
                 """Render canonical path prefixes while hiding unrelated host paths."""
                 value = paths.redact(value, roots=native_output_roots)
                 for root in sorted(redaction_roots, key=lambda item: len(str(item)), reverse=True):
@@ -2815,6 +2977,8 @@ class CommandExecutionService:
                         continue
                     value = paths.redact(value, roots=((str(root), VirtualPath.EXTERNAL),))
                 return paths.redact(value)
+
+            redact = render_command_output
 
             file_creation_mask = constants.GROUP_AND_OTHER_WRITE_MODE_MASK
             current_mask = getattr(self._backend, "file_creation_mask", None)
@@ -2850,7 +3014,7 @@ class CommandExecutionService:
                 policy_version=self._backend.policy_version
                 if isinstance(getattr(self._backend, "policy_version", None), str)
                 else "native-v1",
-                deadline=time.monotonic() + context.settings.command_timeout,
+                deadline=time.monotonic() + context.settings.command_hard_timeout,
                 workspace_id=str(workspace),
                 git_create=git_create,
                 read_context=read_context,
@@ -2899,8 +3063,10 @@ class CommandExecutionService:
                 context,
                 request,
                 redact,
+                paths.display if context.instructions_manager is not None else str,
                 prelaunch_failure=prelaunch_failure,
                 reason=reason,
                 job=job,
+                skill_snapshot=skill_snapshot,
                 admission_cancellation_event=admission_cancellation_event,
             )

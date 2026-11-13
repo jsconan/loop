@@ -9,6 +9,7 @@ import json
 import sys
 import tempfile
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -219,7 +220,21 @@ def _permission_manager_mock():
     permissions.sandbox_write_root_limit.return_value = None
     permissions.sandbox_network_limit.return_value = None
     permissions.temporary_directory_allows_private_names = False
+    permissions.standalone_execution.side_effect = lambda: nullcontext(
+        permissions.temporary_directory
+    )
     return permissions
+
+
+def _use_managed_command_scratch(registry, instructions):
+    """Give standalone command tests matching leased and model-visible scratch roots."""
+    roots = dict(instructions.virtual_paths.command_roots())
+    permissions = registry.permission_manager
+    if isinstance(permissions, Mock):
+        permissions.temporary_directory = roots[VirtualPath.TEMPORARY]
+    scratch = permissions.temporary_directory
+    instructions.set_runtime_environment(RuntimeEnvironment(roots[VirtualPath.WORKSPACE], scratch))
+    return scratch
 
 
 def _approve_sandbox_request(_request, **kwargs):
@@ -271,6 +286,152 @@ def test_registry_closes_its_execution_service():
     registry.close()
     service.close.assert_called_once()
     ToolRegistry().close()
+
+
+@pytest.mark.parametrize("live_state", ["active", "retained"])
+def test_registry_rebind_waits_for_active_commands_but_allows_retained_handles(live_state):
+    """Active jobs keep their session binding; completed retained handles do not block it."""
+    first, second = Mock(), Mock()
+    service = Mock()
+    service.has_active_jobs.return_value = live_state == "active"
+
+    @declare_tool
+    def selected(context: ToolContext) -> str:
+        """Report which synthetic session was captured by this tool invocation."""
+        return "first" if context.session_manager is first else "second"
+
+    registry = ToolRegistry([selected], execution_service=service, session_manager=first)
+    try:
+        registry.bind_session_manager(first)
+        service.has_active_jobs.assert_not_called()
+        if live_state == "active":
+            with pytest.raises(RuntimeError, match="commands are active"):
+                registry.bind_session_manager(second)
+            assert result_value(registry.call("selected", "{}")) == "first"
+        service.has_active_jobs.return_value = False
+        registry.bind_session_manager(second)
+        assert result_value(registry.call("selected", "{}")) == "second"
+    finally:
+        registry.close()
+
+
+@pytest.mark.parametrize("same_session", [False, True])
+def test_session_composition_refuses_active_jobs_before_mutations(same_session):
+    """Composition rejects active jobs even when the requested session is unchanged."""
+    first, second = Mock(), Mock()
+    service = Mock()
+    service.has_active_jobs.return_value = True
+    registry = ToolRegistry(execution_service=service, session_manager=first)
+    effects = []
+    try:
+        with (
+            pytest.raises(RuntimeError, match="commands are active"),
+            registry.compose_session(first if same_session else second),
+        ):
+            effects.append("mutated")
+        assert effects == []
+    finally:
+        registry.close()
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_session_composition_binds_only_after_success(fails):
+    """A failed composition keeps the prior session; success selects the new one."""
+    first, second = Mock(), Mock()
+
+    @declare_tool
+    def selected(context: ToolContext) -> str:
+        """Report the bound synthetic session."""
+        return "first" if context.session_manager is first else "second"
+
+    registry = ToolRegistry([selected], session_manager=first)
+    try:
+        if fails:
+            with (
+                pytest.raises(ValueError, match="composition failed"),
+                registry.compose_session(second),
+            ):
+                raise ValueError("composition failed")
+        else:
+            with registry.compose_session(second):
+                pass
+        assert result_value(registry.call("selected", "{}")) == ("first" if fails else "second")
+    finally:
+        registry.close()
+
+
+def test_session_composition_excludes_stale_command_admission():
+    """A command waiting on composition cannot start under the previously selected session."""
+    first, second = Mock(), Mock()
+    prepared, attempt, release = Event(), Event(), Event()
+    effects = []
+
+    @declare_tool(requires_execution_service=True)
+    def command_probe(context: ToolContext) -> str:
+        """Try to reserve a captured session after composition begins."""
+        prepared.set()
+        if not release.wait(5):
+            raise TimeoutError("Composition did not release the test command.")
+        attempt.set()
+        try:
+            with context.command_admission():
+                effects.append("started")
+        except ValueError:
+            return "stale"
+        return "admitted"
+
+    service = Mock()
+    service.has_active_jobs.return_value = False
+    registry = ToolRegistry([command_probe], execution_service=service, session_manager=first)
+    results = []
+    thread = Thread(target=lambda: results.append(registry.call("command_probe", "{}")))
+    try:
+        thread.start()
+        assert prepared.wait(5)
+        with registry.compose_session(second):
+            release.set()
+            assert attempt.wait(5)
+            assert effects == []
+        thread.join(5)
+        assert not thread.is_alive()
+        assert result_value(results[0]) == "stale"
+        assert effects == []
+    finally:
+        release.set()
+        thread.join(5)
+        registry.close()
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_command_admission_rejects_a_session_rebound_after_context_creation(asynchronous):
+    """A stale command context cannot reserve work after the registry changes sessions."""
+    first, second = Mock(), Mock()
+    service = Mock()
+    service.has_active_jobs.return_value = False
+    effects = []
+
+    @declare_tool(requires_execution_service=True)
+    def command_probe(context: ToolContext) -> str:
+        """Attempt reservation after deliberately changing the selected session."""
+        registry.bind_session_manager(second)
+        try:
+            with context.command_admission():
+                effects.append("reserved")
+        except ValueError as error:
+            return str(error)
+        return "admitted"
+
+    registry = ToolRegistry([command_probe], execution_service=service, session_manager=first)
+    try:
+        output = (
+            asyncio.run(registry.call_async("command_probe", "{}"))
+            if asynchronous
+            else registry.call("command_probe", "{}")
+        )
+        assert result_value(output) == "Command session changed before admission."
+        assert effects == []
+    finally:
+        registry.close()
 
 
 def test_closed_registry_rejects_new_sync_worker_calls():
@@ -4341,6 +4502,37 @@ def test_sync_and_async_dispatch_report_operation_planning_failures():
     assert calls == []
 
 
+def test_unavailable_command_paths_do_not_disclose_host_paths():
+    """All dispatch paths return a safe problem when command roots cannot be captured."""
+
+    class UnavailableInstructions:
+        """Represent an unavailable instruction path snapshot."""
+
+        @property
+        def virtual_paths(self):
+            """Raise a path-bearing filesystem failure."""
+            raise OSError("/private/sensitive/path")
+
+    instructions = UnavailableInstructions()
+    registry = ToolRegistry([run_command])
+    sync = registry.call("run_command", '{"command": ":"}', instructions_manager=instructions)
+    asynchronous = asyncio.run(
+        registry.call_async("run_command", '{"command": ":"}', instructions_manager=instructions)
+    )
+    direct = registry.command("run_command", (":",), instructions_manager=instructions).output
+    for output in (sync, asynchronous, direct):
+        assert json.loads(output)["problem"]["code"] == "tool.planning_failed"
+        assert "/private/sensitive/path" not in output
+
+    @declare_tool
+    def ordinary() -> None:
+        """Represent a tool without command execution authority."""
+
+    registry.register(ordinary)
+    with pytest.raises(OSError, match="/private/sensitive/path"):
+        asyncio.run(registry.call_async("ordinary", "{}", instructions_manager=instructions))
+
+
 @pytest.mark.parametrize(
     "failure",
     [
@@ -4759,6 +4951,7 @@ def test_observed_file_scope_does_not_change_command_working_directory(tmp_path,
     )
     monkeypatch.setattr(registry._execution_service, "_backend", backend)
 
+    _use_managed_command_scratch(registry, instructions)
     output = registry.call(
         "run_command",
         json.dumps({"command": "pwd", "cwd": "."}),
@@ -4768,6 +4961,28 @@ def test_observed_file_scope_does_not_change_command_working_directory(tmp_path,
     assert result_value(output)["stdout"]["content"].strip() == str(tmp_path)
     request = permissions.authorize_sandboxed_command.call_args.args[0]
     assert request.cwd == tmp_path
+
+
+def test_standalone_command_refuses_unmanaged_scratch(tmp_path):
+    """A standalone continuation cannot rely on caller-owned scratch without a lease."""
+    unmanaged = tmp_path / "unmanaged"
+    unmanaged.mkdir(mode=0o700)
+    instructions = InstructionsManager(runtime_environment=RuntimeEnvironment(tmp_path, unmanaged))
+    permissions = PermissionManager(tmp_path)
+    backend = Mock()
+    service = CommandExecutionService(backend, Mock())
+    registry = ToolRegistry(
+        [run_command], permission_manager=permissions, execution_service=service
+    )
+    try:
+        output = registry.call(
+            "run_command", json.dumps({"command": ":"}), instructions_manager=instructions
+        )
+        assert json.loads(output)["problem"]["code"] == "command_job.unavailable"
+        backend.run.assert_not_called()
+    finally:
+        registry.close()
+        permissions.close()
 
 
 def test_command_workspace_prefix_selects_the_workspace_root(tmp_path, monkeypatch):
@@ -4800,6 +5015,7 @@ def test_command_workspace_prefix_selects_the_workspace_root(tmp_path, monkeypat
     )
     monkeypatch.setattr(registry._execution_service, "_backend", backend)
 
+    _use_managed_command_scratch(registry, instructions)
     output = registry.call(
         "run_command",
         json.dumps({"command": "printf cwd", "cwd": "$WORKSPACE_ROOT"}),
@@ -4834,6 +5050,7 @@ def test_command_virtual_workspace_read_roots_do_not_expand_authority(tmp_path, 
     backend.run.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
     monkeypatch.setattr(registry._execution_service, "_backend", backend)
 
+    _use_managed_command_scratch(registry, instructions)
     output = registry.call(
         "run_command",
         json.dumps(
@@ -4915,6 +5132,7 @@ def test_command_accepts_virtual_workspace_cwd(tmp_path, monkeypatch):
     backend = Mock()
     backend.run.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
     monkeypatch.setattr(registry._execution_service, "_backend", backend)
+    _use_managed_command_scratch(registry, instructions)
     output = registry.call(
         "run_command",
         json.dumps({"command": "pwd", "cwd": "$WORKSPACE_ROOT/src"}),
@@ -4947,6 +5165,7 @@ def test_command_output_and_failure_details_preserve_workspace_paths(tmp_path, m
     )
     monkeypatch.setattr(registry._execution_service, "_backend", backend)
 
+    _use_managed_command_scratch(registry, instructions)
     output = registry.call(
         "run_command",
         json.dumps({"command": "pwd", "read_only": True}),
@@ -4978,6 +5197,7 @@ def test_command_sandbox_failure_preserves_workspace_paths(tmp_path, monkeypatch
     )
     monkeypatch.setattr(registry._execution_service, "_backend", backend)
 
+    _use_managed_command_scratch(registry, instructions)
     output = registry.call(
         "run_command",
         json.dumps({"command": "pwd", "read_only": True}),
@@ -5009,7 +5229,7 @@ def test_command_preserves_source_and_binds_concrete_roots(tmp_path, monkeypatch
     )
     observed = []
 
-    def execute(request):
+    def execute(request, **_kwargs):
         """Inspect bound roots and unchanged source at the execution boundary."""
         observed.append(request)
         assert request.paths_are_current()
@@ -5027,6 +5247,7 @@ def test_command_preserves_source_and_binds_concrete_roots(tmp_path, monkeypatch
     backend.run.side_effect = execute
     monkeypatch.setattr(registry._execution_service, "_backend", backend)
 
+    scratch = _use_managed_command_scratch(registry, instructions)
     output = registry.call(
         "run_command",
         json.dumps({"command": 'cat $WORKSPACE_ROOT/a "$TMPDIR/b"'}),
@@ -5057,6 +5278,7 @@ def test_command_ignores_virtual_root_substrings(tmp_path, monkeypatch):
     backend.run.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
     monkeypatch.setattr(registry._execution_service, "_backend", backend)
 
+    _use_managed_command_scratch(registry, instructions)
     output = registry.call(
         "run_command",
         json.dumps({"command": "echo /tmp-old", "read_only": True}),
@@ -5092,7 +5314,7 @@ def test_command_host_retry_preserves_source(tmp_path, monkeypatch):
     )
     host = Mock()
 
-    def execute(request):
+    def execute(request, **_kwargs):
         """Observe the exact source while the separately approved host run is active."""
         assert request.source == "cat $WORKSPACE_ROOT"
         return CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0, stdout=request.source)
@@ -5101,6 +5323,7 @@ def test_command_host_retry_preserves_source(tmp_path, monkeypatch):
     monkeypatch.setattr(registry._execution_service, "_backend", backend)
     monkeypatch.setattr(registry._execution_service, "_host_executor", host)
 
+    _use_managed_command_scratch(registry, instructions)
     output = registry.call(
         "run_command",
         json.dumps({"command": "cat $WORKSPACE_ROOT"}),

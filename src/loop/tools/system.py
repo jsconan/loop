@@ -248,13 +248,17 @@ def run_command(
             max_length=2000,
         ),
     ] = None,
-    background: Annotated[
-        bool,
+    wait_seconds: Annotated[
+        float | None,
+        BeforeValidator(normalize_optional_null),
         Field(
-            description="Return a session-owned job handle after approval while the same command "
-            "continues. Set false for the ordinary one-call wait and final result."
+            description="Maximum initial wait in seconds, or JSON null (unquoted) for the "
+            "configured tools.command_timeout. If still running, returns a handle and cursor for "
+            "read_command_job. The separate hard runtime limit still applies.",
+            ge=0,
+            allow_inf_nan=False,
         ),
-    ] = False,
+    ] = None,
     interactive: Annotated[
         bool,
         Field(
@@ -284,8 +288,8 @@ def run_command(
         network,
         git_write,
         egress_origins=egress_origins,
-        background=background,
         interactive=interactive,
+        wait_seconds=wait_seconds,
         **reason_argument,
     )
 
@@ -320,8 +324,7 @@ def read_command_job(
         BeforeValidator(normalize_optional_null),
         Field(
             description="Wait for output or completion, or use JSON null (unquoted) for the "
-            "configured default. Available output returns immediately. Capped below "
-            "tools.command_timeout; "
+            "configured default. Available output returns immediately. Platform wait limits apply; "
             "use 0 to poll now.",
             ge=0,
             allow_inf_nan=False,
@@ -332,7 +335,7 @@ def read_command_job(
         Field(description="Include the final captured stream previews when needed."),
     ] = False,
 ) -> dict | Problem:
-    """Read until result is non-null, then stop; pass each response's next_cursor to continue."""
+    """Read output pages until result is non-null, even if status is complete."""
     if context.execution_service is None:
         return Problem(
             code="command_job.unavailable",

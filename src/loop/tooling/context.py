@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Event
@@ -10,17 +11,64 @@ from typing import TYPE_CHECKING, Literal
 
 from ..errors import Problem, ProblemException
 from ..interaction import Interaction, require_async_interaction
-from ..utils import content_digest
+from ..utils import VirtualPath, content_digest
 from .models import ToolRuntimeSettings
 
 if TYPE_CHECKING:
     from ..execution import CommandExecutionService
     from ..instructions import InstructionsManager
     from ..permissions import OperationPlan, Operations, PermissionManager
+    from ..permissions.manager import EgressRevocationLease
     from ..session import SessionManager
 
 AdditionalAuthorizer = Callable[[dict[str, object]], "OperationPlan"]
 AdditionalAuthorizerAsync = Callable[[dict[str, object]], Awaitable["OperationPlan"]]
+
+
+@dataclass(frozen=True)
+class CommandEgressAuthority:
+    """Retain only thread-safe egress policy operations for a continued command.
+
+    Args:
+        bind (Callable[[int, EgressRevocationLease], None]): Bind an approved lease.
+        unbind (Callable[[EgressRevocationLease], None]): Remove a settled lease.
+        revision (Callable[[], int | None]): Check the active policy revision.
+    """
+
+    bind: Callable[[int, EgressRevocationLease], None]
+    unbind: Callable[[EgressRevocationLease], None]
+    revision: Callable[[], int | None]
+
+    def bind_egress(self, revision: int, lease: EgressRevocationLease) -> None:
+        """Bind an egress lease to its approved policy revision.
+
+        Args:
+            revision (int): Approved policy revision.
+            lease (EgressRevocationLease): Native attempt's revocation channel.
+
+        Raises:
+            OSError: The authority is closing or its approved policy is no longer current.
+        """
+        self.bind(revision, lease)
+
+    def unbind_egress(self, lease: EgressRevocationLease) -> None:
+        """Remove a settled egress lease.
+
+        Args:
+            lease (EgressRevocationLease): Previously bound revocation channel.
+        """
+        self.unbind(lease)
+
+    def try_egress_policy_revision(self) -> int | None:
+        """Check the policy revision without blocking an update.
+
+        Returns:
+            int | None: Current revision, or None while an update holds the authority.
+
+        Raises:
+            OSError: Required managed authority is unavailable or revocation is uncertain.
+        """
+        return self.revision()
 
 
 def _confirmation_decision(value: object, tool_name: str) -> bool:
@@ -74,6 +122,21 @@ class ToolContext:
             or ``None`` when no signal is supplied to a synchronous dispatch.
         execution_mode (Literal["sync", "async"]): Callback mode selected by the owning registry.
             Defaults to ``"sync"`` for contexts assembled outside registry dispatch.
+        standalone_execution (Callable[[], AbstractContextManager[Path]] | None): Thread-safe
+            scratch lease for commands without a selected session.
+        invalidate_detached (Callable[[], None] | None): Thread-safe instruction invalidation
+            for work that outlives its originating async dispatch.
+        egress_authority (CommandEgressAuthority | None): Thread-safe, limited policy authority
+            for a mediated command that outlives its originating async dispatch.
+        audit_host_detached (Callable[..., None] | None): Thread-safe host-boundary audit callback
+            for work that outlives its originating async dispatch.
+        command_admission (Callable[[], AbstractContextManager[None]] | None): Registry gate
+            protecting the selected session through command reservation.
+        command_authorities (tuple[object, ...] | None): Original shared authorities when
+            owner-thread proxies are used, or None when invocation values are already original.
+        command_paths (VirtualPath | None): Immutable command root snapshot, if captured.
+        admit_skills_detached (Callable[..., bool] | None): Thread-safe skill admission on the
+            original instructions manager for detached command workers.
     """
 
     interaction: Interaction | None
@@ -92,6 +155,14 @@ class ToolContext:
     cancellation_event: Event | None = None
     additional_authorizer_async: AdditionalAuthorizerAsync | None = None
     execution_mode: Literal["sync", "async"] = "sync"
+    standalone_execution: Callable[[], AbstractContextManager[Path]] | None = None
+    invalidate_detached: Callable[[], None] | None = None
+    egress_authority: CommandEgressAuthority | None = None
+    audit_host_detached: Callable[..., None] | None = None
+    command_admission: Callable[[], AbstractContextManager[None]] | None = None
+    command_authorities: tuple[object, ...] | None = None
+    command_paths: VirtualPath | None = None
+    admit_skills_detached: Callable[..., bool] | None = None
 
     def record_file_read(self, path: Path, version: str | None) -> None:
         """Attest to the source version actually inspected by a file reader.
