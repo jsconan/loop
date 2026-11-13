@@ -8,6 +8,8 @@ __all__ = [
     "InteractionOutput",
     "ListMarker",
     "ResponsePresenter",
+    "prompt_recovery",
+    "prompt_recovery_async",
     "require_async_interaction",
 ]
 
@@ -17,6 +19,8 @@ from .interaction import (
     Interaction,
     InteractionInput,
     InteractionOutput,
+    prompt_recovery,
+    prompt_recovery_async,
     require_async_interaction,
 )
 from .models import ListMarker

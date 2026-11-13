@@ -12,7 +12,7 @@ from prompt_toolkit.completion import Completer
 from .. import constants
 from ..errors import Problem, ProblemException
 from ..models import RAW_TOOL_RESULT_PRESENTATION, RunMetrics, ToolResultPresentationSpec
-from ..utils import ChoiceItem
+from ..utils import ChoiceItem, ShutdownRequested
 from .models import ListMarker
 
 
@@ -443,3 +443,85 @@ def require_async_interaction(
             )
         )
     return cast(AsyncInteractionInput, interaction)
+
+
+def _recovery_choice(choice: object, choices: dict[str, str]) -> str:
+    """Return a listed action or halt when recovery was not explicitly selected."""
+    if not isinstance(choice, str) or choice == "exit" or choice not in choices:
+        raise ShutdownRequested() from None
+    return choice
+
+
+def _recovery_options(
+    continue_label: str | None,
+    reset_label: str | None,
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Build the supported recovery actions and their consistent shortcuts."""
+    choices = {"retry": "Reload after fixing the problem"}
+    index = {"retry": "R"}
+    if continue_label is not None:
+        choices["continue"] = continue_label
+        index["continue"] = "C"
+    if reset_label is not None:
+        choices["reset"] = reset_label
+        index["reset"] = "T"
+    choices["exit"] = "Halt"
+    index["exit"] = "Q"
+    return choices, index
+
+
+def prompt_recovery(
+    interaction: Interaction,
+    question: str,
+    *,
+    continue_label: str | None = None,
+    reset_label: str | None = None,
+) -> str:
+    """Request an explicit synchronous recovery choice.
+
+    Args:
+        interaction (Interaction): Interface receiving the recovery prompt.
+        question (str): Recovery prompt text.
+        continue_label (str | None): Description of an available bypass, or None to omit it.
+        reset_label (str | None): Description of an available repair, or None to omit it.
+
+    Returns:
+        str: The explicitly selected non-exit action.
+
+    Raises:
+        ShutdownRequested: If the user exits or input is not a listed action.
+    """
+    choices, index = _recovery_options(continue_label, reset_label)
+    choice = interaction.prompt(question, exit_commands=(), choices=choices, index=index)
+    return _recovery_choice(choice, choices)
+
+
+async def prompt_recovery_async(
+    interaction: Interaction,
+    question: str,
+    *,
+    operation: str,
+    continue_label: str | None = None,
+    reset_label: str | None = None,
+) -> str:
+    """Request an explicit asynchronous recovery choice, halting on exit or invalid input.
+
+    Args:
+        interaction (Interaction): Interface receiving the recovery prompt.
+        question (str): Recovery prompt text.
+        operation (str): Operation requiring asynchronous input.
+        continue_label (str | None): Description of an available bypass, or None to omit it.
+        reset_label (str | None): Description of an available repair, or None to omit it.
+
+    Returns:
+        str: The explicitly selected non-exit action.
+
+    Raises:
+        ShutdownRequested: If the user exits or input is not a listed action.
+        ProblemException: If asynchronous interaction is unavailable.
+    """
+    choices, index = _recovery_options(continue_label, reset_label)
+    choice = await require_async_interaction(interaction, operation).prompt_async(
+        question, exit_commands=(), choices=choices, index=index
+    )
+    return _recovery_choice(choice, choices)
