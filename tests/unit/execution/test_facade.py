@@ -5594,6 +5594,45 @@ def test_command_job_service_binds_reads_and_cancellation_to_session(tmp_path):
     }
 
 
+def test_command_job_read_wait_tracks_current_command_timeout(tmp_path):
+    """Default, explicit, and immediate waits respect the current runtime budget."""
+    service = CommandExecutionService(Mock(), Mock())
+    context = ToolContext(None, "read_command_job", permission_manager=PermissionManager(tmp_path))
+    job = Mock(spec=CommandJob)
+    service._jobs.get = Mock(return_value=job)
+
+    service.read_command_job(context, "handle")
+    job.read.assert_called_with(0, 30, include_output=False, cancellation_event=None)
+    context.settings.command_job_wait_seconds = 20
+    service.read_command_job(context, "handle")
+    job.read.assert_called_with(0, 20, include_output=False, cancellation_event=None)
+    context.settings.command_timeout = 10
+    service.read_command_job(context, "handle")
+    job.read.assert_called_with(0, 9, include_output=False, cancellation_event=None)
+    service.read_command_job(context, "handle", wait_seconds=0)
+    job.read.assert_called_with(0, 0, include_output=False, cancellation_event=None)
+    context.settings.command_timeout = 100
+    service.read_command_job(context, "handle", wait_seconds=50)
+    job.read.assert_called_with(0, 50, include_output=False, cancellation_event=None)
+    service.read_command_job(context, "handle", wait_seconds=100)
+    job.read.assert_called_with(0, 90, include_output=False, cancellation_event=None)
+    interrupted = Event()
+    context = replace(context, cancellation_event=interrupted)
+    service.read_command_job(context, "handle", wait_seconds=0)
+    job.read.assert_called_with(0, 0, include_output=False, cancellation_event=interrupted)
+
+
+@pytest.mark.parametrize("wait", [True, -1, float("inf"), float("nan"), "invalid"])
+def test_command_job_service_rejects_invalid_waits(tmp_path, wait):
+    """Capping waits does not turn invalid values into valid reads."""
+    service = CommandExecutionService(Mock(), Mock())
+    context = ToolContext(None, "read_command_job", permission_manager=PermissionManager(tmp_path))
+    job = CommandJob("owner", None)
+    service._jobs.get = Mock(return_value=job)
+    result = service.read_command_job(context, "handle", wait_seconds=wait)
+    assert result.code == "command_job.invalid_read"
+
+
 def test_command_job_service_rejects_missing_session_scratch_identity(tmp_path):
     """Job tools and launch refuse absent scratch authority without leaking handles."""
     service = CommandExecutionService(Mock(), Mock())

@@ -1459,8 +1459,12 @@ def test_platform_command_capabilities_shape_live_model_definitions(monkeypatch)
     assert "terminal_control" not in unavailable
     assert "read_command_job" in unavailable
     assert "until result is non-null, then stop" in unavailable["read_command_job"].description
+    cursor = unavailable["read_command_job"].parameters["properties"]["cursor"]
+    assert "previous response's next_cursor" in cursor["description"]
     wait = unavailable["read_command_job"].parameters["properties"]["wait_seconds"]
-    assert "use 30 to avoid empty polls" in wait["description"]
+    assert "Capped below tools.command_timeout" in wait["description"]
+    assert "configured default" in wait["description"]
+    assert {item["type"] for item in wait["anyOf"]} == {"number", "null"}
     assert "terminal_control" in registry.names
 
     monkeypatch.setattr(

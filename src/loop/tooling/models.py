@@ -4,7 +4,11 @@ import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from ..constants import DEFAULT_COMMAND_TIMEOUT, DEFAULT_USER_AGENT
+from ..constants import (
+    DEFAULT_COMMAND_JOB_WAIT_SECONDS,
+    DEFAULT_COMMAND_TIMEOUT,
+    DEFAULT_USER_AGENT,
+)
 from ..models import StrEnum
 
 
@@ -138,7 +142,9 @@ class ToolRuntimeSettings:
     Args:
         user_agent (str): HTTP user-agent used by web-content tools.
         command_timeout (float): Finite command runtime budget starting at native launch.
+        command_job_wait_seconds (float): Default wait for command job output or completion.
     """
 
     user_agent: str = DEFAULT_USER_AGENT
     command_timeout: float = DEFAULT_COMMAND_TIMEOUT
+    command_job_wait_seconds: float = DEFAULT_COMMAND_JOB_WAIT_SECONDS

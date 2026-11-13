@@ -66,6 +66,7 @@ max_agent_turns = 25
 
 [tools]
 command_timeout = 3600.0
+command_job_wait_seconds = 30.0
 
 [logging]
 level = "INFO"
@@ -102,6 +103,8 @@ Use `/config` to browse, inspect, change, or reset effective settings. Completio
 Reset behavior depends on the scope. At workspace scope, reset removes the override so the user setting applies. At user or session scope, reset restores the built-in default.
 
 Session settings apply only to the current Loop process and take precedence over environment and file values. A file value remains saved when an environment variable overrides it, so the saved value applies again when the variable is absent. Backend and supported interactive-loop settings apply immediately. Logging, telemetry, and agent identity changes require a restart. API-key input and configuration output are masked.
+
+`tools.command_job_wait_seconds` sets the default maximum wait for each background command read, in seconds. It accepts finite nonnegative values; `0` makes the default an immediate poll. The effective wait is capped at 90% of the current `tools.command_timeout` and the platform's supported thread wait, including when a read explicitly requests a longer wait. Changes to either setting apply to subsequent reads. Available output and command completion return the read early.
 
 `app.yolo` is off by default. Enabling it skips Loop confirmation prompts for eligible operations: the agent can request private data, change or delete files, use networks, and explicitly run commands on the host. Host execution has the host user's authority and can alter or bypass the sandbox. Hard policy denies, invalid identities, and unavailable enforcement still stop requests; the native sandbox remains active for ordinary sandboxed commands. Loop displays this warning before a human `/config set app.yolo true` takes effect. To keep YOLO active after restart, explicitly run `/config set app.yolo true scope=user`. A session setting takes precedence over the saved value. A child process launched inside a native sandbox inherits that sandbox even when its own YOLO setting is enabled. `/config get app.yolo` shows the effective state, source, and saved user value. A session `false` masks a saved user `true` only until restart; set `scope=user` to `false` to keep it off. A user `false` does not erase an active session `true`; disable that session too. Startup announces whether a trusted saved activation is active or suppressed by managed policy. Persistent activation requires an owner-private, real user configuration directory and file. An untrusted or ambiguous saved activation fails closed.
 
@@ -159,6 +162,7 @@ The `loop` command accepts environment overrides for automation:
 | Hyperparameter policy       | `OPENAI_HYPERPARAMETER_POLICY`          | `fallback`                     |
 | Web user agent              | `USER_AGENT`                            | browser-like user agent        |
 | Command timeout             | `LOOP_COMMAND_TIMEOUT`                  | `3600.0`                       |
+| Command job read wait       | `LOOP_COMMAND_JOB_WAIT_SECONDS`         | `30.0`                         |
 | Agent name                  | `LOOP_AGENT_NAME`                       | `Loop`                         |
 | Active input mode           | `LOOP_CONVERSATION_INPUT_MODE`          | `queue`                        |
 | Model                       | `LOOP_MODEL`                            | unset                          |

@@ -271,6 +271,7 @@ class ApplicationRuntime:
                 settings=ToolRuntimeSettings(
                     user_agent=settings.web.user_agent,
                     command_timeout=settings.tools.command_timeout,
+                    command_job_wait_seconds=settings.tools.command_job_wait_seconds,
                 ),
                 execution_service=execution_service,
             )

@@ -53,6 +53,7 @@ _ENVIRONMENT_FIELDS = {
     "OPENAI_HYPERPARAMETER_POLICY": ("backend", "hyperparameter_policy"),
     "USER_AGENT": ("web", "user_agent"),
     "LOOP_COMMAND_TIMEOUT": ("tools", "command_timeout"),
+    "LOOP_COMMAND_JOB_WAIT_SECONDS": ("tools", "command_job_wait_seconds"),
     "LOOP_AGENT_NAME": ("app", "agent_name"),
     "LOOP_CONVERSATION_INPUT_MODE": ("conversation", "input_mode"),
     "LOOP_MODEL": ("app", "model"),

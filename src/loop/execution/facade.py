@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import pwd
 import re
@@ -82,6 +83,7 @@ from .sandbox.constants import (
 from .sandbox.contracts import resolve_selected_executable as _selected_executable
 
 _LOGGER = logging.getLogger(__name__)
+JOB_READ_TIMEOUT_FRACTION = 0.9
 
 
 class WorkspaceExecutableLink(NamedTuple):
@@ -1180,7 +1182,7 @@ class CommandExecutionService:
         context: ToolContext,
         handle: str,
         cursor: int = 0,
-        wait_seconds: float = 0,
+        wait_seconds: float | None = None,
         include_output: bool = False,
     ) -> dict | Problem:
         """Read one bounded page from a session-owned command without replaying it.
@@ -1189,7 +1191,8 @@ class CommandExecutionService:
             context (ToolContext): Current registry-bound session identity.
             handle (str): Opaque handle returned by the original command call.
             cursor (int): Next output event cursor.
-            wait_seconds (float): Bounded wait for output or completion.
+            wait_seconds (float | None): Maximum wait for output or completion, or None for the
+                configured default; capped below the configured command timeout.
             include_output (bool): Include final captured stream previews explicitly.
 
         Returns:
@@ -1207,8 +1210,26 @@ class CommandExecutionService:
         job = self._jobs.get(owner, handle)
         if isinstance(job, Problem):
             return job
+        if wait_seconds is None:
+            wait_seconds = context.settings.command_job_wait_seconds
+        if (
+            not isinstance(wait_seconds, bool)
+            and isinstance(wait_seconds, (int, float))
+            and (isinstance(wait_seconds, int) or math.isfinite(wait_seconds))
+            and wait_seconds >= 0
+        ):
+            wait_seconds = min(
+                wait_seconds,
+                context.settings.command_timeout * JOB_READ_TIMEOUT_FRACTION,
+                threading.TIMEOUT_MAX,
+            )
         try:
-            return job.read(cursor, wait_seconds, include_output=include_output)
+            return job.read(
+                cursor,
+                wait_seconds,
+                include_output=include_output,
+                cancellation_event=context.cancellation_event,
+            )
         except ValueError as error:
             return Problem(
                 code="command_job.invalid_read",

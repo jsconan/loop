@@ -565,6 +565,7 @@ def test_initialize_creates_private_commented_defaults(tmp_path):
     assert "# context_window = <unset>" in content
     assert "[tools]" in content
     assert "command_timeout = 3600.0" in content
+    assert "command_job_wait_seconds = 30.0" in content
     assert path.stat().st_mode & 0o777 == 0o600
     assert manager.load().backend.api_key.get_secret_value() == "local-api-key"
 
@@ -592,6 +593,7 @@ def test_environment_overrides_persisted_values(tmp_path):
         {
             "DEFAULT_MODEL": "environment-model",
             "LOOP_COMMAND_TIMEOUT": "0.25",
+            "LOOP_COMMAND_JOB_WAIT_SECONDS": "0.1",
             "LOOP_TEMPERATURE": "0.7",
             "LOOP_REASONING_EFFORT": "low",
             "OPENAI_HYPERPARAMETER_POLICY": "fallback",
@@ -600,6 +602,7 @@ def test_environment_overrides_persisted_values(tmp_path):
 
     assert settings.backend.default_model == "environment-model"
     assert settings.tools.command_timeout == 0.25
+    assert settings.tools.command_job_wait_seconds == 0.1
     assert settings.app.temperature == 0.7
     assert settings.app.reasoning_effort == "low"
     assert settings.backend.hyperparameter_policy == "fallback"
@@ -616,6 +619,17 @@ def test_command_timeout_requires_a_positive_duration(tmp_path, value):
         manager.set_session("tools.command_timeout", value)
 
     assert manager.effective.tools.command_timeout == 3600.0
+
+
+@pytest.mark.parametrize("value", [-1, float("inf"), float("-inf"), float("nan")])
+def test_command_job_wait_requires_a_nonnegative_finite_duration(tmp_path, value):
+    """Configuration rejects invalid default job read waits."""
+    manager = ConfigurationManager(tmp_path / ".loop" / "config.toml")
+    manager.initialize()
+    manager.load()
+    with pytest.raises(ValidationError):
+        manager.set_session("tools.command_job_wait_seconds", value)
+    assert manager.effective.tools.command_job_wait_seconds == 30.0
 
 
 def test_set_preserves_existing_comments(tmp_path):

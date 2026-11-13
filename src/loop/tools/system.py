@@ -308,23 +308,31 @@ def read_command_job(
     context: ToolContext,
     handle: Annotated[str, Field(description="Opaque handle from run_command.", min_length=32)],
     cursor: Annotated[
-        int, Field(description="Next ordered output event cursor; start at zero.", ge=0)
-    ] = 0,
-    wait_seconds: Annotated[
-        float,
+        int,
         Field(
-            description="Wait up to 30 seconds for new output or completion. When waiting for "
-            "the command to finish, use 30 to avoid empty polls.",
+            description="Start at zero; for each subsequent read pass the previous response's "
+            "next_cursor. An earlier cursor replays output and returns immediately.",
             ge=0,
-            le=30,
         ),
     ] = 0,
+    wait_seconds: Annotated[
+        float | None,
+        BeforeValidator(normalize_optional_null),
+        Field(
+            description="Wait for output or completion, or use JSON null (unquoted) for the "
+            "configured default. Available output returns immediately. Capped below "
+            "tools.command_timeout; "
+            "use 0 to poll now.",
+            ge=0,
+            allow_inf_nan=False,
+        ),
+    ] = None,
     include_output: Annotated[
         bool,
         Field(description="Include the final captured stream previews when needed."),
     ] = False,
 ) -> dict | Problem:
-    """Read until result is non-null, then stop. Complete status may still have output pages."""
+    """Read until result is non-null, then stop; pass each response's next_cursor to continue."""
     if context.execution_service is None:
         return Problem(
             code="command_job.unavailable",

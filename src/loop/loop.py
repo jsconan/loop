@@ -431,6 +431,10 @@ class Loop:
             self.tool_registry.settings.user_agent = settings.web.user_agent
         elif path == "tools.command_timeout":
             self.tool_registry.settings.command_timeout = settings.tools.command_timeout
+        elif path == "tools.command_job_wait_seconds":
+            self.tool_registry.settings.command_job_wait_seconds = (
+                settings.tools.command_job_wait_seconds
+            )
         elif path == "app.model":
             self._model_selection.restore(settings.app.model)
         elif path == "app.temperature":

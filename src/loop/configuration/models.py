@@ -159,6 +159,12 @@ class ToolSettings(BaseModel):
         allow_inf_nan=False,
         json_schema_extra={"required_capabilities": [CommandCapability.CONTEXT_UPDATE.value]},
     )
+    command_job_wait_seconds: float = Field(
+        default=constants.DEFAULT_COMMAND_JOB_WAIT_SECONDS,
+        ge=0,
+        allow_inf_nan=False,
+        json_schema_extra={"required_capabilities": [CommandCapability.CONTEXT_UPDATE.value]},
+    )
 
 
 class LoggingSettings(BaseModel):

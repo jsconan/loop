@@ -441,7 +441,7 @@ def test_loop_applies_live_settings_through_owning_components(tmp_path):
                 "reasoning_effort": "medium",
             },
             "web": {"user_agent": "updated"},
-            "tools": {"command_timeout": 0.25},
+            "tools": {"command_timeout": 0.25, "command_job_wait_seconds": 0.1},
         }
     )
 
@@ -457,6 +457,7 @@ def test_loop_applies_live_settings_through_owning_components(tmp_path):
         "app.reasoning_effort",
         "web.user_agent",
         "tools.command_timeout",
+        "tools.command_job_wait_seconds",
     ):
         assert loop.apply_runtime_settings(path, settings) == "applied now"
     assert loop.apply_runtime_settings("telemetry.batch_size", settings) == (
@@ -471,6 +472,7 @@ def test_loop_applies_live_settings_through_owning_components(tmp_path):
     assert loop.agent.hyperparameters.reasoning_effort == "medium"
     assert loop.tool_registry.settings.user_agent == "updated"
     assert loop.tool_registry.settings.command_timeout == 0.25
+    assert loop.tool_registry.settings.command_job_wait_seconds == 0.1
 
 
 def test_loop_applies_model_changes_through_async_backend_metadata(tmp_path):

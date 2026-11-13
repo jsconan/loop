@@ -1,6 +1,6 @@
 """Verify bounded command continuations and process-local session ownership."""
 
-from threading import Thread
+from threading import Event, Thread
 from unittest.mock import Mock
 
 import pytest
@@ -56,6 +56,69 @@ def test_command_job_pages_ordered_output_and_exposes_settled_result():
     assert settled["cancel_requested"]
     assert settled["events"] == []
     assert settled["result"] == {"exit_code": 0}
+
+
+def test_replayed_cursor_returns_immediately_and_next_cursor_waits(monkeypatch):
+    """Replayed events explain how to advance, while a current cursor waits for changes."""
+    job = jobs.CommandJob("session", None)
+    job.admitted()
+    job.publish("stderr", "first")
+    first = job.read(0)
+    waits = []
+
+    def wait_for(condition, predicate, timeout):
+        """Observe the wait predicate and simulate output when it is not already satisfied."""
+        waits.append((predicate(), timeout))
+        if not waits[-1][0]:
+            job.publish("stdout", "second")
+        return predicate()
+
+    monkeypatch.setattr(jobs.threading.Condition, "wait_for", wait_for)
+    replay = job.read(0, 30)
+    assert replay["events"] == first["events"]
+    assert "previously read output" in replay["continuation"]
+    next_page = job.read(replay["next_cursor"], 30)
+    assert waits == [(True, 30), (False, 30)]
+    assert next_page["events"][0]["content"] == "second"
+    assert "continuation" not in next_page
+
+
+def test_interrupting_job_read_leaves_command_running(monkeypatch):
+    """A run interruption ends the read promptly without cancelling the underlying job."""
+    job = jobs.CommandJob("session", None)
+    job.admitted()
+    interrupted = Event()
+    waits = []
+
+    def wait_for(condition, predicate, timeout):
+        """Simulate an interruption after one bounded condition wait."""
+        waits.append(timeout)
+        if len(waits) == 2:
+            interrupted.set()
+        return predicate()
+
+    monkeypatch.setattr(jobs.threading.Condition, "wait_for", wait_for)
+    monkeypatch.setattr(jobs.time, "monotonic", lambda: 1.0)
+    page = job.read(0, 100, cancellation_event=interrupted)
+    assert waits == [jobs.JOB_READ_CANCELLATION_CHECK_SECONDS] * 2
+    assert page["result"] is None
+    assert page["status"] == "running"
+    assert not job.cancellation_event.is_set()
+
+
+def test_job_read_with_cancellation_signal_honors_wait_deadline(monkeypatch):
+    """A quiet read returns at its deadline even when a cancellation signal is present."""
+    job = jobs.CommandJob("session", None)
+    clock = iter([1.0, 1.0, 2.0])
+    monkeypatch.setattr(jobs.time, "monotonic", lambda: next(clock))
+    wait = Mock(return_value=False)
+    monkeypatch.setattr(jobs.threading.Condition, "wait_for", wait)
+    page = job.read(0, 1, cancellation_event=Event())
+    assert page["events"] == []
+    assert [call.kwargs["timeout"] for call in wait.call_args_list] == [
+        jobs.JOB_READ_CANCELLATION_CHECK_SECONDS,
+        0,
+    ]
 
 
 def test_completed_job_ignores_late_output():
@@ -261,9 +324,9 @@ def test_command_job_rejects_invalid_cursor(cursor):
         jobs.CommandJob("session", None).read(cursor)
 
 
-@pytest.mark.parametrize("wait", [True, -1, 31, float("nan"), "1"])
+@pytest.mark.parametrize("wait", [True, -1, float("inf"), float("nan"), "1"])
 def test_command_job_rejects_unbounded_wait(wait):
-    """A caller cannot hold a read beyond the fixed wait budget."""
+    """A caller cannot request an invalid or unsupported wait."""
     with pytest.raises(ValueError, match="wait"):
         jobs.CommandJob("session", None).read(0, wait)
 

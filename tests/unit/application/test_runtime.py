@@ -108,6 +108,9 @@ def test_create_composes_runtime_from_bound_references(dependencies, assembled):
     tool_kwargs = dependencies["create_default_tool_registry"].call_args.kwargs
     assert tool_kwargs["settings"].user_agent == settings.web.user_agent
     assert tool_kwargs["settings"].command_timeout == settings.tools.command_timeout
+    assert (
+        tool_kwargs["settings"].command_job_wait_seconds == settings.tools.command_job_wait_seconds
+    )
     assert tool_kwargs["permission_manager"] is dependencies["PermissionManager"].return_value
     assert loop_kwargs["permission_manager"] is tool_kwargs["permission_manager"]
     assert loop_kwargs["refresh_sandbox_backend"] == (

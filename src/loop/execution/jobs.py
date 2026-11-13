@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 from collections import deque
@@ -24,6 +25,7 @@ MAX_JOB_OUTPUT_EVENTS = 16_384
 MAX_READ_EVENTS = 4
 JOB_RETENTION_SECONDS = 600.0
 JOB_CLOSE_SECONDS = 5.0
+JOB_READ_CANCELLATION_CHECK_SECONDS = 0.1
 MAX_TERMINAL_INPUT_BYTES = 4_096
 MAX_TERMINAL_PENDING_BYTES = 65_536
 MAX_TERMINAL_SIZE = 500
@@ -280,6 +282,7 @@ class CommandJob:
         wait_seconds: float = 0,
         *,
         include_output: bool = False,
+        cancellation_event: threading.Event | None = None,
     ) -> dict | Problem:
         """Return a bounded output page and the result after retained output is delivered.
 
@@ -287,6 +290,8 @@ class CommandJob:
             cursor (int): Next event cursor requested by this session.
             wait_seconds (float): Maximum time to wait for output or completion.
             include_output (bool): Include the final captured stream previews explicitly.
+            cancellation_event (threading.Event | None): Stop waiting when this read is interrupted,
+                without cancelling the command.
 
         Returns:
             dict | Problem: Ordered page and next cursor, or an expired-cursor error.
@@ -299,20 +304,36 @@ class CommandJob:
         if (
             isinstance(wait_seconds, bool)
             or not isinstance(wait_seconds, (int, float))
-            or not 0 <= wait_seconds <= 30
+            or not 0 <= wait_seconds <= threading.TIMEOUT_MAX
+            or not math.isfinite(wait_seconds)
         ):
-            raise ValueError("Command job wait must be between zero and 30 seconds.")
+            raise ValueError("Command job wait must be finite and within the supported range.")
         with self._condition:
             if cursor > self._next_cursor:
                 raise ValueError("Command output cursor is beyond the produced output.")
-            self._condition.wait_for(
-                lambda: (
-                    cursor < self._oldest_cursor
-                    or cursor < self._next_cursor
-                    or self.finished.is_set()
-                ),
-                timeout=wait_seconds,
-            )
+            deadline = time.monotonic() + wait_seconds if cancellation_event is not None else 0
+            while True:
+                remaining = (
+                    max(0, deadline - time.monotonic())
+                    if cancellation_event is not None
+                    else wait_seconds
+                )
+                interval = (
+                    min(remaining, JOB_READ_CANCELLATION_CHECK_SECONDS)
+                    if cancellation_event is not None
+                    else remaining
+                )
+                ready = self._condition.wait_for(
+                    lambda: (
+                        cursor < self._oldest_cursor
+                        or cursor < self._next_cursor
+                        or self.finished.is_set()
+                        or (cancellation_event is not None and cancellation_event.is_set())
+                    ),
+                    timeout=interval,
+                )
+                if ready or cancellation_event is None or remaining <= 0:
+                    break
             if cursor < self._oldest_cursor:
                 return Problem(
                     code="command_job.cursor_expired",
@@ -331,6 +352,7 @@ class CommandJob:
                     MAX_READ_EVENTS,
                 )
             )
+            replayed = cursor < self._exposed_cursor and bool(events)
             next_cursor = events[-1]["cursor"] + 1 if events else cursor
             self._exposed_cursor = max(self._exposed_cursor, next_cursor)
             result = self._result if next_cursor >= self._next_cursor else None
@@ -353,12 +375,18 @@ class CommandJob:
                         result["metadata"] = container
                     else:
                         result = container
-            return {
+            page = {
                 **self.inspect(),
                 "events": events,
                 "next_cursor": next_cursor,
                 "result": result,
             }
+            if replayed and result is None:
+                page["continuation"] = (
+                    "This page includes previously read output. Pass this page's next_cursor "
+                    "to read subsequent output and wait for changes."
+                )
+            return page
 
 
 class CommandJobs:
