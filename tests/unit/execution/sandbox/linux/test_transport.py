@@ -3,6 +3,7 @@
 import socket
 import stat
 import struct
+import threading
 from contextlib import nullcontext
 from pathlib import Path
 from threading import Event
@@ -202,6 +203,20 @@ def test_transport_reports_timeout_without_a_cancel_event(transport):
 
     with pytest.raises(TimeoutError, match="transport wait expired"):
         linux_transport.exchange_request(config, files, b"request", 20)
+
+
+def test_transport_keeps_long_deadline_across_representable_socket_waits(transport):
+    """A platform-sized receive timeout does not shorten an extended execution deadline."""
+    config, files, connection, *_ = transport
+    connection.recv.side_effect = [TimeoutError(), b"result", b""]
+
+    result = linux_transport.exchange_request(config, files, b"request", 2 * threading.TIMEOUT_MAX)
+
+    assert result == b"result"
+    assert all(
+        call.args[0] == threading.TIMEOUT_MAX for call in connection.settimeout.call_args_list
+    )
+    connection.sendall.assert_called_once()
 
 
 @pytest.mark.parametrize("payload", [None, "text", b"", b"x" * 65537])

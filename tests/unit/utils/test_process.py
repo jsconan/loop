@@ -900,6 +900,42 @@ def test_supervise_process_cancels_before_reaping_the_group_leader(process_os):
     process.wait.assert_called_once()
 
 
+def test_supervise_process_drains_pipes_across_representable_waits(monkeypatch, process_os):
+    """A long execution deadline survives more than one representable reader join."""
+    clock = SimpleNamespace(current=10.0)
+    monkeypatch.setattr("loop.utils.process.time.monotonic", lambda: clock.current)
+    process = MagicMock(pid=123, returncode=0)
+    process.stdout.read.side_effect = ["ready", ""]
+    process.stderr.read.side_effect = ["error", ""]
+    readers = []
+
+    def thread_factory(*, target, daemon):
+        """Complete each reader after the first bounded wait."""
+        thread = MagicMock()
+        thread.is_alive.return_value = True
+
+        def join(timeout):
+            """Advance time on the first join and release the pipe on the next."""
+            if thread.join.call_count == 1:
+                clock.current += timeout
+            else:
+                target()
+                thread.is_alive.return_value = False
+
+        thread.join.side_effect = join
+        readers.append(thread)
+        return thread
+
+    capture = supervise_process(
+        process, 4 * threading.TIMEOUT_MAX, terminate=MagicMock(), thread_factory=thread_factory
+    )
+
+    assert capture.status is ProcessCaptureStatus.COMPLETED
+    assert capture.stdout == "ready" and capture.stderr == "error"
+    assert all(reader.join.call_count >= 2 for reader in readers)
+    assert all(reader.join.call_args_list[0].args == (threading.TIMEOUT_MAX,) for reader in readers)
+
+
 @pytest.mark.parametrize("cancel_reader", [0, 1])
 def test_supervise_process_cancels_while_descendants_retain_pipes(
     monkeypatch, process_os, cancel_reader

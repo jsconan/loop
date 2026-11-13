@@ -440,7 +440,7 @@ def exchange_request(
         raise ValueError("Transport socket differs from fixed ordinary listener authority.")
     identity = _socket_identity(original)
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-        connection.settimeout(_remaining(deadline))
+        connection.settimeout(min(_remaining(deadline), threading.TIMEOUT_MAX))
         connection.connect(str(path))
         pid, uid, gid = struct.unpack(
             PEER_CREDENTIALS_FORMAT,
@@ -454,7 +454,7 @@ def exchange_request(
         _authority(config, files, deadline)
         if observer is not None:
             observer.start(connection, config.generation)
-        connection.settimeout(_remaining(deadline))
+        connection.settimeout(min(_remaining(deadline), threading.TIMEOUT_MAX))
         connection.sendall(
             NATIVE_REQUEST_MAGIC + struct.pack(REQUEST_LENGTH_FORMAT, len(payload)) + payload
         )
@@ -479,7 +479,7 @@ def exchange_request(
                     if (cancellation_event is not None and not response and not cancel_sent)
                     or egress_lease is not None
                     or terminal_input is not None
-                    else remaining
+                    else min(remaining, threading.TIMEOUT_MAX)
                 )
                 try:
                     block = connection.recv(
@@ -492,6 +492,7 @@ def exchange_request(
                         cancellation_event is None
                         and egress_lease is None
                         and terminal_input is None
+                        and remaining <= threading.TIMEOUT_MAX
                     ):
                         raise
                     if (

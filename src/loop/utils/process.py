@@ -614,7 +614,11 @@ def supervise_process(
         else:
             for thread in readers:
                 if cancel_event is None:
-                    thread.join(max(0, deadline - time.monotonic()))
+                    while True:
+                        remaining = max(0, deadline - time.monotonic())
+                        thread.join(min(remaining, threading.TIMEOUT_MAX))
+                        if remaining <= threading.TIMEOUT_MAX or not thread.is_alive():
+                            break
                 else:
                     while thread.is_alive() and not cancel_event.is_set():
                         remaining = deadline - time.monotonic()
