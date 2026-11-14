@@ -6,6 +6,7 @@ from unittest.mock import Mock
 
 import pytest
 from prompt_toolkit.document import Document
+from rich.text import Text
 
 from loop import CommandCompletionAdapter, CompletionManager
 from loop.application import ApplicationPaths
@@ -21,7 +22,7 @@ def application(tmp_path):
     project.mkdir()
     paths = ApplicationPaths(tmp_path / "config", tmp_path / "data", tmp_path / "state")
     workspace_paths = paths.for_workspace("workspace-id", project)
-    return ApplicationCommands(paths, workspace_paths, "workspace-id"), paths
+    return ApplicationCommands(paths, workspace_paths, "workspace-id", "project"), paths
 
 
 def test_dirs_prints_only_existing_global_and_workspace_paths(application):
@@ -41,6 +42,13 @@ def test_dirs_prints_only_existing_global_and_workspace_paths(application):
         "Operational log",
         "Active workspace ID",
     }
+    title = interaction.table.call_args.kwargs["title"]
+    assert isinstance(title, Text)
+    assert title.plain == "Application directories for project:"
+    assert len(title.spans) == 1
+    span = title.spans[0]
+    assert title.plain[span.start : span.end] == "project"
+    assert str(span.style) == "bold"
     assert str(paths.configuration_root) == next(
         row["path"] for row in rows if row["name"] == "Configuration"
     )

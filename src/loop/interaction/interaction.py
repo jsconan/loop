@@ -8,6 +8,7 @@ from contextlib import AbstractContextManager, contextmanager
 from typing import Any, cast
 
 from prompt_toolkit.completion import Completer
+from rich.text import Text
 
 from .. import constants
 from ..errors import Problem, ProblemException
@@ -253,7 +254,7 @@ class InteractionOutput(ABC):
         self,
         items: Iterable[object | Mapping[str, Any]],
         *,
-        title: str | None = None,
+        title: str | Text | None = None,
         prefix: str = "  ",
         columns: Iterable[str] = ("name", "description"),
         max_width: int | None = constants.TABULAR_MAX_WIDTH,
@@ -264,7 +265,7 @@ class InteractionOutput(ABC):
         Args:
             items (Iterable[object | Mapping[str, Any]]): Rows whose mappings or attributes
                 provide the displayed values.
-            title (str | None): Optional title to display above the table.
+            title (str | Text | None): Optional title to display above the table.
             prefix (str): Text to prepend to the first value in each row.
             columns (Iterable[str]): Attribute names to display as columns.
             max_width (int | None): Maximum table width in characters. Defaults to

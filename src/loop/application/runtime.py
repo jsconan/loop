@@ -7,7 +7,7 @@ import inspect
 import logging
 from collections.abc import Callable, Mapping
 from types import TracebackType
-from typing import Self
+from typing import Self, cast
 
 from ..backend import OpenAIBackend
 from ..configuration import ApplicationSettings, ConfigurationCommands, ConfigurationManager
@@ -341,7 +341,12 @@ class ApplicationRuntime:
                 )
             )
             loop.register_command_provider(
-                ApplicationCommands(paths, workspace_paths, workspace.id)
+                ApplicationCommands(
+                    paths,
+                    workspace_paths,
+                    workspace.id,
+                    cast(str, workspace.name),
+                )
             )
             loop.register_command_provider(WorkspaceCommands(workspace, workspace_repository))
             previous_telemetry = get_telemetry()

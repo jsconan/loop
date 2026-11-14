@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field
+from rich.text import Text
 
 from ..commands import CommandArgumentError, CommandContext, CommandRegistration
 from ..completion import (
@@ -72,21 +73,25 @@ class ApplicationCommands:
         paths (ApplicationPaths): Immutable global application paths.
         workspace_paths (WorkspacePaths): Immutable active-workspace storage paths.
         workspace_id (str): Active initialized workspace identifier.
+        workspace_name (str): Human-readable active initialized workspace name.
     """
 
     _paths: ApplicationPaths
     _workspace_paths: WorkspacePaths
     _workspace_id: str
+    _workspace_name: str
 
     def __init__(
         self,
         paths: ApplicationPaths,
         workspace_paths: WorkspacePaths,
         workspace_id: str,
+        workspace_name: str,
     ) -> None:
         self._paths = paths
         self._workspace_paths = workspace_paths
         self._workspace_id = workspace_id
+        self._workspace_name = workspace_name
 
     def get_commands(self) -> tuple[CommandRegistration, ...]:
         """Return the application command registration.
@@ -146,7 +151,7 @@ class ApplicationCommands:
         decision: Annotated[str | None, Field(description="Audit decision filter.")] = None,
         force: Annotated[bool, Field(description="Allow replacing an export file.")] = False,
     ) -> None:
-        """Print application directories or export operational records."""
+        """Print the active workspace name with application directories or export records."""
         if action == "dirs":
             if (
                 any(
@@ -165,9 +170,12 @@ class ApplicationCommands:
                 or force
             ):
                 raise CommandArgumentError("The dirs operation does not accept a destination.")
+            title = Text("Application directories for ")
+            title.append(self._workspace_name, style="bold")
+            title.append(":")
             context.interaction.table(
                 self._directories(),
-                title="Application directories:",
+                title=title,
                 columns=("name", "path"),
             )
             return

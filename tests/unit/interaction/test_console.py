@@ -15,6 +15,7 @@ from prompt_toolkit.document import Document
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.prompt import Confirm
+from rich.text import Text
 
 from loop import (
     ModelCallMetrics,
@@ -852,27 +853,32 @@ def test_info_supports_a_blank_separator(capsys):
     assert capsys.readouterr().out == "\n"
 
 
-def test_table_displays_a_titled_object_catalog(capsys):
-    """Tables render their title, prefix, ordered attributes, and converted values."""
+def test_table_preserves_partial_title_style_and_titled_object_catalog():
+    """Tables preserve styled title spans, prefix, ordered attributes, and values."""
+    output = StringIO()
+    console = Console(file=output, force_terminal=True, color_system="standard", width=200)
+    title = Text("Application directories for ")
+    title.append("project", style="bold")
+    title.append(":")
     items = [
         SimpleNamespace(name="alpha", description="first", count=1),
         SimpleNamespace(name="beta", description="second", count=2),
     ]
 
-    ConsoleInteraction(console=Console(width=200)).table(
+    ConsoleInteraction(console=console).table(
         items,
-        title="Items:",
+        title=title,
         prefix="/",
         columns=("name", "count"),
     )
 
-    output = capsys.readouterr().out
-    assert output.startswith("Items:\n")
-    assert "/alpha" in output
-    assert "1" in output
-    assert "/beta" in output
-    assert "2" in output
-    assert "first" not in output
+    rendered = output.getvalue()
+    assert "Application directories for \x1b[1mproject\x1b[0m:" in rendered
+    assert "/alpha" in rendered
+    assert "1" in rendered
+    assert "/beta" in rendered
+    assert "2" in rendered
+    assert "first" not in rendered
 
 
 def test_table_handles_missing_attributes_empty_columns_and_row_limits(capsys):

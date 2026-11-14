@@ -319,7 +319,12 @@ def test_runtime_command_providers_keep_contextual_completion_in_the_active_loop
     loop.register_command_provider(ConfigurationCommands(configuration, Mock()))
     paths = ApplicationPaths(tmp_path / "config", tmp_path / "data", tmp_path / "state")
     loop.register_command_provider(
-        ApplicationCommands(paths, paths.for_workspace("workspace-id", tmp_path), "workspace-id")
+        ApplicationCommands(
+            paths,
+            paths.for_workspace("workspace-id", tmp_path),
+            "workspace-id",
+            "Project",
+        )
     )
     workspace = Workspace(tmp_path, tmp_path, "workspace-id", "Project", "directory", 1, 1)
     repository = Mock()

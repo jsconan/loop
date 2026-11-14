@@ -533,7 +533,7 @@ class ConsoleInteraction(Interaction, AsyncInteractionInput):
         self,
         items: Iterable[object | Mapping[str, Any]],
         *,
-        title: str | None = None,
+        title: str | Text | None = None,
         prefix: str = "  ",
         columns: Iterable[str] = ("name", "description"),
         max_width: int | None = constants.TABULAR_MAX_WIDTH,
@@ -544,7 +544,7 @@ class ConsoleInteraction(Interaction, AsyncInteractionInput):
         Args:
             items (Iterable[object | Mapping[str, Any]]): Rows whose mappings or attributes
                 provide the displayed values.
-            title (str | None): Optional title to write above the table.
+            title (str | Text | None): Optional title to write above the table.
             prefix (str): Text to prepend to the first value in each row.
             columns (Iterable[str]): Attribute names to display as columns.
             max_width (int | None): Maximum table width in characters. Defaults to
@@ -561,7 +561,7 @@ class ConsoleInteraction(Interaction, AsyncInteractionInput):
             raise ValueError("max_rows cannot be negative.")
 
         if title:
-            self.info(title)
+            self._console.print(title, markup=False, highlight=False)
         column_names = tuple(columns)
         table = Table(*column_names)
         for column in table.columns:
