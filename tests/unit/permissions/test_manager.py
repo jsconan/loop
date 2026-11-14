@@ -4722,25 +4722,41 @@ def test_async_native_prompt_can_show_details_before_approval(tmp_path):
 @pytest.mark.parametrize("asynchronous", [False, True])
 @pytest.mark.parametrize("decision", ["approve", "deny"])
 def test_sandbox_scope_can_be_toggled_before_deciding(tmp_path, asynchronous, decision):
-    """Details and reduced view alternate without authorizing the command."""
+    """Scope details follow approval choices and toggle between F and R before a decision."""
     interaction = ConsoleInteraction(console=Console(file=io.StringIO()), markdown=False)
     interaction.info = Mock()
-    manager = PermissionManager(tmp_path, interaction=interaction)
-    request = native_request(tmp_path, "printf text > output", read_roots=())
-    responses = ["details", "details", "details", "details", decision]
+    manager = PermissionManager(
+        tmp_path, user_configuration_path=tmp_path / "user.yaml", interaction=interaction
+    )
+    request = native_request(tmp_path, "git status")
+    responses = iter(("details", "details", "details", "details", decision))
+    prompts = []
+
+    def capture_prompt(*args, **kwargs):
+        """Snapshot each choice catalog before the next scope toggle."""
+        prompts.append({"choices": dict(kwargs["choices"]), "index": dict(kwargs["index"])})
+        return next(responses)
+
+    async def capture_prompt_async(*args, **kwargs):
+        """Snapshot each asynchronous choice catalog before the next scope toggle."""
+        return capture_prompt(*args, **kwargs)
+
     if asynchronous:
-        interaction.prompt_async = AsyncMock(side_effect=responses)
+        interaction.prompt_async = AsyncMock(side_effect=capture_prompt_async)
         approved = asyncio.run(
             manager.authorize_sandboxed_command_async(request, tool_id="run_command")
         )
-        calls = interaction.prompt_async.await_args_list
     else:
-        interaction.prompt = Mock(side_effect=responses)
+        interaction.prompt = Mock(side_effect=capture_prompt)
         approved = manager.authorize_sandboxed_command(request, tool_id="run_command")
-        calls = interaction.prompt.call_args_list
 
     assert approved is (decision == "approve")
-    assert [call.kwargs["choices"]["details"] for call in calls] == [
+    assert [prompt["index"]["details"] for prompt in prompts] == ["F", "R", "F", "R", "F"]
+    for prompt in prompts:
+        labels = list(prompt["choices"].values())
+        assert labels[-1] in {"Show full scope", "Show reduced scope"}
+        assert all(label == "Deny" or label.startswith("Allow") for label in labels[:-1])
+    assert [prompt["choices"]["details"] for prompt in prompts] == [
         "Show full scope",
         "Show reduced scope",
         "Show full scope",

@@ -2641,6 +2641,7 @@ class PermissionManager:
             if selected != "details":
                 break
             full_scope = not full_scope
+            index["details"] = "R" if full_scope else "F"
             choices = {
                 **choices,
                 "details": "Show reduced scope" if full_scope else "Show full scope",
@@ -2703,6 +2704,7 @@ class PermissionManager:
             if selected != "details":
                 break
             full_scope = not full_scope
+            index["details"] = "R" if full_scope else "F"
             choices = {
                 **choices,
                 "details": "Show reduced scope" if full_scope else "Show full scope",
@@ -2890,20 +2892,21 @@ class PermissionManager:
         """Build permitted interactive choices and their optional similar-command prefix."""
         choices = {"deny": "Deny", "approve": "Allow once", "session": "Allow for this session"}
         index = {"deny": "N", "approve": "Y", "session": "S"}
-        choices["details"] = "Show full scope"
-        index["details"] = "D"
         if fresh_only:
             choices.pop("session")
             index.pop("session")
-            return choices, index, None
-        if self._user_configuration_path is not None:
-            choices["workspace"] = "Allow in this workspace"
-            index["workspace"] = "W"
-            choices["user"] = "Allow for this user"
-            index["user"] = "U"
-        prefix = self._similar_prefix(request.source)
-        if prefix is not None:
-            self._add_similar_sandbox_choices(choices, index, prefix)
+            prefix = None
+        else:
+            if self._user_configuration_path is not None:
+                choices["workspace"] = "Allow in this workspace"
+                index["workspace"] = "W"
+                choices["user"] = "Allow for this user"
+                index["user"] = "U"
+            prefix = self._similar_prefix(request.source)
+            if prefix is not None:
+                self._add_similar_sandbox_choices(choices, index, prefix)
+        choices["details"] = "Show full scope"
+        index["details"] = "F"
         return choices, index, prefix
 
     @staticmethod
