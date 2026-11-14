@@ -6,6 +6,7 @@ import asyncio
 import logging
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from contextlib import AbstractContextManager, asynccontextmanager, nullcontext
+from dataclasses import replace
 from threading import Lock
 from typing import Annotated, Literal, TypeVar
 
@@ -707,7 +708,7 @@ class ConfigurationCommands:
         return tuple(paths)
 
     def _show(self, context: CommandContext, path: str | None) -> None:
-        """Render one or all effective settings without exposing secrets."""
+        """Render effective settings and current YOLO availability without exposing secrets."""
         entries = tuple(entry for entry in self._configuration.entries if not entry.secret)
         if path is not None:
             entry = next(
@@ -720,33 +721,31 @@ class ConfigurationCommands:
                     "Secret fields are not displayed with 'get'. Use 'secret' to update them."
                 )
             entries = (entry,)
+        requested = self._configuration.effective.app.yolo
+        active = requested
+        if path is None or path == "app.yolo":
+            active = self._yolo_active() if self._yolo_active is not None else requested
+        displayed_entries = []
+        for entry in entries:
+            value = entry.value
+            if entry.path == "app.yolo":
+                if requested and not active:
+                    value = "No (blocked by administrator policy)"
+                else:
+                    value = "Yes" if active else "No"
+            elif isinstance(value, bool):
+                value = "Yes" if value else "No"
+            elif isinstance(value, str):
+                value = repr(value)
+            elif value is None:
+                value = "None"
+            displayed_entries.append(replace(entry, value=value) if value != entry.value else entry)
+        entries = tuple(displayed_entries)
         context.interaction.table(
             entries,
             title="Application configuration:",
             columns=("path", "value", "source", "description"),
         )
-        if path is None or path == "app.yolo":
-            requested = self._configuration.effective.app.yolo
-            active = self._yolo_active() if self._yolo_active is not None else requested
-            source = self._configuration.source_for("app.yolo")
-            if requested and not active:
-                source = "inactive"
-            saved = self._configuration.saved_yolo
-            displayed_saved = "unknown" if saved is None else str(saved)
-            detail = (
-                f"YOLO active: {active}; source: {source}; saved user value: {displayed_saved}."
-            )
-            if requested and not active:
-                detail += " A trusted action is required to activate it."
-            elif not active and saved:
-                detail += (
-                    " It will become active on restart; disable with scope=user to persist off."
-                )
-            if active and source == "session" and saved is False:
-                detail += " Disable with scope=session to stop it now."
-            if active and source == "session" and saved:
-                detail += " Disable both session and user scopes to keep it off after restart."
-            context.interaction.info(detail)
 
     async def _set_async(
         self,

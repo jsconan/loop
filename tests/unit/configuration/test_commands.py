@@ -21,8 +21,8 @@ from loop.utils import ShutdownRequested
 from tests.scheduling import deliver_callbacks
 
 
-def test_yolo_command_defaults_to_session_and_displays_activation_and_status(tmp_path):
-    """The human config command explains authority before enabling and reports both lifetimes."""
+def test_yolo_command_defaults_to_session_and_displays_state_in_configuration_table(tmp_path):
+    """Activation warns first, defaults to session scope, and displays the current state."""
     configuration = ConfigurationManager(tmp_path / "config" / "config.toml")
     configuration.initialize()
     configuration.load({})
@@ -44,19 +44,22 @@ def test_yolo_command_defaults_to_session_and_displays_activation_and_status(tmp
     assert "private data" in events[0][1]
     assert events[1] == ("apply", "app.yolo")
     interaction.prompt.assert_not_called()
-    assert "YOLO active: True" in interaction.info.call_args.args[0]
+    entry = next(item for item in interaction.table.call_args.args[0] if item.path == "app.yolo")
+    assert entry.value == "Yes"
 
     assert manager.handle_user_command("/config set app.yolo true scope=user")
     assert configuration.saved_yolo is True
     assert manager.handle_user_command("/config set app.yolo false")
     assert configuration.effective.app.yolo is False
-    assert "will become active on restart" in interaction.info.call_args.args[0]
+    entry = next(item for item in interaction.table.call_args.args[0] if item.path == "app.yolo")
+    assert entry.value == "No"
     assert manager.handle_user_command("/config set app.yolo true scope=session")
     assert manager.handle_user_command("/config set app.yolo false scope=user")
     assert configuration.effective.app.yolo is True
-    assert "Disable with scope=session" in interaction.info.call_args.args[0]
     assert manager.handle_user_command("/config get app.yolo")
-    assert "saved user value: False" in interaction.info.call_args.args[0]
+    entry = next(item for item in interaction.table.call_args.args[0] if item.path == "app.yolo")
+    assert entry.value == "Yes"
+    assert "YOLO active" not in " ".join(call.args[0] for call in interaction.info.call_args_list)
     assert manager.handle_user_command("/config set app.yolo false scope=workspace")
     assert "supports session and user" in interaction.report.call_args.args[0].detail
 
@@ -543,7 +546,8 @@ def test_yolo_reload_cannot_activate_a_forbidden_saved_value(tmp_path):
     assert manager.handle_user_command("/config reload")
     assert "prohibits YOLO" in interaction.report.call_args.args[0].detail
     assert manager.handle_user_command("/config get app.yolo")
-    assert "YOLO active: False; source: inactive" in interaction.info.call_args.args[0]
+    entry = next(item for item in interaction.table.call_args.args[0] if item.path == "app.yolo")
+    assert entry.value == "No (blocked by administrator policy)"
 
 
 @pytest.mark.parametrize("async_dispatch", [False, True])
@@ -610,7 +614,8 @@ def test_yolo_status_reports_managed_suppression(tmp_path):
     provider = ConfigurationCommands(configuration, Mock(), yolo_active=lambda: False)
     manager = CommandManager(providers=(provider,), interaction=interaction)
     assert manager.handle_user_command("/config get app.yolo")
-    assert "YOLO active: False; source: inactive" in interaction.info.call_args.args[0]
+    entry = next(item for item in interaction.table.call_args.args[0] if item.path == "app.yolo")
+    assert entry.value == "No (blocked by administrator policy)"
 
 
 def test_yolo_deactivation_reports_active_run_authority(tmp_path):
@@ -1177,6 +1182,17 @@ def test_config_without_arguments_displays_only_non_secret_entries(tmp_path):
     entries = interaction.table.call_args.args[0]
     assert len(entries) == len(configuration.entries) - 1
     assert all(not entry.secret for entry in entries)
+    for entry in entries:
+        value = configuration.get(entry.path)
+        if isinstance(value, bool):
+            expected = "Yes" if value else "No"
+        elif isinstance(value, str):
+            expected = repr(value)
+        elif value is None:
+            expected = "None"
+        else:
+            expected = value
+        assert entry.value == expected
 
 
 def test_config_set_applies_a_file_override(tmp_path):
