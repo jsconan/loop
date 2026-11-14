@@ -1477,8 +1477,7 @@ def test_installed_execution_streams_only_payload_output_after_verified_entry(
     assert result.outcome is SandboxOutcome.COMPLETED
     frames = [call.args[0] for call in state.connection.send.call_args_list]
     assert frames == [
-        b"O2" + (7).to_bytes(4, "big") + b"warning",
-        b"O2" + (1).to_bytes(4, "big") + b"o",
+        b"O2" + (24).to_bytes(4, "big") + b"warningoverflowdiscarded",
         b"O1" + (5).to_bytes(4, "big") + b"hello",
     ]
 

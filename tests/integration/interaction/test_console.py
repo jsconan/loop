@@ -51,7 +51,7 @@ def test_sandbox_prompt_displays_details_only_when_requested(tmp_path):
 
         async def scenario():
             """Toggle details twice, then deny through the same prompt session."""
-            pipe.send_text("D\nD\nN\n")
+            pipe.send_text("F\nR\nN\n")
             return await asyncio.wait_for(
                 manager.authorize_sandboxed_command_async(request, tool_id="run_command"), 5
             )

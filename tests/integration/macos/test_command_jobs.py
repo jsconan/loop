@@ -29,9 +29,11 @@ from loop.tools.system import (
     cancel_command_job,
     control_command_terminal,
     inspect_command_jobs,
-    read_command_job,
+    poll_command_job,
+    read_command_output,
     run_command,
 )
+from loop.utils.content import encode_content_cursor
 
 pytestmark = [pytest.mark.integration, pytest.mark.e2e, pytest.mark.macos]
 
@@ -56,7 +58,8 @@ def _registry(
         [
             run_command,
             inspect_command_jobs,
-            read_command_job,
+            poll_command_job,
+            read_command_output,
             cancel_command_job,
             control_command_terminal,
         ],
@@ -75,60 +78,94 @@ def _call(registry: ToolRegistry, interaction: Mock, tool: str, **arguments) -> 
     return json.loads(registry.call(tool, json.dumps(arguments), interaction=interaction))
 
 
-def _terminal_result(registry: ToolRegistry, interaction: Mock, handle: str) -> tuple[dict, str]:
-    """Wait for one original terminal job and return its bounded final result and events."""
-    cursor = 0
-    output = []
+def _read_output_page(
+    registry: ToolRegistry,
+    interaction: Mock,
+    handle: str,
+    *,
+    stream: str = "stdout",
+    cursor: str | None = None,
+) -> dict:
+    """Read one immediately available page from an owned command stream."""
+    result = _call(
+        registry,
+        interaction,
+        "read_command_output",
+        handle=handle,
+        stream=stream,
+        cursor=cursor,
+    )
+    assert result["ok"], result
+    return result["result"]
+
+
+def _poll_until_complete(
+    registry: ToolRegistry, interaction: Mock, handle: str, *, wait_seconds: float = 5
+) -> dict:
+    """Wait for job completion without coupling the wait to output arrival."""
     for _ in range(10):
-        page = _call(
+        status = _call(
             registry,
             interaction,
-            "read_command_job",
+            "poll_command_job",
             handle=handle,
-            cursor=cursor,
-            wait_seconds=5,
+            wait_seconds=wait_seconds,
         )
-        assert page["ok"], page
-        body = page["result"]
-        cursor = body["next_cursor"]
-        output.extend(event["content"] for event in body["events"])
-        if body["result"] is not None:
-            return body["result"], "".join(output)
-    pytest.fail("The owned native terminal did not settle.")
+        assert status["ok"], status
+        if status["result"]["status"] == "complete":
+            return status["result"]
+    pytest.fail("The owned native command did not settle.")
 
 
-def test_native_terminal_keeps_streaming_after_final_capture_limit(native_workspace, monkeypatch):
-    """A native terminal remains readable after its bounded final capture fills."""
-    monkeypatch.setattr(macos_backend.constants, "MAX_OUTPUT_CHARS", 64)
+def _read_complete_output(
+    registry: ToolRegistry, interaction: Mock, handle: str, *, stream: str = "stdout"
+) -> str:
+    """Read the completed stream in byte-cursor pages without a live ring."""
+    cursor = None
+    output = []
+    while True:
+        page = _read_output_page(registry, interaction, handle, stream=stream, cursor=cursor)
+        output.append(page["content"])
+        cursor = page.get("next_cursor")
+        if cursor is None:
+            return "".join(output)
+
+
+def _terminal_result(registry: ToolRegistry, interaction: Mock, handle: str) -> tuple[dict, str]:
+    """Wait for an owned terminal to settle, then read its stdout stream."""
+    status = _poll_until_complete(registry, interaction, handle)
+    return status, _read_complete_output(registry, interaction, handle)
+
+
+def test_native_terminal_keeps_streaming_after_final_capture_limit(native_workspace):
+    """A native terminal remains readable after output exceeds the native result cap."""
     registry, interaction, _sessions = _registry(native_workspace, terminal=True)
+    output_limit = macos_backend.constants.MAX_OUTPUT_CHARS + 128
+    command = (
+        f"printf '%{output_limit}s' x | /usr/bin/tr ' ' x; "
+        "read -r response; printf 'after-limit\\n'"
+    )
     try:
         started = _call(
             registry,
             interaction,
             "run_command",
-            command="printf '%s' '" + "x" * 128 + "'; read line; printf 'after-limit\\n'",
+            command=command,
             cwd=str(native_workspace),
+            read_only=True,
             interactive=True,
         )
         assert started["ok"], started
         handle = started["result"]["handle"]
-        cursor = 0
         output = ""
-        for _ in range(10):
-            page = _call(
-                registry,
-                interaction,
-                "read_command_job",
-                handle=handle,
-                cursor=cursor,
-                wait_seconds=5,
-            )
-            assert page["ok"], page
-            cursor = page["result"]["next_cursor"]
-            output += "".join(event["content"] for event in page["result"]["events"])
-            if len(output) >= 128:
-                break
-        assert "x" * 128 in output
+        cursor = None
+        deadline = time.monotonic() + 10
+        while len(output) < output_limit and time.monotonic() < deadline:
+            page = _read_output_page(registry, interaction, handle, cursor=cursor)
+            output += page["content"]
+            cursor = page.get("next_cursor")
+            time.sleep(0.02)
+        assert output == "x" * output_limit
         sent = _call(
             registry,
             interaction,
@@ -138,28 +175,18 @@ def test_native_terminal_keeps_streaming_after_final_capture_limit(native_worksp
             content="go\n",
         )
         assert sent["ok"], sent
-        for _ in range(10):
-            page = _call(
-                registry,
-                interaction,
-                "read_command_job",
-                handle=handle,
-                cursor=cursor,
-                wait_seconds=5,
-            )
-            assert page["ok"], page
-            cursor = page["result"]["next_cursor"]
-            output += "".join(event["content"] for event in page["result"]["events"])
-            if page["result"]["result"] is not None:
-                break
+        status = _poll_until_complete(registry, interaction, handle)
+        page = _read_output_page(registry, interaction, handle, cursor=cursor)
+        output += page["content"]
         assert "after-limit" in output
-        assert page["result"]["result"]["stdout"]["discarded_characters"] > 0
+        assert status["stdout_capture_complete"]
+        assert status["stdout_bytes"] == len(output.encode("utf-8"))
     finally:
         registry.close()
 
 
-def test_native_command_continuation_retains_ordered_output_and_session_ownership(native_workspace):
-    """The same native process supplies a live handle, final result, and isolated cursors."""
+def test_native_command_continuation_retains_output_and_session_ownership(native_workspace):
+    """The same native process supplies status and byte cursors isolated by session."""
     registry, interaction, sessions = _registry(native_workspace)
     other = native_workspace / "other-session"
     other.mkdir(mode=0o700)
@@ -175,52 +202,37 @@ def test_native_command_continuation_retains_ordered_output_and_session_ownershi
         )
         assert started["ok"], started
         handle = started["result"]["handle"]
-        invalid = _call(registry, interaction, "read_command_job", handle=handle, cursor=999999)
-        assert invalid["problem"]["code"] == "command_job.invalid_read"
+        output_handle = started["result"]["output_handles"]["stdout"]
+        future = encode_content_cursor(output_handle, 999999)
+        invalid = _call(
+            registry,
+            interaction,
+            "read_command_output",
+            handle=handle,
+            stream="stdout",
+            cursor=future,
+        )
+        assert invalid["problem"]["code"] == "command_output.invalid_read"
         with pytest.raises(SessionExecutionConflictError):
             sessions.new_session()
         denied = json.loads(
             registry.call(
-                "read_command_job",
-                json.dumps({"handle": handle}),
+                "read_command_output",
+                json.dumps({"handle": handle, "stream": "stdout"}),
                 interaction=interaction,
                 instructions_manager=switched,
             )
         )
         assert denied["problem"]["code"] == "command_job.unavailable"
         assert _call(registry, interaction, "inspect_command_jobs")["result"]["jobs"]
-        cursor = started["result"]["next_cursor"]
-        observed = list(started["result"]["events"])
-        final = None
-        for _ in range(8):
-            page = _call(
-                registry,
-                interaction,
-                "read_command_job",
-                handle=handle,
-                cursor=cursor,
-                wait_seconds=5,
-            )["result"]
-            observed.extend(page["events"])
-            assert page["next_cursor"] >= cursor
-            cursor = page["next_cursor"]
-            if page["result"] is not None:
-                final = page["result"]
-                break
-        assert final is not None
-        assert "content" not in final["stdout"]
-        assert final["lifecycle"]["main_process"] == "exited"
-        assert final["lifecycle"]["descendant_cleanup"] == "uncertain"
-        assert "".join(event["content"] for event in observed if event["stream"] == "stdout") == (
-            "first\nlast\n"
-        )
-        assert [event["cursor"] for event in observed] == list(range(cursor))
-        assert (
-            _call(registry, interaction, "read_command_job", handle=handle, cursor=cursor)[
-                "result"
-            ]["events"]
-            == []
-        )
+        final = _poll_until_complete(registry, interaction, handle)
+        assert "stdout" not in final["result"].get("metadata", {})
+        assert final["main_process"] == "exited"
+        assert final["descendant_cleanup"] == "uncertain"
+        observed = _read_complete_output(registry, interaction, handle)
+        assert observed == "first\nlast\n"
+        end_cursor = encode_content_cursor(output_handle, len(observed.encode("utf-8")))
+        assert _read_output_page(registry, interaction, handle, cursor=end_cursor)["content"] == ""
         sessions.new_session()
     finally:
         registry.close()
@@ -234,50 +246,27 @@ def test_native_command_cancel_reports_uncertain_detached_cleanup(native_workspa
             registry,
             interaction,
             "run_command",
-            command="printf 'ready\\n'; sleep 20",
+            command="printf 'ready\n'; sleep 20",
             cwd=str(native_workspace),
             wait_seconds=0,
         )
         assert started["ok"], started
         handle = started["result"]["handle"]
-        ready = any("ready" in event["content"] for event in started["result"]["events"])
-        cursor = started["result"]["next_cursor"]
-        for _ in range(4):
-            if ready:
-                break
-            page = _call(
-                registry,
-                interaction,
-                "read_command_job",
-                handle=handle,
-                cursor=cursor,
-                wait_seconds=5,
-            )["result"]
-            cursor = page["next_cursor"]
-            if any("ready" in event["content"] for event in page["events"]):
-                ready = True
-                break
-        assert ready, "The native command did not publish live output before cancellation."
+        deadline = time.monotonic() + 10
+        cursor = None
+        output = ""
+        while "ready" not in output and time.monotonic() < deadline:
+            page = _read_output_page(registry, interaction, handle, cursor=cursor)
+            output += page["content"]
+            cursor = page.get("next_cursor")
+            time.sleep(0.02)
+        assert "ready" in output, "The native command did not publish live output before cancel."
         cancelled = _call(registry, interaction, "cancel_command_job", handle=handle)
         assert cancelled["result"]["cancel_requested"]
-        final = None
-        for _ in range(8):
-            page = _call(
-                registry,
-                interaction,
-                "read_command_job",
-                handle=handle,
-                cursor=cursor,
-                wait_seconds=5,
-            )["result"]
-            cursor = page["next_cursor"]
-            if page["result"] is not None:
-                final = page["result"]
-                break
-        assert final is not None
-        assert final["code"] == "sandbox.cancelled"
-        assert final["metadata"]["lifecycle"]["cancel_requested"]
-        assert final["metadata"]["lifecycle"]["descendant_cleanup"] == "uncertain"
+        final = _poll_until_complete(registry, interaction, handle)
+        assert final["result"]["code"] == "sandbox.cancelled"
+        assert final["result"]["metadata"]["lifecycle"]["cancel_requested"]
+        assert final["result"]["metadata"]["lifecycle"]["descendant_cleanup"] == "uncertain"
     finally:
         registry.close()
 
@@ -324,29 +313,10 @@ def test_native_command_hard_deadline_after_continuation(native_workspace):
         handle = started["result"]["handle"]
         initial_elapsed = started["result"]["elapsed_seconds"]
         assert initial_elapsed is not None and initial_elapsed >= 0
-        cursor = started["result"]["next_cursor"]
-        events = list(started["result"]["events"])
-        final = None
-        for _ in range(8):
-            page = _call(
-                registry,
-                interaction,
-                "read_command_job",
-                handle=handle,
-                cursor=cursor,
-                wait_seconds=5,
-            )
-            assert page["ok"], page
-            body = page["result"]
-            assert body["elapsed_seconds"] >= initial_elapsed
-            events.extend(body["events"])
-            cursor = body["next_cursor"]
-            if body["result"] is not None:
-                final = body["result"]
-                break
-        assert final is not None and final["code"] == "sandbox.timed_out"
-        assert final["metadata"]["lifecycle"]["descendant_cleanup"] == "uncertain"
-        assert "ready" in "".join(event["content"] for event in events)
+        final = _poll_until_complete(registry, interaction, handle)
+        assert final["result"]["code"] == "sandbox.timed_out"
+        assert final["result"]["metadata"]["lifecycle"]["descendant_cleanup"] == "uncertain"
+        assert "ready" in _read_complete_output(registry, interaction, handle)
         assert marker.read_text() == "x"
     finally:
         registry.close()
@@ -373,19 +343,25 @@ def test_native_async_public_dispatch_retains_job_owner(native_workspace):
         )
         assert started["ok"], started
         handle = started["result"]["handle"]
-        cursor = 0
         for _ in range(8):
             page = json.loads(
                 await registry.call_async(
-                    "read_command_job",
-                    json.dumps({"handle": handle, "cursor": cursor, "wait_seconds": 5}),
+                    "poll_command_job",
+                    json.dumps({"handle": handle, "wait_seconds": 5}),
                     interaction=interaction,
                 )
             )
             assert page["ok"], page
-            cursor = page["result"]["next_cursor"]
-            if page["result"]["result"] is not None:
-                assert "content" not in page["result"]["result"]["stdout"]
+            if page["result"]["status"] == "complete":
+                output = json.loads(
+                    await registry.call_async(
+                        "read_command_output",
+                        json.dumps({"handle": handle, "stream": "stdout"}),
+                        interaction=interaction,
+                    )
+                )
+                assert output["ok"], output
+                assert output["result"]["content"] == "asyncdone"
                 return
         pytest.fail("The asynchronous native job did not settle.")
 
@@ -444,29 +420,12 @@ def test_native_terminal_job_accepts_input_and_inner_pty(native_workspace):
             content="hello\n",
         )
         assert written["ok"], written
-        cursor = 0
-        content = ""
-        for _ in range(8):
-            page = _call(
-                registry,
-                interaction,
-                "read_command_job",
-                handle=handle,
-                cursor=cursor,
-                wait_seconds=5,
-            )
-            assert page["ok"], page
-            cursor = page["result"]["next_cursor"]
-            content += "".join(event["content"] for event in page["result"]["events"])
-            if final := page["result"]["result"]:
-                assert final.get("exit_code") == 0, final
-                assert "TTY True True" in content
-                assert "INNER True /dev/ttys" in content
-                assert "INPUT hello" in content
-                assert "SIZE 40 100" in content
-                break
-        else:
-            pytest.fail("The native terminal job did not settle.")
+        final, content = _terminal_result(registry, interaction, handle)
+        assert final["exit_code"] == 0, final
+        assert "TTY True True" in content
+        assert "INNER True /dev/ttys" in content
+        assert "INPUT hello" in content
+        assert "SIZE 40 100" in content
     finally:
         registry.close()
 
@@ -503,23 +462,17 @@ def test_native_terminal_eof_and_untrusted_output(native_workspace):
             action="write",
             content="hello\n",
         )["ok"]
-        cursor = 0
+        cursor = None
         output = ""
-        for _ in range(10):
-            page = _call(
-                registry,
-                interaction,
-                "read_command_job",
-                handle=handle,
-                cursor=cursor,
-                wait_seconds=5,
-            )
-            assert page["ok"], page
-            cursor = page["result"]["next_cursor"]
-            output += "".join(event["content"] for event in page["result"]["events"])
+        deadline = time.monotonic() + 10
+        while "INPUT 'hello\\n'" not in output and time.monotonic() < deadline:
+            page = _read_output_page(registry, interaction, handle, cursor=cursor)
+            output += page["content"]
+            cursor = page.get("next_cursor")
+            time.sleep(0.02)
             if "INPUT 'hello\\n'" in output:
                 break
-        else:
+        if "INPUT 'hello\\n'" not in output:
             pytest.fail("The terminal did not consume its input before EOF.")
         assert _call(
             registry,
@@ -628,16 +581,15 @@ def test_native_terminal_shell_interrupt_and_close(native_workspace):
         )
         assert waiting["ok"], waiting
         interrupt_handle = waiting["result"]["handle"]
-        first = _call(
-            registry,
-            interaction,
-            "read_command_job",
-            handle=interrupt_handle,
-            wait_seconds=5,
-        )
-        assert first["ok"] and any(
-            "WAITING" in event["content"] for event in first["result"]["events"]
-        ), first
+        deadline = time.monotonic() + 10
+        output = ""
+        cursor = None
+        while "WAITING" not in output and time.monotonic() < deadline:
+            page = _read_output_page(registry, interaction, interrupt_handle, cursor=cursor)
+            output += page["content"]
+            cursor = page.get("next_cursor")
+            time.sleep(0.02)
+        assert "WAITING" in output, output
         interrupted = _call(
             registry,
             interaction,
@@ -688,20 +640,12 @@ def test_native_terminal_disconnect_stops_owned_main_process(native_workspace):
         )
         assert started["ok"], started
         handle = started["result"]["handle"]
-        cursor = 0
-        for _ in range(5):
-            page = _call(
-                registry,
-                interaction,
-                "read_command_job",
-                handle=handle,
-                cursor=cursor,
-                wait_seconds=2,
-            )
-            assert page["ok"], page
-            cursor = page["result"]["next_cursor"]
-            if marker.exists():
-                break
+        cursor = None
+        deadline = time.monotonic() + 10
+        while not marker.exists() and time.monotonic() < deadline:
+            page = _read_output_page(registry, interaction, handle, cursor=cursor)
+            cursor = page.get("next_cursor")
+            time.sleep(0.02)
         assert marker.exists(), "The owned terminal did not publish its process identity."
         pid = int(marker.read_text(encoding="utf-8").strip())
         os.kill(pid, 0)
@@ -734,17 +678,16 @@ def test_native_terminal_cannot_open_another_live_job(native_workspace):
         )
         assert first["ok"], first
         handle = first["result"]["handle"]
+        cursor = None
+        deadline = time.monotonic() + 10
         for _ in range(10):
             if marker.exists():
                 break
-            page = _call(
-                registry,
-                interaction,
-                "read_command_job",
-                handle=handle,
-                wait_seconds=1,
-            )
-            assert page["ok"], page
+            page = _read_output_page(registry, interaction, handle, cursor=cursor)
+            cursor = page.get("next_cursor")
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.02)
         assert marker.exists()
         foreign = marker.read_text(encoding="utf-8").strip()
         second = _call(
@@ -872,14 +815,8 @@ def test_native_terminal_host_peer_can_transfer_owned_pty_descriptor(native_work
         handle = started["result"]["handle"]
         deadline = time.monotonic() + 10
         while not marker.exists() and time.monotonic() < deadline:
-            page = _call(
-                registry,
-                interaction,
-                "read_command_job",
-                handle=handle,
-                wait_seconds=1,
-            )
-            assert page["ok"], page
+            _read_output_page(registry, interaction, handle)
+            time.sleep(0.02)
         assert marker.exists(), "The sandboxed listener did not publish its owned path."
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
             peer.settimeout(5)
@@ -916,28 +853,22 @@ def test_native_command_continues_past_previous_default_deadline(native_workspac
         )
         assert started["ok"], started
         handle = started["result"]["handle"]
-        cursor = started["result"]["next_cursor"]
-        events = list(started["result"]["events"])
         deadline = time.monotonic() + 330
         final = None
         while time.monotonic() < deadline:
             page = _call(
                 registry,
                 interaction,
-                "read_command_job",
+                "poll_command_job",
                 handle=handle,
-                cursor=cursor,
                 wait_seconds=30,
             )
             assert page["ok"], page
-            body = page["result"]
-            events.extend(body["events"])
-            cursor = body["next_cursor"]
-            if body["result"] is not None:
-                final = body["result"]
+            if page["result"]["status"] == "complete":
+                final = page["result"]
                 break
         assert final is not None and final["exit_code"] == 0, final
-        assert "".join(event["content"] for event in events).endswith("end")
+        assert _read_complete_output(registry, interaction, handle).endswith("end")
         assert (native_workspace / "count").read_text() == "x"
     finally:
         registry.close()
@@ -961,27 +892,22 @@ def test_native_terminal_survives_previous_default_deadline(native_workspace):
         )
         assert started["ok"], started
         handle = started["result"]["handle"]
-        cursor = 0
-        output = []
         final = None
         deadline = time.monotonic() + 330
         while time.monotonic() < deadline:
             page = _call(
                 registry,
                 interaction,
-                "read_command_job",
+                "poll_command_job",
                 handle=handle,
-                cursor=cursor,
-                wait_seconds=5,
+                wait_seconds=30,
             )
             assert page["ok"], page
-            body = page["result"]
-            cursor = body["next_cursor"]
-            output.extend(event["content"] for event in body["events"])
-            if body["result"] is not None:
-                final = body["result"]
+            if page["result"]["status"] == "complete":
+                final = page["result"]
                 break
         assert final is not None and final["exit_code"] == 0, final
-        assert "TERM_BEGIN" in "".join(output) and "TERM_END" in "".join(output)
+        output = _read_complete_output(registry, interaction, handle)
+        assert "TERM_BEGIN" in output and "TERM_END" in output
     finally:
         registry.close()

@@ -33,7 +33,7 @@ from ....constants import (
 )
 from ....utils.hashing import sha256_digest
 from ....utils.json import load_unique_json
-from ....utils.process import ProcessCaptureStatus
+from ....utils.process import ProcessCaptureStatus, ProvisionalTextOutput
 from .. import contracts as shared_contracts
 from ..constants import (
     LC_ALL_ENVIRONMENT_VARIABLE,
@@ -766,8 +766,7 @@ def execute_installed_request(
             output_lock = Lock() if request.stream_output is True else None
             output_marker = NATIVE_PAYLOAD_MARKER_PREFIX + request.attempt_id + "\n"
             pending_marker = ""
-            pending_stderr: list[str] = []
-            pending_stderr_chars = 0
+            pending_stderr = ProvisionalTextOutput()
             marker_checked = False
             marker_valid = False
 
@@ -799,14 +798,11 @@ def execute_installed_request(
 
             def publish_output(stream: str, chunk: str) -> None:
                 """Withhold both streams until the trusted payload marker is verified."""
-                nonlocal pending_marker, pending_stderr_chars, marker_checked, marker_valid
+                nonlocal pending_marker, marker_checked, marker_valid
                 with output_lock:
                     if not marker_checked:
                         if stream == "stderr":
-                            retained = chunk[: max(0, MAX_OUTPUT_CHARS - pending_stderr_chars)]
-                            if retained:
-                                pending_stderr.append(retained)
-                                pending_stderr_chars += len(retained)
+                            pending_stderr.append(chunk)
                             return
                         pending_marker += chunk
                         if len(pending_marker) < len(output_marker):
@@ -814,31 +810,32 @@ def execute_installed_request(
                         marker_checked = True
                         marker_valid = pending_marker.startswith(output_marker)
                         if not marker_valid:
-                            pending_stderr.clear()
+                            pending_stderr.close()
                             return
                         chunk = pending_marker[len(output_marker) :]
                         pending_marker = ""
                         if request.terminal:
                             connection.sendall(b"T")
-                        for pending in pending_stderr:
-                            send_output("stderr", pending)
-                        pending_stderr.clear()
+                        pending_stderr.replay(lambda pending: send_output("stderr", pending))
                     if marker_valid:
                         send_output(stream, chunk)
 
-            captured = supervise_payload(
-                process,
-                installed.config,
-                request.deadline,
-                connection=0,
-                **({"terminal_master": master} if request.terminal else {}),
-                **({"mediator": broker} if broker is not None else {}),
-                **(
-                    {"output_observer": publish_output, "send_lock": output_lock}
-                    if output_lock is not None
-                    else {}
-                ),
-            )
+            try:
+                captured = supervise_payload(
+                    process,
+                    installed.config,
+                    request.deadline,
+                    connection=0,
+                    **({"terminal_master": master} if request.terminal else {}),
+                    **({"mediator": broker} if broker is not None else {}),
+                    **(
+                        {"output_observer": publish_output, "send_lock": output_lock}
+                        if output_lock is not None
+                        else {}
+                    ),
+                )
+            finally:
+                pending_stderr.close()
             if broker is not None and not broker.close():
                 return CommandProcessResult(
                     SandboxOutcome.INVALID,

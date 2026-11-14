@@ -48,7 +48,8 @@ from loop.tooling import ToolRuntimeSettings
 from loop.tools.files import read_text_file, write_text_file
 from loop.tools.system import (
     control_command_terminal,
-    read_command_job,
+    poll_command_job,
+    read_command_output,
     resolve_executable,
     run_command,
 )
@@ -2774,10 +2775,16 @@ def test_public_session_runs_pytest_from_private_unusual_scratch(
     interaction = Mock()
     interaction.prompt.return_value = "approve"
     registry = ToolRegistry(
-        [run_command, read_command_job, resolve_executable, read_cached_content],
+        [
+            run_command,
+            poll_command_job,
+            read_command_output,
+            resolve_executable,
+            read_cached_content,
+        ],
         permission_manager=permissions,
         execution_service=CommandExecutionService(backend, host),
-        settings=ToolRuntimeSettings(command_timeout=60, command_hard_timeout=600),
+        settings=ToolRuntimeSettings(command_timeout=30, command_hard_timeout=600),
     )
     loop = Loop.create_default(
         backend=SimpleNamespace(default_model="test", get_context_window=lambda _: None),
@@ -2868,30 +2875,40 @@ def test_public_session_runs_pytest_from_private_unusual_scratch(
                 )
             )
             content = ""
-            if result["ok"] and "handle" in result["result"]:
-                page = result["result"]
-                handle = page["handle"]
-                while True:
-                    content += "".join(
-                        event["content"] for event in page["events"] if event["stream"] == "stdout"
-                    )
-                    if page["result"] is not None:
-                        final = page["result"]
-                        result = (
-                            {"ok": False, "problem": final}
-                            if "code" in final
-                            else {"ok": True, "result": final}
-                        )
-                        break
+            body = result.get("result") if result["ok"] else result["problem"].get("metadata", {})
+            if result["ok"] and "handle" in body:
+                handle = body["handle"]
+                status = body
+                while status["status"] != "complete":
                     response = json.loads(
                         loop.tool_registry.call(
-                            "read_command_job",
+                            "poll_command_job",
+                            json.dumps({"handle": handle, "wait_seconds": 30}),
+                            interaction=interaction,
+                            instructions_manager=loop.instructions_manager,
+                        )
+                    )
+                    assert response["ok"], response
+                    status = response["result"]
+                result_summary = status.get("result") or {}
+                result = (
+                    {"ok": False, "problem": result_summary}
+                    if "code" in result_summary
+                    else {
+                        "ok": True,
+                        "result": {
+                            "boundary": status.get("boundary"),
+                            "exit_code": status.get("exit_code"),
+                        },
+                    }
+                )
+                cursor = None
+                while True:
+                    response = json.loads(
+                        loop.tool_registry.call(
+                            "read_command_output",
                             json.dumps(
-                                {
-                                    "handle": handle,
-                                    "cursor": page["next_cursor"],
-                                    "wait_seconds": 30,
-                                }
+                                {"handle": handle, "stream": "stdout", "cursor": cursor}
                             ),
                             interaction=interaction,
                             instructions_manager=loop.instructions_manager,
@@ -2899,26 +2916,27 @@ def test_public_session_runs_pytest_from_private_unusual_scratch(
                     )
                     assert response["ok"], response
                     page = response["result"]
-            if result["ok"]:
-                assert result["result"]["boundary"] == "sandbox"
-                stream = result["result"]["stdout"]
+                    content += page["content"]
+                    cursor = page.get("next_cursor")
+                    if cursor is None:
+                        break
             else:
-                stream = result["problem"].get("metadata", {}).get("stdout", {})
-            content += stream.get("content", "")
-            cursor = stream.get("next_cursor")
-            while cursor and (not result["ok"] or expected not in content):
-                continuation = json.loads(
-                    loop.tool_registry.call(
-                        "read_cached_content",
-                        json.dumps({"handle": stream["handle"], "cursor": cursor}),
-                        interaction=interaction,
-                        instructions_manager=loop.instructions_manager,
+                stream = body.get("stdout", {})
+                content = stream.get("content", "")
+                cursor = stream.get("next_cursor")
+                while cursor:
+                    continuation = json.loads(
+                        loop.tool_registry.call(
+                            "read_cached_content",
+                            json.dumps({"handle": stream["handle"], "cursor": cursor}),
+                            interaction=interaction,
+                            instructions_manager=loop.instructions_manager,
+                        )
                     )
-                )
-                assert continuation["ok"], continuation
-                page = continuation["result"]
-                content += page["content"]
-                cursor = page.get("next_cursor")
+                    assert continuation["ok"], continuation
+                    page = continuation["result"]
+                    content += page["content"]
+                    cursor = page.get("next_cursor")
             assert result["ok"], json.dumps(result, indent=2) + "\nFull stdout:\n" + content
             assert expected in content
         host.run_host_command.assert_not_called()

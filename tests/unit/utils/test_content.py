@@ -9,6 +9,7 @@ import pytest
 
 from loop import constants
 from loop.utils.content import (
+    _ContentSpool,
     base64_decode,
     base64_encode,
     bound_tool_result,
@@ -107,6 +108,8 @@ def test_cached_metadata_rejects_noncanonical_handles_and_invalid_values():
         register_cached_metadata(handle.upper(), "source", True)
     with pytest.raises(ValueError, match="Invalid cached content metadata"):
         register_cached_metadata(handle, 1, "yes")
+    with pytest.raises(ValueError, match="Invalid cached content metadata"):
+        register_cached_metadata(handle, "source", False, allow_nul="yes")
 
 
 def test_content_budget_reserves_serialization_space_with_one_policy_limit():
@@ -490,6 +493,88 @@ def test_content_cursors_are_opaque_handle_bound_offsets():
         decode_content_cursor(cursor, other_handle)
     with pytest.raises(ValueError, match="Invalid cached content cursor"):
         decode_content_cursor("invalid", handle)
+
+
+def test_content_spool_appends_pages_and_discards_its_capability(monkeypatch):
+    """Spools preserve NUL and replacement text, reject invalid writes, and release handles."""
+    spool = _ContentSpool("command stdout")
+    assert spool.append("") is None
+    spool.append("a\0�bc")
+    assert spool.has_replacement is True
+    assert spool.read_page(None, 3)["content"] == "a\0"
+    assert spool.read_page(encode_content_cursor(spool.handle, 2), 10)["content"] == "�bc"
+    assert spool.stream_result(capture_complete=True)["decoding_loss"] == "unknown"
+    with pytest.raises(TypeError, match="must be text"):
+        spool.append(b"binary")
+    spool.discard()
+    spool.discard()
+    assert spool.retained is False
+    with pytest.raises(OSError, match="no longer retained"):
+        spool.append("later")
+
+
+def test_content_spool_rolls_back_a_failed_write(monkeypatch):
+    """A partial failed spool write cannot advance the readable byte count."""
+    import loop.utils.content as content_module
+
+    spool = _ContentSpool("command stdout")
+    real_write = content_module.os.write
+    writes = 0
+
+    def fail_after_partial(descriptor, value):
+        nonlocal writes
+        writes += 1
+        if writes == 1:
+            return real_write(descriptor, value[:1])
+        return 0
+
+    monkeypatch.setattr(content_module.os, "write", fail_after_partial)
+    with pytest.raises(OSError, match="stopped accepting"):
+        spool.append("abcdef")
+    assert spool.size_bytes == 0
+    assert spool.read_page(None, 10)["content"] == ""
+
+
+def test_content_spool_reports_failure_when_write_cannot_be_rolled_back(monkeypatch):
+    """Rollback failure does not hide the original output capture error."""
+    import loop.utils.content as content_module
+
+    spool = _ContentSpool("command stdout")
+
+    def fail_write(descriptor, value):
+        raise OSError("write failed")
+
+    def fail_truncate(descriptor, size):
+        raise OSError("truncate failed")
+
+    monkeypatch.setattr(content_module.os, "write", fail_write)
+    monkeypatch.setattr(content_module.os, "ftruncate", fail_truncate)
+    with pytest.raises(OSError, match="write failed"):
+        spool.append("lost")
+    assert spool.size_bytes == 0
+
+
+def test_content_spool_tail_and_incomplete_capture_metadata(monkeypatch):
+    """Large previews expose exact byte tails while short tails avoid unnecessary trimming."""
+    import loop.utils.content as content_module
+
+    monkeypatch.setattr(content_module, "_COMMAND_PREVIEW_BYTES", 4)
+    monkeypatch.setattr(content_module, "_COMMAND_TAIL_BYTES", 10)
+    spool = _ContentSpool("command stdout")
+    spool.append("12345678")
+    result = spool.stream_result(capture_complete=True)
+    assert result["tail"] == {"content": "12345678", "start_byte": 0, "end_byte": 8}
+    incomplete = spool.stream_result(capture_complete=False)
+    assert incomplete["capture_complete"] is False
+    assert incomplete["decoding_loss"] == "unknown"
+
+
+def test_read_bounded_text_requires_boolean_nul_policy(tmp_path):
+    """NUL allowance is an explicit boolean instead of a truthy coercion."""
+    source = tmp_path / "source.txt"
+    source.write_text("content", encoding="utf-8")
+    with pytest.raises(TypeError, match="allow_nul"):
+        read_bounded_text(source, allow_nul=1)
 
 
 @pytest.mark.parametrize(

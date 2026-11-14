@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from loop import BUILTIN_TOOLS, PermissionManager, ToolContext, ToolRegistration, ToolRegistry
-from loop.constants import MAX_OUTPUT_CHARS, MAX_TOOL_RESULT_BYTES
+from loop.constants import MAX_COMMAND_WAIT_SECONDS, MAX_OUTPUT_CHARS, MAX_TOOL_RESULT_BYTES
 from loop.execution import CommandExecutionService
 from loop.execution.coordinator import HostCommandRequest, LocalHostCommandExecutor
 from loop.execution.sandbox import (
@@ -55,7 +55,8 @@ from loop.tools.system import _command_plan
 from loop.tools.system import cancel_command_job as cancel_command_job_tool
 from loop.tools.system import control_command_terminal as control_command_terminal_tool
 from loop.tools.system import inspect_command_jobs as inspect_command_jobs_tool
-from loop.tools.system import read_command_job as read_command_job_tool
+from loop.tools.system import poll_command_job as poll_command_job_tool
+from loop.tools.system import read_command_output as read_command_output_tool
 from loop.tools.system import request_host_command as request_host_command_tool
 from loop.tools.system import resolve_executable as resolve_executable_tool
 from loop.tools.system import run_command as run_command_tool
@@ -128,12 +129,19 @@ class CountingHostCommandExecutor:
         self.requests = []
 
     def run_host_command(
-        self, request: HostCommandRequest, *, cancellation_event=None
+        self,
+        request: HostCommandRequest,
+        *,
+        cancellation_event=None,
+        output_observer=None,
     ) -> CommandProcessResult:
         """Record one approved host request and return the configured process result."""
         assert cancellation_event is None or not cancellation_event.is_set()
         self.requests.append(request)
-        return self._executor.run_host_command(request)
+        result = self._executor.run_host_command(request)
+        if output_observer is not None:
+            output_observer("stdout", result.stdout)
+        return result
 
 
 class RecordingHostOfferInteraction(ApprovingInteraction):
@@ -205,31 +213,34 @@ def test_command_rejects_removed_background_argument():
     service.run_command.assert_not_called()
 
 
-@pytest.mark.parametrize(
-    ("tool", "arguments"),
-    [
-        (inspect_command_jobs_tool, ()),
-        (read_command_job_tool, ("a" * 32,)),
-        (cancel_command_job_tool, ("a" * 32,)),
-    ],
-)
-def test_command_job_tools_require_the_execution_service(tool, arguments):
+def test_command_job_tools_require_the_execution_service():
     """Continuation tools fail safely when native command execution is unavailable."""
-    result = tool(ToolContext(None, tool.__name__), *arguments)
-    assert result.code == "command_job.unavailable"
+    for tool, arguments in (
+        (inspect_command_jobs_tool, ()),
+        (poll_command_job_tool, ("a" * 32,)),
+        (read_command_output_tool, ("a" * 32, "stdout")),
+        (cancel_command_job_tool, ("a" * 32,)),
+    ):
+        result = tool(ToolContext(None, tool.__name__), *arguments)
+        assert result.code == "command_job.unavailable"
 
 
 def test_command_job_tools_delegate_to_current_execution_service():
-    """Continuation calls forward exact handle, cursor, and wait to the bound owner."""
+    """Polling and output reads delegate their independent arguments to the bound owner."""
     service = MagicMock()
     service.inspect_command_jobs.return_value = {"jobs": []}
-    service.read_command_job.return_value = {"events": []}
+    service.poll_command_job.return_value = {"status": "running"}
+    service.read_command_output.return_value = {"content": "page"}
     service.cancel_command_job.return_value = {"cancel_requested": True}
     context = ToolContext(None, "inspect_command_jobs", execution_service=service)
     assert inspect_command_jobs_tool(context) == {"jobs": []}
-    assert read_command_job_tool(context, "a" * 32, 3, 2) == {"events": []}
+    assert poll_command_job_tool(context, "a" * 32, 3) == {"status": "running"}
+    assert read_command_output_tool(context, "a" * 32, "stdout", "cursor", 2) == {
+        "content": "page"
+    }
     assert cancel_command_job_tool(context, "a" * 32) == {"cancel_requested": True}
-    service.read_command_job.assert_called_once_with(context, "a" * 32, 3, 2, False)
+    service.poll_command_job.assert_called_once_with(context, "a" * 32, 3)
+    service.read_command_output.assert_called_once_with(context, "a" * 32, "stdout", "cursor", 2)
     service.cancel_command_job.assert_called_once_with(context, "a" * 32)
 
 
@@ -1459,7 +1470,8 @@ def test_platform_command_capabilities_shape_live_model_definitions(monkeypatch)
         [
             ToolRegistration(run_command_tool, name="sandbox_shell"),
             ToolRegistration(control_command_terminal_tool, name="terminal_control"),
-            read_command_job_tool,
+            poll_command_job_tool,
+            read_command_output_tool,
         ],
         execution_service=service,
     )
@@ -1473,16 +1485,14 @@ def test_platform_command_capabilities_shape_live_model_definitions(monkeypatch)
     assert "interactive" not in unavailable["sandbox_shell"].parameters["required"]
     assert "egress_origins" not in unavailable["sandbox_shell"].parameters["required"]
     assert "terminal_control" not in unavailable
-    assert "read_command_job" in unavailable
-    assert "until result is non-null, even if status is complete" in (
-        unavailable["read_command_job"].description
-    )
-    cursor = unavailable["read_command_job"].parameters["properties"]["cursor"]
-    assert "previous response's next_cursor" in cursor["description"]
-    wait = unavailable["read_command_job"].parameters["properties"]["wait_seconds"]
-    assert "Platform wait limits apply" in wait["description"]
-    assert "configured default" in wait["description"]
-    assert {item["type"] for item in wait["anyOf"]} == {"number", "null"}
+    assert "poll_command_job" in unavailable
+    poll = unavailable["poll_command_job"].parameters["properties"]["wait_seconds"]
+    assert "Output arriving during this wait does not return early" in poll["description"]
+    assert poll["le"] == MAX_COMMAND_WAIT_SECONDS
+    assert {item["type"] for item in poll["anyOf"]} == {"number", "null"}
+    assert "read_command_output" in unavailable
+    cursor = unavailable["read_command_output"].parameters["properties"]["cursor"]
+    assert "Opaque continuation cursor" in cursor["description"]
     assert "terminal_control" in registry.names
 
     monkeypatch.setattr(

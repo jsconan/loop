@@ -94,6 +94,41 @@ def command_operation(tmp_path):
     )
 
 
+def _host_request_context(tmp_path):
+    """Build the freshly approved explicit-host context used by output-spool tests."""
+    manager = PermissionManager(tmp_path)
+    manager.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    interaction = Mock()
+    interaction.supports_fresh_host_approval = True
+    interaction.prompt.return_value = "approve"
+    instructions = Mock()
+    instructions.virtual_paths = VirtualPath(
+        workspace=tmp_path, temporary_directory=manager.temporary_directory
+    )
+    command = "printf host"
+    operation = Operation(
+        tool_id="request_host_command",
+        action=Action.PROCESS_EXECUTE,
+        target=ProcessTarget(
+            argv=(
+                execution_facade.constants.SHELL_COMMAND_PATH,
+                execution_facade.constants.SHELL_COMMAND_OPTION,
+                command,
+            ),
+            cwd=str(tmp_path),
+            boundary=ProcessBoundary.HOST,
+        ),
+    )
+    context = ToolContext(
+        interaction,
+        "request_host_command",
+        operations=(operation,),
+        permission_manager=manager,
+        instructions_manager=instructions,
+    )
+    return manager, context, instructions
+
+
 def test_executable_lookup_resolves_project_selected_tools_independently(tmp_path, monkeypatch):
     """Each named tool receives only its own identity-bound installation reference."""
     first, second = tmp_path / "first", tmp_path / "second"
@@ -461,7 +496,7 @@ def test_explicit_host_request_rejects_missing_working_directory(tmp_path):
     ],
 )
 def test_explicit_host_request_reports_results_and_invalidates_effects(
-    tmp_path, outcome, exit_code, possible_effects, expected
+    tmp_path, monkeypatch, outcome, exit_code, possible_effects, expected
 ):
     """Host outcomes stay separate and possible effects invalidate instruction state."""
     manager = PermissionManager(tmp_path)
@@ -496,6 +531,16 @@ def test_explicit_host_request_reports_results_and_invalidates_effects(
         detail="host stopped",
         possible_effects=possible_effects,
     )
+    created_spools = []
+    create_spool = execution_facade._ContentSpool
+
+    def tracked_spool(source):
+        """Keep references to artifacts so inline-output cleanup can be checked."""
+        spool = create_spool(source)
+        created_spools.append(spool)
+        return spool
+
+    monkeypatch.setattr(execution_facade, "_ContentSpool", tracked_spool)
 
     result = CommandExecutionService(Mock(), host).request_host_command(
         context, "pwd", str(tmp_path), "Needed"
@@ -514,10 +559,88 @@ def test_explicit_host_request_reports_results_and_invalidates_effects(
         assert "recovery_hint" not in result.metadata
     assert result.metadata["stdout"]["content"] == f"{tmp_path}-extra/file"
     assert result.metadata["stderr"]["content"] == f"https://example.test{tmp_path}/file"
+    assert created_spools and all(not spool.retained for spool in created_spools)
     if outcome is SandboxOutcome.COMPLETED or possible_effects:
         instructions.invalidate.assert_called_once_with(None)
     else:
         instructions.invalidate.assert_not_called()
+
+
+def test_explicit_host_request_spools_each_observed_stream_once(tmp_path):
+    """Repeated native observer chunks append to one spool without result duplication."""
+    _, context, _ = _host_request_context(tmp_path)
+    host = Mock()
+
+    def run_host_command(*args, **kwargs):
+        kwargs["output_observer"]("stdout", "first")
+        kwargs["output_observer"]("stdout", "second")
+        return CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0, stdout="firstsecond")
+
+    host.run_host_command.side_effect = run_host_command
+    result = CommandExecutionService(Mock(), host).request_host_command(
+        context, "printf host", str(tmp_path), "Needed"
+    )
+    assert result["stdout"]["content"] == "firstsecond"
+    assert result["stdout"]["captured_bytes"] == len("firstsecond")
+    assert "handle" not in result["stdout"]
+
+
+def test_explicit_host_request_reports_spool_failure(tmp_path, monkeypatch):
+    """A final-result spool failure returns an explicit incomplete-capture problem."""
+    _, context, _ = _host_request_context(tmp_path)
+    host = Mock()
+    host.run_host_command.return_value = CommandProcessResult(
+        SandboxOutcome.COMPLETED, exit_code=0, stdout="output"
+    )
+
+    def fail_append(self, content):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(execution_facade._ContentSpool, "append", fail_append)
+    result = CommandExecutionService(Mock(), host).request_host_command(
+        context, "printf host", str(tmp_path), "Needed"
+    )
+    assert result.code == "command_output.capture_failed"
+    assert result.metadata["capture_failed"] is True
+    assert result.metadata["output_handles"]["stdout"]
+
+
+def test_explicit_host_request_preserves_large_output_handle(tmp_path):
+    """A large host result keeps the full spool when its bounded preview has a handle."""
+    _, context, _ = _host_request_context(tmp_path)
+    content = "x" * (execution_facade.constants.MAX_TOOL_CONTENT_BYTES // 2 + 1)
+    host = Mock()
+    host.run_host_command.return_value = CommandProcessResult(
+        SandboxOutcome.COMPLETED, exit_code=0, stdout=content
+    )
+    result = CommandExecutionService(Mock(), host).request_host_command(
+        context, "printf host", str(tmp_path), "Needed"
+    )
+    assert result["stdout"]["captured_bytes"] == len(content)
+    assert result["stdout"]["handle"]
+    assert cached_path(result["stdout"]["handle"]) is not None
+
+
+def test_explicit_host_request_observer_surfaces_spool_failure(tmp_path, monkeypatch):
+    """An observer write failure propagates through host supervision after recording its cause."""
+    _, context, instructions = _host_request_context(tmp_path)
+    host = Mock()
+
+    def run_host_command(*args, **kwargs):
+        kwargs["output_observer"]("stdout", "output")
+        raise AssertionError("observer failure should interrupt the host call")
+
+    host.run_host_command.side_effect = run_host_command
+
+    def fail_append(self, content):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(execution_facade._ContentSpool, "append", fail_append)
+    with pytest.raises(OSError, match="disk full"):
+        CommandExecutionService(Mock(), host).request_host_command(
+            context, "printf host", str(tmp_path), "Needed"
+        )
+    instructions.invalidate.assert_called_once_with(None)
 
 
 @pytest.mark.parametrize("invalidation_fails", [False, True])
@@ -743,7 +866,7 @@ def test_execution_invalidates_instructions_before_rendering_output(
         instructions_manager=instructions,
     )
     cache = Mock(side_effect=RuntimeError("output cache failed"))
-    monkeypatch.setattr(execution_facade, "store_content", cache)
+    monkeypatch.setattr(execution_facade._ContentSpool, "stream_result", cache)
 
     if invalidation_fails:
         with pytest.raises(ValueError, match="invalidation failed") as error:
@@ -5320,14 +5443,21 @@ def test_unmanaged_scratch_is_refused_before_command_launch(tmp_path):
 @pytest.mark.parametrize("discarded", [0, 1, None])
 def test_large_command_output_includes_a_truthful_final_excerpt(tmp_path, discarded):
     """Complete long streams expose their ending without losing the original continuation."""
-    output = "prefix\n" + "é" * 5000 + "\n72 passed\n"
+    output = "prefix\n" + "é" * 50_000 + "\n72 passed\n"
     backend = Mock()
-    backend.run.return_value = CommandProcessResult(
-        SandboxOutcome.COMPLETED,
-        exit_code=0,
-        stdout=output,
-        stdout_discarded=discarded,
-    )
+
+    def run_with_observer(_request, **kwargs):
+        """Publish native output independently of the bounded result preview."""
+        observed = output if discarded is not None else output[: len(output) // 2]
+        kwargs["output_observer"]("stdout", observed)
+        return CommandProcessResult(
+            SandboxOutcome.COMPLETED,
+            exit_code=0,
+            stdout=output[: execution_facade.constants.MAX_OUTPUT_CHARS],
+            stdout_discarded=discarded,
+        )
+
+    backend.run.side_effect = run_with_observer
     operation = Operation(
         tool_id="run_command",
         action=Action.PROCESS_EXECUTE,
@@ -5345,9 +5475,10 @@ def test_large_command_output_includes_a_truthful_final_excerpt(tmp_path, discar
         ":",
     )
     stream = result["stdout"]
-    encoded = output.encode()
+    captured = output if discarded is not None else output[: len(output) // 2]
+    encoded = captured.encode()
     assert cached_path(stream["handle"])[0].read_bytes() == encoded
-    if discarded == 0:
+    if discarded is not None:
         tail = stream["tail"]
         assert tail["content"].endswith("72 passed\n")
         assert tail["end_byte"] == len(encoded)
@@ -5762,16 +5893,18 @@ def test_deactivated_skill_cannot_be_granted_from_captured_command_paths(tmp_pat
 
 def test_command_job_service_binds_reads_and_cancellation_to_session(tmp_path):
     """Only a matching scratch identity can inspect, read, and cancel a retained job."""
+    from loop.utils.content import encode_content_cursor
+
     first = tmp_path / "first"
     second = tmp_path / "second"
     first.mkdir()
     second.mkdir()
     service = CommandExecutionService(Mock(), Mock())
     first_context = ToolContext(
-        None, "read_command_job", permission_manager=PermissionManager(first)
+        None, "read_command_output", permission_manager=PermissionManager(first)
     )
     second_context = ToolContext(
-        None, "read_command_job", permission_manager=PermissionManager(second)
+        None, "read_command_output", permission_manager=PermissionManager(second)
     )
     owner = service._job_owner(first_context)
     job = CommandJob(owner, 3600)
@@ -5780,61 +5913,92 @@ def test_command_job_service_binds_reads_and_cancellation_to_session(tmp_path):
 
     assert service.inspect_command_jobs(first_context)["jobs"][0]["handle"] == job.handle
     assert service.inspect_command_jobs(second_context)["jobs"] == []
-    assert service.read_command_job(first_context, job.handle)["events"][0]["content"] == "ready"
-    assert service.read_command_job(second_context, job.handle).code == "command_job.unavailable"
-    assert (
-        service.read_command_job(first_context, job.handle, cursor=-1).code
-        == "command_job.invalid_read"
+    assert service.read_command_output(first_context, job.handle, "stdout")["content"] == "ready"
+    assert service.read_command_output(second_context, job.handle, "stdout").code == (
+        "command_job.unavailable"
     )
-    assert (
-        service.read_command_job(first_context, job.handle, cursor=2).code
-        == "command_job.invalid_read"
+    assert service.read_command_output(first_context, job.handle, "stdout", "invalid").code == (
+        "command_output.invalid_read"
+    )
+    future = encode_content_cursor(job._outputs["stdout"].handle, 6)
+    assert service.read_command_output(first_context, job.handle, "stdout", future).code == (
+        "command_output.invalid_read"
     )
     assert service.cancel_command_job(second_context, job.handle).code == "command_job.unavailable"
     assert service.cancel_command_job(first_context, job.handle)["cancel_requested"]
+    job.stream_result("stdout", 0)
     job.complete({"exit_code": 0})
-    assert service.read_command_job(first_context, job.handle, cursor=1)["result"] == {
-        "exit_code": 0
-    }
+    status = service.poll_command_job(first_context, job.handle, wait_seconds=0)
+    assert status["status"] == "complete"
+    assert status["result"]["metadata"]["exit_code"] == 0
 
 
-def test_command_job_read_wait_is_independent_of_command_timeout(tmp_path):
-    """Default, explicit, and immediate waits use a separate bounded read budget."""
+def test_command_job_poll_wait_is_independent_of_command_timeout(tmp_path):
+    """Default and explicit poll budgets are separate from command and hard deadlines."""
     service = CommandExecutionService(Mock(), Mock())
-    context = ToolContext(None, "read_command_job", permission_manager=PermissionManager(tmp_path))
+    context = ToolContext(None, "poll_command_job", permission_manager=PermissionManager(tmp_path))
     job = Mock(spec=CommandJob)
     service._jobs.get = Mock(return_value=job)
 
-    service.read_command_job(context, "handle")
-    job.read.assert_called_with(0, 30, include_output=False, cancellation_event=None)
+    context.settings.command_job_wait_seconds = (
+        execution_facade.constants.MAX_COMMAND_WAIT_SECONDS + 1
+    )
+    service.poll_command_job(context, "handle")
+    job.poll.assert_called_with(
+        execution_facade.constants.MAX_COMMAND_WAIT_SECONDS, cancellation_event=None
+    )
     context.settings.command_job_wait_seconds = 20
-    service.read_command_job(context, "handle")
-    job.read.assert_called_with(0, 20, include_output=False, cancellation_event=None)
+    service.poll_command_job(context, "handle")
+    job.poll.assert_called_with(20, cancellation_event=None)
     context.settings.command_timeout = 10
-    service.read_command_job(context, "handle")
-    job.read.assert_called_with(0, 20, include_output=False, cancellation_event=None)
-    service.read_command_job(context, "handle", wait_seconds=0)
-    job.read.assert_called_with(0, 0, include_output=False, cancellation_event=None)
-    context.settings.command_timeout = 100
-    service.read_command_job(context, "handle", wait_seconds=50)
-    job.read.assert_called_with(0, 50, include_output=False, cancellation_event=None)
-    service.read_command_job(context, "handle", wait_seconds=100)
-    job.read.assert_called_with(0, 100, include_output=False, cancellation_event=None)
+    service.poll_command_job(context, "handle")
+    job.poll.assert_called_with(20, cancellation_event=None)
+    service.poll_command_job(context, "handle", wait_seconds=0)
+    job.poll.assert_called_with(0, cancellation_event=None)
+    maximum = execution_facade.constants.MAX_COMMAND_WAIT_SECONDS
+    service.poll_command_job(context, "handle", wait_seconds=maximum)
+    job.poll.assert_called_with(maximum, cancellation_event=None)
     interrupted = Event()
     context = replace(context, cancellation_event=interrupted)
-    service.read_command_job(context, "handle", wait_seconds=0)
-    job.read.assert_called_with(0, 0, include_output=False, cancellation_event=interrupted)
+    service.poll_command_job(context, "handle", wait_seconds=0)
+    job.poll.assert_called_with(0, cancellation_event=interrupted)
 
 
-@pytest.mark.parametrize("wait", [True, -1, float("inf"), float("nan"), "invalid"])
-def test_command_job_service_rejects_invalid_waits(tmp_path, wait):
-    """Capping waits does not turn invalid values into valid reads."""
+@pytest.mark.parametrize(
+    "wait",
+    [
+        True,
+        -1,
+        float("inf"),
+        float("nan"),
+        "invalid",
+        execution_facade.constants.MAX_COMMAND_WAIT_SECONDS + 1,
+    ],
+)
+def test_command_job_service_rejects_invalid_poll_waits(tmp_path, wait):
+    """An invalid poll duration is rejected without starting an unbounded wait."""
     service = CommandExecutionService(Mock(), Mock())
-    context = ToolContext(None, "read_command_job", permission_manager=PermissionManager(tmp_path))
+    context = ToolContext(None, "poll_command_job", permission_manager=PermissionManager(tmp_path))
     job = CommandJob("owner", 3600)
     service._jobs.get = Mock(return_value=job)
-    result = service.read_command_job(context, "handle", wait_seconds=wait)
-    assert result.code == "command_job.invalid_read"
+    result = service.poll_command_job(context, "handle", wait_seconds=wait)
+    assert result.code == "command_job.invalid_poll"
+
+
+def test_command_job_poll_returns_registry_refusal(tmp_path):
+    """Polling an absent or foreign job returns the registry's typed refusal."""
+    from loop.errors import Problem
+
+    service = CommandExecutionService(Mock(), Mock())
+    context = ToolContext(None, "poll_command_job", permission_manager=PermissionManager(tmp_path))
+    refusal = Problem(
+        code="command_job.unavailable",
+        title="Command job unavailable",
+        detail="The handle is unavailable.",
+        operation="poll_command_job",
+    )
+    service._jobs.get = Mock(return_value=refusal)
+    assert service.poll_command_job(context, "unknown") is refusal
 
 
 def test_command_job_service_rejects_missing_session_scratch_identity(tmp_path, command_operation):
@@ -5846,7 +6010,10 @@ def test_command_job_service_rejects_missing_session_scratch_identity(tmp_path, 
         None, "run_command", operations=(command_operation,), permission_manager=permissions
     )
     assert service.inspect_command_jobs(context).code == "command_job.unavailable"
-    assert service.read_command_job(context, "unknown").code == "command_job.unavailable"
+    assert service.poll_command_job(context, "unknown").code == "command_job.unavailable"
+    assert service.read_command_output(context, "unknown", "stdout").code == (
+        "command_job.unavailable"
+    )
     assert service.cancel_command_job(context, "unknown").code == "command_job.unavailable"
     assert service.run_command(context, ":", wait_seconds=0).code == "command_job.unavailable"
 
@@ -5955,11 +6122,21 @@ def test_command_refuses_a_stopped_origin_before_reserving_a_worker(
     assert not service._jobs.has_active()
 
 
-@pytest.mark.parametrize("wait", [True, -1, float("inf"), float("nan"), "1"])
+@pytest.mark.parametrize(
+    "wait",
+    [
+        True,
+        -1,
+        float("inf"),
+        float("nan"),
+        "1",
+        execution_facade.constants.MAX_COMMAND_WAIT_SECONDS + 1,
+    ],
+)
 def test_command_rejects_invalid_initial_wait_before_launch(
     command_session, command_operation, wait
 ):
-    """Malformed or unbounded initial waits cannot reserve or execute a command."""
+    """Malformed or excessive initial waits cannot reserve or execute a command."""
     sessions, permissions = command_session
     backend = Mock()
     service = CommandExecutionService(backend, Mock())
@@ -5994,11 +6171,20 @@ def test_origin_stop_during_initial_wait_cancels_the_owned_command(
     job = CommandJob("owner", 3600)
     job.admitted()
     monkeypatch.setattr(service._jobs, "start", lambda *_args, **_kwargs: job)
-    monkeypatch.setattr(job, "wait", lambda *_args: stopped.set())
+    waits = []
+
+    def wait(seconds, *_args):
+        """Record the effective initial wait and interrupt the originating call."""
+        waits.append(seconds)
+        stopped.set()
+
+    context.settings.command_timeout = execution_facade.constants.MAX_COMMAND_WAIT_SECONDS + 1
+    monkeypatch.setattr(job, "wait", wait)
 
     result = service.run_command(context, ":")
 
     assert result["handle"] == job.handle
+    assert waits == [execution_facade.constants.MAX_COMMAND_WAIT_SECONDS]
     assert result["cancel_requested"]
     assert job.cancellation_event.is_set()
 
@@ -6048,10 +6234,10 @@ def test_sandbox_failure_after_handoff_does_not_request_host_approval(
     monkeypatch.setattr(service._jobs, "start", reserve)
     first = service.run_command(context, ":", wait_seconds=0)
     workers[0].target()
-    page = service.read_command_job(context, first["handle"], wait_seconds=0)
+    status = service.poll_command_job(context, first["handle"], wait_seconds=0)
 
-    assert page["result"]["code"] == "sandbox.unavailable"
-    assert "host_offer" in page["result"]["metadata"]
+    assert status["result"]["code"] == "sandbox.unavailable"
+    assert "host_offer" in status["result"]["metadata"]
     assert all(
         "without the OS sandbox" not in call.args[0] for call in interaction.prompt.call_args_list
     )
@@ -6243,9 +6429,8 @@ def test_interactive_command_uses_one_owned_job_and_escapes_terminal_output(
     handle = service.run_command(context, ":", interactive=True)
 
     assert handle["terminal"] and handle["status"] == "complete"
-    assert handle["result"]["terminal_output"] == "escaped-controls"
-    result = service.read_command_job(context, handle["handle"], include_output=True)
-    assert result["result"]["stdout"]["content"] == "␛]52;c;bad␇done"
+    result = service.read_command_output(context, handle["handle"], "stdout")
+    assert result["content"] == "␛]52;c;bad␇done"
     assert backend.run.call_count == 1
     approved = backend.run.call_args.args[0]
     assert approved.terminal
@@ -6311,10 +6496,10 @@ def test_command_returns_handle_or_settled_result_without_an_extra_turn(
         assert result["result"] is None
 
 
-def test_initial_page_expiration_preserves_recoverable_handle(
+def test_initial_status_snapshot_keeps_live_output_recoverable(
     monkeypatch, command_session, command_operation
 ):
-    """Output lost during handoff reports its handle and the oldest recoverable cursor."""
+    """Output arriving after the initial snapshot remains available through its stream cursor."""
     service = CommandExecutionService(Mock(), Mock())
     sessions, permissions = command_session
     context = ToolContext(
@@ -6338,32 +6523,35 @@ def test_initial_page_expiration_preserves_recoverable_handle(
             """A synthetic worker requires no thread join."""
 
     monkeypatch.setattr(command_jobs.threading, "Thread", Worker)
-    monkeypatch.setattr(command_jobs, "MAX_JOB_OUTPUT_EVENTS", 1)
     owner = service._job_owner(context)
     job = service._jobs.start(owner, lambda _job: {}, runtime_limit_seconds=3600)
     job.admitted()
     monkeypatch.setattr(service._jobs, "start", lambda *_args, **_kwargs: job)
     inspect = job.inspect
-    raced = []
+    published = []
 
-    def inspect_before_output_rollover():
-        """Publish enough output after the initial snapshot to expire its cursor."""
+    def inspect_before_output():
+        """Publish output after taking the status snapshot returned by run_command."""
         snapshot = inspect()
-        if not raced:
-            raced.append(True)
-            job.publish("stdout", "discarded")
-            job.publish("stderr", "retained")
+        if not published:
+            published.append(True)
+            job.publish("stdout", "first")
+            job.publish("stderr", "second")
         return snapshot
 
-    monkeypatch.setattr(job, "inspect", inspect_before_output_rollover)
+    monkeypatch.setattr(job, "inspect", inspect_before_output)
     result = service.run_command(context, ":", wait_seconds=0)
 
-    assert result.code == "command_job.cursor_expired"
-    assert result.metadata == {"handle": job.handle, "oldest_cursor": 1}
-    page = service.read_command_job(context, result.metadata["handle"], cursor=1, wait_seconds=0)
-    assert page["events"] == [{"cursor": 1, "stream": "stderr", "content": "retained"}]
-    assert page["status"] == "running"
+    assert result["status"] == "running"
+    assert set(result["output_handles"]) == {"stdout", "stderr"}
+    stdout = service.read_command_output(context, result["handle"], "stdout")
+    stderr = service.read_command_output(context, result["handle"], "stderr")
+    assert stdout["content"] == "first"
+    assert stderr["content"] == "second"
+    assert stdout["next_cursor"]
     assert service.cancel_command_job(context, job.handle)["cancel_requested"]
+    job.stream_result("stdout", 0)
+    job.stream_result("stderr", 0)
     job.complete({"exit_code": 0})
 
 

@@ -24,6 +24,8 @@ _SOURCES: dict[str, str] = {}
 _METADATA: dict[str, CachedContentMetadata] = {}
 _LOCK = RLock()
 _SCAN_CHUNK_BYTES = 8 * 1024
+_COMMAND_PREVIEW_BYTES = constants.MAX_TOOL_CONTENT_BYTES // 2
+_COMMAND_TAIL_BYTES = 2 * 1024
 
 
 def get_binary(content: str | bytes) -> bytes:
@@ -149,24 +151,186 @@ def validate_content_handle(handle: str) -> None:
         raise ValueError("Invalid content handle.")
 
 
-def register_cached_metadata(handle: str, source: str, reloadable: bool) -> None:
+def register_cached_metadata(
+    handle: str, source: str, reloadable: bool, *, allow_nul: bool = False
+) -> None:
     """Register artifact metadata loaded from a tool result or newly cached source.
 
     Args:
         handle (str): Opaque canonical artifact handle.
         source (str): Human-readable source for the content.
         reloadable (bool): Whether the source can recreate an expired artifact.
+        allow_nul (bool): Whether the cached text may contain NUL characters.
 
     Raises:
         ValueError: If the handle or metadata values are invalid.
     """
     validate_content_handle(handle)
-    if not isinstance(source, str) or not isinstance(reloadable, bool):
+    if (
+        not isinstance(source, str)
+        or not isinstance(reloadable, bool)
+        or not isinstance(allow_nul, bool)
+    ):
         raise ValueError(  # noqa: TRY004 - cached metadata has one validation contract.
             "Invalid cached content metadata."
         )
     with _LOCK:
-        _METADATA[handle] = CachedContentMetadata(source=source, reloadable=reloadable)
+        metadata = CachedContentMetadata(source=source, reloadable=reloadable)
+        if allow_nul:
+            metadata["allow_nul"] = True
+        _METADATA[handle] = metadata
+
+
+class _ContentSpool:
+    """Append decoded output to a process-local artifact and page it without a size ceiling."""
+
+    handle: str
+    source: str
+    path: Path
+    _lock: RLock
+    _size_bytes: int
+    _has_replacement: bool
+    _discarded: bool
+
+    def __init__(self, source: str) -> None:
+        self.handle = uuid4().hex
+        self.source = source
+        self.path = Path(_CACHE.name, self.handle)
+        self._lock = RLock()
+        self._size_bytes = 0
+        self._has_replacement = False
+        self._discarded = False
+        descriptor = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.close(descriptor)
+        with _LOCK:
+            _SOURCES[self.handle] = source
+            register_cached_metadata(self.handle, source, False, allow_nul=True)
+
+    @property
+    def size_bytes(self) -> int:
+        """Return the number of bytes successfully retained."""
+        with self._lock:
+            return self._size_bytes
+
+    @property
+    def has_replacement(self) -> bool:
+        """Report whether decoded output contains the Unicode replacement character."""
+        with self._lock:
+            return self._has_replacement
+
+    @property
+    def retained(self) -> bool:
+        """Report whether the process-local artifact remains available for reading."""
+        with self._lock:
+            return not self._discarded
+
+    def append(self, content: str) -> None:
+        """Append one complete UTF-8 text chunk without imposing a retention limit."""
+        if not isinstance(content, str):
+            raise TypeError("Spooled output must be text.")
+        encoded = content.encode("utf-8")
+        if not encoded:
+            return
+        with self._lock:
+            if self._discarded:
+                raise OSError("Output spool is no longer retained.")
+            descriptor = os.open(self.path, os.O_WRONLY | os.O_APPEND)
+            start = os.fstat(descriptor).st_size
+            remaining = memoryview(encoded)
+            try:
+                while remaining:
+                    written = os.write(descriptor, remaining)
+                    if written <= 0:
+                        raise OSError("Output spool stopped accepting data.")
+                    remaining = remaining[written:]
+            except BaseException:
+                try:
+                    os.ftruncate(descriptor, start)
+                except OSError:
+                    pass
+                raise
+            finally:
+                os.close(descriptor)
+            self._size_bytes = start + len(encoded)
+            self._has_replacement |= "\ufffd" in content
+
+    def read_page(self, cursor: str | None, max_bytes: int) -> BoundedTextContent:
+        """Read one complete-character page from the retained output."""
+        start_byte = decode_content_cursor(cursor, self.handle) if cursor is not None else 0
+        if (
+            not isinstance(max_bytes, int)
+            or isinstance(max_bytes, bool)
+            or not 1 <= max_bytes <= constants.MAX_TOOL_CONTENT_BYTES
+        ):
+            raise ValueError(
+                f"max_bytes must be between 1 and {constants.MAX_TOOL_CONTENT_BYTES}."
+            )
+        with self._lock:
+            if start_byte > self._size_bytes:
+                raise ValueError("Content cursor is beyond the end of the content.")
+            return read_bounded_text(
+                self.path,
+                start_byte=start_byte,
+                start_line=None,
+                max_bytes=max_bytes,
+                allow_nul=True,
+            )
+
+    def read_prefix(self, max_bytes: int) -> str:
+        """Read a complete-character prefix for a bounded result preview."""
+        page = self.read_page(None, max_bytes)
+        return page["content"]
+
+    def read_tail(self, max_bytes: int) -> dict:
+        """Read a bounded UTF-8 suffix and report its exact byte range."""
+        with self._lock:
+            size = self._size_bytes
+            start = max(0, size - max_bytes - 4)
+            with self.path.open("rb") as stream:
+                stream.seek(start)
+                content = stream.read()
+        text = content.decode("utf-8", errors="ignore")
+        encoded = text.encode("utf-8")
+        if len(encoded) > max_bytes:
+            text = encoded[-max_bytes:].decode("utf-8", errors="ignore")
+            encoded = text.encode("utf-8")
+        start_byte = size - len(encoded)
+        return {"content": text, "start_byte": start_byte, "end_byte": size}
+
+    def stream_result(self, capture_complete: bool) -> dict:
+        """Describe the complete retained stream with a bounded preview and cursor."""
+        content = self.read_prefix(_COMMAND_PREVIEW_BYTES)
+        included = len(content.encode("utf-8"))
+        captured = self.size_bytes
+        result = {
+            "content": content,
+            "captured_bytes": captured,
+            "included_bytes": included,
+            "truncated": included < captured or not capture_complete,
+            "capture_complete": capture_complete,
+            "discarded_characters": 0 if capture_complete else None,
+            "decoding_loss": "none" if capture_complete and not self.has_replacement else "unknown",
+        }
+        if included < captured or not capture_complete:
+            result.update(
+                handle=self.handle,
+                next_cursor=encode_content_cursor(self.handle, included),
+                continuation="Use read_cached_content with this handle and cursor.",
+            )
+            if capture_complete and captured > included:
+                result["tail"] = self.read_tail(_COMMAND_TAIL_BYTES)
+        return result
+
+    def discard(self) -> None:
+        """Remove an unreferenced stream artifact and its process-local capability."""
+        with self._lock:
+            if self._discarded:
+                return
+            self.path.unlink(missing_ok=True)
+            with _LOCK:
+                _SOURCES.pop(self.handle, None)
+                _METADATA.pop(self.handle, None)
+            self._discarded = True
 
 
 def store_content(content: bytes | str, source: str, *, handle: str | None = None) -> str:
@@ -603,6 +767,7 @@ def read_bounded_text(
     max_bytes: int = constants.MAX_TOOL_CONTENT_BYTES,
     preserve_line_boundaries: bool = False,
     include_version: bool = False,
+    allow_nul: bool = False,
 ) -> BoundedTextContent:
     """Read a UTF-8 text range subject to independent byte and line ceilings.
 
@@ -621,6 +786,8 @@ def read_bounded_text(
             larger lines return a byte-resumable fragment. Defaults to ``False``.
         include_version (bool): Whether to hash the complete source through the read descriptor
             and reject changes during capture. Defaults to ``False``.
+        allow_nul (bool): Whether to treat NUL characters as text instead of binary content.
+            Defaults to ``False``.
 
     Returns:
         BoundedTextContent: Text, exact byte range, continuation metadata, and the complete source
@@ -631,8 +798,11 @@ def read_bounded_text(
         ValueError: If ranges are invalid, both starting modes are selected, the offset is beyond
             the source or splits a UTF-8 character, selected content is not UTF-8 text, or a
             versioned source changes.
+        TypeError: If ``allow_nul`` is not a boolean.
     """
     start_byte, start_line = _validate_boundaries(start_byte, start_line, max_lines, max_bytes)
+    if not isinstance(allow_nul, bool):
+        raise TypeError("allow_nul must be a boolean.")
 
     version = None
     size = path.stat().st_size
@@ -643,7 +813,7 @@ def read_bounded_text(
         if start_byte is not None and start_byte > size:
             raise ValueError("start_byte is beyond the end of the content.")
         probe = stream.read(min(size, _SCAN_CHUNK_BYTES))
-        if b"\0" in probe:
+        if not allow_nul and b"\0" in probe:
             raise ValueError("Content appears to be binary.")
         stream.seek(0)
         current_line = 1
@@ -692,7 +862,7 @@ def read_bounded_text(
 
         end = stream.tell()
         encoded = b"".join(chunks)
-        if b"\0" in encoded:
+        if not allow_nul and b"\0" in encoded:
             raise ValueError("Content appears to be binary.")
         try:
             content = encoded.decode("utf-8")

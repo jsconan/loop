@@ -21,7 +21,7 @@ from loop import (
 )
 from loop.tools import web as web_module
 from loop.utils import cached_path as resolve_cached_path
-from loop.utils import encode_content_cursor, store_content
+from loop.utils import encode_content_cursor, register_cached_metadata, store_content
 
 tool_registry: ToolRegistry
 
@@ -562,6 +562,19 @@ def test_read_cached_content_automatically_completes_small_utf8_page(monkeypatch
     assert resumed["effective_max_bytes"] == len("€".encode())
     assert final["content"] == "z"
     assert resumed["start_byte"] == first["end_byte"]
+
+
+def test_read_cached_command_output_accepts_nul_and_resumes_at_byte_cursor():
+    """Command artifacts preserve NUL text through the same cached-content cursor API."""
+    handle = store_content("before\0after", "command stdout")
+    register_cached_metadata(handle, "command stdout", False, allow_nul=True)
+
+    first = json.loads(read_cached_content(handle, max_bytes=6))
+    second = json.loads(read_cached_content(handle, cursor=first["next_cursor"]))
+
+    assert first["content"] == "before"
+    assert second["content"] == "\0after"
+    assert second["start_byte"] == first["end_byte"]
 
 
 def test_fetch_content_rejects_non_http_urls(monkeypatch):

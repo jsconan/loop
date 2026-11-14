@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
+from loop import constants
 from loop.configuration import ApplicationSettings, ConfigurationManager
 from loop.configuration import manager as configuration_module
 from loop.configuration.models import BackendSettings
@@ -638,9 +639,9 @@ def test_command_hard_timeout_requires_a_positive_finite_duration(tmp_path, valu
 
 
 @pytest.mark.parametrize("setting", ["command_timeout", "command_job_wait_seconds"])
-@pytest.mark.parametrize("value", [0, 120])
-def test_command_waits_allow_zero_and_long_durations(tmp_path, setting, value):
-    """Initial and polling waits permit immediate or longer waits."""
+@pytest.mark.parametrize("value", [0, constants.MAX_COMMAND_WAIT_SECONDS + 1])
+def test_command_wait_settings_preserve_finite_values(tmp_path, setting, value):
+    """Configuration retains finite waits even when each public call has a shorter cap."""
     manager = ConfigurationManager(tmp_path / ".loop" / "config.toml")
     manager.initialize()
     manager.load()
@@ -652,13 +653,22 @@ def test_command_waits_allow_zero_and_long_durations(tmp_path, setting, value):
 
 @pytest.mark.parametrize("value", [-1, float("inf"), float("-inf"), float("nan")])
 def test_command_job_wait_requires_a_nonnegative_finite_duration(tmp_path, value):
-    """Configuration rejects invalid default job read waits."""
+    """Configuration rejects negative and non-finite default polling waits."""
     manager = ConfigurationManager(tmp_path / ".loop" / "config.toml")
     manager.initialize()
     manager.load()
     with pytest.raises(ValidationError):
         manager.set_session("tools.command_job_wait_seconds", value)
-    assert manager.effective.tools.command_job_wait_seconds == 30.0
+
+
+@pytest.mark.parametrize("setting", ["command_timeout", "command_job_wait_seconds"])
+def test_command_wait_settings_keep_values_above_the_per_call_maximum(tmp_path, setting):
+    """Persisted waits survive validation and are capped only when a tool call uses them."""
+    manager = ConfigurationManager(tmp_path / ".loop" / "config.toml")
+    manager.initialize()
+    manager.load()
+    manager.set_session(f"tools.{setting}", constants.MAX_COMMAND_WAIT_SECONDS + 1)
+    assert getattr(manager.effective.tools, setting) == constants.MAX_COMMAND_WAIT_SECONDS + 1
 
 
 def test_set_preserves_existing_comments(tmp_path):

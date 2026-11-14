@@ -91,12 +91,14 @@ class HostCommandExecutor(Protocol):
         request: HostCommandRequest,
         *,
         cancellation_event: threading.Event | None = None,
+        output_observer: Callable[[str, str], None] | None = None,
     ) -> CommandProcessResult:
         """Run one exact, separately approved host request.
 
         Args:
             request (HostCommandRequest): Exact approved command and effective environment.
             cancellation_event (threading.Event | None): Optional signal requesting child cleanup.
+            output_observer (Callable[[str, str], None] | None): Optional complete-output sink.
 
         Returns:
             CommandProcessResult: Bounded host process result.
@@ -111,12 +113,14 @@ class LocalHostCommandExecutor:
         request: HostCommandRequest,
         *,
         cancellation_event: threading.Event | None = None,
+        output_observer: Callable[[str, str], None] | None = None,
     ) -> CommandProcessResult:
         """Capture one approved host process within its bound deadline.
 
         Args:
             request (HostCommandRequest): Exact host command approved by the user.
             cancellation_event (threading.Event | None): Optional signal requesting child cleanup.
+            output_observer (Callable[[str, str], None] | None): Optional complete-output sink.
 
         Returns:
             CommandProcessResult: Bounded process output and exit or timeout outcome.
@@ -151,6 +155,7 @@ class LocalHostCommandExecutor:
             thread_factory=threading.Thread,
             cancel_event=cancellation_event,
             preserve_newlines=True,
+            output_observer=output_observer,
         )
         if capture.status is ProcessCaptureStatus.UNAVAILABLE:
             incomplete = capture.stdout_discarded is None or capture.stderr_discarded is None
@@ -448,6 +453,7 @@ class CommandExecutionCoordinator:
         *,
         execution_timeout: float | None = None,
         cancellation_event: threading.Event | None = None,
+        output_observer: Callable[[str, str], None] | None = None,
     ) -> CommandProcessResult | None:
         """Request one explicit host run with fresh consent or an exact trusted grant.
 
@@ -457,6 +463,7 @@ class CommandExecutionCoordinator:
             reason (str): Model-supplied explanation for needing unrestricted execution.
             execution_timeout (float | None): Optional execution budget after approval.
             cancellation_event (threading.Event | None): Optional cancellation signal.
+            output_observer (Callable[[str, str], None] | None): Optional complete-output sink.
 
         Returns:
             CommandProcessResult | None: Host result, or None if authorization fails.
@@ -485,6 +492,7 @@ class CommandExecutionCoordinator:
             request,
             execution_timeout=execution_timeout,
             cancellation_event=cancellation_event,
+            output_observer=output_observer,
         )
 
     def retry_host_command(
@@ -494,6 +502,7 @@ class CommandExecutionCoordinator:
         *,
         execution_timeout: float | None = None,
         cancellation_event: threading.Event | None = None,
+        output_observer: Callable[[str, str], None] | None = None,
         on_authorized: Callable[[], bool] | None = None,
         on_admitted: Callable[[], None] | None = None,
     ) -> CommandProcessResult | None:
@@ -505,6 +514,7 @@ class CommandExecutionCoordinator:
             execution_timeout (float | None): Execution budget in seconds to start after host
                 approval. Defaults to preserving the caller's absolute deadline.
             cancellation_event (threading.Event | None): Optional run cancellation signal.
+            output_observer (Callable[[str, str], None] | None): Optional complete-output sink.
             on_authorized (Callable[[], bool] | None): Final authority gate before recording
                 approval; False refuses the host attempt.
             on_admitted (Callable[[], None] | None): Notify the owner before host execution.
@@ -768,14 +778,12 @@ class CommandExecutionCoordinator:
             if cancellation_event is not None and cancellation_event.is_set():
                 self._record_host_boundary("host_command.cancelled", offer)
                 return None
-            result = (
-                self._host_executor.run_host_command(
-                    host_request,
-                    cancellation_event=cancellation_event,
-                )
-                if cancellation_event is not None
-                else self._host_executor.run_host_command(host_request)
-            )
+            host_arguments = {}
+            if cancellation_event is not None:
+                host_arguments["cancellation_event"] = cancellation_event
+            if output_observer is not None:
+                host_arguments["output_observer"] = output_observer
+            result = self._host_executor.run_host_command(host_request, **host_arguments)
         except Exception:
             telemetry_audit(
                 "host_command.execution_failed",

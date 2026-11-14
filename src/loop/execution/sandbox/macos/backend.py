@@ -45,7 +45,7 @@ from ....utils import (
     supervise_process,
 )
 from ....utils.path import has_extended_access_acl
-from ....utils.process import is_finite_deadline
+from ....utils.process import ProvisionalTextOutput, is_finite_deadline
 from ..constants import (
     LANG_ENVIRONMENT_VARIABLE,
     MINIMAL_SYSTEM_PATH,
@@ -2919,8 +2919,7 @@ class MacOSSeatbeltBackend:
             )
             raise
         pending_marker = ""
-        pending_stderr: list[str] = []
-        pending_stderr_chars = 0
+        pending_stderr = ProvisionalTextOutput()
         marker_checked = False
         marker_valid = False
         output_lock = threading.Lock()
@@ -2931,16 +2930,11 @@ class MacOSSeatbeltBackend:
 
         def observe_output(stream: str, chunk: str) -> None:
             """Publish both streams only after authenticating the shell entry marker."""
-            nonlocal pending_marker, pending_stderr_chars, marker_checked, marker_valid
+            nonlocal pending_marker, marker_checked, marker_valid
             with output_lock:
                 if not marker_checked:
                     if stream == "stderr":
-                        retained = chunk[
-                            : max(0, constants.MAX_OUTPUT_CHARS - pending_stderr_chars)
-                        ]
-                        if retained:
-                            pending_stderr.append(retained)
-                            pending_stderr_chars += len(retained)
+                        pending_stderr.append(chunk)
                         return
                     pending_marker += chunk
                     if len(pending_marker) < len(shell_marker):
@@ -2948,15 +2942,17 @@ class MacOSSeatbeltBackend:
                     marker_checked = True
                     marker_valid = pending_marker.startswith(shell_marker)
                     if not marker_valid:
-                        pending_stderr.clear()
+                        pending_stderr.close()
                         return
                     terminal_ready.set()
                     chunk = pending_marker[len(shell_marker) :]
                     pending_marker = ""
                     if output_observer is not None:
-                        for pending in pending_stderr:
-                            output_observer("stderr", pending)
-                    pending_stderr.clear()
+                        pending_stderr.replay(
+                            lambda pending: output_observer("stderr", pending)
+                        )
+                    else:
+                        pending_stderr.close()
                 if marker_valid and chunk and output_observer is not None:
                     output_observer(stream, chunk)
 
@@ -3021,6 +3017,7 @@ class MacOSSeatbeltBackend:
                     terminal_failures.append(
                         TimeoutError("Interactive terminal controller did not stop.")
                     )
+            pending_stderr.close()
         if terminal_failures:
             return CommandProcessResult(
                 SandboxOutcome.UNAVAILABLE,

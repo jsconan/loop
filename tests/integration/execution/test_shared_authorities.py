@@ -16,7 +16,12 @@ from loop.instructions import InstructionsManager, RuntimeEnvironment
 from loop.permissions import PermissionManager
 from loop.session import SessionManager
 from loop.tooling import ToolRegistry
-from loop.tools.system import cancel_command_job, read_command_job, run_command
+from loop.tools.system import (
+    cancel_command_job,
+    poll_command_job,
+    read_command_output,
+    run_command,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -67,7 +72,7 @@ def test_shared_authority_prevents_recomposition_until_job_settles(
     )
     first_service = CommandExecutionService(make_backend(run), Mock())
     first = ToolRegistry(
-        [run_command, read_command_job, cancel_command_job],
+        [run_command, poll_command_job, read_command_output, cancel_command_job],
         permission_manager=first_permissions,
         execution_service=first_service,
         session_manager=first_session,

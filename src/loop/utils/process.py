@@ -15,6 +15,8 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from enum import StrEnum
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Protocol, cast
 
 from .. import constants
@@ -136,6 +138,47 @@ class CapturedChunks(list[str]):
         """
         if self.observer is not None:
             self.observer(self._stream, value)
+
+
+class ProvisionalTextOutput:
+    """Spool text received before a native command-entry marker is authenticated."""
+
+    _directory: TemporaryDirectory
+    _path: Path
+    _closed: bool
+
+    def __init__(self) -> None:
+        self._directory = TemporaryDirectory(prefix="loop-command-provisional-")
+        self._path = Path(self._directory.name, "output")
+        self._closed = False
+        with self._path.open("x", encoding="utf-8", newline=""):
+            pass
+
+    def append(self, content: str) -> None:
+        """Append one decoded chunk without retaining an unbounded in-memory buffer."""
+        with self._path.open("a", encoding="utf-8", newline="") as stream:
+            stream.write(content)
+
+    def replay(self, observer: Callable[[str], None]) -> None:
+        """Replay buffered chunks and close the temporary file even if delivery fails."""
+        try:
+            with self._path.open("r", encoding="utf-8", newline="") as stream:
+                while chunk := stream.read(constants.DEFAULT_STREAM_CHUNK_SIZE):
+                    observer(chunk)
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        """Close buffered output when command entry was rejected or capture failed."""
+        if not self._closed:
+            try:
+                self._directory.cleanup()
+            except TypeError:
+                # Tests may replace os.open for the execution boundary and trip shutil's
+                # descriptor-relative cleanup; remove this private one-file tree directly.
+                self._path.unlink(missing_ok=True)
+                Path(self._directory.name).rmdir()
+            self._closed = True
 
 
 _SHELL_SYNTAX = frozenset("|;&<>`()$")

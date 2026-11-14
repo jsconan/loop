@@ -144,7 +144,7 @@ class ToolRuntimeSettings:
         user_agent (str): HTTP user-agent used by web-content tools.
         command_timeout (float): Default initial wait for command completion or continuation.
         command_hard_timeout (float): Finite execution limit beginning at native launch.
-        command_job_wait_seconds (float): Default wait for command job output or completion.
+        command_job_wait_seconds (float): Default wait for command job completion.
     """
 
     user_agent: str = DEFAULT_USER_AGENT

@@ -518,8 +518,12 @@ def test_terminal_execute_gates_output_and_controls_on_verified_shell(
     if not control_failure:
         assert result.stdout == "visible"
         assert observed == (
-            [("stderr", "pre-entry")]
-            + ([("stderr", "o")] if pending_stderr == 2 else [])
+            [
+                (
+                    "stderr",
+                    "pre-entryoverflowdiscarded" if pending_stderr == 2 else "pre-entry",
+                )
+            ]
             + [("stdout", "visible")]
             if pending_stderr
             else [("stdout", "visible")]

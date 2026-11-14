@@ -1,4 +1,4 @@
-"""Retain bounded, session-owned command continuations without replaying shell source."""
+"""Retain session-owned command jobs and complete output without replaying shell source."""
 
 from __future__ import annotations
 
@@ -9,40 +9,23 @@ import time
 from collections import deque
 from collections.abc import Callable
 from contextvars import copy_context
-from itertools import islice
-from typing import NamedTuple
 from uuid import uuid4
 
+from .. import constants
 from ..errors import Problem, log_problem
+from ..utils.content import _ContentSpool, encode_content_cursor
 from ..utils.process import render_terminal_text
 
 _LOGGER = logging.getLogger(__name__)
+_OUTPUT_RESULT_KEYS = frozenset({"stdout", "stderr", "terminal_output", "output_handles"})
 MAX_ACTIVE_JOBS = 4
 MAX_RETAINED_JOBS = 8
-MAX_JOB_OUTPUT_BYTES = 1_000_000
-MAX_OUTPUT_EVENT_CHARS = 1_024
-MAX_JOB_OUTPUT_EVENTS = 16_384
-MAX_READ_EVENTS = 4
 JOB_RETENTION_SECONDS = 600.0
 JOB_CLOSE_SECONDS = 5.0
 JOB_READ_CANCELLATION_CHECK_SECONDS = 0.1
 MAX_TERMINAL_INPUT_BYTES = 4_096
 MAX_TERMINAL_PENDING_BYTES = 65_536
 MAX_TERMINAL_SIZE = 500
-
-
-class CommandOutputEvent(NamedTuple):
-    """Retain one ordered output chunk with its stream and cursor.
-
-    Args:
-        cursor (int): Monotonic cursor for readers.
-        stream (str): Captured stdout or stderr stream.
-        content (str): Decoded output chunk.
-    """
-
-    cursor: int
-    stream: str
-    content: str
 
 
 class CommandCancellation(threading.Event):
@@ -107,7 +90,7 @@ class CommandCancellation(threading.Event):
 
 
 class CommandJob:
-    """Own one admitted attempt, its bounded output, and its cancellation signal.
+    """Own one admitted attempt, its complete output spools, and its cancellation signal.
 
     Args:
         owner (str): Stable session scratch identity allowed to inspect this job.
@@ -126,15 +109,14 @@ class CommandJob:
     completed_at: float | None
     admitted_at: float | None
     _condition: threading.Condition
-    _events: deque[CommandOutputEvent]
-    _event_bytes: int
-    _oldest_cursor: int
-    _next_cursor: int
-    _exposed_cursor: int
+    _outputs: dict[str, _ContentSpool]
+    _observed: dict[str, bool]
+    _capture_complete: dict[str, bool]
+    _output_handles_exposed: bool
     _status: str
     _result: dict | Problem | None
     _error: BaseException | None
-    _dropped_characters: int
+    _capture_error: OSError | None
     _terminal_frames: deque[bytes]
     _terminal_pending_bytes: int
     _handoff_lock: threading.Lock
@@ -154,15 +136,16 @@ class CommandJob:
         self.completed_at = None
         self.admitted_at = None
         self._condition = threading.Condition()
-        self._events = deque()
-        self._event_bytes = 0
-        self._oldest_cursor = 0
-        self._next_cursor = 0
-        self._exposed_cursor = 0
+        self._outputs = {
+            stream: _ContentSpool(f"command {stream}") for stream in ("stdout", "stderr")
+        }
+        self._observed = {stream: False for stream in self._outputs}
+        self._capture_complete = {stream: False for stream in self._outputs}
+        self._output_handles_exposed = False
         self._status = "preparing"
         self._result = None
         self._error = None
-        self._dropped_characters = 0
+        self._capture_error = None
         self._terminal_frames = deque()
         self._terminal_pending_bytes = 0
         self._handoff_lock = threading.Lock()
@@ -232,7 +215,7 @@ class CommandJob:
             self._condition.notify_all()
 
     def publish(self, stream: str, content: str) -> None:
-        """Retain ordered bounded output events until the job completes.
+        """Append every observed output character to its stream spool.
 
         Args:
             stream (str): Exact ``stdout`` or ``stderr`` stream name.
@@ -246,36 +229,130 @@ class CommandJob:
         if self.terminal:
             content = render_terminal_text(content)
         with self._condition:
-            if self.finished.is_set():
+            if self.finished.is_set() or self._capture_error is not None:
                 return
-            start = 0
-            while start < len(content):
-                last = self._events[-1] if self._events else None
-                extend = (
-                    last is not None
-                    and last.stream == stream
-                    and last.cursor >= self._exposed_cursor
-                    and len(last.content) < MAX_OUTPUT_EVENT_CHARS
-                )
-                capacity = MAX_OUTPUT_EVENT_CHARS - len(last.content) if extend else 0
-                chunk = content[start : start + (capacity if extend else MAX_OUTPUT_EVENT_CHARS)]
-                start += len(chunk)
-                size = len(chunk.encode("utf-8"))
-                if extend:
-                    self._events[-1] = last._replace(content=last.content + chunk)
-                else:
-                    self._events.append(CommandOutputEvent(self._next_cursor, stream, chunk))
-                    self._next_cursor += 1
-                self._event_bytes += size
-                while (
-                    self._event_bytes > MAX_JOB_OUTPUT_BYTES
-                    or len(self._events) > MAX_JOB_OUTPUT_EVENTS
+            self._observed[stream] |= bool(content)
+            try:
+                self._outputs[stream].append(content)
+            except OSError as error:
+                self._capture_error = error
+                self.cancellation_event.set()
+
+    def output_sizes(self) -> dict[str, int]:
+        """Return the successfully retained byte count for each process stream.
+
+        Returns:
+            dict[str, int]: Retained UTF-8 byte counts keyed by ``stdout`` and ``stderr``.
+        """
+        with self._condition:
+            return {stream: output.size_bytes for stream, output in self._outputs.items()}
+
+    def capture_result_output(self, result: object, before: dict[str, int]) -> None:
+        """Retain result text when a backend did not publish that stream incrementally.
+
+        Args:
+            result (object): Result containing optional ``stdout`` and ``stderr`` text.
+            before (dict[str, int]): Per-stream byte counts taken before the attempt.
+        """
+        with self._condition:
+            for stream in ("stdout", "stderr"):
+                content = getattr(result, stream, "")
+                if not isinstance(content, str) or not content:
+                    continue
+                if self._outputs[stream].size_bytes == before[stream]:
+                    try:
+                        self._outputs[stream].append(
+                            render_terminal_text(content) if self.terminal else content
+                        )
+                    except OSError as error:
+                        self._capture_error = error
+                        self.cancellation_event.set()
+
+    def read_output(self, stream: str, cursor: str | None, max_bytes: int) -> dict:
+        """Read one immediately available page from a retained stream.
+
+        Args:
+            stream (str): Captured ``stdout`` or ``stderr`` stream name.
+            cursor (str | None): Opaque content cursor, or None to start at byte zero.
+            max_bytes (int): Maximum UTF-8 bytes returned in the page.
+
+        Returns:
+            dict: One page, continuation cursor when needed, and capture completion state.
+
+        Raises:
+            ValueError: The stream, cursor, or requested page size is invalid.
+        """
+        if stream not in self._outputs:
+            raise ValueError("Unknown command output stream.")
+        with self._condition:
+            output = self._outputs[stream]
+            if not output.retained:
+                raise ValueError("Command output is no longer retained.")
+            page = output.read_page(cursor, max_bytes)
+            end = page["end_byte"]
+            result = {
+                **page,
+                "job_complete": self.finished.is_set(),
+                "capture_complete": self._capture_complete[stream],
+                "capture_failed": self._capture_error is not None,
+            }
+            if end < output.size_bytes or not result["job_complete"]:
+                result["next_cursor"] = encode_content_cursor(output.handle, end)
+            return result
+
+    def stream_result(self, stream: str, discarded: int | None) -> dict:
+        """Return a bounded result preview backed by the retained stream.
+
+        Args:
+            stream (str): Captured ``stdout`` or ``stderr`` stream name.
+            discarded (int | None): Native capture overflow count, or None if draining stopped.
+
+        Returns:
+            dict: Bounded preview, loss metadata and cached-content continuation when needed.
+
+        Raises:
+            ValueError: The stream name is invalid.
+        """
+        if stream not in self._outputs:
+            raise ValueError("Unknown command output stream.")
+        with self._condition:
+            complete = discarded is not None and (discarded == 0 or self._observed[stream])
+            self._capture_complete[stream] = complete
+            return self._outputs[stream].stream_result(complete)
+
+    def output_handles(self) -> dict[str, str]:
+        """Return stable cached-content handles for both growing streams.
+
+        Returns:
+            dict[str, str]: Cached-content handles keyed by ``stdout`` and ``stderr``.
+        """
+        with self._condition:
+            handles = {
+                stream: output.handle
+                for stream, output in self._outputs.items()
+                if output.retained
+            }
+            self._output_handles_exposed |= bool(handles)
+            return handles
+
+    def release_unreferenced_output(self, result: dict | Problem) -> None:
+        """Discard completed stream files that were returned inline and never exposed by handle.
+
+        Args:
+            result (dict | Problem): Final tool result returned by the initial command call.
+        """
+        with self._condition:
+            if self._output_handles_exposed:
+                return
+            output = result.metadata if isinstance(result, Problem) else result
+            handles = output.get("output_handles", {}) if isinstance(output, dict) else {}
+            for stream, spool in self._outputs.items():
+                item = output.get(stream) if isinstance(output, dict) else None
+                if (
+                    (not isinstance(item, dict) or item.get("handle") != spool.handle)
+                    and (not isinstance(handles, dict) or handles.get(stream) != spool.handle)
                 ):
-                    dropped = self._events.popleft()
-                    self._event_bytes -= len(dropped.content.encode("utf-8"))
-                    self._dropped_characters += len(dropped.content)
-                    self._oldest_cursor = dropped.cursor + 1
-            self._condition.notify_all()
+                    spool.discard()
 
     def complete(self, result: dict | Problem, error: BaseException | None = None) -> None:
         """Publish the final result once and wake any blocked readers.
@@ -288,6 +365,22 @@ class CommandJob:
             with self._condition:
                 if self.finished.is_set():
                     return
+                capture_error = self._capture_error
+                if capture_error is not None:
+                    result = Problem(
+                        code="command_output.capture_failed",
+                        title="Command output capture failed",
+                        detail=(
+                            "The command was stopped because its output could not be retained "
+                            "completely. Previously captured output remains readable."
+                        ),
+                        operation="run_command",
+                        metadata={
+                            "output_handles": self.output_handles(),
+                            "capture_failed": True,
+                        },
+                    )
+                    error = None
                 self._result = result
                 self._error = error if not self._handed_off else None
                 self._terminal_frames.clear()
@@ -297,7 +390,10 @@ class CommandJob:
                 self.ready.set()
                 self.finished.set()
                 self._condition.notify_all()
+            report_capture = capture_error is not None
             report = self._handed_off and error is not None and isinstance(result, Problem)
+        if report_capture:
+            log_problem(_LOGGER, result, capture_error)
         if report:
             log_problem(_LOGGER, result, error)
 
@@ -423,12 +519,14 @@ class CommandJob:
         """Return the lifecycle state without command source or output content.
 
         Returns:
-            dict: Handle, status, elapsed time since admission, hard execution limit,
-                cancellation flag, cursors, and output loss count.
+            dict: Handle, lifecycle status, elapsed time, runtime limit, output sizes and result
+                summary.
         """
         with self._condition:
-            outcome = self._result.metadata if isinstance(self._result, Problem) else self._result
+            result = self._result
+            outcome = result.metadata if isinstance(result, Problem) else result
             lifecycle = outcome.get("lifecycle", {}) if isinstance(outcome, dict) else {}
+            diagnostics = outcome.get("sandbox_diagnostics", {}) if isinstance(outcome, dict) else {}
             elapsed = (
                 max(
                     0.0,
@@ -447,128 +545,91 @@ class CommandJob:
                 "cancel_requested": self.cancellation_event.is_set(),
                 "main_process": lifecycle.get("main_process", "unknown"),
                 "descendant_cleanup": lifecycle.get("descendant_cleanup", "uncertain"),
-                "oldest_cursor": self._oldest_cursor,
-                "next_cursor": self._next_cursor,
-                "dropped_characters": self._dropped_characters,
+                "stdout_bytes": self._outputs["stdout"].size_bytes,
+                "stderr_bytes": self._outputs["stderr"].size_bytes,
+                "capture_failed": self._capture_error is not None,
+                "stdout_capture_complete": self._capture_complete["stdout"],
+                "stderr_capture_complete": self._capture_complete["stderr"],
+                "boundary": outcome.get("boundary") if isinstance(outcome, dict) else None,
+                "exit_code": outcome.get("exit_code") if isinstance(outcome, dict) else None,
+                "outcome": diagnostics.get("outcome")
+                or (result.code if isinstance(result, Problem) else None),
+                "result": self._result_summary(result),
+                "output_handles": self.output_handles(),
             }
 
-    def read(
-        self,
-        cursor: int,
-        wait_seconds: float = 0,
-        *,
-        include_output: bool = False,
-        cancellation_event: threading.Event | None = None,
-    ) -> dict | Problem:
-        """Return a bounded output page and the result after retained output is delivered.
+    @staticmethod
+    def _result_summary(result: dict | Problem | None) -> dict | None:
+        """Return final status details without embedding command output content.
 
         Args:
-            cursor (int): Next event cursor requested by this session.
-            wait_seconds (float): Maximum time to wait for output or completion.
-            include_output (bool): Include the final captured stream previews explicitly.
+            result (dict | Problem | None): Settled command result, if available.
+
+        Returns:
+            dict | None: Safe non-output summary for a completed command.
+        """
+        if isinstance(result, Problem):
+            summary = result.model_dump(exclude={"metadata"})
+            metadata = {
+                key: value
+                for key, value in result.metadata.items()
+                if key not in _OUTPUT_RESULT_KEYS
+            }
+        elif isinstance(result, dict):
+            summary = {}
+            metadata = {
+                key: value for key, value in result.items() if key not in _OUTPUT_RESULT_KEYS
+            }
+        else:
+            return None
+        if metadata:
+            summary["metadata"] = metadata
+        return summary
+
+    def poll(
+        self,
+        wait_seconds: float,
+        *,
+        cancellation_event: threading.Event | None = None,
+    ) -> dict:
+        """Wait for job completion or timeout without returning output content.
+
+        Args:
+            wait_seconds (float): Maximum time to wait for job completion.
             cancellation_event (threading.Event | None): Stop waiting when this read is interrupted,
                 without cancelling the command.
 
         Returns:
-            dict | Problem: Ordered page and next cursor, or an expired-cursor error.
+            dict: Current lifecycle status, whether the job completed, and retained byte counts.
 
         Raises:
-            ValueError: Cursor is invalid or beyond produced output, or the wait budget is invalid.
+            ValueError: The wait budget is invalid or exceeds the platform's supported range.
         """
-        if not isinstance(cursor, int) or isinstance(cursor, bool) or cursor < 0:
-            raise ValueError("Command output cursor must be a nonnegative integer.")
         if (
             isinstance(wait_seconds, bool)
             or not isinstance(wait_seconds, (int, float))
-            or not 0 <= wait_seconds <= threading.TIMEOUT_MAX
+            or not 0 <= wait_seconds <= constants.MAX_COMMAND_WAIT_SECONDS
             or not math.isfinite(wait_seconds)
         ):
-            raise ValueError("Command job wait must be finite and within the supported range.")
+            raise ValueError(
+                "Command job poll must be finite and at most "
+                f"{constants.MAX_COMMAND_WAIT_SECONDS} seconds."
+            )
         with self._condition:
-            if cursor > self._next_cursor:
-                raise ValueError("Command output cursor is beyond the produced output.")
-            deadline = time.monotonic() + wait_seconds if cancellation_event is not None else 0
-            while True:
-                remaining = (
-                    max(0, deadline - time.monotonic())
-                    if cancellation_event is not None
-                    else wait_seconds
-                )
+            deadline = time.monotonic() + wait_seconds
+            while not self.finished.is_set() and not (
+                cancellation_event is not None and cancellation_event.is_set()
+            ):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
                 interval = (
                     min(remaining, JOB_READ_CANCELLATION_CHECK_SECONDS)
                     if cancellation_event is not None
                     else remaining
                 )
-                ready = self._condition.wait_for(
-                    lambda: (
-                        cursor < self._oldest_cursor
-                        or cursor < self._next_cursor
-                        or self.finished.is_set()
-                        or (cancellation_event is not None and cancellation_event.is_set())
-                    ),
-                    timeout=interval,
-                )
-                if ready or cancellation_event is None or remaining <= 0:
-                    break
-            if cursor < self._oldest_cursor:
-                return Problem(
-                    code="command_job.cursor_expired",
-                    title="Command output cursor expired",
-                    detail="Earlier command output exceeded the retained job limit.",
-                    operation="read_command_job",
-                    metadata={"oldest_cursor": self._oldest_cursor},
-                )
-            events = list(
-                islice(
-                    (
-                        {"cursor": event.cursor, "stream": event.stream, "content": event.content}
-                        for event in self._events
-                        if event.cursor >= cursor
-                    ),
-                    MAX_READ_EVENTS,
-                )
-            )
-            replayed = cursor < self._exposed_cursor and bool(events)
-            next_cursor = events[-1]["cursor"] + 1 if events else cursor
-            self._exposed_cursor = max(self._exposed_cursor, next_cursor)
-            result = self._result if next_cursor >= self._next_cursor else None
-            if isinstance(result, Problem):
-                result = result.model_dump()
-            if isinstance(result, dict) and not include_output:
-                result = dict(result)
-                container = result.get("metadata") if "metadata" in result else result
-                if isinstance(container, dict) and container.get("boundary") != "host":
-                    container = dict(container)
-                    for stream in ("stdout", "stderr"):
-                        value = container.get(stream)
-                        if isinstance(value, dict):
-                            container[stream] = {
-                                key: item
-                                for key, item in value.items()
-                                if key not in {"content", "tail"}
-                            }
-                    if "metadata" in result:
-                        result["metadata"] = container
-                    else:
-                        result = container
-            page = {
-                **self.inspect(),
-                "events": events,
-                "next_cursor": next_cursor,
-                "output_remaining": next_cursor < self._next_cursor,
-                "result": result,
-            }
-            if self.finished.is_set() and page["output_remaining"]:
-                page["continuation"] = (
-                    "The command has completed. Pass next_cursor to read remaining output "
-                    "and its final result."
-                )
-            elif replayed and result is None:
-                page["continuation"] = (
-                    "This page includes previously read output. Pass this page's next_cursor "
-                    "to read subsequent output and wait for changes."
-                )
-            return page
+                self._condition.wait(interval)
+            return self.inspect()
 
 
 class CommandJobs:

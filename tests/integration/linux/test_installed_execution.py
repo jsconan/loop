@@ -84,11 +84,13 @@ from loop.tools.system import (
     cancel_command_job,
     control_command_terminal,
     inspect_command_jobs,
-    read_command_job,
+    poll_command_job,
+    read_command_output,
     resolve_executable,
     run_command,
 )
 from loop.utils import VirtualPath
+from loop.utils.content import encode_content_cursor
 from loop.utils.yaml import load_yaml
 
 _ALIAS_DIRECTORY = os.environ.get("LOOP_NATIVE_SOCKET_ALIAS_DIRECTORY")
@@ -631,7 +633,8 @@ def public_client():
         [
             run_command,
             inspect_command_jobs,
-            read_command_job,
+            poll_command_job,
+            read_command_output,
             cancel_command_job,
             control_command_terminal,
             resolve_executable,
@@ -652,53 +655,134 @@ def public_client():
     )
     try:
         results = []
-        for call in value["calls"]:
-            arguments = dict(call["arguments"])
-            for name, source in call.get("argument_sources", {}).items():
-                result = results[source["result_index"]]
-                result = result.get("result", result)
-                arguments[name] = result[source["result_key"]]
-            result = json.loads(
+        output_cursors = {}
+        output_contents = {}
+
+        def call_tool(name, arguments):
+            """Call one public tool through the same installed registry."""
+            return json.loads(
                 registry.call(
-                    call["tool"],
+                    name,
                     json.dumps(arguments),
                     interaction=interaction,
                     instructions_manager=instructions,
                 )
             )
+
+        def read_available_output(handle, status):
+            """Read one bounded page from each stream without coupling it to polling."""
+            cursors = output_cursors.setdefault(handle, {"stdout": None, "stderr": None})
+            contents = output_contents.setdefault(handle, {"stdout": [], "stderr": []})
+            events = []
+            output_handles = status.get("output_handles", {})
+            for stream in ("stdout", "stderr"):
+                page = call_tool(
+                    "read_command_output",
+                    {
+                        "handle": handle,
+                        "stream": stream,
+                        "cursor": cursors[stream],
+                    },
+                )
+                if not page["ok"]:
+                    return page, events
+                page = page["result"]
+                content = page["content"]
+                contents[stream].append(content)
+                if content:
+                    events.append({"stream": stream, "content": content})
+                if stream in output_handles:
+                    cursors[stream] = encode_content_cursor(
+                        output_handles[stream], page["end_byte"]
+                    )
+            return None, events
+
+        for call in value["calls"]:
+            arguments = dict(call["arguments"])
+            for name, source in call.get("argument_sources", {}).items():
+                if call["tool"] == "poll_command_job" and name == "cursor":
+                    continue
+                result = results[source["result_index"]]
+                result = result.get("result", result)
+                arguments[name] = result[source["result_key"]]
+            if call["tool"] == "poll_command_job":
+                arguments.pop("cursor", None)
+                result = call_tool(call["tool"], arguments)
+                if result["ok"]:
+                    status = result["result"]
+                    failure, events = read_available_output(status["handle"], status)
+                    result = failure or {"ok": True, "result": {**status, "events": events}}
+            elif call["tool"] == "run_command":
+                result = call_tool(call["tool"], arguments)
+                if result.get("ok"):
+                    status = result["result"]
+                    if "handle" in status and "status" in status:
+                        failure, events = read_available_output(status["handle"], status)
+                        result = failure or {
+                            "ok": True,
+                            "result": {**status, "events": events},
+                        }
+            else:
+                result = call_tool(call["tool"], arguments)
             if call.get("await_completion") and result.get("ok"):
                 page = result["result"]
-                if "handle" in page and "next_cursor" in page and "status" in page:
+                if "handle" in page and "status" in page:
                     deadline = time.monotonic() + value.get("seconds", 2) + 10
                     while True:
                         if time.monotonic() >= deadline:
                             raise TimeoutError("Command continuation did not settle.")
-                        read = json.loads(
-                            registry.call(
-                                "read_command_job",
-                                json.dumps(
-                                    {
-                                        "handle": page["handle"],
-                                        "cursor": page["next_cursor"],
-                                        "wait_seconds": 10,
-                                        "include_output": True,
-                                    }
-                                ),
-                                interaction=interaction,
-                                instructions_manager=instructions,
-                            )
+                        polled = call_tool(
+                            "poll_command_job",
+                            {"handle": page["handle"], "wait_seconds": 10},
                         )
-                        if not read["ok"]:
-                            result = read
+                        if not polled["ok"]:
+                            result = polled
                             break
-                        page = read["result"]
-                        if page["result"] is not None:
-                            final = page["result"]
-                            result = (
-                                {"ok": False, "problem": final}
-                                if "code" in final and "title" in final
-                                else {"ok": True, "result": final}
+                        page = polled["result"]
+                        failure, _events = read_available_output(page["handle"], page)
+                        if failure is not None:
+                            result = failure
+                            break
+                        cursors = output_cursors[page["handle"]]
+                        reached_end = all(
+                            cursors[stream] is not None
+                            and output_contents[page["handle"]][stream]
+                            and sum(
+                                len(content.encode("utf-8"))
+                                for content in output_contents[page["handle"]][stream]
                             )
+                            >= page[f"{stream}_bytes"]
+                            for stream in ("stdout", "stderr")
+                        )
+                        if page["status"] == "complete" and reached_end:
+                            final = page.get("result") or {}
+                            streams = {
+                                stream: {
+                                    "content": "".join(output_contents[page["handle"]][stream]),
+                                    "captured_bytes": page[f"{stream}_bytes"],
+                                    "included_bytes": page[f"{stream}_bytes"],
+                                    "truncated": not page[f"{stream}_capture_complete"],
+                                    "capture_complete": page[f"{stream}_capture_complete"],
+                                    "discarded_characters": (
+                                        0 if page[f"{stream}_capture_complete"] else None
+                                    ),
+                                    "decoding_loss": (
+                                        "none" if page[f"{stream}_capture_complete"] else "unknown"
+                                    ),
+                                }
+                                for stream in ("stdout", "stderr")
+                            }
+                            if "code" in final and "title" in final:
+                                metadata = dict(final.get("metadata", {}))
+                                metadata.update(streams)
+                                final["metadata"] = metadata
+                                result = {"ok": False, "problem": final}
+                            else:
+                                metadata = final.pop("metadata", {})
+                                if isinstance(metadata, dict):
+                                    final = {**metadata, **final}
+                                final.update(streams)
+                                result = {"ok": True, "result": final}
                             break
             results.append(result)
         print(
@@ -1000,38 +1084,35 @@ def test_public_command_continuation_streams_one_process_and_verifies_cleanup(pu
             },
         },
         {
-            "tool": "read_command_job",
+            "tool": "poll_command_job",
             "arguments": {"wait_seconds": 5},
             "argument_sources": {
                 "handle": {"result_index": 0, "result_key": "handle"},
-                "cursor": {"result_index": 0, "result_key": "next_cursor"},
             },
         },
         {
-            "tool": "read_command_job",
+            "tool": "poll_command_job",
             "arguments": {"wait_seconds": 5},
             "argument_sources": {
                 "handle": {"result_index": 0, "result_key": "handle"},
-                "cursor": {"result_index": 1, "result_key": "next_cursor"},
             },
         },
         {
-            "tool": "read_command_job",
+            "tool": "poll_command_job",
             "arguments": {"wait_seconds": 5},
             "argument_sources": {
                 "handle": {"result_index": 0, "result_key": "handle"},
-                "cursor": {"result_index": 2, "result_key": "next_cursor"},
             },
         },
         {
-            "tool": "read_command_job",
-            "arguments": {"cursor": 999999},
+            "tool": "read_command_output",
+            "arguments": {"stream": "stdout", "cursor": "invalid-cursor"},
             "argument_sources": {"handle": {"result_index": 0, "result_key": "handle"}},
         },
     ]
     results = invoke_tools(public, calls, seconds=5)
     assert all(item["ok"] for item in results[:-1]), results
-    assert results[-1]["problem"]["code"] == "command_job.invalid_read"
+    assert results[-1]["problem"]["code"] == "command_output.invalid_read"
     pages = [item["result"] for item in results[:-1]]
     output = "".join(
         event["content"]
@@ -1040,8 +1121,8 @@ def test_public_command_continuation_streams_one_process_and_verifies_cleanup(pu
         if event["stream"] == "stdout"
     )
     assert output == "first\nlast\n"
-    assert "content" not in pages[-1]["result"]["stdout"]
-    assert pages[-1]["result"]["lifecycle"]["descendant_cleanup"] == "verified_absent"
+    assert pages[-1]["status"] == "complete"
+    assert pages[-1]["descendant_cleanup"] == "verified_absent"
     require_drained(generation)
 
 
@@ -1062,11 +1143,10 @@ def test_public_command_cancellation_waits_for_cgroup_cleanup(public, interactiv
                 },
             },
             {
-                "tool": "read_command_job",
+                "tool": "poll_command_job",
                 "arguments": {"wait_seconds": 5},
                 "argument_sources": {
                     "handle": {"result_index": 0, "result_key": "handle"},
-                    "cursor": {"result_index": 0, "result_key": "next_cursor"},
                 },
             },
             {
@@ -1075,11 +1155,10 @@ def test_public_command_cancellation_waits_for_cgroup_cleanup(public, interactiv
                 "argument_sources": {"handle": {"result_index": 0, "result_key": "handle"}},
             },
             {
-                "tool": "read_command_job",
+                "tool": "poll_command_job",
                 "arguments": {"wait_seconds": 5},
                 "argument_sources": {
                     "handle": {"result_index": 0, "result_key": "handle"},
-                    "cursor": {"result_index": 1, "result_key": "next_cursor"},
                 },
             },
         ],
@@ -1113,11 +1192,10 @@ def test_public_command_hard_deadline_after_continuation(public):
     for index in range(1, 7):
         calls.append(
             {
-                "tool": "read_command_job",
+                "tool": "poll_command_job",
                 "arguments": {"wait_seconds": 5},
                 "argument_sources": {
                     "handle": {"result_index": 0, "result_key": "handle"},
-                    "cursor": {"result_index": index - 1, "result_key": "next_cursor"},
                 },
             }
         )
@@ -1359,11 +1437,9 @@ def test_public_interactive_shell_reuses_one_owned_terminal(public):
     ]
     for index in range(2, 10):
         sources = {"handle": {"result_index": 0, "result_key": "handle"}}
-        if index > 2:
-            sources["cursor"] = {"result_index": index - 1, "result_key": "next_cursor"}
         calls.append(
             {
-                "tool": "read_command_job",
+                "tool": "poll_command_job",
                 "arguments": {"wait_seconds": 5},
                 "argument_sources": sources,
             }
@@ -1373,7 +1449,7 @@ def test_public_interactive_shell_reuses_one_owned_terminal(public):
     assert results[0]["result"]["terminal"]
     output = "".join(event["content"] for item in results[2:] for event in item["result"]["events"])
     assert "nested-ok" in output, json.dumps(results, indent=2)
-    assert results[-1]["result"]["result"]["lifecycle"]["descendant_cleanup"] == ("verified_absent")
+    assert results[-1]["result"]["descendant_cleanup"] == "verified_absent"
     require_drained(generation)
 
 
@@ -1397,11 +1473,10 @@ def test_public_terminal_streams_after_native_capture_limit(public):
     for index in range(1, 129):
         calls.append(
             {
-                "tool": "read_command_job",
+                "tool": "poll_command_job",
                 "arguments": {"wait_seconds": 0.1},
                 "argument_sources": {
                     "handle": {"result_index": 0, "result_key": "handle"},
-                    "cursor": {"result_index": index - 1, "result_key": "next_cursor"},
                 },
             }
         )
@@ -1415,14 +1490,10 @@ def test_public_terminal_streams_after_native_capture_limit(public):
     for index in range(130, 290):
         calls.append(
             {
-                "tool": "read_command_job",
+                "tool": "poll_command_job",
                 "arguments": {"wait_seconds": 0.1},
                 "argument_sources": {
                     "handle": {"result_index": 0, "result_key": "handle"},
-                    "cursor": {
-                        "result_index": 128 if index == 130 else index - 1,
-                        "result_key": "next_cursor",
-                    },
                 },
             }
         )
@@ -1434,10 +1505,12 @@ def test_public_terminal_streams_after_native_capture_limit(public):
         if index != 129
         for event in item["result"]["events"]
     )
-    assert "after-limit" in output
-    final = results[-1]["result"]["result"]
-    assert final["stdout"]["discarded_characters"] > 0
-    assert final["lifecycle"]["descendant_cleanup"] == "verified_absent"
+    assert output.endswith("after-limit")
+    assert output.count("x") == 1_010_000
+    final = results[-1]["result"]
+    assert final["stdout_bytes"] == len(output.encode("utf-8"))
+    assert final["stdout_capture_complete"]
+    assert final["descendant_cleanup"] == "verified_absent"
     require_drained(generation)
 
 
@@ -1498,11 +1571,9 @@ def test_public_terminal_tty_resize_eof_and_untrusted_controls(public):
     ]
     for index in range(4, 12):
         sources = {"handle": {"result_index": 0, "result_key": "handle"}}
-        if index > 4:
-            sources["cursor"] = {"result_index": index - 1, "result_key": "next_cursor"}
         calls.append(
             {
-                "tool": "read_command_job",
+                "tool": "poll_command_job",
                 "arguments": {"wait_seconds": 5},
                 "argument_sources": sources,
             }
@@ -1516,7 +1587,7 @@ def test_public_terminal_tty_resize_eof_and_untrusted_controls(public):
     assert "EOF ''" in output, output
     assert "␛]52;c;bad␇" in output and "permission approved" in output
     assert "\x1b" not in output and "\x07" not in output
-    assert results[-1]["result"]["result"]["lifecycle"]["descendant_cleanup"] == ("verified_absent")
+    assert results[-1]["result"]["descendant_cleanup"] == "verified_absent"
     require_drained(generation)
 
 
@@ -1550,11 +1621,9 @@ def test_public_terminal_interrupt_and_explicit_close(public):
     ]
     for index in range(4, 9):
         sources = {"handle": {"result_index": 0, "result_key": "handle"}}
-        if index > 4:
-            sources["cursor"] = {"result_index": index - 1, "result_key": "next_cursor"}
         calls.append(
             {
-                "tool": "read_command_job",
+                "tool": "poll_command_job",
                 "arguments": {"wait_seconds": 5},
                 "argument_sources": sources,
             }
@@ -1590,7 +1659,7 @@ def test_public_terminal_close_cancels_running_job(public):
             "argument_sources": {"handle": {"result_index": 0, "result_key": "handle"}},
         },
         {
-            "tool": "read_command_job",
+            "tool": "poll_command_job",
             "arguments": {"wait_seconds": 1},
             "argument_sources": {"handle": {"result_index": 0, "result_key": "handle"}},
         },
@@ -1638,11 +1707,9 @@ def test_public_terminal_cannot_write_host_pty_or_spoof_approval(public):
         ]
         for index in range(1, 8):
             sources = {"handle": {"result_index": 0, "result_key": "handle"}}
-            if index > 1:
-                sources["cursor"] = {"result_index": index - 1, "result_key": "next_cursor"}
             calls.append(
                 {
-                    "tool": "read_command_job",
+                    "tool": "poll_command_job",
                     "arguments": {"wait_seconds": 5},
                     "argument_sources": sources,
                 }
@@ -1697,16 +1764,15 @@ def test_public_terminal_cannot_inject_into_another_live_session(public):
             },
         },
         {
-            "tool": "read_command_job",
+            "tool": "poll_command_job",
             "arguments": {"wait_seconds": 30},
             "argument_sources": {"handle": {"result_index": 0, "result_key": "handle"}},
         },
         {
-            "tool": "read_command_job",
+            "tool": "poll_command_job",
             "arguments": {"wait_seconds": 30},
             "argument_sources": {
                 "handle": {"result_index": 0, "result_key": "handle"},
-                "cursor": {"result_index": 1, "result_key": "next_cursor"},
             },
         },
     ]
@@ -1741,11 +1807,9 @@ def test_public_terminal_cannot_inject_into_another_live_session(public):
             ]
             for index in range(1, 7):
                 sources = {"handle": {"result_index": 0, "result_key": "handle"}}
-                if index > 1:
-                    sources["cursor"] = {"result_index": index - 1, "result_key": "next_cursor"}
                 second_calls.append(
                     {
-                        "tool": "read_command_job",
+                        "tool": "poll_command_job",
                         "arguments": {"wait_seconds": 5},
                         "argument_sources": sources,
                     }
@@ -1832,11 +1896,9 @@ def test_public_terminal_preserves_file_network_signal_and_descriptor_isolation(
             ]
             for index in range(1, 9):
                 sources = {"handle": {"result_index": 0, "result_key": "handle"}}
-                if index > 1:
-                    sources["cursor"] = {"result_index": index - 1, "result_key": "next_cursor"}
                 calls.append(
                     {
-                        "tool": "read_command_job",
+                        "tool": "poll_command_job",
                         "arguments": {"wait_seconds": 5},
                         "argument_sources": sources,
                     }
@@ -1877,19 +1939,17 @@ def test_public_command_default_wait_continues_same_process(public):
             },
         },
         {
-            "tool": "read_command_job",
+            "tool": "poll_command_job",
             "arguments": {"wait_seconds": 5},
             "argument_sources": {
                 "handle": {"result_index": 0, "result_key": "handle"},
-                "cursor": {"result_index": 0, "result_key": "next_cursor"},
             },
         },
         {
-            "tool": "read_command_job",
+            "tool": "poll_command_job",
             "arguments": {"wait_seconds": 5},
             "argument_sources": {
                 "handle": {"result_index": 0, "result_key": "handle"},
-                "cursor": {"result_index": 1, "result_key": "next_cursor"},
             },
         },
     ]
@@ -1898,7 +1958,7 @@ def test_public_command_default_wait_continues_same_process(public):
     initial = results[0]["result"]
     assert initial["result"] is None and initial["elapsed_seconds"] >= 0
     pages = [item["result"] for item in results[1:]]
-    assert any(page["result"] is not None and page["result"]["exit_code"] == 0 for page in pages)
+    assert any(page["result"] is not None and page["exit_code"] == 0 for page in pages)
     assert "finished" in "".join(event["content"] for page in pages for event in page["events"])
     assert (workspace / "continuation-count").read_text() == "x"
     require_drained(generation)
@@ -1924,11 +1984,9 @@ def test_public_terminal_continues_same_process_past_old_deadline(public):
     ]
     for index in range(2, 10):
         sources = {"handle": {"result_index": 0, "result_key": "handle"}}
-        if index > 2:
-            sources["cursor"] = {"result_index": index - 1, "result_key": "next_cursor"}
         calls.append(
             {
-                "tool": "read_command_job",
+                "tool": "poll_command_job",
                 "arguments": {"wait_seconds": 30},
                 "argument_sources": sources,
             }
@@ -1939,7 +1997,7 @@ def test_public_terminal_continues_same_process_past_old_deadline(public):
     assert all(item["ok"] for item in results), results
     output = "".join(event["content"] for item in results[2:] for event in item["result"]["events"])
     assert "long-done" in output
-    assert results[-1]["result"]["result"]["lifecycle"]["descendant_cleanup"] == ("verified_absent")
+    assert results[-1]["result"]["descendant_cleanup"] == "verified_absent"
     require_drained(generation)
 
 
@@ -1962,11 +2020,10 @@ def test_public_command_continues_past_previous_default_deadline(public, noisy):
     for index in range(1, 15):
         calls.append(
             {
-                "tool": "read_command_job",
+                "tool": "poll_command_job",
                 "arguments": {"wait_seconds": 30},
                 "argument_sources": {
                     "handle": {"result_index": 0, "result_key": "handle"},
-                    "cursor": {"result_index": index - 1, "result_key": "next_cursor"},
                 },
             }
         )
@@ -1976,7 +2033,7 @@ def test_public_command_continues_past_previous_default_deadline(public, noisy):
     assert all(item["ok"] for item in results), results
     output = "".join(event["content"] for item in results for event in item["result"]["events"])
     assert output.endswith("end")
-    assert results[-1]["result"]["result"]["lifecycle"]["descendant_cleanup"] == "verified_absent"
+    assert results[-1]["result"]["descendant_cleanup"] == "verified_absent"
     assert (workspace / "count").read_text() == "x"
     require_drained(generation)
 

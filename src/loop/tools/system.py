@@ -253,9 +253,12 @@ def run_command(
         BeforeValidator(normalize_optional_null),
         Field(
             description="Maximum initial wait in seconds, or JSON null (unquoted) for the "
-            "configured tools.command_timeout. If still running, returns a handle and cursor for "
-            "read_command_job. The separate hard runtime limit still applies.",
+            "configured tools.command_timeout. If still running, returns a continuation handle. "
+            "Use poll_command_job for completion and read_command_output for captured text. "
+            f"The maximum wait is {constants.MAX_COMMAND_WAIT_SECONDS:g} seconds. "
+            "The separate hard runtime limit still applies.",
             ge=0,
+            le=constants.MAX_COMMAND_WAIT_SECONDS,
             allow_inf_nan=False,
         ),
     ] = None,
@@ -263,7 +266,8 @@ def run_command(
         bool,
         Field(
             description="Open one owned sandboxed pseudo-terminal and return its handle after "
-            "approval. Use read_command_job and control_command_terminal for the same process. "
+            "approval. Use poll_command_job, read_command_output, and "
+            "control_command_terminal for the same process. "
             "Cannot combine with egress_origins."
         ),
     ] = False,
@@ -308,34 +312,24 @@ def inspect_command_jobs(context: ToolContext) -> dict | Problem:
 
 
 @tool(requires_execution_service=True)
-def read_command_job(
+def poll_command_job(
     context: ToolContext,
     handle: Annotated[str, Field(description="Opaque handle from run_command.", min_length=32)],
-    cursor: Annotated[
-        int,
-        Field(
-            description="Start at zero; for each subsequent read pass the previous response's "
-            "next_cursor. An earlier cursor replays output and returns immediately.",
-            ge=0,
-        ),
-    ] = 0,
     wait_seconds: Annotated[
         float | None,
         BeforeValidator(normalize_optional_null),
         Field(
-            description="Wait for output or completion, or use JSON null (unquoted) for the "
-            "configured default. Available output returns immediately. Platform wait limits apply; "
-            "use 0 to poll now.",
+            description="Wait for command completion or timeout, or use JSON null (unquoted) for "
+            "the configured default. Output arriving during this wait does not return early. "
+            f"The maximum wait is {constants.MAX_COMMAND_WAIT_SECONDS:g} seconds. "
+            "Use 0 for an immediate status check.",
             ge=0,
+            le=constants.MAX_COMMAND_WAIT_SECONDS,
             allow_inf_nan=False,
         ),
     ] = None,
-    include_output: Annotated[
-        bool,
-        Field(description="Include the final captured stream previews when needed."),
-    ] = False,
 ) -> dict | Problem:
-    """Read output pages until result is non-null, even if status is complete."""
+    """Wait for command completion without returning output content."""
     if context.execution_service is None:
         return Problem(
             code="command_job.unavailable",
@@ -343,12 +337,45 @@ def read_command_job(
             detail="Native command execution service is unavailable.",
             operation=context.tool_name,
         )
-    return context.execution_service.read_command_job(
+    return context.execution_service.poll_command_job(context, handle, wait_seconds)
+
+
+@tool(requires_execution_service=True)
+def read_command_output(
+    context: ToolContext,
+    handle: Annotated[str, Field(description="Opaque handle from run_command.", min_length=32)],
+    stream: Annotated[Literal["stdout", "stderr"], Field(description="Process output stream.")],
+    cursor: Annotated[
+        str | None,
+        BeforeValidator(normalize_optional_null),
+        Field(
+            description="Opaque continuation cursor, or JSON null (unquoted) for the start of "
+            "the stream."
+        ),
+    ] = None,
+    max_bytes: Annotated[
+        int,
+        Field(
+            description="Maximum UTF-8 bytes to return; a character may adjust the boundary.",
+            ge=1,
+            le=constants.MAX_TOOL_CONTENT_BYTES,
+        ),
+    ] = constants.MAX_TOOL_CONTENT_BYTES,
+) -> dict | Problem:
+    """Read one immediately available page from a command output stream."""
+    if context.execution_service is None:
+        return Problem(
+            code="command_job.unavailable",
+            title="Command output unavailable",
+            detail="Native command execution service is unavailable.",
+            operation=context.tool_name,
+        )
+    return context.execution_service.read_command_output(
         context,
         handle,
+        stream,
         cursor,
-        wait_seconds,
-        include_output,
+        max_bytes,
     )
 
 

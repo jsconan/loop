@@ -16,6 +16,7 @@ import pytest
 from loop.utils.process import (
     CapturedChunks,
     ProcessCaptureStatus,
+    ProvisionalTextOutput,
     is_finite_deadline,
     kill_process_group,
     parse_command_line,
@@ -156,6 +157,44 @@ def test_read_bounded_stream_drains_every_chunk_but_retains_the_configured_limit
     assert discarded == 9
     assert stream.read.call_count == 4
     stream.read.assert_called_with(8192)
+
+
+def test_provisional_text_output_replays_spooled_chunks_without_loss():
+    """Pre-authentication text is replayed in bounded chunks from a temporary file."""
+    spool = ProvisionalTextOutput()
+    content = "é" * 8193
+    spool.append(content)
+    chunks = []
+
+    spool.replay(chunks.append)
+
+    assert "".join(chunks) == content
+    assert len(chunks) == 2
+    assert not spool._path.exists()
+    spool.close()
+
+
+def test_provisional_text_output_closes_when_delivery_fails():
+    """A failed replay closes its temporary file instead of leaking a descriptor."""
+    spool = ProvisionalTextOutput()
+    spool.append("buffered")
+
+    def fail(_chunk):
+        """Represent a failed authenticated output transport."""
+        raise OSError("transport disconnected")
+
+    with pytest.raises(OSError, match="transport disconnected"):
+        spool.replay(fail)
+    assert not spool._path.exists()
+
+
+def test_provisional_text_output_discards_untrusted_text():
+    """Output from a process without an authenticated entry marker is discarded."""
+    spool = ProvisionalTextOutput()
+    spool.append("untrusted")
+    path = spool._path
+    spool.close()
+    assert not path.exists()
 
 
 def test_read_bounded_stream_can_drain_without_retaining_output():

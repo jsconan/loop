@@ -15,7 +15,7 @@ from loop.instructions import InstructionsManager, RuntimeEnvironment, Skill, Sk
 from loop.permissions import PermissionManager, PolicyScope
 from loop.session import SessionManager
 from loop.tooling import ToolRegistry
-from loop.tools.system import read_command_job, run_command
+from loop.tools.system import poll_command_job, read_command_output, run_command
 
 pytestmark = pytest.mark.integration
 
@@ -231,7 +231,7 @@ def test_async_host_fallback_with_skill_settles_after_origin_loop_closes(tmp_pat
 
     host.run_host_command.side_effect = finish_host
     registry = ToolRegistry(
-        [run_command, read_command_job],
+        [run_command, poll_command_job, read_command_output],
         permission_manager=permissions,
         execution_service=CommandExecutionService(native, host),
         session_manager=sessions,
@@ -264,23 +264,30 @@ def test_async_host_fallback_with_skill_settles_after_origin_loop_closes(tmp_pat
         assert first["result"]["status"] == "running"
         assert len(permissions.host_command_rules()) == 1
         release.set()
-        page = json.loads(
+        status = json.loads(
             registry.call(
-                "read_command_job",
+                "poll_command_job",
+                json.dumps({"handle": first["result"]["handle"], "wait_seconds": 5}),
+                instructions_manager=instructions,
+            )
+        )
+        assert status["ok"], status
+        assert status["result"]["status"] == "complete"
+        assert status["result"]["exit_code"] == 0
+        output = json.loads(
+            registry.call(
+                "read_command_output",
                 json.dumps(
                     {
                         "handle": first["result"]["handle"],
-                        "cursor": first["result"]["next_cursor"],
-                        "wait_seconds": 5,
-                        "include_output": True,
+                        "stream": "stdout",
                     }
                 ),
                 instructions_manager=instructions,
             )
         )
-        assert page["ok"], page
-        assert page["result"]["result"]["exit_code"] == 0
-        assert page["result"]["result"]["stdout"]["content"] == "host-complete"
+        assert output["ok"], output
+        assert output["result"]["content"] == "host-complete"
         assert native.run.call_count == host.run_host_command.call_count == 1
     finally:
         release.set()

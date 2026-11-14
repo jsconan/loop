@@ -24,7 +24,7 @@ from loop.permissions import (
 )
 from loop.session import SessionManager
 from loop.tooling import ToolContext, ToolRegistry
-from loop.tools.system import read_command_job, run_command
+from loop.tools.system import poll_command_job, read_command_output, run_command
 
 pytestmark = pytest.mark.integration
 
@@ -164,7 +164,7 @@ def test_async_command_survives_owner_loop_closure(tmp_path, monkeypatch, mode):
     invalidate = Mock(wraps=instructions.invalidate)
     monkeypatch.setattr(instructions, "invalidate", invalidate)
     registry = ToolRegistry(
-        [run_command, read_command_job],
+        [run_command, poll_command_job, read_command_output],
         permission_manager=permissions,
         execution_service=CommandExecutionService(backend, host),
         session_manager=sessions,
@@ -184,30 +184,28 @@ def test_async_command_survives_owner_loop_closure(tmp_path, monkeypatch, mode):
         )
         return json.loads(result), loop
 
-    async def finish(handle, cursor):
-        """Read all remaining pages through a new event loop."""
-        events = []
+    async def finish(handle):
+        """Poll for completion and read the output separately through a new loop."""
         for _ in range(10):
             result = json.loads(
                 await registry.call_async(
-                    "read_command_job",
-                    json.dumps(
-                        {
-                            "handle": handle,
-                            "cursor": cursor,
-                            "wait_seconds": 5,
-                            "include_output": True,
-                        }
-                    ),
+                    "poll_command_job",
+                    json.dumps({"handle": handle, "wait_seconds": 5}),
                     instructions_manager=instructions,
                 )
             )
             assert result["ok"], result
-            page = result["result"]
-            events.extend(page["events"])
-            cursor = page["next_cursor"]
-            if page["result"] is not None:
-                return page["result"], events
+            status = result["result"]
+            if status["status"] == "complete":
+                output = json.loads(
+                    await registry.call_async(
+                        "read_command_output",
+                        json.dumps({"handle": handle, "stream": "stdout"}),
+                        instructions_manager=instructions,
+                    )
+                )
+                assert output["ok"], output
+                return status, output["result"]
         pytest.fail("The continued command did not settle.")
 
     try:
@@ -217,21 +215,17 @@ def test_async_command_survives_owner_loop_closure(tmp_path, monkeypatch, mode):
         assert first["result"]["status"] == "running"
         invalidate.reset_mock()
         release.set()
-        final, events = asyncio.run(
-            finish(first["result"]["handle"], first["result"]["next_cursor"])
-        )
+        final, output = asyncio.run(finish(first["result"]["handle"]))
         if mode == "host_offer":
-            assert final["code"] == "sandbox.unavailable"
-            assert "host_offer" in final["metadata"]
-            assert events == []
+            assert final["result"]["code"] == "sandbox.unavailable"
+            assert "host_offer" in final["result"]["metadata"]
+            assert output["content"] == ""
             invalidate.assert_not_called()
             interaction.prompt_async.assert_not_awaited()
             host.run_host_command.assert_not_called()
         else:
-            assert "exit_code" in final, final
             assert final["exit_code"] == 0
-            assert final["stdout"]["content"] == "continued output"
-            assert "".join(event["content"] for event in events) == "continued output"
+            assert output["content"] == "continued output"
             invalidate.assert_called_once_with(None)
         if mode == "mediated":
             assert revisions == [permissions.egress_policy_revision()]
@@ -284,17 +278,16 @@ def test_command_yields_once_and_can_be_cancelled_without_replay(tmp_path):
         assert started.wait(timeout=5)
         assert first["status"] == "running"
         assert first["elapsed_seconds"] >= 0
-        page = service.read_command_job(context, first["handle"], wait_seconds=0)
-        assert page["handle"] == first["handle"]
-        assert page["status"] == "running"
+        status = service.poll_command_job(context, first["handle"], wait_seconds=0)
+        assert status["handle"] == first["handle"]
+        assert status["status"] == "running"
+        assert "stdout" not in status
         assert backend.run.call_count == 1
         assert captured == ["original-context"]
 
         cancellation = service.cancel_command_job(context, first["handle"])
         assert cancellation["cancel_requested"]
-        final = service.read_command_job(
-            context, first["handle"], cursor=first["next_cursor"], wait_seconds=5
-        )
+        final = service.poll_command_job(context, first["handle"], wait_seconds=5)
         assert final["status"] == "complete"
         assert final["result"]["code"] == "sandbox.cancelled"
         assert final["elapsed_seconds"] >= first["elapsed_seconds"]
@@ -316,13 +309,15 @@ def test_approved_host_retry_remains_owned_after_handoff(tmp_path, monkeypatch, 
     backend.run.return_value = CommandProcessResult(SandboxOutcome.UNAVAILABLE, detail="no sandbox")
     host = Mock()
 
-    def run_host(_request, *, cancellation_event):
+    def run_host(_request, *, cancellation_event, output_observer=None):
         """Wait for the test to settle or cancel the approved host attempt."""
         host_started.set()
         if not release_host.wait(timeout=5):
             raise TimeoutError("Synthetic host command was not released.")
         if cancellation_event.is_set():
             return CommandProcessResult(SandboxOutcome.CANCELLED, possible_effects=True)
+        if output_observer is not None:
+            output_observer("stdout", "host output")
         return CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0, stdout="host output")
 
     def wait_for_host(_job, _seconds, _cancellation_event):
@@ -362,16 +357,15 @@ def test_approved_host_retry_remains_owned_after_handoff(tmp_path, monkeypatch, 
         if cancel:
             assert service.cancel_command_job(context, first["handle"])["cancel_requested"]
         release_host.set()
-        final = service.read_command_job(
-            context, first["handle"], cursor=first["next_cursor"], wait_seconds=5
-        )
+        final = service.poll_command_job(context, first["handle"], wait_seconds=5)
         assert final["status"] == "complete"
         if cancel:
             assert final["result"]["code"] == "host_command.cancelled"
             assert final["cancel_requested"]
         else:
-            assert final["result"]["boundary"] == "host"
-            assert final["result"]["stdout"]["content"] == "host output"
+            assert final["boundary"] == "host"
+            output = service.read_command_output(context, first["handle"], "stdout")
+            assert output["content"] == "host output"
         backend.run.assert_called_once()
         host.run_host_command.assert_called_once()
     finally:
@@ -418,9 +412,7 @@ def test_host_approval_is_not_requested_after_handoff(tmp_path):
         first = service.run_command(context, ":", wait_seconds=0)
         assert first["status"] == "running"
         release_sandbox.set()
-        final = service.read_command_job(
-            context, first["handle"], cursor=first["next_cursor"], wait_seconds=5
-        )
+        final = service.poll_command_job(context, first["handle"], wait_seconds=5)
         assert final["status"] == "complete"
         assert final["result"]["code"] == "sandbox.unavailable"
         assert "host_offer" in final["result"]["metadata"]
@@ -504,7 +496,7 @@ def test_origin_cancellation_during_host_approval_prevents_launch(tmp_path, monk
         assert len(outcomes) == 1
         owned = service.inspect_command_jobs(context)["jobs"]
         assert len(owned) == 1
-        final = service.read_command_job(
+        final = service.poll_command_job(
             replace(context, cancellation_event=None), owned[0]["handle"], wait_seconds=5
         )
         assert final["status"] == "complete"
@@ -520,21 +512,24 @@ def test_origin_cancellation_during_host_approval_prevents_launch(tmp_path, monk
         permissions.close()
 
 
-def test_cancelled_async_read_preserves_the_command(tmp_path, monkeypatch):
-    """Read live output, interrupt a later read, and retrieve the command's final result."""
+def test_cancelled_async_poll_preserves_the_command(tmp_path, monkeypatch):
+    """Output does not end a poll, and cancelling a poll leaves the command running."""
     release = Event()
     emit = Event()
-    reading = Event()
+    output_published = Event()
+    polling = Event()
     backend = Mock()
 
     def run_command(*_args, **kwargs):
-        """Publish live output and remain active until the test releases the command."""
+        """Publish a partial stream, then remain active until the test releases the job."""
         if not emit.wait(timeout=5):
             raise TimeoutError("Synthetic command was not allowed to emit output.")
         kwargs["output_observer"]("stdout", "ready")
+        output_published.set()
         if not release.wait(timeout=5):
             raise TimeoutError("Synthetic command was not released.")
-        return CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0, stdout="done")
+        kwargs["output_observer"]("stdout", "done")
+        return CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0, stdout="readydone")
 
     backend.run.side_effect = run_command
     sessions = SessionManager()
@@ -556,52 +551,53 @@ def test_cancelled_async_read_preserves_the_command(tmp_path, monkeypatch):
         session_manager=sessions,
     )
     registry = ToolRegistry(
-        [read_command_job],
+        [poll_command_job, read_command_output],
         permission_manager=permissions,
         execution_service=service,
         session_manager=sessions,
     )
-    original_read = service.read_command_job
+    original_poll = service.poll_command_job
 
-    def observe_read(*args, **kwargs):
-        """Expose admission to the actual execution service read."""
-        reading.set()
-        return original_read(*args, **kwargs)
+    def observe_poll(*args, **kwargs):
+        """Expose that the async poll entered its completion wait."""
+        polling.set()
+        return original_poll(*args, **kwargs)
 
-    monkeypatch.setattr(service, "read_command_job", observe_read)
+    monkeypatch.setattr(service, "poll_command_job", observe_poll)
 
     async def scenario():
-        """Read live output, cancel a subsequent wait, and finish the same command."""
+        """Read one page, interrupt the separate completion wait, then finish the job."""
         handle = service.run_command(context, ":", wait_seconds=0)["handle"]
-        arguments = json.dumps({"handle": handle, "cursor": 0, "wait_seconds": 30})
-        task = asyncio.create_task(registry.call_async("read_command_job", arguments))
-        assert await asyncio.to_thread(reading.wait, 5), "Read was not admitted."
         emit.set()
-        page = json.loads(await asyncio.wait_for(task, timeout=2))["result"]
-        assert page["events"][0]["content"] == "ready"
-        assert page["status"] == "running"
+        assert await asyncio.to_thread(output_published.wait, 5), "Output was not published."
+        page = json.loads(
+            await registry.call_async(
+                "read_command_output",
+                json.dumps({"handle": handle, "stream": "stdout"}),
+            )
+        )["result"]
+        assert page["content"] == "ready"
+        assert page["job_complete"] is False
         cursor = page["next_cursor"]
-        assert cursor == 1
-        reading.clear()
-        arguments = json.dumps({"handle": handle, "cursor": cursor, "wait_seconds": 30})
-        task = asyncio.create_task(registry.call_async("read_command_job", arguments))
-        assert await asyncio.to_thread(reading.wait, 5), "Second read was not admitted."
+
+        arguments = json.dumps({"handle": handle, "wait_seconds": 30})
+        task = asyncio.create_task(registry.call_async("poll_command_job", arguments))
+        assert await asyncio.to_thread(polling.wait, 5), "Poll was not admitted."
+        assert not task.done(), "New output must not complete a poll."
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, timeout=2)
-        immediate = json.loads(
-            await registry.call_async(
-                "read_command_job",
-                json.dumps({"handle": handle, "cursor": cursor, "wait_seconds": 0}),
-            )
-        )["result"]
+
+        immediate = service.poll_command_job(context, handle, wait_seconds=0)
         assert immediate["status"] == "running"
-        assert immediate["events"] == []
-        assert immediate["next_cursor"] == cursor
+        assert "stdout" not in immediate
         assert not immediate["cancel_requested"]
         release.set()
-        final = json.loads(await registry.call_async("read_command_job", arguments))["result"]
-        assert final["result"]["exit_code"] == 0
+        final = original_poll(context, handle, wait_seconds=5)
+        assert final["status"] == "complete"
+        assert final["exit_code"] == 0
+        resumed = service.read_command_output(context, handle, "stdout", cursor)
+        assert resumed["content"] == "done"
 
     try:
         asyncio.run(scenario())

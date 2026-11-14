@@ -59,6 +59,7 @@ class CachedContentMetadata(TypedDict):
 
     source: str
     reloadable: bool
+    allow_nul: NotRequired[bool]
 
 
 class TextSearchContext(TypedDict):

@@ -1,4 +1,4 @@
-"""Verify bounded command continuations and process-local session ownership."""
+"""Verify command output spooling and process-local session ownership."""
 
 from threading import Event, Thread
 from unittest.mock import Mock
@@ -34,48 +34,150 @@ def workers(monkeypatch):
     return created
 
 
-def test_command_job_pages_ordered_output_and_exposes_settled_result():
-    """A cursor advances over bounded events without reusing earlier output."""
+def test_command_job_spools_and_pages_the_complete_output():
+    """Large streams remain byte exact and cursor-readable beyond native capture ceilings."""
+    from types import SimpleNamespace
+
+    from loop.constants import MAX_OUTPUT_CHARS, MAX_TOOL_CONTENT_BYTES
+
     job = jobs.CommandJob("session", 3600.0)
     job.admitted()
-    job.publish("stdout", "a" * (jobs.MAX_OUTPUT_EVENT_CHARS + 1))
+    content = ("abé\0" * 210_000) + "tail"
+    job.publish("stdout", content)
     job.publish("stderr", "err")
+    job.capture_result_output(
+        SimpleNamespace(stdout=content[:MAX_OUTPUT_CHARS], stderr="err"),
+        {"stdout": 0, "stderr": 0},
+    )
+    stdout = job.stream_result("stdout", len(content) - MAX_OUTPUT_CHARS)
+    stderr = job.stream_result("stderr", 0)
+    job.complete({"exit_code": 0, "stdout": stdout, "stderr": stderr})
 
-    first = job.read(0)
-    second = job.read(1)
-    assert first["status"] == "running"
-    assert [event["cursor"] for event in first["events"]] == [0, 1, 2]
-    assert first["next_cursor"] == 3
-    assert [event["stream"] for event in second["events"]] == ["stdout", "stderr"]
-    assert second["next_cursor"] == 3
+    assert stdout["capture_complete"] is True
+    assert stdout["captured_bytes"] == len(content.encode("utf-8"))
+    assert stdout["content"] != content
+    assert stderr["content"] == "err"
+    pages = []
+    cursor = None
+    while True:
+        page = job.read_output("stdout", cursor, MAX_TOOL_CONTENT_BYTES)
+        pages.append(page["content"])
+        cursor = page.get("next_cursor")
+        if cursor is None:
+            break
+    assert "".join(pages) == content
+    assert page["job_complete"] is True
+    assert page["capture_complete"] is True
+    assert "\0" in pages[0]
 
-    job.cancel()
-    job.complete({"exit_code": 0})
-    settled = job.read(3)
-    assert settled["status"] == "complete"
-    assert settled["cancel_requested"]
-    assert settled["events"] == []
-    assert settled["result"] == {"exit_code": 0}
 
-
-def test_completed_job_identifies_remaining_output_and_execution_limit():
-    """A completed job distinguishes unread pages from a still-running process."""
-    job = jobs.CommandJob("session", 7200.0)
+def test_command_job_output_pages_resume_while_the_process_is_running():
+    """A read returns the available page immediately and resumes from its exact byte cursor."""
+    job = jobs.CommandJob("session", 3600.0)
     job.admitted()
-    job.publish("stdout", "a" * (jobs.MAX_OUTPUT_EVENT_CHARS * (jobs.MAX_READ_EVENTS + 1)))
-    job.complete({"exit_code": 0})
+    job.publish("stdout", "€first")
+    first = job.read_output("stdout", None, 1)
+    assert first["content"] == "€"
+    assert first["included_bytes"] == 3
+    assert first["job_complete"] is False
+    assert first["capture_complete"] is False
 
-    first = job.read(0)
-    assert first["status"] == "complete"
-    assert first["runtime_limit_seconds"] == 7200.0
-    assert first["output_remaining"] is True
-    assert first["result"] is None
-    assert "command has completed" in first["continuation"]
+    job.publish("stdout", "second")
+    next_page = job.read_output("stdout", first["next_cursor"], 20)
+    assert next_page["content"] == "firstsecond"
+    assert next_page["start_byte"] == 3
+    assert next_page["job_complete"] is False
 
-    final = job.read(first["next_cursor"])
-    assert final["runtime_limit_seconds"] == 7200.0
-    assert final["output_remaining"] is False
-    assert final["result"] == {"exit_code": 0}
+
+def test_command_job_rejects_future_output_cursor():
+    """A future byte offset cannot hide output that arrives later."""
+    from loop.utils.content import encode_content_cursor
+
+    job = jobs.CommandJob("session", 3600.0)
+    job.publish("stdout", "first")
+    cursor = encode_content_cursor(job._outputs["stdout"].handle, 6)
+    with pytest.raises(ValueError, match="beyond the end"):
+        job.read_output("stdout", cursor, 10)
+    assert job.read_output("stdout", None, 10)["content"] == "first"
+
+
+def test_fallback_capture_does_not_claim_capped_output_is_complete():
+    """A native result fallback cannot masquerade as the complete live observer stream."""
+    from types import SimpleNamespace
+
+    from loop.constants import MAX_OUTPUT_CHARS
+
+    job = jobs.CommandJob("session", 3600.0)
+    job.capture_result_output(
+        SimpleNamespace(stdout="x" * MAX_OUTPUT_CHARS, stderr=""),
+        {"stdout": 0, "stderr": 0},
+    )
+    result = job.stream_result("stdout", 10)
+    assert result["captured_bytes"] == MAX_OUTPUT_CHARS
+    assert result["capture_complete"] is False
+    assert result["discarded_characters"] is None
+
+
+def test_job_poll_waits_for_completion_not_for_output(monkeypatch):
+    """Published stream data does not wake a poll before timeout or job completion."""
+    now = [0.0]
+    monkeypatch.setattr(jobs.time, "monotonic", lambda: now[0])
+    job = jobs.CommandJob("session", 3600.0)
+    job.admitted()
+    waits = []
+
+    def publish_during_wait(timeout):
+        """Publish output but leave the job active until the poll budget expires."""
+        waits.append(timeout)
+        job.publish("stdout", "available")
+        now[0] += timeout
+        return False
+
+    monkeypatch.setattr(job._condition, "wait", publish_during_wait)
+    status = job.poll(5)
+    assert waits == [5]
+    assert status["status"] == "running"
+    assert status["stdout_bytes"] == len("available")
+    assert not status["cancel_requested"]
+    assert not job.cancellation_event.is_set()
+
+
+def test_job_poll_returns_when_completion_wakes_it(monkeypatch):
+    """A completion notification ends the wait and returns only status metadata."""
+    job = jobs.CommandJob("session", 3600.0)
+    job.admitted()
+    waits = []
+
+    def complete_during_wait(timeout):
+        """Settle the command while poll is waiting on the completion condition."""
+        waits.append(timeout)
+        job.complete({"exit_code": 0})
+        return False
+
+    monkeypatch.setattr(job._condition, "wait", complete_during_wait)
+    status = job.poll(5)
+    assert waits == [5]
+    assert status["status"] == "complete"
+    assert status["exit_code"] == 0
+    assert "stdout" not in status
+
+
+def test_job_poll_interrupt_stops_wait_without_cancelling_command(monkeypatch):
+    """Cancelling a poll stops that caller's wait but leaves command ownership intact."""
+    job = jobs.CommandJob("session", 3600.0)
+    job.admitted()
+    interrupted = Event()
+
+    def interrupt_during_wait(_timeout):
+        """Simulate a call interruption while the job itself remains active."""
+        interrupted.set()
+        return False
+
+    monkeypatch.setattr(job._condition, "wait", interrupt_during_wait)
+    status = job.poll(5, cancellation_event=interrupted)
+    assert status["status"] == "running"
+    assert not status["cancel_requested"]
+    assert not job.cancellation_event.is_set()
 
 
 def test_command_job_elapsed_time_stops_at_completion(monkeypatch):
@@ -86,7 +188,7 @@ def test_command_job_elapsed_time_stops_at_completion(monkeypatch):
     assert job.inspect()["elapsed_seconds"] is None
     job.admitted()
     now[0] = 12.0
-    assert job.read(0)["elapsed_seconds"] == 2.0
+    assert job.inspect()["elapsed_seconds"] == 2.0
     now[0] = 15.0
     job.complete({"exit_code": 0})
     now[0] = 20.0
@@ -194,7 +296,7 @@ def test_detached_job_reports_an_unexpected_failure_once(monkeypatch):
     problem = Problem(code="command_job.failed", title="Failed", detail="Safe failure")
     job.complete(problem, error)
     assert job.result() is problem
-    assert job.read(0)["result"] == problem.model_dump()
+    assert job.inspect()["outcome"] == problem.code
     logged.assert_called_once()
     assert logged.call_args.args[1:] == (problem, error)
 
@@ -226,197 +328,19 @@ def test_initial_job_wait_stops_at_deadline_or_origin_cancellation(monkeypatch):
     assert not job.cancellation_event.is_set()
 
 
-def test_job_read_wait_expiry_keeps_the_admitted_job_running(monkeypatch):
-    """A read wait can expire without cancelling or completing the owned command."""
-    now = [4.0]
-    monkeypatch.setattr(jobs.time, "monotonic", lambda: now[0])
-    job = jobs.CommandJob("session", 3600.0)
-    job.admitted()
-
-    def expire(_condition, _predicate, timeout):
-        """Advance the controlled clock through the requested wait."""
-        now[0] += timeout
-        return False
-
-    monkeypatch.setattr(jobs.threading.Condition, "wait_for", expire)
-    page = job.read(0, wait_seconds=3)
-    assert page["status"] == "running"
-    assert page["elapsed_seconds"] == 3.0
-    assert page["events"] == []
-    assert page["result"] is None
-    assert not page["cancel_requested"]
-    assert not job.cancellation_event.is_set()
-
-
-def test_replayed_cursor_returns_immediately_and_next_cursor_waits(monkeypatch):
-    """Replayed events explain how to advance, while a current cursor waits for changes."""
-    job = jobs.CommandJob("session", 3600.0)
-    job.admitted()
-    job.publish("stderr", "first")
-    first = job.read(0)
-    waits = []
-
-    def wait_for(condition, predicate, timeout):
-        """Observe the wait predicate and simulate output when it is not already satisfied."""
-        waits.append((predicate(), timeout))
-        if not waits[-1][0]:
-            job.publish("stdout", "second")
-        return predicate()
-
-    monkeypatch.setattr(jobs.threading.Condition, "wait_for", wait_for)
-    replay = job.read(0, 30)
-    assert replay["events"] == first["events"]
-    assert "previously read output" in replay["continuation"]
-    next_page = job.read(replay["next_cursor"], 30)
-    assert waits == [(True, 30), (False, 30)]
-    assert next_page["events"][0]["content"] == "second"
-    assert "continuation" not in next_page
-
-
-def test_interrupting_job_read_leaves_command_running(monkeypatch):
-    """A run interruption ends the read promptly without cancelling the underlying job."""
-    job = jobs.CommandJob("session", 3600.0)
-    job.admitted()
-    interrupted = Event()
-    waits = []
-
-    def wait_for(condition, predicate, timeout):
-        """Simulate an interruption after one bounded condition wait."""
-        waits.append(timeout)
-        if len(waits) == 2:
-            interrupted.set()
-        return predicate()
-
-    monkeypatch.setattr(jobs.threading.Condition, "wait_for", wait_for)
-    monkeypatch.setattr(jobs.time, "monotonic", lambda: 1.0)
-    page = job.read(0, 100, cancellation_event=interrupted)
-    assert waits == [jobs.JOB_READ_CANCELLATION_CHECK_SECONDS] * 2
-    assert page["result"] is None
-    assert page["status"] == "running"
-    assert not job.cancellation_event.is_set()
-
-
-def test_job_read_with_cancellation_signal_honors_wait_deadline(monkeypatch):
-    """A quiet read returns at its deadline even when a cancellation signal is present."""
-    job = jobs.CommandJob("session", 3600.0)
-    clock = iter([1.0, 1.0, 2.0])
-    monkeypatch.setattr(jobs.time, "monotonic", lambda: next(clock))
-    wait = Mock(return_value=False)
-    monkeypatch.setattr(jobs.threading.Condition, "wait_for", wait)
-    page = job.read(0, 1, cancellation_event=Event())
-    assert page["events"] == []
-    assert [call.kwargs["timeout"] for call in wait.call_args_list] == [
-        jobs.JOB_READ_CANCELLATION_CHECK_SECONDS,
-        0,
-    ]
-
-
 def test_completed_job_ignores_late_output():
-    """A completed job cannot acquire events from a late pipe reader."""
+    """A completed job cannot append output from a late pipe reader."""
     job = jobs.CommandJob("session", 3600.0)
     job.publish("stdout", "before")
     job.complete({"exit_code": 0})
-    before = job.read(0)
+    before = job.output_sizes()
     job.publish("stdout", "after")
     job.publish("stderr", "after")
-    assert job.read(0) == before
-
-
-def test_fragmented_output_coalesces_without_changing_delivered_events():
-    """Small writes remain bounded and a cursor never skips later appended output."""
-    job = jobs.CommandJob("session", 3600.0)
-    for _ in range(10_000):
-        job.publish("stdout", "x")
-    first = job.read(0)
-    assert len(first["events"]) == 4
-    assert all(len(event["content"]) == jobs.MAX_OUTPUT_EVENT_CHARS for event in first["events"])
-    cursor = first["next_cursor"]
-    job.publish("stdout", "end")
-    collected = "".join(event["content"] for event in first["events"])
-    while cursor < job.inspect()["next_cursor"]:
-        page = job.read(cursor)
-        collected += "".join(event["content"] for event in page["events"])
-        cursor = page["next_cursor"]
-    assert collected == "x" * 10_000 + "end"
-    job.publish("stdout", "after-read")
-    page = job.read(cursor)
-    assert page["events"][0]["content"] == "after-read"
-
-
-def test_alternating_output_bounds_events_and_reports_loss(monkeypatch):
-    """Alternating streams cannot bypass the event limit or silently lose output."""
-    monkeypatch.setattr(jobs, "MAX_JOB_OUTPUT_EVENTS", 2)
-    job = jobs.CommandJob("session", 3600.0)
-    job.publish("stdout", "a")
-    job.publish("stderr", "b")
-    job.publish("stdout", "c")
-    expired = job.read(0)
-    assert expired.code == "command_job.cursor_expired"
-    assert expired.metadata["oldest_cursor"] == 1
-    assert job.inspect()["dropped_characters"] == 1
-    assert [event["content"] for event in job.read(1)["events"]] == ["b", "c"]
-
-
-@pytest.mark.parametrize("completed", [False, True])
-def test_future_cursor_is_rejected_without_skipping_output(completed):
-    """A future cursor cannot hide retained or subsequently published output."""
-    job = jobs.CommandJob("session", 3600.0)
-    job.publish("stdout", "first")
-    if completed:
-        job.complete({"exit_code": 0})
-    with pytest.raises(ValueError, match="beyond the produced output"):
-        job.read(2)
-    page = job.read(0)
-    assert page["events"][0]["content"] == "first"
-    assert (page["result"] is not None) is completed
-    if not completed:
-        job.publish("stdout", "second")
-        assert job.read(page["next_cursor"])["events"][0]["content"] == "second"
-
-
-def test_settled_result_waits_until_all_retained_pages_are_delivered():
-    """A completed job does not signal a final result before its output is paged."""
-    job = jobs.CommandJob("session", 3600.0)
-    for index in range(jobs.MAX_READ_EVENTS + 1):
-        job.publish("stdout" if index % 2 == 0 else "stderr", str(index))
-    job.complete({"exit_code": 0})
-    first = job.read(0)
-    assert first["status"] == "complete"
-    assert first["result"] is None
-    last = job.read(first["next_cursor"])
-    assert last["result"] == {"exit_code": 0}
-    assert last["events"][-1]["content"] == str(jobs.MAX_READ_EVENTS)
-
-
-@pytest.mark.parametrize("failure", [False, True])
-def test_settled_output_previews_are_available_only_on_request(failure):
-    """Pages avoid repeating captured output while retaining explicit full-result access."""
-    job = jobs.CommandJob("session", 3600.0)
-    job.publish("stdout", "visible")
-    output = {"stdout": {"content": "visible", "captured_bytes": 7, "tail": {"content": "e"}}}
-    result = (
-        Problem(code="test.failed", title="Failed", detail="Failed", metadata=output)
-        if failure
-        else output
-    )
-    job.complete(result)
-    page = job.read(0)
-    summary = page["result"]["metadata"] if failure else page["result"]
-    assert summary["stdout"] == {"captured_bytes": 7}
-    full = job.read(page["next_cursor"], include_output=True)["result"]
-    full = full["metadata"] if failure else full
-    assert full == output
-
-
-def test_settled_result_preserves_non_mapping_metadata():
-    """Results with no stream metadata remain available without transformation."""
-    job = jobs.CommandJob("session", 3600.0)
-    job.complete({"metadata": None})
-    assert job.read(0)["result"] == {"metadata": None}
+    assert job.output_sizes() == before
 
 
 def test_terminal_job_bounds_transient_controls_and_escapes_output():
-    """An owned terminal queues exact controls and renders unsafe output without retaining input."""
+    """An owned terminal queues exact controls and renders unsafe output visibly."""
     job = jobs.CommandJob("session", 3600.0, terminal=True)
     job.admitted()
     job.write_terminal("é\n")
@@ -424,9 +348,10 @@ def test_terminal_job_bounds_transient_controls_and_escapes_output():
     job.terminal_eof()
     job.terminal_interrupt()
     job.publish("stdout", "ready\x1b]52;c;secret\x07\r\n")
+    output = job.read_output("stdout", None, 100)
 
     assert job.inspect()["terminal"]
-    assert job.read(0)["events"][0]["content"] == "ready\u241b]52;c;secret\u2407\u240d\n"
+    assert output["content"] == "ready\u241b]52;c;secret\u2407\u240d\n"
     assert job.next_terminal_frame() == b"I\x00\x03\xc3\xa9\n"
     assert job.next_terminal_frame() == b"Z\x00\x1e\x00d"
     assert job.next_terminal_frame() == b"F"
@@ -480,45 +405,124 @@ def test_settled_job_rejects_late_admission_completion_and_cancel():
     job.cancel()
     assert job.inspect()["status"] == "complete"
     assert not job.inspect()["cancel_requested"]
-    assert job.read(0)["result"] == {"exit_code": 0}
+    assert job.result() == {"exit_code": 0}
 
 
-def test_command_job_expired_cursor_and_structured_failure(monkeypatch):
-    """A bounded ring reports lost earlier events and keeps a safe final failure."""
-    monkeypatch.setattr(jobs, "MAX_JOB_OUTPUT_BYTES", 4)
+def test_output_capture_failure_is_explicit_and_stops_the_command(monkeypatch):
+    """A failed spool write cancels execution and becomes an explicit capture problem."""
+    logged = Mock()
+    monkeypatch.setattr(jobs, "log_problem", logged)
+
+    def fail_append(_spool, _content):
+        """Represent an output filesystem that cannot retain another byte."""
+        raise OSError("disk full")
+
+    monkeypatch.setattr(jobs._ContentSpool, "append", fail_append)
     job = jobs.CommandJob("session", 3600.0)
-    job.publish("stdout", "abcd")
-    job.publish("stderr", "ef")
-    expired = job.read(0)
-    assert isinstance(expired, Problem)
-    assert expired.code == "command_job.cursor_expired"
-    assert expired.metadata == {"oldest_cursor": 1}
-    assert job.inspect()["dropped_characters"] == 4
+    job.publish("stdout", "unretained")
+    assert job.cancellation_event.is_set()
+    job.complete({"exit_code": 0})
+    result = job.result()
+    assert isinstance(result, Problem)
+    assert result.code == "command_output.capture_failed"
+    assert result.metadata["capture_failed"] is True
+    logged.assert_called_once()
 
-    failure = Problem(code="test.failed", title="Failed", detail="Safe failure")
-    job.complete(failure)
-    assert job.read(1)["result"] == failure.model_dump()
+
+def test_result_fallback_capture_failure_is_explicit_and_stops_the_command(monkeypatch):
+    """A failed fallback write is reported through the same capture-failure path."""
+    from types import SimpleNamespace
+
+    logged = Mock()
+    monkeypatch.setattr(jobs, "log_problem", logged)
+
+    def fail_append(_spool, _content):
+        """Represent a full filesystem when a backend result is retained."""
+        raise OSError("disk full")
+
+    monkeypatch.setattr(jobs._ContentSpool, "append", fail_append)
+    job = jobs.CommandJob("session", 3600.0)
+    job.capture_result_output(
+        SimpleNamespace(stdout="unretained", stderr=""),
+        {"stdout": 0, "stderr": 0},
+    )
+
+    assert job.cancellation_event.is_set()
+    job.complete({"exit_code": 0})
+    assert job.result().code == "command_output.capture_failed"
+    logged.assert_called_once()
 
 
 @pytest.mark.parametrize("stream", ["other", "", "STDOUT"])
 def test_command_job_rejects_unknown_output_stream(stream):
-    """Only the two authenticated process streams may enter a job page."""
+    """Only the two authenticated process streams may enter a job spool."""
     with pytest.raises(ValueError, match="output stream"):
         jobs.CommandJob("session", 3600.0).publish(stream, "x")
 
 
-@pytest.mark.parametrize("cursor", [-1, True, "0"])
-def test_command_job_rejects_invalid_cursor(cursor):
-    """Malformed cursors cannot silently restart output from zero."""
+@pytest.mark.parametrize("stream", ["other", "", "STDOUT"])
+def test_command_job_rejects_unknown_output_read_stream(stream):
+    """A read cannot address any stream outside stdout and stderr."""
+    with pytest.raises(ValueError, match="output stream"):
+        jobs.CommandJob("session", 3600.0).read_output(stream, None, 10)
+
+
+def test_command_job_rejects_unknown_output_result_stream():
+    """A final result cannot request metadata for an unowned stream."""
+    with pytest.raises(ValueError, match="output stream"):
+        jobs.CommandJob("session", 3600.0).stream_result("other", 0)
+
+
+@pytest.mark.parametrize("cursor", ["invalid", "", "0"])
+def test_command_job_rejects_invalid_output_cursor(cursor):
+    """Malformed or cross-stream cursors cannot silently restart output."""
     with pytest.raises(ValueError, match="cursor"):
-        jobs.CommandJob("session", 3600.0).read(cursor)
+        jobs.CommandJob("session", 3600.0).read_output("stdout", cursor, 10)
 
 
-@pytest.mark.parametrize("wait", [True, -1, float("inf"), float("nan"), "1"])
-def test_command_job_rejects_unbounded_wait(wait):
-    """A caller cannot request an invalid or unsupported wait."""
-    with pytest.raises(ValueError, match="wait"):
-        jobs.CommandJob("session", 3600.0).read(0, wait)
+@pytest.mark.parametrize("max_bytes", [True, 0, -1, "1"])
+def test_command_job_rejects_invalid_output_page_size(max_bytes):
+    """A page request must contain a positive byte ceiling."""
+    with pytest.raises(ValueError, match="max_bytes"):
+        jobs.CommandJob("session", 3600.0).read_output("stdout", None, max_bytes)
+
+
+@pytest.mark.parametrize(
+    "wait",
+    [True, -1, float("inf"), float("nan"), "1", jobs.constants.MAX_COMMAND_WAIT_SECONDS + 1],
+)
+def test_command_job_rejects_unbounded_poll_wait(wait):
+    """A poll wait must be finite and shorter than the hard per-call bound."""
+    with pytest.raises(ValueError, match="poll"):
+        jobs.CommandJob("session", 3600.0).poll(wait)
+
+
+def test_unreferenced_inline_output_is_discarded_but_exposed_output_survives():
+    """Small inline results release their files while returned handles preserve full streams."""
+    inline = jobs.CommandJob("session", 3600.0)
+    inline.publish("stdout", "small")
+    output = inline.stream_result("stdout", 0)
+    inline.release_unreferenced_output({"stdout": output})
+    with pytest.raises(ValueError, match="no longer retained"):
+        inline.read_output("stdout", None, 10)
+
+    exposed = jobs.CommandJob("session", 3600.0)
+    exposed.publish("stdout", "x" * jobs.constants.MAX_TOOL_CONTENT_BYTES)
+    result = exposed.stream_result("stdout", 0)
+    exposed.release_unreferenced_output(Problem(
+        code="test.failed", title="Failed", detail="Failed", metadata={"stdout": result}
+    ))
+    assert exposed.read_output("stdout", None, 10)["content"] == "x" * 10
+
+
+def test_exposed_command_output_survives_inline_result_cleanup():
+    """Once status exposes output handles, result rendering cannot discard their spools."""
+    job = jobs.CommandJob("session", 3600.0)
+    job.publish("stdout", "retained")
+    handles = job.output_handles()
+    job.release_unreferenced_output({})
+    assert handles["stdout"] == job._outputs["stdout"].handle
+    assert job.read_output("stdout", None, 20)["content"] == "retained"
 
 
 def test_command_jobs_create_distinct_workers_and_bind_handles_to_one_session(workers):
@@ -660,8 +664,10 @@ def test_command_jobs_report_worker_failure_and_start_failure(workers, monkeypat
     job = registry.start("owner", fail, runtime_limit_seconds=3600.0)
     workers[0].target()
     job.handoff()
-    assert job.read(0)["result"]["code"] == "command_job.failed"
-    assert "sensitive detail" not in job.read(0)["result"]["detail"]
+    result = job.result()
+    assert isinstance(result, Problem)
+    assert result.code == "command_job.failed"
+    assert "sensitive detail" not in result.detail
 
     def refused_start(_self):
         """Fail before a worker can own the attempt."""

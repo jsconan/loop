@@ -310,9 +310,9 @@ def read_cached_content(
 ) -> CachedContentResult | Problem:
     """Read a bounded, resumable portion of cached or explicitly referenced text."""
     try:
+        metadata = cached_metadata(handle)
         resolved = cached_path(handle)
         if resolved is None:
-            metadata = cached_metadata(handle)
             if metadata is None or not metadata["reloadable"]:
                 return Problem(
                     code="content.handle_expired",
@@ -346,6 +346,7 @@ def read_cached_content(
             start_line=None if start_byte is not None else start_line,
             max_lines=max_lines,
             max_bytes=max_bytes,
+            allow_nul=bool(metadata and metadata.get("allow_nul", False)),
         )
         result = _cached_result(handle, source, bounded)
         context.record_cached_read(handle)

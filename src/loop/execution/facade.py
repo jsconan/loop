@@ -30,11 +30,10 @@ from ..telemetry import telemetry_trace_event
 from ..utils import (
     ProcessCapture,
     VirtualPath,
-    encode_content_cursor,
     open_selected_file,
     ripgrep_path,
-    store_content,
 )
+from ..utils.content import _ContentSpool
 from ..utils.process import render_terminal_text
 from .coordinator import (
     CommandExecutionCoordinator,
@@ -46,8 +45,6 @@ from .jobs import (
     JOB_CLOSE_SECONDS,
     JOB_RETENTION_SECONDS,
     MAX_ACTIVE_JOBS,
-    MAX_JOB_OUTPUT_BYTES,
-    MAX_JOB_OUTPUT_EVENTS,
     MAX_RETAINED_JOBS,
     CommandJob,
     CommandJobs,
@@ -140,8 +137,6 @@ _HOST_AUTHORITY_NOTICE = (
     "authority, subject to independent OS and outer-environment restrictions. "
     "A further request may repeat effects."
 )
-# Both streams may contain characters that expand sixfold in serialized JSON.
-_STREAM_TAIL_BYTES = 512
 # Keep generated interpreter lines within the shortest supported native limit.
 _MAX_PORTABLE_SHEBANG_PREFIX_BYTES = 127
 _FORWARDING_SHELL_HEADER = os.fsencode(f"#!{constants.SHELL_COMMAND_PATH}\n")
@@ -193,44 +188,6 @@ class ExecutableGrant:
     identity: tuple[int, int]
     opt_aliases: tuple[tuple[Path, int, int, Path], ...]
     managed_package: bool
-
-
-def _stream_output(
-    chunks: list[str],
-    discarded: int | None,
-    source: str,
-) -> dict:
-    """Return bounded stream previews with capture and decoding-loss metadata."""
-    content = "".join(chunks)
-    encoded = content.encode("utf-8")
-    preview = encoded[: constants.MAX_TOOL_CONTENT_BYTES // 2].decode("utf-8", errors="ignore")
-    included = len(preview.encode("utf-8"))
-    result = {
-        "content": preview,
-        "captured_bytes": len(encoded),
-        "included_bytes": included,
-        "truncated": included < len(encoded) or discarded != 0,
-        "capture_complete": discarded == 0,
-        "discarded_characters": discarded,
-        "decoding_loss": "none" if discarded == 0 and "\ufffd" not in content else "unknown",
-    }
-    if included < len(encoded):
-        handle = store_content(encoded, source)
-        result.update(
-            handle=handle,
-            next_cursor=encode_content_cursor(handle, included),
-            continuation="Use read_cached_content with this handle and cursor.",
-        )
-        if discarded == 0:
-            tail = encoded[max(included, len(encoded) - _STREAM_TAIL_BYTES) :].decode(
-                "utf-8", errors="ignore"
-            )
-            result["tail"] = {
-                "content": tail,
-                "start_byte": len(encoded) - len(tail.encode("utf-8")),
-                "end_byte": len(encoded),
-            }
-    return result
 
 
 def _redact_denial_observation(
@@ -1183,32 +1140,26 @@ class CommandExecutionService:
             "limits": {
                 "active_jobs": MAX_ACTIVE_JOBS,
                 "retained_jobs": MAX_RETAINED_JOBS,
-                "output_bytes_per_job": MAX_JOB_OUTPUT_BYTES,
-                "output_events_per_job": MAX_JOB_OUTPUT_EVENTS,
                 "retention_seconds": JOB_RETENTION_SECONDS,
             },
         }
 
-    def read_command_job(
+    def poll_command_job(
         self,
         context: ToolContext,
         handle: str,
-        cursor: int = 0,
         wait_seconds: float | None = None,
-        include_output: bool = False,
     ) -> dict | Problem:
-        """Read one bounded page from a session-owned command without replaying it.
+        """Wait for one session-owned command to complete or until the poll timeout.
 
         Args:
             context (ToolContext): Current registry-bound session identity.
             handle (str): Opaque handle returned by the original command call.
-            cursor (int): Next output event cursor.
-            wait_seconds (float | None): Maximum wait for output or completion, or None for the
+            wait_seconds (float | None): Maximum wait for completion, or None for the
                 configured default; capped at the supported job-read limit.
-            include_output (bool): Include final captured stream previews explicitly.
 
         Returns:
-            dict | Problem: Ordered page and final result after retained output, or a safe refusal.
+            dict | Problem: Current lifecycle status without output content, or a safe refusal.
         """
         try:
             owner = self._job_owner(context)
@@ -1223,28 +1174,61 @@ class CommandExecutionService:
         if isinstance(job, Problem):
             return job
         if wait_seconds is None:
-            wait_seconds = context.settings.command_job_wait_seconds
-        if (
-            not isinstance(wait_seconds, bool)
-            and isinstance(wait_seconds, (int, float))
-            and (isinstance(wait_seconds, int) or math.isfinite(wait_seconds))
-            and wait_seconds >= 0
-        ):
             wait_seconds = min(
-                wait_seconds,
-                threading.TIMEOUT_MAX,
+                context.settings.command_job_wait_seconds,
+                constants.MAX_COMMAND_WAIT_SECONDS,
             )
         try:
-            return job.read(
-                cursor,
+            return job.poll(
                 wait_seconds,
-                include_output=include_output,
                 cancellation_event=context.cancellation_event,
             )
         except ValueError as error:
             return Problem(
-                code="command_job.invalid_read",
-                title="Invalid command job read",
+                code="command_job.invalid_poll",
+                title="Invalid command job poll",
+                detail=str(error),
+                operation=context.tool_name,
+            )
+
+    def read_command_output(
+        self,
+        context: ToolContext,
+        handle: str,
+        stream: str,
+        cursor: str | None = None,
+        max_bytes: int = constants.MAX_TOOL_CONTENT_BYTES,
+    ) -> dict | Problem:
+        """Read currently captured command text immediately from one owned stream.
+
+        Args:
+            context (ToolContext): Current registry-bound session identity.
+            handle (str): Opaque handle returned by the original command call.
+            stream (str): Captured ``stdout`` or ``stderr`` stream name.
+            cursor (str | None): Opaque continuation cursor, or None to start at byte zero.
+            max_bytes (int): Maximum UTF-8 bytes returned in this page.
+
+        Returns:
+            dict | Problem: One available text page and a cursor for later output, or a refusal.
+        """
+        try:
+            owner = self._job_owner(context)
+        except (OSError, ValueError):
+            return Problem(
+                code="command_job.unavailable",
+                title="Command output unavailable",
+                detail="Session scratch identity is unavailable.",
+                operation=context.tool_name,
+            )
+        job = self._jobs.get(owner, handle)
+        if isinstance(job, Problem):
+            return job
+        try:
+            return {"job_handle": handle, "stream": stream, **job.read_output(stream, cursor, max_bytes)}
+        except ValueError as error:
+            return Problem(
+                code="command_output.invalid_read",
+                title="Invalid command output read",
                 detail=str(error),
                 operation=context.tool_name,
             )
@@ -1433,6 +1417,7 @@ class CommandExecutionService:
             return None
 
         try:
+            output_sizes = job.output_sizes()
             attempt = coordinator.run_sandboxed(
                 request,
                 context.tool_name,
@@ -1450,6 +1435,8 @@ class CommandExecutionService:
                 ),
                 **reason_argument,
             )
+            if attempt.result is not None:
+                job.capture_result_output(attempt.result, output_sizes)
             possible_effects = attempt.result is not None and (
                 attempt.result.outcome is SandboxOutcome.COMPLETED
                 or attempt.result.possible_effects
@@ -1476,14 +1463,18 @@ class CommandExecutionService:
                         return admit_skills(skill_snapshot, lambda: None)
 
                     try:
+                        host_output_sizes = job.output_sizes()
                         retry = coordinator.retry_host_command(
                             attempt.offer,
                             request,
                             execution_timeout=context.settings.command_hard_timeout,
                             cancellation_event=context.cancellation_event,
                             on_admitted=complete_host_admission,
+                            output_observer=job.publish,
                             **({"on_authorized": host_authorized} if admit_skills else {}),
                         )
+                        if retry is not None:
+                            job.capture_result_output(retry, host_output_sizes)
                     finally:
                         if reserved_interaction:
                             job.end_interaction()
@@ -1602,8 +1593,8 @@ class CommandExecutionService:
                 if result.outcome is SandboxOutcome.COMPLETED or result.possible_effects
                 else "not_started",
             },
-            "stdout": _stream_output([result.stdout], result.stdout_discarded, "command stdout"),
-            "stderr": _stream_output([result.stderr], result.stderr_discarded, "command stderr"),
+            "stdout": job.stream_result("stdout", result.stdout_discarded),
+            "stderr": job.stream_result("stderr", result.stderr_discarded),
             "sandbox_diagnostics": {
                 "outcome": attempt.result.outcome.value,
                 "exit_code": attempt.result.exit_code,
@@ -1823,6 +1814,28 @@ class CommandExecutionService:
         coordinator = CommandExecutionCoordinator(
             self._backend, self._host_executor, context.permission_manager, context.interaction
         )
+        output_spools: dict[str, _ContentSpool] = {}
+        observed = {"stdout": False, "stderr": False}
+        output_lock = threading.Lock()
+        output_errors: list[OSError] = []
+
+        def output_spool(stream: str) -> _ContentSpool:
+            """Create each output artifact only when its stream produces data."""
+            with output_lock:
+                if stream not in output_spools:
+                    output_spools[stream] = _ContentSpool(f"host command {stream}")
+                return output_spools[stream]
+
+        def observe_output(stream: str, content: str) -> None:
+            """Retain every decoded host output chunk before bounded result capture."""
+            try:
+                output_spool(stream).append(content)
+            except OSError as error:
+                output_errors.append(error)
+                raise
+            with output_lock:
+                observed[stream] |= bool(content)
+
         try:
             result = coordinator.request_host_command(
                 request,
@@ -1830,6 +1843,7 @@ class CommandExecutionService:
                 reason,
                 execution_timeout=context.settings.command_hard_timeout,
                 cancellation_event=context.cancellation_event,
+                output_observer=observe_output,
             )
         except BaseException as exc:
             try:
@@ -1846,15 +1860,65 @@ class CommandExecutionService:
             )
         if result.outcome is SandboxOutcome.COMPLETED or result.possible_effects:
             context.invalidate_instructions()
+        try:
+            for stream in ("stdout", "stderr"):
+                content = getattr(result, stream)
+                if content and not observed[stream]:
+                    output_spool(stream).append(content)
+        except OSError as error:
+            output_errors.append(error)
+        complete = {
+            "stdout": result.stdout_discarded is not None
+            and (result.stdout_discarded == 0 or observed["stdout"]),
+            "stderr": result.stderr_discarded is not None
+            and (result.stderr_discarded == 0 or observed["stderr"]),
+        }
+
+        def stream_result(stream: str) -> dict:
+            """Render a retained stream or the empty bounded result for no output."""
+            spool = output_spools.get(stream)
+            if spool is not None:
+                return spool.stream_result(complete[stream] and not output_errors)
+            return {
+                "content": "",
+                "captured_bytes": 0,
+                "included_bytes": 0,
+                "truncated": not complete[stream] or bool(output_errors),
+                "capture_complete": complete[stream] and not output_errors,
+                "discarded_characters": 0 if complete[stream] and not output_errors else None,
+                "decoding_loss": "none" if complete[stream] and not output_errors else "unknown",
+            }
+
+        streams = {stream: stream_result(stream) for stream in ("stdout", "stderr")}
         output = {
             "boundary": "host",
             "authority_notice": _HOST_AUTHORITY_NOTICE,
             "exit_code": result.exit_code,
             "possible_effects": result.outcome is SandboxOutcome.COMPLETED
             or result.possible_effects,
-            "stdout": _stream_output([result.stdout], result.stdout_discarded, "command stdout"),
-            "stderr": _stream_output([result.stderr], result.stderr_discarded, "command stderr"),
+            **streams,
         }
+        if output_errors:
+            problem = Problem(
+                code="command_output.capture_failed",
+                title="Command output capture failed",
+                detail="Command output could not be retained completely.",
+                operation=context.tool_name,
+                metadata={
+                    "boundary": "host",
+                    "exit_code": result.exit_code,
+                    "possible_effects": output["possible_effects"],
+                    "output_handles": {
+                        stream: spool.handle for stream, spool in output_spools.items()
+                    },
+                    "capture_failed": True,
+                },
+            )
+            log_problem(_LOGGER, problem, output_errors[0])
+            return problem
+        for stream, spool in output_spools.items():
+            if "handle" not in streams[stream]:
+                spool.discard()
         if result.outcome is not SandboxOutcome.COMPLETED and result.possible_effects:
             output["recovery_hint"] = _interrupted_effect_notice("host")
         if result.outcome is SandboxOutcome.COMPLETED:
@@ -1915,8 +1979,8 @@ class CommandExecutionService:
                 retained only until the detached attempt enters native admission.
 
         Returns:
-            dict | Problem: Final bounded output, an owned continuation, or a typed failure that
-                may include a separate host offer.
+            dict | Problem: Final output, an owned continuation, or a typed failure that may
+                include a separate host offer.
         """
         with self._backend_lease() as available:
             if not available:
@@ -2010,18 +2074,24 @@ class CommandExecutionService:
         if job is None:
             runtime_settings = replace(context.settings)
             if wait_seconds is None:
-                wait_seconds = runtime_settings.command_timeout
+                wait_seconds = min(
+                    runtime_settings.command_timeout,
+                    constants.MAX_COMMAND_WAIT_SECONDS,
+                )
             if (
                 isinstance(wait_seconds, bool)
                 or not isinstance(wait_seconds, (int, float))
                 or isinstance(wait_seconds, float)
                 and not math.isfinite(wait_seconds)
-                or wait_seconds < 0
+                or not 0 <= wait_seconds <= constants.MAX_COMMAND_WAIT_SECONDS
             ):
                 return Problem(
                     code="command_job.invalid_wait",
                     title="Invalid command wait",
-                    detail="The initial wait must be a finite nonnegative number of seconds.",
+                    detail=(
+                        "The initial wait must be finite and between 0 and "
+                        f"{constants.MAX_COMMAND_WAIT_SECONDS} seconds."
+                    ),
                     operation=context.tool_name,
                 )
             if context.cancellation_event is not None and context.cancellation_event.is_set():
@@ -2125,19 +2195,13 @@ class CommandExecutionService:
                     retrieving_result = False
                     reserved.handoff(context.cancellation_event)
                     if result is not None:
+                        reserved.release_unreferenced_output(result)
                         return result
                     response = {
                         **reserved.inspect(),
-                        "continuation": (
-                            "Use read_command_job with this handle and its next cursor."
-                        ),
+                        "continuation": "Use poll_command_job to wait for completion and "
+                        "read_command_output to read captured stdout or stderr.",
                     }
-                    page = reserved.read(response["oldest_cursor"])
-                    if isinstance(page, Problem):
-                        return page.model_copy(
-                            update={"metadata": {**page.metadata, "handle": reserved.handle}}
-                        )
-                    response.update(page)
                     return response
             except (OSError, ValueError, SessionExecutionConflictError):
                 if isinstance(reserved, CommandJob):
