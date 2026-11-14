@@ -262,9 +262,7 @@ class _ContentSpool:
             or isinstance(max_bytes, bool)
             or not 1 <= max_bytes <= constants.MAX_TOOL_CONTENT_BYTES
         ):
-            raise ValueError(
-                f"max_bytes must be between 1 and {constants.MAX_TOOL_CONTENT_BYTES}."
-            )
+            raise ValueError(f"max_bytes must be between 1 and {constants.MAX_TOOL_CONTENT_BYTES}.")
         with self._lock:
             if start_byte > self._size_bytes:
                 raise ValueError("Content cursor is beyond the end of the content.")

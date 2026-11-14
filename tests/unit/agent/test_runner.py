@@ -1239,7 +1239,11 @@ def test_runner_waits_for_one_configured_command_without_an_extra_turn(tmp_path,
         [run_command],
         permission_manager=PermissionManager(tmp_path),
         execution_service=CommandExecutionService(native, Mock()),
-        settings=ToolRuntimeSettings(command_timeout=75, command_hard_timeout=75),
+        settings=ToolRuntimeSettings(
+            command_default_initial_wait_seconds=75,
+            command_job_runtime_limit_seconds=75,
+            command_max_wait_seconds=75,
+        ),
     )
     runner = file_runner(tmp_path, model, registry=registry)
     runner.session_manager.add_user_message("Run the task")

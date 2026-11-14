@@ -42,8 +42,8 @@ def _registry(
     workspace: Path,
     *,
     terminal: bool = False,
-    command_timeout: float = 10,
-    command_hard_timeout: float = 3600,
+    command_default_initial_wait_seconds: float = 10,
+    command_job_runtime_limit_seconds: float = 3600,
 ) -> tuple[ToolRegistry, Mock, SessionManager]:
     """Compose public command tools with one real native backend and approval surface."""
     interaction = Mock()
@@ -66,7 +66,8 @@ def _registry(
         permission_manager=permissions,
         execution_service=CommandExecutionService(backend, LocalHostCommandExecutor()),
         settings=ToolRuntimeSettings(
-            command_timeout=command_timeout, command_hard_timeout=command_hard_timeout
+            command_default_initial_wait_seconds=command_default_initial_wait_seconds,
+            command_job_runtime_limit_seconds=command_job_runtime_limit_seconds,
         ),
         session_manager=sessions,
     )
@@ -229,8 +230,8 @@ def test_native_command_continuation_retains_output_and_session_ownership(native
         assert "stdout" not in final["result"].get("metadata", {})
         assert final["main_process"] == "exited"
         assert final["descendant_cleanup"] == "uncertain"
-        observed = _read_complete_output(registry, interaction, handle)
-        assert observed == "first\nlast\n"
+        assert final["stdout"]["content"] == "first\nlast\n"
+        observed = final["stdout"]["content"]
         end_cursor = encode_content_cursor(output_handle, len(observed.encode("utf-8")))
         assert _read_output_page(registry, interaction, handle, cursor=end_cursor)["content"] == ""
         sessions.new_session()
@@ -274,7 +275,9 @@ def test_native_command_cancel_reports_uncertain_detached_cleanup(native_workspa
 def test_native_command_default_wait_continues_same_process(native_workspace):
     """The configured initial wait yields a cursor while the original process continues."""
     registry, interaction, _sessions = _registry(
-        native_workspace, command_timeout=0.1, command_hard_timeout=10
+        native_workspace,
+        command_default_initial_wait_seconds=0.1,
+        command_job_runtime_limit_seconds=10,
     )
     try:
         started = _call(
@@ -298,7 +301,9 @@ def test_native_command_default_wait_continues_same_process(native_workspace):
 def test_native_command_hard_deadline_after_continuation(native_workspace):
     """A short wait preserves one command until its separate hard deadline stops it."""
     registry, interaction, _sessions = _registry(
-        native_workspace, command_timeout=0.1, command_hard_timeout=2
+        native_workspace,
+        command_default_initial_wait_seconds=0.1,
+        command_job_runtime_limit_seconds=2,
     )
     marker = native_workspace / "deadline-count"
     try:
@@ -353,15 +358,7 @@ def test_native_async_public_dispatch_retains_job_owner(native_workspace):
             )
             assert page["ok"], page
             if page["result"]["status"] == "complete":
-                output = json.loads(
-                    await registry.call_async(
-                        "read_command_output",
-                        json.dumps({"handle": handle, "stream": "stdout"}),
-                        interaction=interaction,
-                    )
-                )
-                assert output["ok"], output
-                assert output["result"]["content"] == "asyncdone"
+                assert page["result"]["stdout"]["content"] == "asyncdone"
                 return
         pytest.fail("The asynchronous native job did not settle.")
 

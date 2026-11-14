@@ -681,9 +681,10 @@ def test_safe_config_changes_apply_during_runs_and_hide_unsafe_values(tmp_path):
     assert "app.max_agent_turns" in {item.text for item in setting_values}
     assert not any(item.text.startswith("backend.") for item in setting_values)
     assert {
-        "tools.command_timeout",
-        "tools.command_hard_timeout",
-        "tools.command_job_wait_seconds",
+        "tools.command_job_runtime_limit_seconds",
+        "tools.command_default_initial_wait_seconds",
+        "tools.command_default_poll_wait_seconds",
+        "tools.command_max_wait_seconds",
     } <= {item.text for item in completion.get_completions(Document("/config set tools."), Mock())}
 
     manager.handle_user_command("/config set backend.base_url https://new.example scope=session")

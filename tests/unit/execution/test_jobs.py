@@ -1,5 +1,6 @@
 """Verify command output spooling and process-local session ownership."""
 
+import json
 from threading import Event, Thread
 from unittest.mock import Mock
 
@@ -7,6 +8,7 @@ import pytest
 
 from loop.errors import Problem
 from loop.execution import jobs
+from loop.utils.content import encode_content_cursor
 
 
 @pytest.fixture
@@ -138,12 +140,14 @@ def test_job_poll_waits_for_completion_not_for_output(monkeypatch):
     assert waits == [5]
     assert status["status"] == "running"
     assert status["stdout_bytes"] == len("available")
+    assert status["stdout"]["content"] == "available"
+    assert status["stdout"]["next_cursor"]
     assert not status["cancel_requested"]
     assert not job.cancellation_event.is_set()
 
 
 def test_job_poll_returns_when_completion_wakes_it(monkeypatch):
-    """A completion notification ends the wait and returns only status metadata."""
+    """A completion notification ends the wait and returns output with status."""
     job = jobs.CommandJob("session", 3600.0)
     job.admitted()
     waits = []
@@ -159,7 +163,71 @@ def test_job_poll_returns_when_completion_wakes_it(monkeypatch):
     assert waits == [5]
     assert status["status"] == "complete"
     assert status["exit_code"] == 0
-    assert "stdout" not in status
+    assert status["stdout"]["content"] == ""
+    assert status["stderr"]["content"] == ""
+
+
+def test_job_poll_cursors_return_only_new_output_pages():
+    """Per-stream cursors continue after prior poll output without repeating text."""
+    job = jobs.CommandJob("session", 3600.0)
+    job.admitted()
+    job.publish("stdout", "first")
+    first = job.poll(0)
+    cursor = first["stdout"]["next_cursor"]
+
+    job.publish("stdout", "second")
+    second = job.poll(0, stdout_cursor=cursor)
+
+    assert first["stdout"]["content"] == "first"
+    assert second["stdout"]["content"] == "second"
+    assert second["stdout"]["start_byte"] == len("first")
+
+
+def test_job_poll_pages_fit_the_tool_result_budget():
+    """Poll pages shrink when escaped text would exceed the complete result budget."""
+    from loop.constants import MAX_TOOL_RESULT_BYTES
+
+    job = jobs.CommandJob("session", 3600.0)
+    job.admitted()
+    job.publish("stdout", "\x01" * 5000)
+    job.publish("stderr", "\x02" * 5000)
+
+    status = job.poll(0)
+
+    assert len(json.dumps({"ok": True, "result": status}).encode("utf-8")) < MAX_TOOL_RESULT_BYTES
+    assert status["stdout"]["included_bytes"] < status["stdout"]["captured_bytes"]
+    assert status["stderr"]["included_bytes"] < status["stderr"]["captured_bytes"]
+    assert status["stdout"]["next_cursor"]
+    assert status["stderr"]["next_cursor"]
+
+
+def test_job_poll_reduces_page_to_zero_when_the_envelope_budget_is_too_small(monkeypatch):
+    """A zero-byte poll page keeps its cursor when no content fits the result envelope."""
+    monkeypatch.setattr(jobs.constants, "MAX_TOOL_RESULT_BYTES", 128)
+    monkeypatch.setattr(jobs.constants, "MAX_TOOL_CONTENT_BYTES", 1)
+    job = jobs.CommandJob("session", 3600.0)
+    job.admitted()
+    job.publish("stdout", "x")
+    job.complete({"exit_code": 0})
+
+    status = job.status_with_output()
+
+    assert status["stdout"]["content"] == ""
+    assert status["stderr"]["content"] == ""
+    assert status["stdout"]["included_bytes"] == 0
+    assert status["stderr"]["included_bytes"] == 0
+    assert status["stdout"]["next_cursor"]
+
+
+def test_job_poll_rejects_cursor_beyond_current_output():
+    """A cursor into future bytes is rejected before the poll starts waiting."""
+    job = jobs.CommandJob("session", 3600.0)
+    job.admitted()
+    job.publish("stdout", "current")
+    future = encode_content_cursor(job._outputs["stdout"].handle, 100)
+
+    with pytest.raises(ValueError, match="beyond the end"):
+        job.poll(5, stdout_cursor=future)
 
 
 def test_job_poll_interrupt_stops_wait_without_cancelling_command(monkeypatch):
@@ -497,6 +565,16 @@ def test_command_job_rejects_unbounded_poll_wait(wait):
         jobs.CommandJob("session", 3600.0).poll(wait)
 
 
+@pytest.mark.parametrize(
+    "maximum",
+    [True, -1, float("inf"), float("nan"), "1", jobs.constants.MAX_COMMAND_WAIT_SECONDS + 1],
+)
+def test_command_job_rejects_invalid_poll_maximum(maximum):
+    """A configured maximum outside the supported wait range is rejected."""
+    with pytest.raises(ValueError, match="maximum"):
+        jobs.CommandJob("session", 3600.0).poll(0, max_wait_seconds=maximum)
+
+
 def test_unreferenced_inline_output_is_discarded_but_exposed_output_survives():
     """Small inline results release their files while returned handles preserve full streams."""
     inline = jobs.CommandJob("session", 3600.0)
@@ -509,9 +587,9 @@ def test_unreferenced_inline_output_is_discarded_but_exposed_output_survives():
     exposed = jobs.CommandJob("session", 3600.0)
     exposed.publish("stdout", "x" * jobs.constants.MAX_TOOL_CONTENT_BYTES)
     result = exposed.stream_result("stdout", 0)
-    exposed.release_unreferenced_output(Problem(
-        code="test.failed", title="Failed", detail="Failed", metadata={"stdout": result}
-    ))
+    exposed.release_unreferenced_output(
+        Problem(code="test.failed", title="Failed", detail="Failed", metadata={"stdout": result})
+    )
     assert exposed.read_output("stdout", None, 10)["content"] == "x" * 10
 
 

@@ -60,7 +60,7 @@ from ..utils import (
     is_async_callable,
     settle_future_async,
 )
-from .context import CommandEgressAuthority, ToolContext
+from .context import ToolContext
 from .file_observations import FileObservations
 from .models import (
     ToolExecutionAdmissionRejected,
@@ -1080,6 +1080,8 @@ class ToolRegistry:
                 if not self._platform_capability(item.capability):
                     definition.parameters["properties"].pop(item.argument)
                     definition.parameters["required"].remove(item.argument)
+            if tool.definition_transform is not None:
+                definition = tool.definition_transform(definition, self._settings)
             definitions.append(definition)
         return definitions
 
@@ -1473,11 +1475,9 @@ class ToolRegistry:
                     instructions_manager,
                     file_observations,
                 ),
-                command=(
-                    getattr(tool.function, "__module__", None) == "loop.tools.system"
-                    and getattr(tool.function, "__name__", None) == "run_command"
-                ),
             )
+            if tool.worker_context_transform is not None:
+                worker_context = tool.worker_context_transform(context, worker_context)
             active_context = worker_context
         try:
 
@@ -1974,8 +1974,6 @@ class ToolRegistry:
         context: ToolContext,
         portal: ToolExecutionPortal,
         additional_authorizer: (Callable[[dict[str, object]], Awaitable[OperationPlan]] | None),
-        *,
-        command: bool = False,
     ) -> ToolContext:
         """Give a worker detached values and owner-thread proxies for session services."""
         return ToolContext(
@@ -2008,40 +2006,6 @@ class ToolRegistry:
             ),
             execution_service=context.execution_service,
             session_manager=context.session_manager,
-            standalone_execution=(
-                context.permission_manager.standalone_execution
-                if command and context.permission_manager is not None
-                else None
-            ),
-            invalidate_detached=(
-                partial(context.instructions_manager.invalidate, None)
-                if command and context.instructions_manager is not None
-                else None
-            ),
-            egress_authority=(
-                CommandEgressAuthority(
-                    context.permission_manager.bind_egress,
-                    context.permission_manager.unbind_egress,
-                    context.permission_manager.try_egress_policy_revision,
-                )
-                if command and context.permission_manager is not None
-                else None
-            ),
-            audit_host_detached=(
-                context.permission_manager.record_host_boundary
-                if command and context.permission_manager is not None
-                else None
-            ),
-            command_admission=context.command_admission,
-            command_authorities=(context.permission_manager, context.instructions_manager)
-            if command
-            else None,
-            command_paths=context.command_paths,
-            admit_skills_detached=(
-                context.instructions_manager.admit_command_skills
-                if command and context.instructions_manager is not None
-                else None
-            ),
             file_versions={},
             read_versions={},
             cancellation_event=context.cancellation_event,

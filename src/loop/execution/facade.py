@@ -1149,17 +1149,24 @@ class CommandExecutionService:
         context: ToolContext,
         handle: str,
         wait_seconds: float | None = None,
+        stdout_cursor: str | None = None,
+        stderr_cursor: str | None = None,
     ) -> dict | Problem:
-        """Wait for one session-owned command to complete or until the poll timeout.
+        """Wait for one session-owned command and return available output pages.
 
         Args:
             context (ToolContext): Current registry-bound session identity.
             handle (str): Opaque handle returned by the original command call.
             wait_seconds (float | None): Maximum wait for completion, or None for the
-                configured default; capped at the supported job-read limit.
+                configured poll default; capped at ``command_max_wait_seconds``.
+            stdout_cursor (str | None): Cursor returned by the prior stdout page, or None to start
+                at the beginning of that stream.
+            stderr_cursor (str | None): Cursor returned by the prior stderr page, or None to start
+                at the beginning of that stream.
 
         Returns:
-            dict | Problem: Current lifecycle status without output content, or a safe refusal.
+            dict | Problem: Current lifecycle status and one bounded page from each stream, or a
+                safe refusal.
         """
         try:
             owner = self._job_owner(context)
@@ -1174,13 +1181,13 @@ class CommandExecutionService:
         if isinstance(job, Problem):
             return job
         if wait_seconds is None:
-            wait_seconds = min(
-                context.settings.command_job_wait_seconds,
-                constants.MAX_COMMAND_WAIT_SECONDS,
-            )
+            wait_seconds = context.settings.command_default_poll_wait_seconds
         try:
             return job.poll(
                 wait_seconds,
+                max_wait_seconds=context.settings.command_max_wait_seconds,
+                stdout_cursor=stdout_cursor,
+                stderr_cursor=stderr_cursor,
                 cancellation_event=context.cancellation_event,
             )
         except ValueError as error:
@@ -1224,7 +1231,11 @@ class CommandExecutionService:
         if isinstance(job, Problem):
             return job
         try:
-            return {"job_handle": handle, "stream": stream, **job.read_output(stream, cursor, max_bytes)}
+            return {
+                "job_handle": handle,
+                "stream": stream,
+                **job.read_output(stream, cursor, max_bytes),
+            }
         except ValueError as error:
             return Problem(
                 code="command_output.invalid_read",
@@ -1422,7 +1433,7 @@ class CommandExecutionService:
                 request,
                 context.tool_name,
                 prelaunch_failure=prelaunch_failure,
-                execution_timeout=context.settings.command_hard_timeout,
+                execution_timeout=context.settings.command_job_runtime_limit_seconds,
                 cancellation_event=context.cancellation_event,
                 admission_cancellation_event=admission_cancellation_event,
                 on_admitted=sandbox_admitted,
@@ -1467,7 +1478,7 @@ class CommandExecutionService:
                         retry = coordinator.retry_host_command(
                             attempt.offer,
                             request,
-                            execution_timeout=context.settings.command_hard_timeout,
+                            execution_timeout=context.settings.command_job_runtime_limit_seconds,
                             cancellation_event=context.cancellation_event,
                             on_admitted=complete_host_admission,
                             output_observer=job.publish,
@@ -1800,7 +1811,7 @@ class CommandExecutionService:
                 network=False,
                 environment=environment,
                 policy_version="host-request-v1",
-                deadline=time.monotonic() + context.settings.command_hard_timeout,
+                deadline=time.monotonic() + context.settings.command_job_runtime_limit_seconds,
                 workspace_id=str(workspace),
                 scratch_root=scratch,
             )
@@ -1841,7 +1852,7 @@ class CommandExecutionService:
                 request,
                 context.tool_name,
                 reason,
-                execution_timeout=context.settings.command_hard_timeout,
+                execution_timeout=context.settings.command_job_runtime_limit_seconds,
                 cancellation_event=context.cancellation_event,
                 output_observer=observe_output,
             )
@@ -1973,7 +1984,7 @@ class CommandExecutionService:
             reason (str | None): Explanation shown to the user for additional sandbox authority.
             interactive (bool): Return an owned terminal handle after approval where qualified.
             wait_seconds (float | None): Initial wait after admission, or None for the configured
-                default.
+                default, bounded by ``command_max_wait_seconds``.
             job (CommandJob | None): Internal owner of a previously reserved command attempt.
             admission_cancellation_event (threading.Event | None): Original run stop signal
                 retained only until the detached attempt enters native admission.
@@ -2029,13 +2040,19 @@ class CommandExecutionService:
         """Bind and execute a command while its selected backend lease remains active."""
         try:
             command_deadline(
-                context.settings.command_hard_timeout, constants.COMMAND_PREPARATION_SECONDS
+                context.settings.command_job_runtime_limit_seconds,
+                constants.COMMAND_PREPARATION_SECONDS,
             )
         except ValueError:
             return Problem(
                 code="command_job.invalid_runtime",
                 title="Command runtime limit is not representable",
-                detail="Reduce tools.command_hard_timeout to a value supported by this clock.",
+                detail=(
+                    "The active total runtime limit of "
+                    f"{context.settings.command_job_runtime_limit_seconds:g} seconds "
+                    "(tools.command_job_runtime_limit_seconds) exceeds the range supported "
+                    "by this clock."
+                ),
                 operation=context.tool_name,
             )
         if interactive and SandboxCapability.TERMINAL not in self.backend_capabilities:
@@ -2074,23 +2091,22 @@ class CommandExecutionService:
         if job is None:
             runtime_settings = replace(context.settings)
             if wait_seconds is None:
-                wait_seconds = min(
-                    runtime_settings.command_timeout,
-                    constants.MAX_COMMAND_WAIT_SECONDS,
-                )
+                wait_seconds = runtime_settings.command_default_initial_wait_seconds
             if (
                 isinstance(wait_seconds, bool)
                 or not isinstance(wait_seconds, (int, float))
                 or isinstance(wait_seconds, float)
                 and not math.isfinite(wait_seconds)
-                or not 0 <= wait_seconds <= constants.MAX_COMMAND_WAIT_SECONDS
+                or not 0 <= wait_seconds <= runtime_settings.command_max_wait_seconds
+                or runtime_settings.command_max_wait_seconds > constants.MAX_COMMAND_WAIT_SECONDS
             ):
                 return Problem(
                     code="command_job.invalid_wait",
                     title="Invalid command wait",
                     detail=(
                         "The initial wait must be finite and between 0 and "
-                        f"{constants.MAX_COMMAND_WAIT_SECONDS} seconds."
+                        f"{runtime_settings.command_max_wait_seconds:g} seconds, as configured by "
+                        "tools.command_max_wait_seconds."
                     ),
                     operation=context.tool_name,
                 )
@@ -2174,7 +2190,9 @@ class CommandExecutionService:
                         reserved = self._jobs.start(
                             owner,
                             execute,
-                            runtime_limit_seconds=runtime_settings.command_hard_timeout,
+                            runtime_limit_seconds=(
+                                runtime_settings.command_job_runtime_limit_seconds
+                            ),
                             on_settled=authority_lease.release,
                             **({"terminal": True} if interactive else {}),
                         )
@@ -2198,9 +2216,10 @@ class CommandExecutionService:
                         reserved.release_unreferenced_output(result)
                         return result
                     response = {
-                        **reserved.inspect(),
-                        "continuation": "Use poll_command_job to wait for completion and "
-                        "read_command_output to read captured stdout or stderr.",
+                        **reserved.status_with_output(),
+                        "continuation": "Use poll_command_job to wait for completion and read "
+                        "new output. Pass stdout.next_cursor and stderr.next_cursor to continue; "
+                        "use read_command_output for immediate additional pages.",
                     }
                     return response
             except (OSError, ValueError, SessionExecutionConflictError):
@@ -3078,7 +3097,7 @@ class CommandExecutionService:
                 policy_version=self._backend.policy_version
                 if isinstance(getattr(self._backend, "policy_version", None), str)
                 else "native-v1",
-                deadline=time.monotonic() + context.settings.command_hard_timeout,
+                deadline=time.monotonic() + context.settings.command_job_runtime_limit_seconds,
                 workspace_id=str(workspace),
                 git_create=git_create,
                 read_context=read_context,

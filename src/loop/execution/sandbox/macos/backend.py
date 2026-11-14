@@ -2948,9 +2948,7 @@ class MacOSSeatbeltBackend:
                     chunk = pending_marker[len(shell_marker) :]
                     pending_marker = ""
                     if output_observer is not None:
-                        pending_stderr.replay(
-                            lambda pending: output_observer("stderr", pending)
-                        )
+                        pending_stderr.replay(lambda pending: output_observer("stderr", pending))
                     else:
                         pending_stderr.close()
                 if marker_valid and chunk and output_observer is not None:

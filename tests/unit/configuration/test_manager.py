@@ -565,9 +565,10 @@ def test_initialize_creates_private_commented_defaults(tmp_path):
     assert 'api_key = "local-api-key"' in content
     assert "# context_window = <unset>" in content
     assert "[tools]" in content
-    assert "command_timeout = 10.0" in content
-    assert "command_hard_timeout = 3600.0" in content
-    assert "command_job_wait_seconds = 30.0" in content
+    assert "command_job_runtime_limit_seconds = 3600.0" in content
+    assert "command_default_initial_wait_seconds = 10.0" in content
+    assert "command_default_poll_wait_seconds = 30.0" in content
+    assert "command_max_wait_seconds = 60.0" in content
     assert path.stat().st_mode & 0o777 == 0o600
     assert manager.load().backend.api_key.get_secret_value() == "local-api-key"
 
@@ -594,9 +595,10 @@ def test_environment_overrides_persisted_values(tmp_path):
     settings = manager.load(
         {
             "DEFAULT_MODEL": "environment-model",
-            "LOOP_COMMAND_TIMEOUT": "0.25",
-            "LOOP_COMMAND_HARD_TIMEOUT": "120.5",
-            "LOOP_COMMAND_JOB_WAIT_SECONDS": "0.1",
+            "LOOP_COMMAND_DEFAULT_INITIAL_WAIT_SECONDS": "0.25",
+            "LOOP_COMMAND_JOB_RUNTIME_LIMIT_SECONDS": "120.5",
+            "LOOP_COMMAND_DEFAULT_POLL_WAIT_SECONDS": "0.1",
+            "LOOP_COMMAND_MAX_WAIT_SECONDS": "45",
             "LOOP_TEMPERATURE": "0.7",
             "LOOP_REASONING_EFFORT": "low",
             "OPENAI_HYPERPARAMETER_POLICY": "fallback",
@@ -604,44 +606,47 @@ def test_environment_overrides_persisted_values(tmp_path):
     )
 
     assert settings.backend.default_model == "environment-model"
-    assert settings.tools.command_timeout == 0.25
-    assert settings.tools.command_hard_timeout == 120.5
-    assert settings.tools.command_job_wait_seconds == 0.1
+    assert settings.tools.command_default_initial_wait_seconds == 0.25
+    assert settings.tools.command_job_runtime_limit_seconds == 120.5
+    assert settings.tools.command_default_poll_wait_seconds == 0.1
+    assert settings.tools.command_max_wait_seconds == 45
     assert settings.app.temperature == 0.7
     assert settings.app.reasoning_effort == "low"
     assert settings.backend.hyperparameter_policy == "fallback"
 
 
 @pytest.mark.parametrize("value", [-1, float("inf"), float("-inf"), float("nan")])
-def test_command_timeout_requires_a_nonnegative_finite_duration(tmp_path, value):
+def test_command_initial_wait_requires_a_nonnegative_finite_duration(tmp_path, value):
     """Configuration rejects invalid initial command waits."""
     manager = ConfigurationManager(tmp_path / ".loop" / "config.toml")
     manager.initialize()
     manager.load()
 
     with pytest.raises(ValidationError):
-        manager.set_session("tools.command_timeout", value)
+        manager.set_session("tools.command_default_initial_wait_seconds", value)
 
-    assert manager.effective.tools.command_timeout == 10.0
+    assert manager.effective.tools.command_default_initial_wait_seconds == 10.0
 
 
 @pytest.mark.parametrize("value", [0, -1, float("inf"), float("-inf"), float("nan")])
-def test_command_hard_timeout_requires_a_positive_finite_duration(tmp_path, value):
-    """Configuration rejects invalid hard execution limits."""
+def test_command_runtime_limit_requires_a_positive_finite_duration(tmp_path, value):
+    """Configuration rejects invalid total command runtime limits."""
     manager = ConfigurationManager(tmp_path / ".loop" / "config.toml")
     manager.initialize()
     manager.load()
 
     with pytest.raises(ValidationError):
-        manager.set_session("tools.command_hard_timeout", value)
+        manager.set_session("tools.command_job_runtime_limit_seconds", value)
 
-    assert manager.effective.tools.command_hard_timeout == 3600.0
+    assert manager.effective.tools.command_job_runtime_limit_seconds == 3600.0
 
 
-@pytest.mark.parametrize("setting", ["command_timeout", "command_job_wait_seconds"])
-@pytest.mark.parametrize("value", [0, constants.MAX_COMMAND_WAIT_SECONDS + 1])
-def test_command_wait_settings_preserve_finite_values(tmp_path, setting, value):
-    """Configuration retains finite waits even when each public call has a shorter cap."""
+@pytest.mark.parametrize(
+    "setting", ["command_default_initial_wait_seconds", "command_default_poll_wait_seconds"]
+)
+@pytest.mark.parametrize("value", [0, constants.DEFAULT_COMMAND_MAX_WAIT_SECONDS])
+def test_command_wait_defaults_accept_values_through_the_configured_cap(tmp_path, setting, value):
+    """Configuration accepts finite default waits up to the shared maximum."""
     manager = ConfigurationManager(tmp_path / ".loop" / "config.toml")
     manager.initialize()
     manager.load()
@@ -652,23 +657,106 @@ def test_command_wait_settings_preserve_finite_values(tmp_path, setting, value):
 
 
 @pytest.mark.parametrize("value", [-1, float("inf"), float("-inf"), float("nan")])
-def test_command_job_wait_requires_a_nonnegative_finite_duration(tmp_path, value):
+def test_command_poll_wait_requires_a_nonnegative_finite_duration(tmp_path, value):
     """Configuration rejects negative and non-finite default polling waits."""
     manager = ConfigurationManager(tmp_path / ".loop" / "config.toml")
     manager.initialize()
     manager.load()
     with pytest.raises(ValidationError):
-        manager.set_session("tools.command_job_wait_seconds", value)
+        manager.set_session("tools.command_default_poll_wait_seconds", value)
 
 
-@pytest.mark.parametrize("setting", ["command_timeout", "command_job_wait_seconds"])
-def test_command_wait_settings_keep_values_above_the_per_call_maximum(tmp_path, setting):
-    """Persisted waits survive validation and are capped only when a tool call uses them."""
+@pytest.mark.parametrize(
+    "setting", ["command_default_initial_wait_seconds", "command_default_poll_wait_seconds"]
+)
+def test_command_wait_defaults_cannot_exceed_the_shared_maximum(tmp_path, setting):
+    """Configuration rejects defaults larger than the explicit per-call wait cap."""
     manager = ConfigurationManager(tmp_path / ".loop" / "config.toml")
     manager.initialize()
     manager.load()
-    manager.set_session(f"tools.{setting}", constants.MAX_COMMAND_WAIT_SECONDS + 1)
-    assert getattr(manager.effective.tools, setting) == constants.MAX_COMMAND_WAIT_SECONDS + 1
+
+    with pytest.raises(ValidationError) as exc_info:
+        manager.set_session(f"tools.{setting}", constants.DEFAULT_COMMAND_MAX_WAIT_SECONDS + 1)
+
+    message = str(exc_info.value)
+    assert f"tools.{setting}=61" in message
+    assert (
+        f"tools.command_max_wait_seconds={constants.DEFAULT_COMMAND_MAX_WAIT_SECONDS:g}" in message
+    )
+
+
+@pytest.mark.parametrize(
+    "value", [-1, float("inf"), float("-inf"), float("nan"), constants.MAX_COMMAND_WAIT_SECONDS + 1]
+)
+def test_command_max_wait_requires_a_finite_supported_duration(tmp_path, value):
+    """Configuration rejects unsupported shared wait caps."""
+    manager = ConfigurationManager(tmp_path / ".loop" / "config.toml")
+    manager.initialize()
+    manager.load()
+
+    with pytest.raises(ValidationError):
+        manager.set_session("tools.command_max_wait_seconds", value)
+
+
+def test_legacy_command_environment_names_are_ignored(tmp_path):
+    """Only canonical command environment names configure command waits."""
+    manager = ConfigurationManager(tmp_path / "config.toml")
+
+    settings = manager.load(
+        {
+            "LOOP_COMMAND_TIMEOUT": "20",
+            "LOOP_COMMAND_HARD_TIMEOUT": "120",
+            "LOOP_COMMAND_JOB_WAIT_SECONDS": "15",
+        }
+    )
+
+    assert settings.tools.command_default_initial_wait_seconds == 10.0
+    assert settings.tools.command_job_runtime_limit_seconds == 3600.0
+    assert settings.tools.command_default_poll_wait_seconds == 30.0
+
+
+def test_legacy_command_setting_names_are_rejected_in_saved_configuration(tmp_path):
+    """Saved command settings must use the currently supported names."""
+    manager = ConfigurationManager(tmp_path / "config.toml")
+    manager.path.write_text("[tools]\ncommand_timeout = 60.0\n", encoding="utf-8")
+
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        manager.load({})
+
+
+def test_legacy_command_setting_paths_are_rejected(tmp_path):
+    """Configuration updates require the canonical command setting names."""
+    manager = ConfigurationManager(tmp_path / "config.toml")
+    manager.load()
+
+    with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
+        manager.set_session("tools.command_timeout", 60.0)
+
+
+def test_zero_command_wait_cap_allows_immediate_default_waits(tmp_path):
+    """A zero shared cap is valid when both default command waits are also zero."""
+    manager = ConfigurationManager(tmp_path / "config.toml")
+    manager.load()
+    manager.set_session("tools.command_default_initial_wait_seconds", 0)
+    manager.set_session("tools.command_default_poll_wait_seconds", 0)
+
+    settings = manager.set_session("tools.command_max_wait_seconds", 0)
+
+    assert settings.tools.command_default_initial_wait_seconds == 0
+    assert settings.tools.command_default_poll_wait_seconds == 0
+    assert settings.tools.command_max_wait_seconds == 0
+
+
+def test_maximum_command_wait_cap_is_configurable(tmp_path):
+    """The shared wait cap can be configured through its absolute supported maximum."""
+    manager = ConfigurationManager(tmp_path / "config.toml")
+    manager.load()
+
+    settings = manager.set_session(
+        "tools.command_max_wait_seconds", constants.MAX_COMMAND_WAIT_SECONDS
+    )
+
+    assert settings.tools.command_max_wait_seconds == constants.MAX_COMMAND_WAIT_SECONDS
 
 
 def test_set_preserves_existing_comments(tmp_path):

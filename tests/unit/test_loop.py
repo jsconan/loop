@@ -477,9 +477,10 @@ def test_loop_applies_live_settings_through_owning_components(tmp_path):
             },
             "web": {"user_agent": "updated"},
             "tools": {
-                "command_timeout": 0.25,
-                "command_job_wait_seconds": 0.1,
-                "command_hard_timeout": 42,
+                "command_job_runtime_limit_seconds": 42,
+                "command_default_initial_wait_seconds": 0.25,
+                "command_default_poll_wait_seconds": 0.1,
+                "command_max_wait_seconds": 50,
             },
         }
     )
@@ -495,9 +496,10 @@ def test_loop_applies_live_settings_through_owning_components(tmp_path):
         "app.temperature",
         "app.reasoning_effort",
         "web.user_agent",
-        "tools.command_timeout",
-        "tools.command_hard_timeout",
-        "tools.command_job_wait_seconds",
+        "tools.command_default_initial_wait_seconds",
+        "tools.command_default_poll_wait_seconds",
+        "tools.command_max_wait_seconds",
+        "tools.command_job_runtime_limit_seconds",
     ):
         assert loop.apply_runtime_settings(path, settings) == "applied now"
     assert loop.apply_runtime_settings("telemetry.batch_size", settings) == (
@@ -511,9 +513,10 @@ def test_loop_applies_live_settings_through_owning_components(tmp_path):
     assert loop.agent.hyperparameters.temperature == 0.2
     assert loop.agent.hyperparameters.reasoning_effort == "medium"
     assert loop.tool_registry.settings.user_agent == "updated"
-    assert loop.tool_registry.settings.command_timeout == 0.25
-    assert loop.tool_registry.settings.command_hard_timeout == 42
-    assert loop.tool_registry.settings.command_job_wait_seconds == 0.1
+    assert loop.tool_registry.settings.command_default_initial_wait_seconds == 0.25
+    assert loop.tool_registry.settings.command_job_runtime_limit_seconds == 42
+    assert loop.tool_registry.settings.command_default_poll_wait_seconds == 0.1
+    assert loop.tool_registry.settings.command_max_wait_seconds == 50
 
 
 def test_loop_applies_model_changes_through_async_backend_metadata(tmp_path):

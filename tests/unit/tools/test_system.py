@@ -14,7 +14,14 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from loop import BUILTIN_TOOLS, PermissionManager, ToolContext, ToolRegistration, ToolRegistry
-from loop.constants import MAX_COMMAND_WAIT_SECONDS, MAX_OUTPUT_CHARS, MAX_TOOL_RESULT_BYTES
+from loop.constants import (
+    DEFAULT_COMMAND_INITIAL_WAIT_SECONDS,
+    DEFAULT_COMMAND_JOB_RUNTIME_LIMIT_SECONDS,
+    DEFAULT_COMMAND_MAX_WAIT_SECONDS,
+    DEFAULT_COMMAND_POLL_WAIT_SECONDS,
+    MAX_OUTPUT_CHARS,
+    MAX_TOOL_RESULT_BYTES,
+)
 from loop.execution import CommandExecutionService
 from loop.execution.coordinator import HostCommandRequest, LocalHostCommandExecutor
 from loop.execution.sandbox import (
@@ -226,7 +233,7 @@ def test_command_job_tools_require_the_execution_service():
 
 
 def test_command_job_tools_delegate_to_current_execution_service():
-    """Polling and output reads delegate their independent arguments to the bound owner."""
+    """Polling pages and immediate output reads delegate to the bound execution owner."""
     service = MagicMock()
     service.inspect_command_jobs.return_value = {"jobs": []}
     service.poll_command_job.return_value = {"status": "running"}
@@ -234,12 +241,18 @@ def test_command_job_tools_delegate_to_current_execution_service():
     service.cancel_command_job.return_value = {"cancel_requested": True}
     context = ToolContext(None, "inspect_command_jobs", execution_service=service)
     assert inspect_command_jobs_tool(context) == {"jobs": []}
-    assert poll_command_job_tool(context, "a" * 32, 3) == {"status": "running"}
-    assert read_command_output_tool(context, "a" * 32, "stdout", "cursor", 2) == {
-        "content": "page"
-    }
+    assert poll_command_job_tool(
+        context,
+        "a" * 32,
+        3,
+        "stdout-cursor",
+        "stderr-cursor",
+    ) == {"status": "running"}
+    assert read_command_output_tool(context, "a" * 32, "stdout", "cursor", 2) == {"content": "page"}
     assert cancel_command_job_tool(context, "a" * 32) == {"cancel_requested": True}
-    service.poll_command_job.assert_called_once_with(context, "a" * 32, 3)
+    service.poll_command_job.assert_called_once_with(
+        context, "a" * 32, 3, "stdout-cursor", "stderr-cursor"
+    )
     service.read_command_output.assert_called_once_with(context, "a" * 32, "stdout", "cursor", 2)
     service.cancel_command_job.assert_called_once_with(context, "a" * 32)
 
@@ -1480,6 +1493,19 @@ def test_platform_command_capabilities_shape_live_model_definitions(monkeypatch)
     properties = unavailable["sandbox_shell"].parameters["properties"]
     assert "background" not in properties
     assert "wait_seconds" in properties
+    assert properties["wait_seconds"]["maximum"] == DEFAULT_COMMAND_MAX_WAIT_SECONDS
+    initial_description = properties["wait_seconds"]["description"]
+    assert (
+        f"up to {DEFAULT_COMMAND_MAX_WAIT_SECONDS:g} seconds (tools.command_max_wait_seconds)"
+    ) in initial_description
+    assert (
+        f"default is {DEFAULT_COMMAND_INITIAL_WAIT_SECONDS:g} seconds "
+        "(tools.command_default_initial_wait_seconds)"
+    ) in initial_description
+    assert (
+        f"runtime limit of {DEFAULT_COMMAND_JOB_RUNTIME_LIMIT_SECONDS:g} seconds "
+        "(tools.command_job_runtime_limit_seconds)"
+    ) in initial_description
     assert "interactive" not in properties
     assert "egress_origins" not in properties
     assert "interactive" not in unavailable["sandbox_shell"].parameters["required"]
@@ -1488,11 +1514,26 @@ def test_platform_command_capabilities_shape_live_model_definitions(monkeypatch)
     assert "poll_command_job" in unavailable
     poll = unavailable["poll_command_job"].parameters["properties"]["wait_seconds"]
     assert "Output arriving during this wait does not return early" in poll["description"]
-    assert poll["le"] == MAX_COMMAND_WAIT_SECONDS
+    assert "one available page from each output stream" in poll["description"]
+    assert poll["maximum"] == DEFAULT_COMMAND_MAX_WAIT_SECONDS
+    assert (
+        f"default is {DEFAULT_COMMAND_POLL_WAIT_SECONDS:g} seconds "
+        "(tools.command_default_poll_wait_seconds)"
+    ) in poll["description"]
+    assert (
+        f"up to {DEFAULT_COMMAND_MAX_WAIT_SECONDS:g} seconds (tools.command_max_wait_seconds)"
+    ) in poll["description"]
+    assert (
+        f"runtime limit of {DEFAULT_COMMAND_JOB_RUNTIME_LIMIT_SECONDS:g} seconds "
+        "(tools.command_job_runtime_limit_seconds)"
+    ) in poll["description"]
     assert {item["type"] for item in poll["anyOf"]} == {"number", "null"}
+    assert "stdout_cursor" in unavailable["poll_command_job"].parameters["properties"]
+    assert "stderr_cursor" in unavailable["poll_command_job"].parameters["properties"]
     assert "read_command_output" in unavailable
     cursor = unavailable["read_command_output"].parameters["properties"]["cursor"]
     assert "Opaque continuation cursor" in cursor["description"]
+    assert "more from one command stream" in unavailable["read_command_output"].description
     assert "terminal_control" in registry.names
 
     monkeypatch.setattr(
@@ -1532,6 +1573,39 @@ def test_platform_command_capabilities_shape_live_model_definitions(monkeypatch)
         in supported["terminal_control"].parameters["properties"]["action"]["description"]
     )
     assert "interactive" not in unavailable["sandbox_shell"].parameters["properties"]
+
+
+def test_command_wait_schema_tracks_configured_durations(registry):
+    """Run and poll schemas pair active duration values with config paths."""
+    registry.settings.command_max_wait_seconds = 45
+    registry.settings.command_default_initial_wait_seconds = 12
+    registry.settings.command_default_poll_wait_seconds = 8
+    registry.settings.command_job_runtime_limit_seconds = 300
+
+    definitions = {definition.name: definition for definition in registry.definitions()}
+
+    initial = definitions["run_command"].parameters["properties"]["wait_seconds"]
+    assert initial["maximum"] == 45
+    assert (
+        "default is 12 seconds (tools.command_default_initial_wait_seconds)"
+        in initial["description"]
+    )
+    assert "up to 45 seconds (tools.command_max_wait_seconds)" in initial["description"]
+    assert (
+        "runtime limit of 300 seconds (tools.command_job_runtime_limit_seconds)"
+        in initial["description"]
+    )
+    assert "{" not in initial["description"]
+
+    poll = definitions["poll_command_job"].parameters["properties"]["wait_seconds"]
+    assert poll["maximum"] == 45
+    assert "default is 8 seconds (tools.command_default_poll_wait_seconds)" in poll["description"]
+    assert "up to 45 seconds (tools.command_max_wait_seconds)" in poll["description"]
+    assert (
+        "runtime limit of 300 seconds (tools.command_job_runtime_limit_seconds)"
+        in poll["description"]
+    )
+    assert "{" not in poll["description"]
 
 
 def test_run_command_accepts_opaque_shell_and_returns_bounded_result(monkeypatch, registry):
@@ -2601,7 +2675,7 @@ def test_run_command_keeps_host_timeout_distinct(monkeypatch, registry):
     assert problem["metadata"]["boundary"] == "host"
 
 
-def test_run_command_timeout_does_not_offer_host_retry(monkeypatch, registry):
+def test_run_command_default_initial_wait_seconds_does_not_offer_host_retry(monkeypatch, registry):
     """A timed-out sandbox attempt is not reclassified as a host offer."""
     monkeypatch.setattr(
         registry._execution_service,

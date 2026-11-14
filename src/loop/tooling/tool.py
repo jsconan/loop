@@ -40,6 +40,7 @@ from .models import (
     ToolExecutionOutcomeUnknown,
     ToolFinalInterruption,
     ToolPreflight,
+    ToolRuntimeSettings,
 )
 from .utils import (
     ToolRegistrationError,
@@ -54,6 +55,9 @@ from .utils import (
 _TOOL_ATTR = "__loop_tool__"
 _LOGGER = logging.getLogger(__name__)
 _TOOL_INVOCATION: ContextVar[object | None] = ContextVar("tool_invocation", default=None)
+
+ToolDefinitionTransform = Callable[[ToolDefinition, ToolRuntimeSettings], ToolDefinition]
+ToolWorkerContextTransform = Callable[[ToolContext, ToolContext], ToolContext]
 
 
 class ToolContinuation(Coroutine[Any, Any, Any]):
@@ -489,6 +493,10 @@ class Tool:
         platform_argument_capabilities (tuple[PlatformArgumentCapability | tuple[str, str], ...]):
             Arguments and native platform capabilities omitted from unsupported model schemas.
             Bare pairs are normalized to named records during registration.
+        definition_transform (ToolDefinitionTransform | None): Customize the model-facing
+            definition using current runtime settings, or ``None`` for the declared definition.
+        worker_context_transform (ToolWorkerContextTransform | None): Add tool-owned context to a
+            worker copy during asynchronous dispatch, or ``None`` to use the generic context.
     """
 
     function: Callable[..., Any]
@@ -507,6 +515,8 @@ class Tool:
     private_arguments: bool = False
     platform_capability: str | None = None
     platform_argument_capabilities: tuple[PlatformArgumentCapability | tuple[str, str], ...] = ()
+    definition_transform: ToolDefinitionTransform | None = None
+    worker_context_transform: ToolWorkerContextTransform | None = None
 
     def registered(
         self,
@@ -1489,6 +1499,8 @@ def tool[ToolFunction: Callable[..., Any]](
     private_arguments: bool = False,
     platform_capability: str | None = None,
     platform_argument_capabilities: tuple[PlatformArgumentCapability | tuple[str, str], ...] = (),
+    definition_transform: ToolDefinitionTransform | None = None,
+    worker_context_transform: ToolWorkerContextTransform | None = None,
 ) -> Callable[[ToolFunction], ToolFunction]: ...
 
 
@@ -1510,6 +1522,8 @@ def tool[ToolFunction: Callable[..., Any]](
     private_arguments: bool = False,
     platform_capability: str | None = None,
     platform_argument_capabilities: tuple[PlatformArgumentCapability | tuple[str, str], ...] = (),
+    definition_transform: ToolDefinitionTransform | None = None,
+    worker_context_transform: ToolWorkerContextTransform | None = None,
 ) -> ToolFunction | Callable[[ToolFunction], ToolFunction]:
     """Declare a function as an LLM-callable tool without registering it.
 
@@ -1537,6 +1551,10 @@ def tool[ToolFunction: Callable[..., Any]](
         platform_capability (str | None): Native platform capability required for model exposure.
         platform_argument_capabilities (tuple[PlatformArgumentCapability | tuple[str, str], ...]):
             Named records or bare argument and native capability pairs for model exposure.
+        definition_transform (ToolDefinitionTransform | None): Customize the model-facing
+            definition using current runtime settings, or ``None`` for the declared definition.
+        worker_context_transform (ToolWorkerContextTransform | None): Add tool-owned context to a
+            worker copy during asynchronous dispatch, or ``None`` to use the generic context.
 
     Returns:
         ToolFunction | Callable[[ToolFunction], ToolFunction]: The unchanged declared function,
@@ -1564,6 +1582,8 @@ def tool[ToolFunction: Callable[..., Any]](
                 private_arguments=private_arguments,
                 platform_capability=platform_capability,
                 platform_argument_capabilities=platform_argument_capabilities,
+                definition_transform=definition_transform,
+                worker_context_transform=worker_context_transform,
             ),
         )
         return target

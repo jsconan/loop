@@ -52,9 +52,10 @@ _ENVIRONMENT_FIELDS = {
     "LOOP_REPETITION_MIN_COUNT": ("backend", "repetition_min_count"),
     "OPENAI_HYPERPARAMETER_POLICY": ("backend", "hyperparameter_policy"),
     "USER_AGENT": ("web", "user_agent"),
-    "LOOP_COMMAND_TIMEOUT": ("tools", "command_timeout"),
-    "LOOP_COMMAND_HARD_TIMEOUT": ("tools", "command_hard_timeout"),
-    "LOOP_COMMAND_JOB_WAIT_SECONDS": ("tools", "command_job_wait_seconds"),
+    "LOOP_COMMAND_DEFAULT_INITIAL_WAIT_SECONDS": ("tools", "command_default_initial_wait_seconds"),
+    "LOOP_COMMAND_JOB_RUNTIME_LIMIT_SECONDS": ("tools", "command_job_runtime_limit_seconds"),
+    "LOOP_COMMAND_DEFAULT_POLL_WAIT_SECONDS": ("tools", "command_default_poll_wait_seconds"),
+    "LOOP_COMMAND_MAX_WAIT_SECONDS": ("tools", "command_max_wait_seconds"),
     "LOOP_AGENT_NAME": ("app", "agent_name"),
     "LOOP_CONVERSATION_INPUT_MODE": ("conversation", "input_mode"),
     "LOOP_MODEL": ("app", "model"),
@@ -579,8 +580,8 @@ class ConfigurationManager:
             str: ``"session"``, ``"environment"``, ``"workspace"``, ``"user"``, or
                 ``"default"``. YOLO reports user scope for its saved value.
         """
-        self._split_path(dotted_path)
-        return self._sources.get(dotted_path, "default")
+        section, field = self._split_path(dotted_path)
+        return self._sources.get(f"{section}.{field}", "default")
 
     @property
     def saved_yolo(self) -> bool | None:
@@ -667,7 +668,8 @@ class ConfigurationManager:
         Raises:
             ValueError: If YOLO is given a value other than true or false.
         """
-        self._split_path(dotted_path)
+        section, field = self._split_path(dotted_path)
+        dotted_path = f"{section}.{field}"
         if dotted_path == "app.yolo":
             value = self._normalize_yolo_value(value)
         previous = self._session_values.copy()
@@ -807,7 +809,8 @@ class ConfigurationManager:
         Raises:
             ValueError: If the path has no in-memory override.
         """
-        self._split_path(dotted_path)
+        section, field = self._split_path(dotted_path)
+        dotted_path = f"{section}.{field}"
         if dotted_path not in self._session_values:
             raise ValueError(f"No session override exists for '{dotted_path}'.")
         del self._session_values[dotted_path]

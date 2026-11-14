@@ -65,9 +65,10 @@ max_agent_turns = 25
 # See "Web requests" below to override it.
 
 [tools]
-command_timeout = 10.0
-command_hard_timeout = 3600.0
-command_job_wait_seconds = 30.0
+command_job_runtime_limit_seconds = 3600.0
+command_default_initial_wait_seconds = 10.0
+command_default_poll_wait_seconds = 30.0
+command_max_wait_seconds = 60.0
 
 [logging]
 level = "INFO"
@@ -105,7 +106,7 @@ Reset behavior depends on the scope. At workspace scope, reset removes the overr
 
 Session settings apply only to the current Loop process and take precedence over environment and file values. A file value remains saved when an environment variable overrides it, so the saved value applies again when the variable is absent. Backend and supported interactive-loop settings apply immediately. Logging, telemetry, and agent identity changes require a restart. API-key input and configuration output are masked.
 
-`tools.command_timeout` sets the default initial wait for a command, and `tools.command_job_wait_seconds` sets the default completion-poll wait. Both settings accept finite nonnegative values; each individual run or poll call is capped at 30 seconds, so larger saved values remain valid and are capped when used. A value of `0` makes the corresponding call return immediately. A poll ends only when its wait expires or the command completes, regardless of output arriving during the wait. `tools.command_hard_timeout` sets the separate finite, positive execution deadline in seconds; it is captured when a job starts. Extremely large values that exceed the clock's ability to preserve the native preparation deadline are rejected; reduce the hard timeout if this occurs. Changes to the wait settings apply to subsequent calls, while changes to the hard timeout apply to new jobs.
+The command settings name four separate durations. `tools.command_job_runtime_limit_seconds` sets the finite, positive deadline for the whole command, starting when the native process launches. `tools.command_default_initial_wait_seconds` is the default wait in the first `run_command` call; `tools.command_default_poll_wait_seconds` is the default wait in `poll_command_job`. Both defaults accept finite nonnegative values. `tools.command_max_wait_seconds` is the shared cap for an explicit or default `wait_seconds` value in either call; it defaults to 60 seconds and may be configured from 0 through 3,600 seconds. The initial and poll defaults must each be no greater than this cap. A wait of `0` returns immediately. A poll ends only when its wait expires or the command completes, regardless of output arriving during the wait. The runtime limit is captured when a job starts; wait settings apply to subsequent calls. Runtime limits that exceed the clock's ability to preserve the native preparation deadline are rejected.
 
 `app.yolo` is off by default. Enabling it skips Loop confirmation prompts for eligible operations: the agent can request private data, change or delete files, use networks, and explicitly run commands on the host. Host execution has the host user's authority and can alter or bypass the sandbox. Hard policy denies, invalid identities, and unavailable enforcement still stop requests; the native sandbox remains active for ordinary sandboxed commands. Loop displays this warning before a human `/config set app.yolo true` takes effect. To keep YOLO active after restart, explicitly run `/config set app.yolo true scope=user`. A session setting takes precedence over the saved value. A child process launched inside a native sandbox inherits that sandbox even when its own YOLO setting is enabled. `/config get app.yolo` shows the effective state, source, and saved user value. A session `false` masks a saved user `true` only until restart; set `scope=user` to `false` to keep it off. A user `false` does not erase an active session `true`; disable that session too. Startup announces whether a trusted saved activation is active or suppressed by managed policy. Persistent activation requires an owner-private, real user configuration directory and file. An untrusted or ambiguous saved activation fails closed.
 
@@ -151,36 +152,37 @@ Project-path mentions use immutable content snapshots so resumed conversations s
 
 The `loop` command accepts environment overrides for automation:
 
-| Setting                     | Environment variable                    | Built-in default               |
-| --------------------------- | --------------------------------------- | ------------------------------ |
-| Base URL                    | `BASE_URL`                              | `http://localhost:8000/v1`     |
-| Backend model               | `DEFAULT_MODEL`                         | `nvidia/Qwen3.6-35B-A3B-NVFP4` |
-| API key                     | `OPENAI_API_KEY`                        | `local-api-key`                |
-| Context window              | `CONTEXT_WINDOW`                        | unset                          |
-| Automatic retries           | `OPENAI_MAX_RETRIES`                    | `2`                            |
-| Temperature                 | `LOOP_TEMPERATURE`                      | unset                          |
-| Reasoning effort            | `LOOP_REASONING_EFFORT`                 | unset                          |
-| Hyperparameter policy       | `OPENAI_HYPERPARAMETER_POLICY`          | `fallback`                     |
-| Web user agent              | `USER_AGENT`                            | browser-like user agent        |
-| Command initial wait        | `LOOP_COMMAND_TIMEOUT`                  | `10.0`                         |
-| Command hard timeout        | `LOOP_COMMAND_HARD_TIMEOUT`             | `3600.0`                       |
-| Command job completion poll | `LOOP_COMMAND_JOB_WAIT_SECONDS`         | `30.0`                         |
-| Agent name                  | `LOOP_AGENT_NAME`                       | `Loop`                         |
-| Active input mode           | `LOOP_CONVERSATION_INPUT_MODE`          | `queue`                        |
-| Model                       | `LOOP_MODEL`                            | unset                          |
-| Stream responses            | `LOOP_STREAM`                           | `true`                         |
-| Debug responses             | `LOOP_DEBUG`                            | `false`                        |
-| Compaction threshold        | `LOOP_COMPACTION_THRESHOLD`             | `0.8`                          |
-| Prompt on recoverable error | `LOOP_PROMPT_ON_RECOVERABLE_ERROR`      | `true`                         |
-| Maximum agent turns         | `LOOP_MAX_AGENT_TURNS`                  | `25`                           |
-| Log level                   | `LOOP_LOG_LEVEL`                        | `INFO`                         |
-| Log size                    | `LOOP_LOG_MAX_BYTES`                    | `5242880`                      |
-| Log backups                 | `LOOP_LOG_BACKUP_COUNT`                 | `3`                            |
-| Telemetry queue capacity    | `LOOP_TELEMETRY_QUEUE_CAPACITY`         | `4096`                         |
-| Telemetry batch size        | `LOOP_TELEMETRY_BATCH_SIZE`             | `128`                          |
-| Telemetry flush interval    | `LOOP_TELEMETRY_FLUSH_SECONDS`          | `0.1`                          |
-| Telemetry shutdown timeout  | `LOOP_TELEMETRY_SHUTDOWN_TIMEOUT`       | `2.0`                          |
-| SQLite busy timeout         | `LOOP_TELEMETRY_SQLITE_BUSY_TIMEOUT_MS` | `2500`                         |
+| Setting                     | Environment variable                        | Built-in default               |
+| --------------------------- | ------------------------------------------- | ------------------------------ |
+| Base URL                    | `BASE_URL`                                  | `http://localhost:8000/v1`     |
+| Backend model               | `DEFAULT_MODEL`                             | `nvidia/Qwen3.6-35B-A3B-NVFP4` |
+| API key                     | `OPENAI_API_KEY`                            | `local-api-key`                |
+| Context window              | `CONTEXT_WINDOW`                            | unset                          |
+| Automatic retries           | `OPENAI_MAX_RETRIES`                        | `2`                            |
+| Temperature                 | `LOOP_TEMPERATURE`                          | unset                          |
+| Reasoning effort            | `LOOP_REASONING_EFFORT`                     | unset                          |
+| Hyperparameter policy       | `OPENAI_HYPERPARAMETER_POLICY`              | `fallback`                     |
+| Web user agent              | `USER_AGENT`                                | browser-like user agent        |
+| Command runtime limit       | `LOOP_COMMAND_JOB_RUNTIME_LIMIT_SECONDS`    | `3600.0`                       |
+| Command initial wait        | `LOOP_COMMAND_DEFAULT_INITIAL_WAIT_SECONDS` | `10.0`                         |
+| Command completion poll     | `LOOP_COMMAND_DEFAULT_POLL_WAIT_SECONDS`    | `30.0`                         |
+| Maximum command wait        | `LOOP_COMMAND_MAX_WAIT_SECONDS`             | `60.0`                         |
+| Agent name                  | `LOOP_AGENT_NAME`                           | `Loop`                         |
+| Active input mode           | `LOOP_CONVERSATION_INPUT_MODE`              | `queue`                        |
+| Model                       | `LOOP_MODEL`                                | unset                          |
+| Stream responses            | `LOOP_STREAM`                               | `true`                         |
+| Debug responses             | `LOOP_DEBUG`                                | `false`                        |
+| Compaction threshold        | `LOOP_COMPACTION_THRESHOLD`                 | `0.8`                          |
+| Prompt on recoverable error | `LOOP_PROMPT_ON_RECOVERABLE_ERROR`          | `true`                         |
+| Maximum agent turns         | `LOOP_MAX_AGENT_TURNS`                      | `25`                           |
+| Log level                   | `LOOP_LOG_LEVEL`                            | `INFO`                         |
+| Log size                    | `LOOP_LOG_MAX_BYTES`                        | `5242880`                      |
+| Log backups                 | `LOOP_LOG_BACKUP_COUNT`                     | `3`                            |
+| Telemetry queue capacity    | `LOOP_TELEMETRY_QUEUE_CAPACITY`             | `4096`                         |
+| Telemetry batch size        | `LOOP_TELEMETRY_BATCH_SIZE`                 | `128`                          |
+| Telemetry flush interval    | `LOOP_TELEMETRY_FLUSH_SECONDS`              | `0.1`                          |
+| Telemetry shutdown timeout  | `LOOP_TELEMETRY_SHUTDOWN_TIMEOUT`           | `2.0`                          |
+| SQLite busy timeout         | `LOOP_TELEMETRY_SQLITE_BUSY_TIMEOUT_MS`     | `2500`                         |
 
 `OpenAIBackend` does not read environment variables or apply deployment defaults. Python callers configure it directly; credentials remain private to the backend.
 

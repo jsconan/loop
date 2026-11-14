@@ -100,13 +100,13 @@ def test_command_snapshots_hard_limit_before_approval(tmp_path, monkeypatch):
         permission_manager=permissions,
         session_manager=sessions,
     )
-    context.settings.command_hard_timeout = 42
+    context.settings.command_job_runtime_limit_seconds = 42
     result = []
     thread = Thread(target=lambda: result.append(service.run_command(context, ":")))
     try:
         thread.start()
         assert approval_entered.wait(5)
-        context.settings.command_hard_timeout = 1
+        context.settings.command_job_runtime_limit_seconds = 1
         release_approval.set()
         thread.join(5)
         assert not thread.is_alive()
@@ -185,27 +185,24 @@ def test_async_command_survives_owner_loop_closure(tmp_path, monkeypatch, mode):
         return json.loads(result), loop
 
     async def finish(handle):
-        """Poll for completion and read the output separately through a new loop."""
+        """Poll for completion and take command output from the same result."""
+        cursors = {"stdout_cursor": None, "stderr_cursor": None}
         for _ in range(10):
             result = json.loads(
                 await registry.call_async(
                     "poll_command_job",
-                    json.dumps({"handle": handle, "wait_seconds": 5}),
+                    json.dumps({"handle": handle, "wait_seconds": 5, **cursors}),
                     instructions_manager=instructions,
                 )
             )
             assert result["ok"], result
             status = result["result"]
+            cursors = {
+                f"{stream}_cursor": status[stream].get("next_cursor")
+                for stream in ("stdout", "stderr")
+            }
             if status["status"] == "complete":
-                output = json.loads(
-                    await registry.call_async(
-                        "read_command_output",
-                        json.dumps({"handle": handle, "stream": "stdout"}),
-                        instructions_manager=instructions,
-                    )
-                )
-                assert output["ok"], output
-                return status, output["result"]
+                return status, status["stdout"]
         pytest.fail("The continued command did not settle.")
 
     try:
@@ -281,7 +278,7 @@ def test_command_yields_once_and_can_be_cancelled_without_replay(tmp_path):
         status = service.poll_command_job(context, first["handle"], wait_seconds=0)
         assert status["handle"] == first["handle"]
         assert status["status"] == "running"
-        assert "stdout" not in status
+        assert status["stdout"]["content"] == ""
         assert backend.run.call_count == 1
         assert captured == ["original-context"]
 
@@ -364,8 +361,7 @@ def test_approved_host_retry_remains_owned_after_handoff(tmp_path, monkeypatch, 
             assert final["cancel_requested"]
         else:
             assert final["boundary"] == "host"
-            output = service.read_command_output(context, first["handle"], "stdout")
-            assert output["content"] == "host output"
+            assert final["stdout"]["content"] == "host output"
         backend.run.assert_called_once()
         host.run_host_command.assert_called_once()
     finally:
@@ -566,21 +562,21 @@ def test_cancelled_async_poll_preserves_the_command(tmp_path, monkeypatch):
     monkeypatch.setattr(service, "poll_command_job", observe_poll)
 
     async def scenario():
-        """Read one page, interrupt the separate completion wait, then finish the job."""
+        """Poll returns current output while the separate completion wait remains pending."""
         handle = service.run_command(context, ":", wait_seconds=0)["handle"]
         emit.set()
         assert await asyncio.to_thread(output_published.wait, 5), "Output was not published."
-        page = json.loads(
+        immediate = json.loads(
             await registry.call_async(
-                "read_command_output",
-                json.dumps({"handle": handle, "stream": "stdout"}),
+                "poll_command_job",
+                json.dumps({"handle": handle, "wait_seconds": 0}),
             )
         )["result"]
-        assert page["content"] == "ready"
-        assert page["job_complete"] is False
-        cursor = page["next_cursor"]
+        assert immediate["stdout"]["content"] == "ready"
+        assert immediate["status"] == "running"
+        cursor = immediate["stdout"]["next_cursor"]
 
-        arguments = json.dumps({"handle": handle, "wait_seconds": 30})
+        arguments = json.dumps({"handle": handle, "wait_seconds": 30, "stdout_cursor": cursor})
         task = asyncio.create_task(registry.call_async("poll_command_job", arguments))
         assert await asyncio.to_thread(polling.wait, 5), "Poll was not admitted."
         assert not task.done(), "New output must not complete a poll."
@@ -588,16 +584,15 @@ def test_cancelled_async_poll_preserves_the_command(tmp_path, monkeypatch):
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, timeout=2)
 
-        immediate = service.poll_command_job(context, handle, wait_seconds=0)
-        assert immediate["status"] == "running"
-        assert "stdout" not in immediate
-        assert not immediate["cancel_requested"]
+        waiting = service.poll_command_job(context, handle, wait_seconds=0, stdout_cursor=cursor)
+        assert waiting["status"] == "running"
+        assert waiting["stdout"]["content"] == ""
+        assert not waiting["cancel_requested"]
         release.set()
-        final = original_poll(context, handle, wait_seconds=5)
+        final = original_poll(context, handle, wait_seconds=5, stdout_cursor=cursor)
         assert final["status"] == "complete"
         assert final["exit_code"] == 0
-        resumed = service.read_command_output(context, handle, "stdout", cursor)
-        assert resumed["content"] == "done"
+        assert final["stdout"]["content"] == "done"
 
     try:
         asyncio.run(scenario())

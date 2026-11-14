@@ -1,5 +1,7 @@
 """Provide tools for interacting with the system."""
 
+from dataclasses import replace
+from functools import partial
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -8,8 +10,16 @@ from pydantic import BeforeValidator, Field, ValidationInfo
 from .. import constants
 from ..errors import Problem
 from ..execution.sandbox.contracts import SandboxCapability, normalize_egress_origin
+from ..models import ToolDefinition
 from ..permissions import Action, Operation, OperationPlan, ProcessBoundary, ProcessTarget
-from ..tooling import PlatformArgumentCapability, ToolContext, normalize_optional_null, tool
+from ..tooling import (
+    PlatformArgumentCapability,
+    ToolContext,
+    ToolRuntimeSettings,
+    normalize_optional_null,
+    tool,
+)
+from ..tooling.context import CommandEgressAuthority
 from ..utils import VirtualPath
 
 
@@ -104,6 +114,83 @@ def _host_command_plan(arguments: dict[str, object]) -> OperationPlan:
     )
 
 
+def _configure_wait_definition(
+    definition: ToolDefinition,
+    settings: ToolRuntimeSettings,
+    *,
+    default_wait_seconds: float,
+    default_setting: str,
+) -> ToolDefinition:
+    """Replace each field description's wait placeholders with active values."""
+    wait_schema = definition.parameters["properties"]["wait_seconds"]
+    maximum = settings.command_max_wait_seconds
+    wait_schema["maximum"] = maximum
+    wait_schema["description"] = wait_schema["description"].format(
+        maximum_seconds=maximum,
+        maximum_setting="tools.command_max_wait_seconds",
+        default_seconds=default_wait_seconds,
+        default_setting=default_setting,
+        runtime_limit_seconds=settings.command_job_runtime_limit_seconds,
+        runtime_limit_setting="tools.command_job_runtime_limit_seconds",
+    )
+    return definition
+
+
+def _run_command_definition(
+    definition: ToolDefinition, settings: ToolRuntimeSettings
+) -> ToolDefinition:
+    """Include active initial-wait and whole-command durations in the schema."""
+    return _configure_wait_definition(
+        definition,
+        settings,
+        default_wait_seconds=settings.command_default_initial_wait_seconds,
+        default_setting="tools.command_default_initial_wait_seconds",
+    )
+
+
+def _poll_command_job_definition(
+    definition: ToolDefinition, settings: ToolRuntimeSettings
+) -> ToolDefinition:
+    """Include active poll-wait and whole-command durations in the schema."""
+    return _configure_wait_definition(
+        definition,
+        settings,
+        default_wait_seconds=settings.command_default_poll_wait_seconds,
+        default_setting="tools.command_default_poll_wait_seconds",
+    )
+
+
+def _command_worker_context(context: ToolContext, worker_context: ToolContext) -> ToolContext:
+    """Add the command tool's narrowly scoped authorities to its worker context."""
+    permissions = context.permission_manager
+    instructions = context.instructions_manager
+    return replace(
+        worker_context,
+        standalone_execution=(
+            permissions.standalone_execution if permissions is not None else None
+        ),
+        invalidate_detached=(
+            partial(instructions.invalidate, None) if instructions is not None else None
+        ),
+        egress_authority=(
+            CommandEgressAuthority(
+                permissions.bind_egress,
+                permissions.unbind_egress,
+                permissions.try_egress_policy_revision,
+            )
+            if permissions is not None
+            else None
+        ),
+        audit_host_detached=(permissions.record_host_boundary if permissions is not None else None),
+        command_admission=context.command_admission,
+        command_authorities=(permissions, instructions),
+        command_paths=context.command_paths,
+        admit_skills_detached=(
+            instructions.admit_command_skills if instructions is not None else None
+        ),
+    )
+
+
 @tool(
     actions={Action.PROCESS_EXECUTE},
     operation_planner=_host_command_plan,
@@ -145,6 +232,8 @@ def request_host_command(
     actions={Action.PROCESS_EXECUTE},
     operation_planner=_command_plan,
     execution_authorization=True,
+    definition_transform=_run_command_definition,
+    worker_context_transform=_command_worker_context,
     platform_argument_capabilities=(
         PlatformArgumentCapability("interactive", SandboxCapability.TERMINAL),
         PlatformArgumentCapability("egress_origins", SandboxCapability.MEDIATED_EGRESS),
@@ -252,11 +341,15 @@ def run_command(
         float | None,
         BeforeValidator(normalize_optional_null),
         Field(
-            description="Maximum initial wait in seconds, or JSON null (unquoted) for the "
-            "configured tools.command_timeout. If still running, returns a continuation handle. "
-            "Use poll_command_job for completion and read_command_output for captured text. "
-            f"The maximum wait is {constants.MAX_COMMAND_WAIT_SECONDS:g} seconds. "
-            "The separate hard runtime limit still applies.",
+            description=(
+                "Wait for up to {maximum_seconds:g} seconds ({maximum_setting}) during the "
+                "initial call. The default is {default_seconds:g} seconds ({default_setting}); "
+                "use JSON null (unquoted) for the default or 0 for an immediate response. The "
+                "whole command has a runtime limit of {runtime_limit_seconds:g} seconds "
+                "({runtime_limit_setting}). If the command remains active, this call returns "
+                "its continuation and available output. Use poll_command_job to wait for "
+                "completion and read_command_output only when more output pages are needed."
+            ),
             ge=0,
             le=constants.MAX_COMMAND_WAIT_SECONDS,
             allow_inf_nan=False,
@@ -266,8 +359,8 @@ def run_command(
         bool,
         Field(
             description="Open one owned sandboxed pseudo-terminal and return its handle after "
-            "approval. Use poll_command_job, read_command_output, and "
-            "control_command_terminal for the same process. "
+            "approval. Use poll_command_job and its output cursors for the same process; use "
+            "read_command_output for more output pages and control_command_terminal for input. "
             "Cannot combine with egress_origins."
         ),
     ] = False,
@@ -311,7 +404,10 @@ def inspect_command_jobs(context: ToolContext) -> dict | Problem:
     return context.execution_service.inspect_command_jobs(context)
 
 
-@tool(requires_execution_service=True)
+@tool(
+    requires_execution_service=True,
+    definition_transform=_poll_command_job_definition,
+)
 def poll_command_job(
     context: ToolContext,
     handle: Annotated[str, Field(description="Opaque handle from run_command.", min_length=32)],
@@ -319,17 +415,38 @@ def poll_command_job(
         float | None,
         BeforeValidator(normalize_optional_null),
         Field(
-            description="Wait for command completion or timeout, or use JSON null (unquoted) for "
-            "the configured default. Output arriving during this wait does not return early. "
-            f"The maximum wait is {constants.MAX_COMMAND_WAIT_SECONDS:g} seconds. "
-            "Use 0 for an immediate status check.",
+            description=(
+                "Wait for command completion or this wait's timeout, up to {maximum_seconds:g} "
+                "seconds ({maximum_setting}). The default is {default_seconds:g} seconds "
+                "({default_setting}); use JSON null (unquoted) for the default or 0 for an "
+                "immediate status check. The whole command has a runtime limit of "
+                "{runtime_limit_seconds:g} seconds ({runtime_limit_setting}). Output arriving "
+                "during this wait does not return early. The result includes one available "
+                "page from each output stream."
+            ),
             ge=0,
             le=constants.MAX_COMMAND_WAIT_SECONDS,
             allow_inf_nan=False,
         ),
     ] = None,
+    stdout_cursor: Annotated[
+        str | None,
+        BeforeValidator(normalize_optional_null),
+        Field(
+            description="Cursor from stdout.next_cursor in a prior run or poll result; "
+            "JSON null (unquoted) starts at the beginning."
+        ),
+    ] = None,
+    stderr_cursor: Annotated[
+        str | None,
+        BeforeValidator(normalize_optional_null),
+        Field(
+            description="Cursor from stderr.next_cursor in a prior run or poll result; "
+            "JSON null (unquoted) starts at the beginning."
+        ),
+    ] = None,
 ) -> dict | Problem:
-    """Wait for command completion without returning output content."""
+    """Wait for command completion or timeout and return one page from each output stream."""
     if context.execution_service is None:
         return Problem(
             code="command_job.unavailable",
@@ -337,7 +454,13 @@ def poll_command_job(
             detail="Native command execution service is unavailable.",
             operation=context.tool_name,
         )
-    return context.execution_service.poll_command_job(context, handle, wait_seconds)
+    return context.execution_service.poll_command_job(
+        context,
+        handle,
+        wait_seconds,
+        stdout_cursor,
+        stderr_cursor,
+    )
 
 
 @tool(requires_execution_service=True)
@@ -362,7 +485,7 @@ def read_command_output(
         ),
     ] = constants.MAX_TOOL_CONTENT_BYTES,
 ) -> dict | Problem:
-    """Read one immediately available page from a command output stream."""
+    """Immediately read more from one command stream when poll pages are insufficient."""
     if context.execution_service is None:
         return Problem(
             code="command_job.unavailable",

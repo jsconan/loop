@@ -9,6 +9,7 @@ __all__ = [
     "Tool",
     "ToolCommands",
     "ToolContext",
+    "ToolDefinitionTransform",
     "ToolExecutionAdmissionRejected",
     "ToolExecutionCancelled",
     "ToolExecutionInterrupted",
@@ -22,6 +23,7 @@ __all__ = [
     "ToolRegistryView",
     "ToolRuntimeSettings",
     "ToolStatus",
+    "ToolWorkerContextTransform",
     "get_tool_arguments_model",
     "get_tool_description",
     "get_tool_schema",
@@ -49,7 +51,15 @@ from .models import (
     ToolRuntimeSettings,
     ToolStatus,
 )
-from .tool import OwnedToolTask, PlatformArgumentCapability, Tool, ToolRegistration, tool
+from .tool import (
+    OwnedToolTask,
+    PlatformArgumentCapability,
+    Tool,
+    ToolDefinitionTransform,
+    ToolRegistration,
+    ToolWorkerContextTransform,
+    tool,
+)
 from .tool_registry import ToolRegistry, ToolRegistryView
 from .utils import (
     get_tool_arguments_model,

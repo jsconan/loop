@@ -646,10 +646,10 @@ def public_client():
         permission_manager=permissions,
         execution_service=CommandExecutionService(backend, RefusingHost()),
         settings=ToolRuntimeSettings(
-            command_timeout=value.get("initial_wait")
+            command_default_initial_wait_seconds=value.get("initial_wait")
             if value.get("initial_wait") is not None
             else value.get("seconds", 2),
-            command_hard_timeout=value.get("seconds", 2),
+            command_job_runtime_limit_seconds=value.get("seconds", 2),
         ),
         session_manager=command_sessions,
     )
@@ -657,6 +657,7 @@ def public_client():
         results = []
         output_cursors = {}
         output_contents = {}
+        output_offsets = {}
 
         def call_tool(name, arguments):
             """Call one public tool through the same installed registry."""
@@ -669,33 +670,28 @@ def public_client():
                 )
             )
 
-        def read_available_output(handle, status):
-            """Read one bounded page from each stream without coupling it to polling."""
+        def collect_output_pages(status):
+            """Collect the pages included in a run or poll result without another tool call."""
+            handle = status["handle"]
             cursors = output_cursors.setdefault(handle, {"stdout": None, "stderr": None})
             contents = output_contents.setdefault(handle, {"stdout": [], "stderr": []})
+            offsets = output_offsets.setdefault(handle, {"stdout": 0, "stderr": 0})
             events = []
-            output_handles = status.get("output_handles", {})
             for stream in ("stdout", "stderr"):
-                page = call_tool(
-                    "read_command_output",
-                    {
-                        "handle": handle,
-                        "stream": stream,
-                        "cursor": cursors[stream],
-                    },
-                )
-                if not page["ok"]:
-                    return page, events
-                page = page["result"]
+                page = status.get(stream, {})
+                if not isinstance(page, dict):
+                    continue
                 content = page["content"]
                 contents[stream].append(content)
+                offsets[stream] = page["end_byte"]
+                cursors[stream] = page.get("next_cursor")
+                if cursors[stream] is None and status["status"] == "complete":
+                    output_handle = status.get("output_handles", {}).get(stream)
+                    if output_handle:
+                        cursors[stream] = encode_content_cursor(output_handle, page["end_byte"])
                 if content:
                     events.append({"stream": stream, "content": content})
-                if stream in output_handles:
-                    cursors[stream] = encode_content_cursor(
-                        output_handles[stream], page["end_byte"]
-                    )
-            return None, events
+            return events
 
         for call in value["calls"]:
             arguments = dict(call["arguments"])
@@ -707,18 +703,22 @@ def public_client():
                 arguments[name] = result[source["result_key"]]
             if call["tool"] == "poll_command_job":
                 arguments.pop("cursor", None)
+                handle = arguments["handle"]
+                cursors = output_cursors.setdefault(handle, {"stdout": None, "stderr": None})
+                arguments.setdefault("stdout_cursor", cursors["stdout"])
+                arguments.setdefault("stderr_cursor", cursors["stderr"])
                 result = call_tool(call["tool"], arguments)
                 if result["ok"]:
                     status = result["result"]
-                    failure, events = read_available_output(status["handle"], status)
-                    result = failure or {"ok": True, "result": {**status, "events": events}}
+                    events = collect_output_pages(status)
+                    result = {"ok": True, "result": {**status, "events": events}}
             elif call["tool"] == "run_command":
                 result = call_tool(call["tool"], arguments)
                 if result.get("ok"):
                     status = result["result"]
                     if "handle" in status and "status" in status:
-                        failure, events = read_available_output(status["handle"], status)
-                        result = failure or {
+                        events = collect_output_pages(status)
+                        result = {
                             "ok": True,
                             "result": {**status, "events": events},
                         }
@@ -731,27 +731,26 @@ def public_client():
                     while True:
                         if time.monotonic() >= deadline:
                             raise TimeoutError("Command continuation did not settle.")
+                        cursors = output_cursors.setdefault(
+                            page["handle"], {"stdout": None, "stderr": None}
+                        )
                         polled = call_tool(
                             "poll_command_job",
-                            {"handle": page["handle"], "wait_seconds": 10},
+                            {
+                                "handle": page["handle"],
+                                "wait_seconds": 10,
+                                "stdout_cursor": cursors["stdout"],
+                                "stderr_cursor": cursors["stderr"],
+                            },
                         )
                         if not polled["ok"]:
                             result = polled
                             break
                         page = polled["result"]
-                        failure, _events = read_available_output(page["handle"], page)
-                        if failure is not None:
-                            result = failure
-                            break
-                        cursors = output_cursors[page["handle"]]
+                        collect_output_pages(page)
+                        offsets = output_offsets[page["handle"]]
                         reached_end = all(
-                            cursors[stream] is not None
-                            and output_contents[page["handle"]][stream]
-                            and sum(
-                                len(content.encode("utf-8"))
-                                for content in output_contents[page["handle"]][stream]
-                            )
-                            >= page[f"{stream}_bytes"]
+                            offsets[stream] >= page[f"{stream}_bytes"]
                             for stream in ("stdout", "stderr")
                         )
                         if page["status"] == "complete" and reached_end:
@@ -760,7 +759,7 @@ def public_client():
                                 stream: {
                                     "content": "".join(output_contents[page["handle"]][stream]),
                                     "captured_bytes": page[f"{stream}_bytes"],
-                                    "included_bytes": page[f"{stream}_bytes"],
+                                    "included_bytes": offsets[stream],
                                     "truncated": not page[f"{stream}_capture_complete"],
                                     "capture_complete": page[f"{stream}_capture_complete"],
                                     "discarded_characters": (
@@ -1081,20 +1080,6 @@ def test_public_command_continuation_streams_one_process_and_verifies_cleanup(pu
                 "command": "printf 'first\\n'; sleep 0.3; printf 'last\\n'",
                 "cwd": str(workspace),
                 "wait_seconds": 0,
-            },
-        },
-        {
-            "tool": "poll_command_job",
-            "arguments": {"wait_seconds": 5},
-            "argument_sources": {
-                "handle": {"result_index": 0, "result_key": "handle"},
-            },
-        },
-        {
-            "tool": "poll_command_job",
-            "arguments": {"wait_seconds": 5},
-            "argument_sources": {
-                "handle": {"result_index": 0, "result_key": "handle"},
             },
         },
         {

@@ -10,7 +10,7 @@ import sys
 import tempfile
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
 from threading import Event, Lock, Thread, get_ident
@@ -57,6 +57,7 @@ from loop.execution.sandbox import CommandProcessResult, SandboxOutcome, Sandbox
 from loop.execution.sandbox.macos.backend import MacOSSeatbeltBackend
 from loop.instructions import InstructionsManager
 from loop.interaction import ConsoleInteraction, Interaction
+from loop.models import ToolDefinition
 from loop.permissions import CommandAnalysis, PermissionRule, PolicyScope
 from loop.permissions.protection import protected_workspace_paths
 from loop.tooling import (
@@ -410,7 +411,16 @@ def test_command_admission_rejects_a_session_rebound_after_context_creation(asyn
     service.has_active_jobs.return_value = False
     effects = []
 
-    @declare_tool(requires_execution_service=True)
+    def preserve_command_admission(
+        context: ToolContext, worker_context: ToolContext
+    ) -> ToolContext:
+        """Pass the declared command admission lease into a worker context."""
+        return replace(worker_context, command_admission=context.command_admission)
+
+    @declare_tool(
+        requires_execution_service=True,
+        worker_context_transform=preserve_command_admission,
+    )
     def command_probe(context: ToolContext) -> str:
         """Attempt reservation after deliberately changing the selected session."""
         registry.bind_session_manager(second)
@@ -3956,6 +3966,47 @@ def test_definitions_preserve_registration_order():
 
     assert [definition.name for definition in registry.definitions()] == ["calculate", "second"]
     assert registry.names == ["calculate", "second"]
+
+
+def test_tool_transforms_customize_generic_definitions_and_worker_contexts():
+    """Tool-owned transforms customize definitions and worker context without name checks."""
+
+    def customize_definition(
+        definition: ToolDefinition, settings: ToolRuntimeSettings
+    ) -> ToolDefinition:
+        """Include a current runtime value in a model-facing definition."""
+        definition.description = f"{definition.description} {settings.user_agent}"
+        return definition
+
+    def customize_worker_context(
+        owner_context: ToolContext, worker_context: ToolContext
+    ) -> ToolContext:
+        """Copy one tool-owned marker into its worker context."""
+        return replace(
+            worker_context,
+            file_versions={"worker_marker": owner_context.call_id or "missing"},
+        )
+
+    @declare_tool(
+        definition_transform=customize_definition,
+        worker_context_transform=customize_worker_context,
+    )
+    def inspect_context(context: ToolContext) -> str:
+        """Return a value installed by this tool's worker-context transform."""
+        return context.file_versions["worker_marker"]
+
+    registry = ToolRegistry(
+        [inspect_context],
+        settings=ToolRuntimeSettings(user_agent="runtime-value"),
+    )
+    try:
+        definition = registry.definitions()[0]
+        output = asyncio.run(registry.call_async("inspect_context", "{}", call_id="call-123"))
+    finally:
+        registry.close()
+
+    assert definition.description.endswith("runtime-value")
+    assert result_value(output) == "call-123"
 
 
 def test_registry_view_exposes_the_live_registry_catalog():

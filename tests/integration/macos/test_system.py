@@ -560,7 +560,9 @@ def test_timeout_warns_about_effects_without_replay(backend, native_workspace, m
         [run_command],
         permission_manager=PermissionManager(native_workspace),
         execution_service=CommandExecutionService(backend, host),
-        settings=ToolRuntimeSettings(command_timeout=2, command_hard_timeout=2),
+        settings=ToolRuntimeSettings(
+            command_default_initial_wait_seconds=2, command_job_runtime_limit_seconds=2
+        ),
     )
     try:
         result = json.loads(
@@ -2784,7 +2786,9 @@ def test_public_session_runs_pytest_from_private_unusual_scratch(
         ],
         permission_manager=permissions,
         execution_service=CommandExecutionService(backend, host),
-        settings=ToolRuntimeSettings(command_timeout=30, command_hard_timeout=600),
+        settings=ToolRuntimeSettings(
+            command_default_initial_wait_seconds=30, command_job_runtime_limit_seconds=600
+        ),
     )
     loop = Loop.create_default(
         backend=SimpleNamespace(default_model="test", get_context_window=lambda _: None),
@@ -2907,9 +2911,7 @@ def test_public_session_runs_pytest_from_private_unusual_scratch(
                     response = json.loads(
                         loop.tool_registry.call(
                             "read_command_output",
-                            json.dumps(
-                                {"handle": handle, "stream": "stdout", "cursor": cursor}
-                            ),
+                            json.dumps({"handle": handle, "stream": "stdout", "cursor": cursor}),
                             interaction=interaction,
                             instructions_manager=loop.instructions_manager,
                         )

@@ -270,9 +270,16 @@ class ApplicationRuntime:
                 permission_manager=permission_manager,
                 settings=ToolRuntimeSettings(
                     user_agent=settings.web.user_agent,
-                    command_timeout=settings.tools.command_timeout,
-                    command_hard_timeout=settings.tools.command_hard_timeout,
-                    command_job_wait_seconds=settings.tools.command_job_wait_seconds,
+                    command_job_runtime_limit_seconds=(
+                        settings.tools.command_job_runtime_limit_seconds
+                    ),
+                    command_default_initial_wait_seconds=(
+                        settings.tools.command_default_initial_wait_seconds
+                    ),
+                    command_default_poll_wait_seconds=(
+                        settings.tools.command_default_poll_wait_seconds
+                    ),
+                    command_max_wait_seconds=settings.tools.command_max_wait_seconds,
                 ),
                 execution_service=execution_service,
             )

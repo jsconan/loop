@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import threading
@@ -13,7 +14,7 @@ from uuid import uuid4
 
 from .. import constants
 from ..errors import Problem, log_problem
-from ..utils.content import _ContentSpool, encode_content_cursor
+from ..utils.content import _ContentSpool, decode_content_cursor, encode_content_cursor
 from ..utils.process import render_terminal_text
 
 _LOGGER = logging.getLogger(__name__)
@@ -328,12 +329,76 @@ class CommandJob:
         """
         with self._condition:
             handles = {
-                stream: output.handle
-                for stream, output in self._outputs.items()
-                if output.retained
+                stream: output.handle for stream, output in self._outputs.items() if output.retained
             }
             self._output_handles_exposed |= bool(handles)
             return handles
+
+    def _output_page(self, stream: str, cursor: str | None, max_bytes: int) -> dict:
+        """Render the output available after one stream cursor."""
+        output = self._outputs[stream]
+        if max_bytes:
+            page = self.read_output(stream, cursor, max_bytes)
+        else:
+            start = decode_content_cursor(cursor, output.handle) if cursor is not None else 0
+            size = output.size_bytes
+            page = {
+                "content": "",
+                "start_byte": start,
+                "end_byte": start,
+                "included_bytes": 0,
+                "size_bytes": size,
+            }
+            if start < size or not self.finished.is_set():
+                page["next_cursor"] = encode_content_cursor(output.handle, start)
+
+        capture_complete = self._capture_complete[stream]
+        size = output.size_bytes
+        end = page["end_byte"]
+        more_available = end < size or not self.finished.is_set()
+        result = {
+            "content": page["content"],
+            "captured_bytes": size,
+            "included_bytes": page["included_bytes"],
+            "start_byte": page["start_byte"],
+            "end_byte": end,
+            "truncated": more_available or not capture_complete,
+            "capture_complete": capture_complete,
+            "discarded_characters": 0 if capture_complete else None,
+            "decoding_loss": (
+                "none" if capture_complete and not output.has_replacement else "unknown"
+            ),
+        }
+        if "next_cursor" in page:
+            result.update(
+                handle=output.handle,
+                next_cursor=page["next_cursor"],
+                continuation=(
+                    "Pass this stream cursor to poll_command_job or read_command_output."
+                ),
+            )
+        return result
+
+    def status_with_output(
+        self,
+        stdout_cursor: str | None = None,
+        stderr_cursor: str | None = None,
+    ) -> dict:
+        """Return current job status with bounded pages from both streams.
+
+        Returns:
+            dict: Current lifecycle status and cursor pages sized to fit the tool-result limit.
+        """
+        with self._condition:
+            max_bytes = constants.MAX_TOOL_CONTENT_BYTES
+            while True:
+                result = self.inspect()
+                result["stdout"] = self._output_page("stdout", stdout_cursor, max_bytes)
+                result["stderr"] = self._output_page("stderr", stderr_cursor, max_bytes)
+                encoded = json.dumps({"ok": True, "result": result}).encode("utf-8")
+                if len(encoded) <= constants.MAX_TOOL_RESULT_BYTES - 512 or max_bytes == 0:
+                    return result
+                max_bytes //= 2
 
     def release_unreferenced_output(self, result: dict | Problem) -> None:
         """Discard completed stream files that were returned inline and never exposed by handle.
@@ -348,9 +413,8 @@ class CommandJob:
             handles = output.get("output_handles", {}) if isinstance(output, dict) else {}
             for stream, spool in self._outputs.items():
                 item = output.get(stream) if isinstance(output, dict) else None
-                if (
-                    (not isinstance(item, dict) or item.get("handle") != spool.handle)
-                    and (not isinstance(handles, dict) or handles.get(stream) != spool.handle)
+                if (not isinstance(item, dict) or item.get("handle") != spool.handle) and (
+                    not isinstance(handles, dict) or handles.get(stream) != spool.handle
                 ):
                     spool.discard()
 
@@ -526,7 +590,9 @@ class CommandJob:
             result = self._result
             outcome = result.metadata if isinstance(result, Problem) else result
             lifecycle = outcome.get("lifecycle", {}) if isinstance(outcome, dict) else {}
-            diagnostics = outcome.get("sandbox_diagnostics", {}) if isinstance(outcome, dict) else {}
+            diagnostics = (
+                outcome.get("sandbox_diagnostics", {}) if isinstance(outcome, dict) else {}
+            )
             elapsed = (
                 max(
                     0.0,
@@ -590,32 +656,53 @@ class CommandJob:
         self,
         wait_seconds: float,
         *,
+        max_wait_seconds: float = constants.MAX_COMMAND_WAIT_SECONDS,
+        stdout_cursor: str | None = None,
+        stderr_cursor: str | None = None,
         cancellation_event: threading.Event | None = None,
     ) -> dict:
-        """Wait for job completion or timeout without returning output content.
+        """Wait for job completion or timeout, then return available output pages.
 
         Args:
             wait_seconds (float): Maximum time to wait for job completion.
+            max_wait_seconds (float): Configured maximum accepted wait for this call.
+            stdout_cursor (str | None): Cursor for the next stdout page.
+            stderr_cursor (str | None): Cursor for the next stderr page.
             cancellation_event (threading.Event | None): Stop waiting when this read is interrupted,
                 without cancelling the command.
 
         Returns:
-            dict: Current lifecycle status, whether the job completed, and retained byte counts.
+            dict: Current lifecycle status and available pages for both process streams.
 
         Raises:
-            ValueError: The wait budget is invalid or exceeds the platform's supported range.
+            ValueError: The wait budget or configured maximum is invalid or unsupported.
         """
+        if (
+            isinstance(max_wait_seconds, bool)
+            or not isinstance(max_wait_seconds, (int, float))
+            or not math.isfinite(max_wait_seconds)
+            or not 0 <= max_wait_seconds <= constants.MAX_COMMAND_WAIT_SECONDS
+        ):
+            raise ValueError("Command job poll maximum is outside the supported range.")
         if (
             isinstance(wait_seconds, bool)
             or not isinstance(wait_seconds, (int, float))
-            or not 0 <= wait_seconds <= constants.MAX_COMMAND_WAIT_SECONDS
+            or not 0 <= wait_seconds <= max_wait_seconds
             or not math.isfinite(wait_seconds)
         ):
             raise ValueError(
-                "Command job poll must be finite and at most "
-                f"{constants.MAX_COMMAND_WAIT_SECONDS} seconds."
+                "Command job poll wait must be finite and between 0 and "
+                f"{max_wait_seconds:g} seconds."
             )
         with self._condition:
+            for stream, cursor in (
+                ("stdout", stdout_cursor),
+                ("stderr", stderr_cursor),
+            ):
+                if cursor is not None:
+                    offset = decode_content_cursor(cursor, self._outputs[stream].handle)
+                    if offset > self._outputs[stream].size_bytes:
+                        raise ValueError("Content cursor is beyond the end of the content.")
             deadline = time.monotonic() + wait_seconds
             while not self.finished.is_set() and not (
                 cancellation_event is not None and cancellation_event.is_set()
@@ -629,7 +716,7 @@ class CommandJob:
                     else remaining
                 )
                 self._condition.wait(interval)
-            return self.inspect()
+            return self.status_with_output(stdout_cursor, stderr_cursor)
 
 
 class CommandJobs:

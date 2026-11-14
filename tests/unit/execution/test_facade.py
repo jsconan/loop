@@ -401,12 +401,13 @@ def test_command_rejects_unrepresentable_configured_runtime_before_admission():
     backend = Mock()
     service = CommandExecutionService(backend, Mock())
     context = ToolContext(None, "run_command")
-    context.settings.command_hard_timeout = 1e20
+    context.settings.command_job_runtime_limit_seconds = 1e20
 
     result = service.run_command(context, "pwd")
 
     assert result.code == "command_job.invalid_runtime"
-    assert "Reduce tools.command_hard_timeout" in result.detail
+    assert "1e+20 seconds" in result.detail
+    assert "1e+20 seconds (tools.command_job_runtime_limit_seconds)" in result.detail
     backend.run.assert_not_called()
     assert not service.has_active_jobs()
 
@@ -5933,35 +5934,77 @@ def test_command_job_service_binds_reads_and_cancellation_to_session(tmp_path):
     assert status["result"]["metadata"]["exit_code"] == 0
 
 
-def test_command_job_poll_wait_is_independent_of_command_timeout(tmp_path):
-    """Default and explicit poll budgets are separate from command and hard deadlines."""
+def test_command_job_poll_wait_is_independent_of_initial_wait_and_uses_shared_cap(tmp_path):
+    """Polling uses its own default while both wait operations share the configured cap."""
     service = CommandExecutionService(Mock(), Mock())
     context = ToolContext(None, "poll_command_job", permission_manager=PermissionManager(tmp_path))
     job = Mock(spec=CommandJob)
     service._jobs.get = Mock(return_value=job)
 
-    context.settings.command_job_wait_seconds = (
-        execution_facade.constants.MAX_COMMAND_WAIT_SECONDS + 1
-    )
+    context.settings.command_default_poll_wait_seconds = 20
+    context.settings.command_max_wait_seconds = 60
     service.poll_command_job(context, "handle")
     job.poll.assert_called_with(
-        execution_facade.constants.MAX_COMMAND_WAIT_SECONDS, cancellation_event=None
+        20,
+        max_wait_seconds=60,
+        stdout_cursor=None,
+        stderr_cursor=None,
+        cancellation_event=None,
     )
-    context.settings.command_job_wait_seconds = 20
+    context.settings.command_default_initial_wait_seconds = 10
     service.poll_command_job(context, "handle")
-    job.poll.assert_called_with(20, cancellation_event=None)
-    context.settings.command_timeout = 10
-    service.poll_command_job(context, "handle")
-    job.poll.assert_called_with(20, cancellation_event=None)
+    job.poll.assert_called_with(
+        20,
+        max_wait_seconds=60,
+        stdout_cursor=None,
+        stderr_cursor=None,
+        cancellation_event=None,
+    )
     service.poll_command_job(context, "handle", wait_seconds=0)
-    job.poll.assert_called_with(0, cancellation_event=None)
-    maximum = execution_facade.constants.MAX_COMMAND_WAIT_SECONDS
+    job.poll.assert_called_with(
+        0, max_wait_seconds=60, stdout_cursor=None, stderr_cursor=None, cancellation_event=None
+    )
+    maximum = execution_facade.constants.DEFAULT_COMMAND_MAX_WAIT_SECONDS
     service.poll_command_job(context, "handle", wait_seconds=maximum)
-    job.poll.assert_called_with(maximum, cancellation_event=None)
+    job.poll.assert_called_with(
+        maximum,
+        max_wait_seconds=60,
+        stdout_cursor=None,
+        stderr_cursor=None,
+        cancellation_event=None,
+    )
     interrupted = Event()
     context = replace(context, cancellation_event=interrupted)
     service.poll_command_job(context, "handle", wait_seconds=0)
-    job.poll.assert_called_with(0, cancellation_event=interrupted)
+    job.poll.assert_called_with(
+        0,
+        max_wait_seconds=60,
+        stdout_cursor=None,
+        stderr_cursor=None,
+        cancellation_event=interrupted,
+    )
+
+
+def test_command_job_poll_forwards_per_stream_cursors(tmp_path):
+    """Each stream resumes from the cursor returned by its prior poll page."""
+    service = CommandExecutionService(Mock(), Mock())
+    context = ToolContext(None, "poll_command_job", permission_manager=PermissionManager(tmp_path))
+    job = Mock(spec=CommandJob)
+    service._jobs.get = Mock(return_value=job)
+    service.poll_command_job(
+        context,
+        "handle",
+        wait_seconds=0,
+        stdout_cursor="stdout-cursor",
+        stderr_cursor="stderr-cursor",
+    )
+    job.poll.assert_called_once_with(
+        0,
+        max_wait_seconds=execution_facade.constants.DEFAULT_COMMAND_MAX_WAIT_SECONDS,
+        stdout_cursor="stdout-cursor",
+        stderr_cursor="stderr-cursor",
+        cancellation_event=None,
+    )
 
 
 @pytest.mark.parametrize(
@@ -5972,7 +6015,7 @@ def test_command_job_poll_wait_is_independent_of_command_timeout(tmp_path):
         float("inf"),
         float("nan"),
         "invalid",
-        execution_facade.constants.MAX_COMMAND_WAIT_SECONDS + 1,
+        execution_facade.constants.DEFAULT_COMMAND_MAX_WAIT_SECONDS + 1,
     ],
 )
 def test_command_job_service_rejects_invalid_poll_waits(tmp_path, wait):
@@ -6130,7 +6173,7 @@ def test_command_refuses_a_stopped_origin_before_reserving_a_worker(
         float("inf"),
         float("nan"),
         "1",
-        execution_facade.constants.MAX_COMMAND_WAIT_SECONDS + 1,
+        execution_facade.constants.DEFAULT_COMMAND_MAX_WAIT_SECONDS + 1,
     ],
 )
 def test_command_rejects_invalid_initial_wait_before_launch(
@@ -6149,12 +6192,51 @@ def test_command_rejects_invalid_initial_wait_before_launch(
     )
     result = service.run_command(context, ":", wait_seconds=wait)
     assert result.code == "command_job.invalid_wait"
+    assert (
+        "between 0 and 60 seconds, as configured by tools.command_max_wait_seconds" in result.detail
+    )
     backend.run.assert_not_called()
     assert not service._jobs.has_active()
 
 
+def test_command_rejects_a_configured_wait_cap_above_the_supported_maximum(
+    command_session, command_operation
+):
+    """An unsupported configured cap cannot admit a command or extend its initial wait."""
+    sessions, permissions = command_session
+    backend = Mock()
+    service = CommandExecutionService(backend, Mock())
+    context = ToolContext(
+        None,
+        "run_command",
+        operations=(command_operation,),
+        permission_manager=permissions,
+        session_manager=sessions,
+    )
+    context.settings.command_max_wait_seconds = (
+        execution_facade.constants.MAX_COMMAND_WAIT_SECONDS + 1
+    )
+
+    result = service.run_command(context, ":", wait_seconds=0)
+
+    assert result.code == "command_job.invalid_wait"
+    assert (
+        f"between 0 and {context.settings.command_max_wait_seconds:g} seconds, as configured by "
+        "tools.command_max_wait_seconds"
+    ) in result.detail
+    backend.run.assert_not_called()
+    assert not service._jobs.has_active()
+
+
+@pytest.mark.parametrize(
+    ("configured_wait", "maximum_wait"),
+    [
+        (60, 60),
+        (75, 75),
+    ],
+)
 def test_origin_stop_during_initial_wait_cancels_the_owned_command(
-    monkeypatch, command_session, command_operation
+    monkeypatch, command_session, command_operation, configured_wait, maximum_wait
 ):
     """A stop seen before handoff is carried to the admitted job."""
     sessions, permissions = command_session
@@ -6178,13 +6260,14 @@ def test_origin_stop_during_initial_wait_cancels_the_owned_command(
         waits.append(seconds)
         stopped.set()
 
-    context.settings.command_timeout = execution_facade.constants.MAX_COMMAND_WAIT_SECONDS + 1
+    context.settings.command_default_initial_wait_seconds = configured_wait
+    context.settings.command_max_wait_seconds = maximum_wait
     monkeypatch.setattr(job, "wait", wait)
 
     result = service.run_command(context, ":")
 
     assert result["handle"] == job.handle
-    assert waits == [execution_facade.constants.MAX_COMMAND_WAIT_SECONDS]
+    assert waits == [configured_wait]
     assert result["cancel_requested"]
     assert job.cancellation_event.is_set()
 

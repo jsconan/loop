@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 from pydantic_core import PydanticCustomError
 
 from .. import constants
@@ -153,24 +153,48 @@ class ToolSettings(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    command_timeout: float = Field(
-        default=constants.DEFAULT_COMMAND_TIMEOUT,
-        ge=0,
-        allow_inf_nan=False,
-        json_schema_extra={"required_capabilities": [CommandCapability.CONTEXT_UPDATE.value]},
-    )
-    command_hard_timeout: float = Field(
-        default=constants.DEFAULT_COMMAND_HARD_TIMEOUT,
+    command_job_runtime_limit_seconds: float = Field(
+        default=constants.DEFAULT_COMMAND_JOB_RUNTIME_LIMIT_SECONDS,
         gt=0,
         allow_inf_nan=False,
         json_schema_extra={"required_capabilities": [CommandCapability.CONTEXT_UPDATE.value]},
     )
-    command_job_wait_seconds: float = Field(
-        default=constants.DEFAULT_COMMAND_JOB_WAIT_SECONDS,
+    command_default_initial_wait_seconds: float = Field(
+        default=constants.DEFAULT_COMMAND_INITIAL_WAIT_SECONDS,
         ge=0,
         allow_inf_nan=False,
         json_schema_extra={"required_capabilities": [CommandCapability.CONTEXT_UPDATE.value]},
     )
+    command_default_poll_wait_seconds: float = Field(
+        default=constants.DEFAULT_COMMAND_POLL_WAIT_SECONDS,
+        ge=0,
+        allow_inf_nan=False,
+        json_schema_extra={"required_capabilities": [CommandCapability.CONTEXT_UPDATE.value]},
+    )
+    command_max_wait_seconds: float = Field(
+        default=constants.DEFAULT_COMMAND_MAX_WAIT_SECONDS,
+        ge=0,
+        le=constants.MAX_COMMAND_WAIT_SECONDS,
+        allow_inf_nan=False,
+        json_schema_extra={"required_capabilities": [CommandCapability.CONTEXT_UPDATE.value]},
+    )
+
+    @model_validator(mode="after")
+    def validate_command_waits(self) -> ToolSettings:
+        """Require defaults for both waits to fit within their shared configured cap."""
+        if self.command_default_initial_wait_seconds > self.command_max_wait_seconds:
+            raise ValueError(
+                f"tools.command_default_initial_wait_seconds="
+                f"{self.command_default_initial_wait_seconds:g} cannot exceed "
+                f"tools.command_max_wait_seconds={self.command_max_wait_seconds:g}."
+            )
+        if self.command_default_poll_wait_seconds > self.command_max_wait_seconds:
+            raise ValueError(
+                f"tools.command_default_poll_wait_seconds="
+                f"{self.command_default_poll_wait_seconds:g} cannot exceed "
+                f"tools.command_max_wait_seconds={self.command_max_wait_seconds:g}."
+            )
+        return self
 
 
 class LoggingSettings(BaseModel):

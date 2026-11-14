@@ -433,13 +433,21 @@ class Loop:
             self._compaction.threshold = settings.app.compaction_threshold
         elif path == "web.user_agent":
             self.tool_registry.settings.user_agent = settings.web.user_agent
-        elif path == "tools.command_timeout":
-            self.tool_registry.settings.command_timeout = settings.tools.command_timeout
-        elif path == "tools.command_hard_timeout":
-            self.tool_registry.settings.command_hard_timeout = settings.tools.command_hard_timeout
-        elif path == "tools.command_job_wait_seconds":
-            self.tool_registry.settings.command_job_wait_seconds = (
-                settings.tools.command_job_wait_seconds
+        elif path == "tools.command_job_runtime_limit_seconds":
+            self.tool_registry.settings.command_job_runtime_limit_seconds = (
+                settings.tools.command_job_runtime_limit_seconds
+            )
+        elif path == "tools.command_default_initial_wait_seconds":
+            self.tool_registry.settings.command_default_initial_wait_seconds = (
+                settings.tools.command_default_initial_wait_seconds
+            )
+        elif path == "tools.command_default_poll_wait_seconds":
+            self.tool_registry.settings.command_default_poll_wait_seconds = (
+                settings.tools.command_default_poll_wait_seconds
+            )
+        elif path == "tools.command_max_wait_seconds":
+            self.tool_registry.settings.command_max_wait_seconds = (
+                settings.tools.command_max_wait_seconds
             )
         elif path == "app.model":
             self._model_selection.restore(settings.app.model)
