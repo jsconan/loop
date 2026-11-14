@@ -35,7 +35,7 @@ Test filenames, names, docstrings, fixtures and documentation must describe dura
 - Build realistic payloads, responses, events, and tool calls that reach behavior naturally.
 - Assert public results, emitted output, forwarded requests, filesystem effects, or interactions with injected dependencies.
 - Mock external dependencies and collaborators at their public boundary. Test collaborator internals only in their owning suite.
-- Test module-level helpers in their defining module's suite, not again through every consumer.
+- Test private helpers through the owning module's public behavior in that module's suite; import a helper directly only when it is intentionally part of the supported public API. Do not duplicate implementation tests in every consumer suite.
 
 Fix unexpected warnings and errors at their cause. Capture intended warnings with `pytest.warns`, logged errors with `caplog`, and exceptions with `pytest.raises`; assert the specific diagnostic. Do not add broad warning/error filters, exclusions or permissive assertions to hide failures.
 
