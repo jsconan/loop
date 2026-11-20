@@ -51,6 +51,8 @@ Make every test deterministic, idempotent, standalone, and independent of execut
 
 ## Verify in increasing scope
 
+In addition to automated unit and regression checks, perform an ad-hoc smoke test of changed behavior in a realistic application flow. Use the real application composition, supported configuration layout, user interaction, and relevant native or dependency boundaries; isolated mocks and contract assertions alone do not establish that a feature works. Own disposable test data, preserve user configuration, and inspect observable output and effects. Exercise the requested positive behavior and relevant denial or failure behavior. Report the smoke-test evidence separately from automated checks; if the real prerequisite is unavailable, report the behavior as unverified rather than claiming completion.
+
 Use the installed test environment directly so sandbox verification does not initialize dependency-manager caches. Install dependencies separately with `uv sync`. Run the affected module suite independently first:
 
 ```shell
