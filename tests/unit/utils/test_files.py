@@ -1,12 +1,21 @@
 """Tests for general filesystem mutation utilities."""
 
-from pathlib import Path
+import os
 from unittest.mock import MagicMock
 
 import pytest
 
 from loop.utils.files import is_binary_file, write_text_atomically
 from loop.utils.hashing import sha256_digest
+
+
+@pytest.mark.parametrize("field", ["expected_parent_device", "expected_parent_inode"])
+def test_atomic_write_checks_individually_supplied_parent_identity(tmp_path, field):
+    """A single captured parent identity component remains an enforced precondition."""
+    target = tmp_path / "new"
+    with pytest.raises(RuntimeError, match="parent changed"):
+        write_text_atomically(target, "content", expected_digest=None, **{field: -1})
+    assert not target.exists()
 
 
 def test_is_binary_file_detects_nul_bytes_within_its_bounded_probe(tmp_path):
@@ -41,6 +50,35 @@ def test_write_text_atomically_preserves_existing_permission_bits(tmp_path):
     write_text_atomically(target, "new", expected_digest=digest)
 
     assert target.stat().st_mode & 0o777 == 0o755
+
+
+def test_atomic_replacement_requires_current_alias_accounting(tmp_path):
+    """A linked destination needs a current bound timestamp and preserves the other inode name."""
+    target = tmp_path / "target"
+    target.write_text("ordinary")
+    alias = tmp_path / "alias"
+    alias.hardlink_to(target)
+    digest = sha256_digest(b"ordinary")
+    status = target.stat()
+    for changes in (
+        {},
+        {"expected_ctime_ns": status.st_ctime_ns},
+        {"expected_ctime_ns": -1, "expected_link_count": status.st_nlink},
+        {"expected_ctime_ns": status.st_ctime_ns, "expected_link_count": -1},
+    ):
+        with pytest.raises(RuntimeError, match="replacement was cancelled"):
+            write_text_atomically(target, "new", expected_digest=digest, **changes)
+    write_text_atomically(
+        target,
+        "new",
+        expected_digest=digest,
+        expected_device=status.st_dev,
+        expected_inode=status.st_ino,
+        expected_ctime_ns=status.st_ctime_ns,
+        expected_link_count=status.st_nlink,
+    )
+    assert target.read_text() == "new"
+    assert alias.read_text() == "ordinary"
 
 
 def test_write_text_atomically_rejects_changed_creation_and_replacement_targets(tmp_path):
@@ -107,7 +145,7 @@ def test_write_text_atomically_cleans_up_staged_content_after_commit_failure(tmp
     target = tmp_path / "target.txt"
     target.write_text("old", encoding="utf-8")
     digest = sha256_digest(target.read_bytes())
-    monkeypatch.setattr(Path, "replace", MagicMock(side_effect=OSError("commit failed")))
+    monkeypatch.setattr(os, "replace", MagicMock(side_effect=OSError("commit failed")))
 
     with pytest.raises(OSError, match="commit failed"):
         write_text_atomically(target, "new", expected_digest=digest)

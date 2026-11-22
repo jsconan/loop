@@ -75,6 +75,7 @@ __all__ = [
     "new_uuid",
     "normalized_key",
     "open_selected_file",
+    "open_selected_parent",
     "parse_command_line",
     "payload_digest",
     "private_directory_lock",
@@ -162,6 +163,7 @@ from .path import (
     is_path_ignored,
     iter_visible_paths,
     open_selected_file,
+    open_selected_parent,
     private_directory_lock,
 )
 from .process import (

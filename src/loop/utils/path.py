@@ -39,7 +39,8 @@ def open_selected_file(root: Path, path: Path, identity: tuple[int, int]) -> int
     relative = path.relative_to(root)
     if not relative.parts or ".." in relative.parts:
         raise ValueError("Selected file must be inside its root.")
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    access = getattr(os, "O_SEARCH", getattr(os, "O_PATH", os.O_RDONLY))
+    flags = access | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
     before = root.lstat()
     with ExitStack() as stack:
         directory = os.open(root, flags)
@@ -66,6 +67,41 @@ def open_selected_file(root: Path, path: Path, identity: tuple[int, int]) -> int
             os.close(descriptor)
             raise
         return descriptor
+
+
+@contextmanager
+def open_selected_parent(path: Path, identity: tuple[int, int] | None = None) -> Iterator[int]:
+    """Pin a real parent directory for a descriptor-relative filesystem mutation.
+
+    Args:
+        path (Path): Absolute normalized destination below the filesystem root.
+        identity (tuple[int, int] | None): Authorized parent device/inode, when already bound.
+
+    Yields:
+        int: Parent descriptor valid only inside the context.
+
+    Raises:
+        ValueError: The path is relative, root-only or contains parent traversal.
+        OSError: An ancestor is a symlink or cannot be opened.
+        RuntimeError: The selected parent no longer has its authorized identity.
+    """
+    if not path.is_absolute() or path == Path(path.anchor) or ".." in path.parts:
+        raise ValueError("Selected mutation requires an absolute normalized file path.")
+    access = getattr(os, "O_SEARCH", getattr(os, "O_PATH", os.O_RDONLY))
+    flags = access | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    with ExitStack() as stack:
+        directory = os.open(path.anchor, flags)
+        stack.callback(os.close, directory)
+        for part in path.parent.parts[1:]:
+            directory = os.open(part, flags, dir_fd=directory)
+            stack.callback(os.close, directory)
+        bound = os.fstat(directory)
+        current = path.parent.lstat()
+        if (bound.st_dev, bound.st_ino) != (current.st_dev, current.st_ino) or (
+            identity is not None and (bound.st_dev, bound.st_ino) != identity
+        ):
+            raise RuntimeError("The target parent changed after approval; mutation was cancelled.")
+        yield directory
 
 
 def ensure_private_directory(

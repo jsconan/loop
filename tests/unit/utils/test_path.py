@@ -17,9 +17,59 @@ from loop.utils import (
     is_path_ignored,
     iter_visible_paths,
     open_selected_file,
+    open_selected_parent,
     private_directory_lock,
 )
 from loop.utils import path as path_module
+
+
+@pytest.mark.parametrize("path", [Path("relative"), Path("/"), Path("/tmp/../file")])
+def test_open_selected_parent_rejects_unbound_paths(path):
+    """Mutation parents require an absolute normalized non-root selection."""
+    with pytest.raises(ValueError, match="absolute normalized"), open_selected_parent(path):
+        pytest.fail("An invalid parent must not become usable.")
+
+
+@pytest.mark.parametrize("access", ["search", "path", "read"])
+@pytest.mark.parametrize("selection", ["file", "parent"])
+def test_selected_descriptors_use_directory_traversal_access(
+    tmp_path, monkeypatch, access, selection
+):
+    """Descriptor walks request search access without requiring ancestor directory listings."""
+    source = tmp_path / "file"
+    source.write_bytes(b"selected")
+    details = source.stat()
+    search_flag, path_flag = 1 << 40, 1 << 41
+    native_access = getattr(os, "O_SEARCH", getattr(os, "O_PATH", os.O_RDONLY))
+    monkeypatch.delattr(os, "O_SEARCH", raising=False)
+    monkeypatch.delattr(os, "O_PATH", raising=False)
+    expected = {"search": search_flag, "path": path_flag, "read": os.O_RDONLY}[access]
+    if access != "read":
+        monkeypatch.setattr(
+            os, "O_SEARCH" if access == "search" else "O_PATH", expected, raising=False
+        )
+    original_open = os.open
+    directories = []
+
+    def open_entry(path, flags, *args, **kwargs):
+        """Validate portable flags, then open the fixture with the local OS interface."""
+        if flags & os.O_DIRECTORY:
+            assert flags == expected | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+            directories.append(path)
+            flags = (flags & ~(search_flag | path_flag)) | native_access
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", open_entry)
+    if selection == "file":
+        descriptor = open_selected_file(tmp_path, source, (details.st_dev, details.st_ino))
+        try:
+            assert os.read(descriptor, 100) == b"selected"
+        finally:
+            os.close(descriptor)
+    else:
+        with open_selected_parent(source) as descriptor:
+            assert os.fstat(descriptor).st_ino == tmp_path.stat().st_ino
+    assert directories
 
 
 def test_open_selected_file_reads_identity_bound_file(tmp_path):
