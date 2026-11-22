@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 import re
 import runpy
 from contextlib import contextmanager
@@ -84,6 +85,37 @@ def test_loader_authenticates_and_removes_import_snapshot(reviewed):
         "install", "generation", 1000, 1000, "", {"nested/file.py": b"code"}
     )
     assert not Path(module.sys.path[0]).exists()
+
+
+@pytest.mark.parametrize("refused", [False, True])
+def test_loader_applies_fixed_modes_only_to_the_reviewed_operation(
+    reviewed, tmp_path, capsys, refused
+):
+    """Keep imports private, publish traversable policy and restore the caller's mask on exit."""
+
+    def install(*args):
+        """Model the kernel namespace creation performed by the elevated installer."""
+        imports = Path(module.sys.path[0])
+        assert imports.stat().st_mode & 0o777 == 0o700
+        assert (imports / "nested/file.py").stat().st_mode & 0o777 == 0o400
+        (tmp_path / "namespace").mkdir()
+        os.close(os.open(tmp_path / "reservation", os.O_CREAT | os.O_EXCL, 0o444))
+        if refused:
+            raise ValueError("Owned setup refusal")
+
+    reviewed[3].side_effect = install
+    previous_umask = os.umask(0o077)
+    try:
+        if refused:
+            assert_loader_refusal(capsys, "Owned setup refusal")
+        else:
+            assert module.main() == 0
+        (tmp_path / "after").mkdir()
+    finally:
+        os.umask(previous_umask)
+    assert (tmp_path / "namespace").stat().st_mode & 0o777 == 0o755
+    assert (tmp_path / "reservation").stat().st_mode & 0o777 == 0o444
+    assert (tmp_path / "after").stat().st_mode & 0o777 == 0o700
 
 
 @pytest.mark.parametrize(

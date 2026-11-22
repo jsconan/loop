@@ -25,6 +25,7 @@ _SYSTEM_RUNTIME_DIRECTORY = "/run"
 _AUTHENTICATED_IMPORT_PREFIX = "loop-native-authenticated-"
 _PRIVATE_TEMP_DIRECTORY_MODE = 0o700
 _OWNER_READ_ONLY_FILE_MODE = 0o400
+_SYSTEM_SETUP_UMASK = 0o022
 
 
 def _validate_invocation() -> tuple[str, str, str, str, str, str, str]:
@@ -113,14 +114,19 @@ def _invoke_reviewed_setup(
 
         from loop.execution.sandbox.linux.setup import install_reviewed
 
-        install_reviewed(
-            arguments[2],
-            arguments[3],
-            int(arguments[4]),
-            int(arguments[5]),
-            arguments[6],
-            {name: contents[name] for name in runtime_names},
-        )
+        # The kernel applies the creating process's mask to the AppArmor namespace itself.
+        previous_umask = os.umask(_SYSTEM_SETUP_UMASK)
+        try:
+            install_reviewed(
+                arguments[2],
+                arguments[3],
+                int(arguments[4]),
+                int(arguments[5]),
+                arguments[6],
+                {name: contents[name] for name in runtime_names},
+            )
+        finally:
+            os.umask(previous_umask)
 
 
 def _execute_reviewed_setup() -> None:
