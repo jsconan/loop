@@ -443,6 +443,7 @@ def test_supervise_process_kills_same_group_descendant_after_parent_exit(process
         """Represent a reader held open by a descendant without creating a real thread."""
         thread = boundary.thread_factory(**kwargs)
         thread.is_alive.return_value = True
+        thread.join.side_effect = boundary.clock.sleep
         return thread
 
     capture = supervise_process(boundary.process, 101, thread_factory=retained_thread)
@@ -451,7 +452,8 @@ def test_supervise_process_kills_same_group_descendant_after_parent_exit(process
     boundary.kill.assert_called_once_with(123, 9)
     assert [call.args for call in boundary.close.call_args_list] == [(101,), (102,)]
     assert boundary.process.wait.call_count == 1
-    assert all(thread.join.call_count == 2 for thread in boundary.threads)
+    assert capture.stdout_discarded is None and capture.stderr_discarded is None
+    assert boundary.clock.current == pytest.approx(101 + 2 * constants.COMMAND_CLEANUP_WAIT_SECONDS)
 
 
 def test_native_child_receives_only_the_isolated_environment(tmp_path, process_clock):

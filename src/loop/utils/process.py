@@ -323,10 +323,12 @@ def read_bounded_stream(
             poller.register(descriptor, select.POLLIN | select.POLLHUP | select.POLLERR)
         while True:
             if poller is not None:
-                if chunks.stop.is_set():
+                events = poller.poll(50)
+                # A closed writer leaves a finite tail which can still be captured in full.
+                if chunks.stop.is_set() and not (events and events[0][1] & select.POLLHUP):
                     incomplete = True
                     break
-                if not poller.poll(50):
+                if not events:
                     continue
             try:
                 if decoder is None:
@@ -560,8 +562,8 @@ def supervise_process(
 
     Observe leader exit without reaping it, then signal the group and wait for its leader before
     taking the output snapshot. The leader remains waitable until signaling is attempted. A
-    bounded wait can expire without confirming that the leader was reaped. Give readers
-    a bounded cleanup interval to consume the resulting pipe EOF; incomplete draining retains
+    bounded wait can expire without confirming that the leader was reaped. Give readers a shared
+    cleanup interval to reach pipe EOF before asking them to stop. Incomplete draining retains
     unknown discard counts. A reader failure makes an otherwise completed capture unavailable.
     Observe cancellation while draining inherited pipes after leader exit, and never extend the
     execution deadline. Built-in POSIX pipe readers stop cooperatively during cleanup; an injected
@@ -620,6 +622,13 @@ def supervise_process(
             )
         except BaseException:  # noqa: BLE001 - the supervisor must report every reader failure.
             discarded[index] = None
+
+    def join_cleanup_readers() -> None:
+        """Share one cleanup wait between the still-running output readers."""
+        cleanup_deadline = time.monotonic() + constants.COMMAND_CLEANUP_WAIT_SECONDS
+        for thread in started_readers:
+            if thread.is_alive():
+                thread.join(max(0.0, cleanup_deadline - time.monotonic()))
 
     try:
         if not is_finite_deadline(deadline):
@@ -706,9 +715,10 @@ def supervise_process(
             if cleanup_error is None:
                 cleanup_error = exc
 
+        # Reaping the leader does not guarantee that its signaled writers have closed.
+        join_cleanup_readers()
         reader_stop.set()
-        for thread in started_readers:
-            thread.join(constants.COMMAND_CLEANUP_WAIT_SECONDS)
+        join_cleanup_readers()
 
         for index, stream in enumerate(streams):
             if (

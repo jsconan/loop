@@ -5,6 +5,7 @@ import errno
 import io
 import logging
 import os
+import select
 import subprocess
 import threading
 import time
@@ -143,6 +144,20 @@ def test_supervised_reader_stops_when_no_pipe_data_arrives(monkeypatch, process_
     assert read_bounded_stream(stream, chunks) is None
     assert stream.closed
     assert not chunks
+
+
+def test_supervised_reader_drains_closed_pipe_during_cleanup(monkeypatch, process_os):
+    """A pending cleanup still captures the final bytes and EOF after the sole writer exits."""
+    stop = threading.Event()
+    stop.set()
+    poller = MagicMock()
+    poller.poll.return_value = [(42, select.POLLIN | select.POLLHUP)]
+    monkeypatch.setattr("loop.utils.process.select.poll", lambda: poller)
+    buffer = io.BytesIO(b"final output")
+    buffer.fileno = lambda: 42
+    chunks = CapturedChunks("stdout", None, stop)
+    assert read_bounded_stream(io.TextIOWrapper(buffer), chunks) == 0
+    assert chunks == ["final output"]
 
 
 def test_read_bounded_stream_drains_every_chunk_but_retains_the_configured_limit():
@@ -587,7 +602,10 @@ def test_supervise_process_cleans_up_when_reader_setup_fails(
     for thread in threads:
         thread.is_alive.return_value = False
     if alive:
-        threads[index].is_alive.side_effect = [True, False]
+        threads[index].is_alive.return_value = True
+        threads[index].join.side_effect = lambda _timeout: setattr(
+            threads[index].is_alive, "return_value", False
+        )
     if failure == "start":
         threads[index].start.side_effect = exception
     created = []
@@ -605,8 +623,6 @@ def test_supervise_process_cleans_up_when_reader_setup_fails(
 
     terminate.assert_called_once_with(process)
     process.wait.assert_called_once()
-    if failure == "start" and (index == 1 or alive):
-        threads[0].join.assert_called_once()
     if failure == "start" and alive:
         threads[index].join.assert_called_once()
     process.stdout.close.assert_called_once()
@@ -1288,3 +1304,44 @@ def test_supervise_process_captures_buffered_output_after_termination(failure, s
     assert result.stdout == "rea" and result.stderr == "er"
     assert result.stdout_discarded == 2 and result.stderr_discarded == 3
     assert result.exit_code is None
+
+
+def test_supervise_process_drains_queued_output_before_descendant_pipe_closes(
+    monkeypatch, process_os
+):
+    """A timeout retains queued pipe data before the signaled writer reaches EOF."""
+    monkeypatch.setattr("loop.utils.process.time.monotonic", lambda: 101.0)
+    poller = MagicMock()
+    poller.poll.side_effect = [[(42, select.POLLIN)], [(42, select.POLLHUP)]]
+    monkeypatch.setattr("loop.utils.process.select.poll", lambda: poller)
+    buffer = io.BytesIO(b"ready-final")
+    buffer.fileno = lambda: 42
+    process = MagicMock(stdout=io.TextIOWrapper(buffer), returncode=-9)
+    process.stderr.read.return_value = ""
+    terminate = MagicMock()
+
+    def thread_factory(*, target, daemon):
+        """Schedule reading only during the bounded post-termination join."""
+        thread = MagicMock()
+        thread.is_alive.return_value = True
+
+        def join(timeout):
+            """Drain only after the owned process group receives its signal."""
+            if not terminate.called:
+                assert timeout == 0
+                return
+            terminate.assert_called_once_with(process)
+            target()
+            thread.is_alive.return_value = False
+
+        thread.join.side_effect = join
+        return thread
+
+    result = supervise_process(
+        process, 100, stdout_limit=5, terminate=terminate, thread_factory=thread_factory
+    )
+
+    assert result.status is ProcessCaptureStatus.TIMED_OUT
+    assert result.stdout == "ready"
+    assert result.stdout_discarded == 6
+    assert process.stdout.closed
