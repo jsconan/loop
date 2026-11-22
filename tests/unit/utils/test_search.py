@@ -11,6 +11,18 @@ from loop.utils.process import ProcessCapture, ProcessCaptureStatus
 from loop.utils.search import ripgrep_path, search_text_paths
 
 
+@pytest.mark.parametrize("native", [False, True])
+def test_search_skips_binary_content_from_bound_descriptors(tmp_path, native):
+    """Binary candidates produce no matches or native subprocess input."""
+    source = tmp_path / "binary"
+    source.write_bytes(b"match\0content")
+    runner = Mock(side_effect=AssertionError("Binary input must not start ripgrep."))
+    assert search_text_paths(
+        [source], "match", root=tmp_path, native_runner=runner if native else None
+    ) == ([], False)
+    runner.assert_not_called()
+
+
 def test_ripgrep_path_uses_host_lookup_order(tmp_path, monkeypatch):
     """The locator preserves shell lookup order without launching the result."""
     hostile = tmp_path / "hostile"

@@ -60,6 +60,7 @@ def search_text_paths(
     context_lines: int = 0,
     max_results: int = 100,
     max_bytes: int = constants.MAX_TOOL_CONTENT_BYTES,
+    opener: Callable[[Path], int] | None = None,
     native_runner: Callable[[tuple[str, ...], tuple[int, ...], float], ProcessCapture | None]
     | None = None,
 ) -> tuple[list[TextSearchMatch], bool]:
@@ -74,6 +75,8 @@ def search_text_paths(
         context_lines (int): Number of neighboring lines retained around every match.
         max_results (int): Maximum matching lines returned across every file.
         max_bytes (int): Maximum approximate result bytes retained across matches and context.
+        opener (Callable[[Path], int] | None): Policy-bound descriptor opener for direct tools,
+            or None for a trusted caller using selected file identities.
         native_runner (Callable | None): Trusted read-only argv executor for ripgrep searches,
             or None to use the bounded in-process matcher.
 
@@ -93,6 +96,7 @@ def search_text_paths(
         native = _search_native(
             candidates,
             query,
+            opener=opener,
             root=root,
             regex=regex,
             case=case,
@@ -122,8 +126,15 @@ def search_text_paths(
         trailing = 0
         try:
             selected = path.stat()
-            descriptor = open_selected_file(root, path, (selected.st_dev, selected.st_ino))
+            descriptor = (
+                opener(path)
+                if opener is not None
+                else open_selected_file(root, path, (selected.st_dev, selected.st_ino))
+            )
             with os.fdopen(descriptor, "r", encoding="utf-8", errors="replace") as stream:
+                if "\0" in stream.read(constants.DEFAULT_STREAM_CHUNK_SIZE):
+                    continue
+                stream.seek(0)
                 number = 0
                 while raw := stream.readline(_MAX_LINE_CHARS + 2):
                     number += 1
@@ -188,6 +199,7 @@ def _search_native(
     query: str,
     *,
     root: Path,
+    opener: Callable[[Path], int] | None,
     regex: bool,
     case: TextSearchCase,
     context_lines: int,
@@ -207,11 +219,20 @@ def _search_native(
             for path in candidates[offset : offset + 200]:
                 try:
                     details = path.stat()
-                    descriptor = open_selected_file(root, path, (details.st_dev, details.st_ino))
+                    descriptor = (
+                        opener(path)
+                        if opener is not None
+                        else open_selected_file(root, path, (details.st_dev, details.st_ino))
+                    )
                 except OSError as exc:
                     raise RuntimeError(f"Could not search selected file: {path}") from exc
                 stack.callback(os.close, descriptor)
+                if b"\0" in os.read(descriptor, constants.DEFAULT_STREAM_CHUNK_SIZE):
+                    continue
+                os.lseek(descriptor, 0, os.SEEK_SET)
                 selected[descriptor] = str(path.relative_to(root))
+            if not selected:
+                continue
             arguments = [
                 "--json",
                 "--no-config",
