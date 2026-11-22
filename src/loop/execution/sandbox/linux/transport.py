@@ -50,6 +50,7 @@ if TYPE_CHECKING:
 
 _SO_PEERCRED_OPTION = getattr(socket, "SO_PEERCRED", SO_PEERCRED_OPTION_FALLBACK)
 _RESPONSE_READ_CHUNK_BYTES = 4096
+_CONTROL_POLL_SECONDS = 0.05
 _EGRESS_CONTROL_SECONDS = 2.0
 _EGRESS_HEARTBEAT_SECONDS = 0.5
 _OUTPUT_FRAME_MAX_BYTES = 4 * DEFAULT_STREAM_CHUNK_SIZE
@@ -379,8 +380,10 @@ def exchange_request(
     Call from the ordinary client after authorization, using installation authority supplied
     by the management owner. Authenticate exact unit bytes, fixed local socket ownership and
     inode, and the root systemd listener peer before transmitting any content. Send the existing
-    version-one admission frame and read a bounded response through EOF. Cancellable clients keep
-    the write side open for one supervisor control byte and wait for the receiver's cleanup result.
+    version-one admission frame and collect the bounded response until the peer closes. If the
+    peer resets after starting its terminal record, retain the received bytes for the caller's
+    complete envelope and attempt identity checks. Cancellable clients check before each response
+    read and keep the write side open for one supervisor control byte and the cleanup result.
     Revalidate installed and socket authority before returning. Do not retry: EOF, cancellation,
     a deadline or transport error does not establish whether command effects occurred.
 
@@ -469,13 +472,26 @@ def exchange_request(
         try:
             while True:
                 remaining = _remaining(delivery_deadline)
+                if (
+                    cancellation_event is not None
+                    and cancellation_event.is_set()
+                    and not response
+                    and not cancel_sent
+                ):
+                    connection.settimeout(min(remaining, _CONTROL_POLL_SECONDS))
+                    try:
+                        connection.sendall(NATIVE_CANCEL_FRAME)
+                    except (BrokenPipeError, ConnectionResetError):
+                        # The receiver can finish before it reads cancellation. Drain its result.
+                        pass
+                    cancel_sent = True
                 if terminal_ready and terminal_input is not None and not response:
                     frame = terminal_input()
                     if frame is not None:
                         connection.settimeout(min(remaining, 1.0))
                         connection.sendall(frame)
                 connection.settimeout(
-                    min(remaining, 0.05)
+                    min(remaining, _CONTROL_POLL_SECONDS)
                     if (cancellation_event is not None and not response and not cancel_sent)
                     or egress_lease is not None
                     or terminal_input is not None
@@ -485,6 +501,12 @@ def exchange_request(
                     block = connection.recv(
                         min(_RESPONSE_READ_CHUNK_BYTES, MAX_NATIVE_RESULT_BYTES + 1 - len(response))
                     )
+                except ConnectionResetError:
+                    if not response:
+                        raise
+                    # The receiver can close after sending its final record. The caller
+                    # authenticates the complete envelope and rejects any truncated record.
+                    break
                 except TimeoutError:
                     if egress_lease is not None and ready and not egress_lease.healthy():
                         raise OSError("Mediated egress health acknowledgement timed out.") from None
@@ -495,14 +517,6 @@ def exchange_request(
                         and remaining <= threading.TIMEOUT_MAX
                     ):
                         raise
-                    if (
-                        cancellation_event is not None
-                        and cancellation_event.is_set()
-                        and not response
-                        and not cancel_sent
-                    ):
-                        connection.sendall(NATIVE_CANCEL_FRAME)
-                        cancel_sent = True
                     continue
                 if not block:
                     break

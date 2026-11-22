@@ -1,5 +1,6 @@
 """Verify bounded ordinary transport and original listener authority before content transmission."""
 
+import json
 import socket
 import stat
 import struct
@@ -193,6 +194,38 @@ def test_transport_waits_for_cleanup_ack_after_sending_cancellation(transport):
     assert result == b"cleanup-confirmed"
     assert connection.sendall.call_args_list[0].args[0].endswith(b"private request")
     assert connection.sendall.call_args_list[1].args == (NATIVE_CANCEL_FRAME,)
+    connection.shutdown.assert_not_called()
+
+
+@pytest.mark.parametrize("cancel_error", [None, BrokenPipeError(), ConnectionResetError()])
+def test_transport_sends_cancellation_between_continuous_output_frames(transport, cancel_error):
+    """Deliver cancellation once even while the receiver keeps producing output."""
+    config, files, connection, *_ = transport
+    cancellation = Event()
+    observed = Mock(side_effect=lambda *_: cancellation.set())
+    frame = b"O1\x00\x00\x00\x02ok"
+    blocks = iter((frame, frame, b'{"result":"cancelled"}', b""))
+    connection.sendall.side_effect = [None, cancel_error]
+
+    def receive(_size):
+        """Require the control frame before processing more live output."""
+        if cancellation.is_set():
+            assert connection.sendall.call_count == 2
+            assert connection.sendall.call_args.args == (NATIVE_CANCEL_FRAME,)
+        return next(blocks)
+
+    connection.recv.side_effect = receive
+    result = linux_transport.exchange_request(
+        config,
+        files,
+        b"request",
+        20,
+        cancellation_event=cancellation,
+        output_observer=observed,
+    )
+
+    assert result == b'{"result":"cancelled"}'
+    assert observed.call_count == 2
     connection.shutdown.assert_not_called()
 
 
@@ -392,7 +425,8 @@ def test_transport_late_installed_drift_never_returns_response(transport):
     connection.sendall.assert_called_once()
 
 
-def test_transport_restores_large_attempt_bound_result(transport):
+@pytest.mark.parametrize("end", [b"", ConnectionResetError()])
+def test_transport_restores_large_attempt_bound_result(transport, end):
     """A result larger than its request ceiling passes bounded transport without losing Unicode."""
     from loop.execution.sandbox.contracts import CommandProcessResult, SandboxOutcome
 
@@ -402,10 +436,34 @@ def test_transport_restores_large_attempt_bound_result(transport):
         SandboxOutcome.COMPLETED, exit_code=17, stdout="😀" * 65536, stderr="ordinary failure"
     )
     wire = result.to_wire(attempt)
-    connection.recv.side_effect = [*(wire[i : i + 4096] for i in range(0, len(wire), 4096)), b""]
+    connection.recv.side_effect = [*(wire[i : i + 4096] for i in range(0, len(wire), 4096)), end]
     received = linux_transport.exchange_request(config, files, b"request", 20)
     assert CommandProcessResult.from_wire(received, attempt) == result
     assert connection.sendall.call_args.args[0] == b"LOOP\x01" + struct.pack("!I", 7) + b"request"
+
+
+def test_transport_reset_before_result_preserves_failure(transport):
+    """Streaming output alone cannot complete an attempt after the receiver resets."""
+    config, files, connection, *_ = transport
+    observer = Mock()
+    connection.recv.side_effect = [b"O1\x00\x00\x00\x02ok", ConnectionResetError()]
+    with pytest.raises(ConnectionResetError):
+        linux_transport.exchange_request(config, files, b"request", 20, output_observer=observer)
+    observer.assert_called_once_with("stdout", "ok")
+
+
+def test_truncated_result_at_receiver_reset_cannot_complete_attempt(transport):
+    """A reset after a partial terminal record still requires a complete typed result."""
+    from loop.execution.sandbox.contracts import CommandProcessResult, SandboxOutcome
+
+    config, files, connection, *_ = transport
+    attempt = "1248c892-42dc-4b68-a3fb-30d2a70a93a7"
+    wire = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0).to_wire(attempt)
+    connection.recv.side_effect = [wire[:-1], ConnectionResetError()]
+    received = linux_transport.exchange_request(config, files, b"request", 20)
+    with pytest.raises(json.JSONDecodeError) as error:
+        CommandProcessResult.from_wire(received, attempt)
+    assert error.value.pos == len(received)
 
 
 def test_transport_timeout_capture_uses_fixed_delivery_interval(transport, monkeypatch):
