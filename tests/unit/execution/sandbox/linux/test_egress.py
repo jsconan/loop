@@ -29,8 +29,10 @@ def broker(monkeypatch):
     monkeypatch.setattr(egress.socket, "MSG_CMSG_CLOEXEC", 0x40000000, raising=False)
     channel = Mock()
     channel.send.return_value = 1
-    request = SimpleNamespace(egress_origins=(ORIGIN,), network=False, deadline=20.0)
-    owner = egress.EgressBroker(request, channel)
+    request = SimpleNamespace(
+        ingress_port=None, egress_origins=(ORIGIN,), network=False, deadline=20.0
+    )
+    owner = egress.NetworkBroker(request, channel)
     return owner, channel, clock, thread, monkeypatch
 
 
@@ -40,7 +42,7 @@ def test_broker_binds_first_heartbeat_and_pauses_new_routes(broker):
     assert not owner.active()
     assert not owner.allow_new()
     assert not owner.lease_expired()
-    owner.start_lease()
+    owner.start_lease(20.0)
     assert owner.heartbeat(7)
     assert owner.heartbeat(7)
     assert not owner.heartbeat(6)
@@ -61,11 +63,30 @@ def test_broker_binds_first_heartbeat_and_pauses_new_routes(broker):
     channel.close.assert_called_once()
 
 
+def test_broker_observes_the_launched_deadline_after_preparation_expires(broker):
+    """New and continuing routes honor the runtime ceiling independently of heartbeat health."""
+    owner, _channel, clock, _thread, _patch = broker
+    clock[0] = 19.0
+    owner.start_lease(25.0)
+    assert owner.heartbeat(7)
+    clock[0] = 20.5
+    assert owner.allow_new()
+    assert owner.active()
+
+    clock[0] = 24.0
+    assert owner.heartbeat(7)
+    clock[0] = 25.0
+    assert not owner.lease_expired()
+    assert not owner.allow_new()
+    assert not owner.active()
+    assert owner.close()
+
+
 @pytest.mark.parametrize("gate_failure", ["short-send", "closed-channel"])
 def test_broker_refuses_an_unacknowledged_namespace_gate(broker, gate_failure):
     """A missing first gate byte cannot authorize the private proxy listener."""
     owner, channel, _clock, _thread, _patch = broker
-    owner.start_lease()
+    owner.start_lease(20.0)
     if gate_failure == "short-send":
         channel.send.return_value = 0
     else:
@@ -90,8 +111,9 @@ def test_broker_close_reports_unsettled_worker_and_tolerates_closed_sockets(brok
     client.close.assert_called_once()
     worker.join.assert_called_once()
     monkeypatch.setattr(egress.threading, "current_thread", lambda: worker)
-    second = egress.EgressBroker(
-        SimpleNamespace(egress_origins=(ORIGIN,), network=False, deadline=20.0), Mock()
+    second = egress.NetworkBroker(
+        SimpleNamespace(ingress_port=None, egress_origins=(ORIGIN,), network=False, deadline=20.0),
+        Mock(),
     )
     second._workers.add(worker)
     assert not second.close()
@@ -101,7 +123,7 @@ def test_broker_close_reports_unsettled_worker_and_tolerates_closed_sockets(brok
 def test_broker_revision_closes_every_tracked_route(broker, revision):
     """A newer revision confirms closure while a stale one fails closed."""
     owner, channel, _clock, _thread, _patch = broker
-    owner.start_lease()
+    owner.start_lease(20.0)
     assert owner.heartbeat(7)
     assert owner.accept_revision(revision) is (revision == 8)
     assert not owner.active()
@@ -115,15 +137,15 @@ def test_broker_refuses_missing_or_broad_grants(monkeypatch):
     """Never construct a mediator for no grant or unrestricted direct networking."""
     monkeypatch.setattr(egress.threading, "Thread", Mock())
     for origins, network in (((), False), ((ORIGIN,), True)):
-        request = SimpleNamespace(egress_origins=origins, network=network)
-        with pytest.raises(ValueError, match="mediated-only"):
-            egress.EgressBroker(request, Mock())
+        request = SimpleNamespace(ingress_port=None, egress_origins=origins, network=network)
+        with pytest.raises(ValueError, match="isolated mediated network"):
+            egress.NetworkBroker(request, Mock())
 
 
 def test_broker_selects_only_public_pinned_answer(broker, monkeypatch):
     """Skip forbidden resolver answers and connect to one checked numeric sockaddr."""
     owner, _channel, _clock, _thread, _patch = broker
-    owner.start_lease()
+    owner.start_lease(20.0)
     assert owner.heartbeat(7)
     answers = [
         (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.168.1.2", 80)),
@@ -131,7 +153,9 @@ def test_broker_selects_only_public_pinned_answer(broker, monkeypatch):
         (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("11.0.0.2", 80)),
     ]
     monkeypatch.setattr(egress.socket, "getaddrinfo", Mock(return_value=answers))
-    monkeypatch.setattr(egress.EgressBroker, "_external_route", staticmethod(lambda _address: True))
+    monkeypatch.setattr(
+        egress.NetworkBroker, "_external_route", staticmethod(lambda _address: True)
+    )
     upstream = Mock()
     monkeypatch.setattr(egress.socket, "socket", Mock(return_value=upstream))
 
@@ -148,7 +172,7 @@ def test_broker_selects_only_public_pinned_answer(broker, monkeypatch):
 def test_broker_re_resolves_after_a_previous_allowed_connection(broker, monkeypatch):
     """A later forbidden DNS answer never reuses an earlier pinned address."""
     owner, _channel, _clock, _thread, _patch = broker
-    owner.start_lease()
+    owner.start_lease(20.0)
     assert owner.heartbeat(7)
     answers = [
         [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("11.0.0.2", 80))],
@@ -156,7 +180,9 @@ def test_broker_re_resolves_after_a_previous_allowed_connection(broker, monkeypa
     ]
     resolver = Mock(side_effect=answers)
     monkeypatch.setattr(egress.socket, "getaddrinfo", resolver)
-    monkeypatch.setattr(egress.EgressBroker, "_external_route", staticmethod(lambda _address: True))
+    monkeypatch.setattr(
+        egress.NetworkBroker, "_external_route", staticmethod(lambda _address: True)
+    )
     upstream = Mock()
     monkeypatch.setattr(egress.socket, "socket", Mock(return_value=upstream))
     assert owner.connect(ORIGIN) is upstream
@@ -176,7 +202,7 @@ def test_broker_route_probe_rejects_host_local_and_unusable_routes(monkeypatch, 
         return_value=SimpleNamespace(stdout=json.dumps([{"type": route, "dev": "eth0"}]).encode())
     )
     monkeypatch.setattr(egress.subprocess, "run", probe)
-    assert egress.EgressBroker._external_route(ipaddress.ip_address("11.0.0.2")) is (
+    assert egress.NetworkBroker._external_route(ipaddress.ip_address("11.0.0.2")) is (
         route == "unicast"
     )
     probe.assert_called_once()
@@ -198,7 +224,7 @@ def test_broker_route_probe_fails_closed_on_untrusted_or_invalid_metadata(monkey
     if unsafe == "tool":
         probe.side_effect = OSError("missing route tool")
     monkeypatch.setattr(egress.subprocess, "run", probe)
-    assert not egress.EgressBroker._external_route(ipaddress.ip_address("11.0.0.2"))
+    assert not egress.NetworkBroker._external_route(ipaddress.ip_address("11.0.0.2"))
 
 
 def _handler(method="GET", path=ORIGIN + "/", headers=None, body=b""):
@@ -493,7 +519,7 @@ def test_namespace_proxy_refuses_unsealed_child_before_fork(monkeypatch, failure
 def test_broker_connection_failures_never_return_an_upstream(broker, monkeypatch, case):
     """DNS, route, socket, connect and policy changes fail before transport reuse."""
     owner, _channel, _clock, _thread, _patch = broker
-    owner.start_lease()
+    owner.start_lease(20.0)
     assert owner.heartbeat(7)
     if case == "paused":
         assert owner.pause(7)
@@ -510,7 +536,7 @@ def test_broker_connection_failures_never_return_an_upstream(broker, monkeypatch
             "getaddrinfo",
             Mock(return_value=[(family, socket.SOCK_STREAM, 6, "", (address, 80))]),
         )
-    monkeypatch.setattr(egress.EgressBroker, "_external_route", staticmethod(lambda _: True))
+    monkeypatch.setattr(egress.NetworkBroker, "_external_route", staticmethod(lambda _: True))
     upstream = Mock()
     if case == "socket":
         monkeypatch.setattr(egress.socket, "socket", Mock(side_effect=OSError("socket")))
@@ -530,7 +556,7 @@ def test_broker_connection_failures_never_return_an_upstream(broker, monkeypatch
 def test_broker_rechecks_each_transport_before_admission(broker, monkeypatch, case):
     """Reject malformed origins, route changes, capacity, and a revoked pinned connection."""
     owner, _channel, _clock, _thread, _patch = broker
-    owner.start_lease()
+    owner.start_lease(20.0)
     assert owner.heartbeat(7)
     if case == "missing-host":
         owner.request.egress_origins = ("http://",)
@@ -543,7 +569,7 @@ def test_broker_rechecks_each_transport_before_admission(broker, monkeypatch, ca
         Mock(return_value=[(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("11.0.0.2", 80))]),
     )
     monkeypatch.setattr(
-        egress.EgressBroker, "_external_route", staticmethod(lambda _: case != "route")
+        egress.NetworkBroker, "_external_route", staticmethod(lambda _: case != "route")
     )
     upstream = Mock()
     monkeypatch.setattr(egress.socket, "socket", Mock(return_value=upstream))
@@ -584,14 +610,22 @@ def test_broker_refuses_new_socket_after_attempt_socket_limit(broker):
         "not-admitted",
         "worker-limit",
         "peer-error",
+        "revoke-before-start",
+        "revoke-at-start",
     ],
 )
 def test_broker_handoff_accepts_only_one_private_tcp_descriptor(monkeypatch, case):
-    """Close malformed FD handoffs and never admit a foreign or truncated descriptor."""
+    """Admit only a valid private socket and confirm revocation during worker startup."""
     clock = [10.0]
     monkeypatch.setattr(egress.time, "monotonic", lambda: clock[0])
     reader = {}
     workers = []
+    lock = MagicMock()
+
+    def revoke(*_exit):
+        """Revoke when the receiving thread releases the lock at the chosen handoff."""
+        lock.__exit__.side_effect = None
+        assert owner.accept_revision(8)
 
     def thread(*, target, daemon, args=()):
         """Keep native worker callbacks deterministic without starting real threads."""
@@ -602,9 +636,26 @@ def test_broker_handoff_accepts_only_one_private_tcp_descriptor(monkeypatch, cas
             reader["run"] = target
         elif case == "start-error":
             worker.start.side_effect = RuntimeError("cannot start")
+        elif case == "revoke-at-start":
+
+            def require_started(_timeout):
+                """Closure must only join workers whose startup has completed."""
+                worker.start.assert_called_once()
+
+            worker.join.side_effect = require_started
+            lock.__exit__.side_effect = revoke
         return worker
 
-    monkeypatch.setattr(egress.threading, "Thread", thread)
+    monkeypatch.setattr(
+        egress,
+        "threading",
+        SimpleNamespace(
+            Event=egress.threading.Event,
+            Lock=lambda: lock,
+            Thread=thread,
+            current_thread=egress.threading.current_thread,
+        ),
+    )
     monkeypatch.setattr(egress.socket, "MSG_CMSG_CLOEXEC", 0x40000000, raising=False)
     channel = Mock()
     if case == "idle":
@@ -636,13 +687,23 @@ def test_broker_handoff_accepts_only_one_private_tcp_descriptor(monkeypatch, cas
     accepted.getpeername.return_value = ("127.0.0.1", 41001)
     if case == "peer-error":
         accepted.getpeername.side_effect = OSError("peer disappeared")
+    elif case == "revoke-before-start":
+
+        def revoke_tracked_route():
+            """Arrange revocation immediately after the client is tracked."""
+            lock.__exit__.side_effect = revoke
+            return ("127.0.0.1", 41001)
+
+        accepted.getpeername.side_effect = revoke_tracked_route
     factory = Mock(return_value=accepted)
     if case in {"fd-ctor", "fd-close-fails"}:
         factory.side_effect = OSError("bad descriptor")
     monkeypatch.setattr(egress.socket, "socket", factory)
-    request = SimpleNamespace(egress_origins=(ORIGIN,), network=False, deadline=20.0)
-    owner = egress.EgressBroker(request, channel)
-    owner.start_lease()
+    request = SimpleNamespace(
+        ingress_port=None, egress_origins=(ORIGIN,), network=False, deadline=20.0
+    )
+    owner = egress.NetworkBroker(request, channel)
+    owner.start_lease(20.0)
     assert owner.heartbeat(7)
     if case == "not-admitted":
         assert owner.pause(7)
@@ -663,6 +724,12 @@ def test_broker_handoff_accepts_only_one_private_tcp_descriptor(monkeypatch, cas
         accepted.close.assert_called_once()
     elif case == "start-error" or case in {"not-admitted", "worker-limit", "peer-error"}:
         accepted.close.assert_called_once()
+    elif case == "revoke-at-start":
+        workers[1].join.assert_called_once()
+        accepted.close.assert_called_once()
+    elif case == "revoke-before-start":
+        assert len(workers) == 1
+        accepted.shutdown.assert_called_once_with(socket.SHUT_RDWR)
     elif case in {"wrong-data", "truncated", "two-fds"}:
         assert close_fd.call_count == (2 if case == "two-fds" else 1)
         factory.assert_not_called()
@@ -704,10 +771,11 @@ def test_broker_handoff_rejects_nonprivate_or_nontcp_socket(monkeypatch, problem
     accepted.getsockname.return_value = ("192.168.1.2" if problem == "local" else "127.0.0.1", 4000)
     accepted.getpeername.return_value = ("192.168.1.3" if problem == "peer" else "127.0.0.1", 4001)
     monkeypatch.setattr(egress.socket, "socket", Mock(return_value=accepted))
-    owner = egress.EgressBroker(
-        SimpleNamespace(egress_origins=(ORIGIN,), network=False, deadline=20.0), channel
+    owner = egress.NetworkBroker(
+        SimpleNamespace(ingress_port=None, egress_origins=(ORIGIN,), network=False, deadline=20.0),
+        channel,
     )
-    owner.start_lease()
+    owner.start_lease(20.0)
     assert owner.heartbeat(7)
     reader["run"]()
     accepted.close.assert_called_once()
@@ -722,3 +790,69 @@ def test_closed_broker_reader_does_not_receive_another_descriptor(broker, monkey
     thread.call_args.kwargs["target"]()
     polling.assert_not_called()
     channel.close.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "ending",
+    [
+        "ack",
+        "invalid-ack",
+        "unknown-ack",
+        "short-send",
+        "io",
+        "paused",
+        "capacity",
+        "pause-race",
+        "closed",
+    ],
+)
+def test_ingress_handoff_retains_revocable_host_socket(broker, monkeypatch, ending):
+    """Publish only the approved loopback port and close duplicates on ACK, loss or refusal."""
+    owner, channel, _clock, thread, _patch = broker
+    owner.request.ingress_port = 8123
+    owner.request.egress_origins = ()
+    listener, client = Mock(), Mock()
+    client.fileno.return_value = 17
+    listener.accept.return_value = (client, ("127.0.0.1", 40000))
+    monkeypatch.setattr(egress.socket, "socket", Mock(return_value=listener))
+    assert owner.heartbeat(7)
+    listener.bind.assert_called_once_with(("127.0.0.1", 8123))
+    channel.sendmsg.return_value = 4 if ending == "short-send" else 5
+    channel.recv.return_value = (
+        b"bad"
+        if ending == "invalid-ack"
+        else b"D" + (2 if ending == "unknown-ack" else 1).to_bytes(4)
+    )
+    if ending == "paused":
+        assert owner.pause(7)
+    elif ending == "capacity":
+        monkeypatch.setattr(egress, "MAX_CLIENTS", 0)
+    elif ending == "pause-race":
+        monkeypatch.setattr(owner, "allow_new", lambda: owner.pause(7))
+    elif ending == "closed":
+        owner.close()
+    ready = [([], [], []), ([listener], [], []), ([channel], [], []), OSError("closed")]
+    if ending == "io":
+        ready = [ValueError("invalid descriptor")]
+    monkeypatch.setattr(egress.select, "select", Mock(side_effect=ready))
+    thread.call_args.kwargs["target"]()
+    assert not owner.active()
+    listener.close.assert_called()
+    if ending in {"paused", "capacity", "pause-race", "closed", "io"}:
+        channel.sendmsg.assert_not_called()
+    else:
+        args = channel.sendmsg.call_args.args
+        assert args[0] == [b"C\x00\x00\x00\x01"]
+        assert list(args[1][0][2]) == [17]
+        client.close.assert_called()
+
+
+def test_ingress_reader_can_wait_before_first_approved_heartbeat(broker, monkeypatch):
+    """No listener exists before authority activation and control loss closes the route."""
+    owner, channel, _clock, thread, _patch = broker
+    owner.request.ingress_port = 8123
+    selected = Mock(side_effect=[([], [], []), OSError("closed")])
+    monkeypatch.setattr(egress.select, "select", selected)
+    thread.call_args.kwargs["target"]()
+    assert selected.call_args_list[0].args[0] == [channel]
+    assert not owner.active()

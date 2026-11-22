@@ -72,13 +72,16 @@ def _enter_and_execute(request: Any, value: dict[str, Any]) -> None:
             os.close(descriptor)
     egress_fd = value.get("egress_fd")
     origins = getattr(request, "egress_origins", ())
-    if isinstance(origins, tuple) and origins:
+    if (isinstance(origins, tuple) and origins) or request.ingress_port is not None:
         if not isinstance(egress_fd, int) or isinstance(egress_fd, bool) or egress_fd <= 2:
             raise ValueError("Mediated egress descriptor is unavailable.")
         if not stat.S_ISSOCK(os.fstat(egress_fd).st_mode):
             raise ValueError("Mediated egress descriptor is not a socket.")
     elif egress_fd is not None:
         raise ValueError("Unexpected mediated egress descriptor.")
+    descriptor_filter = value.get("payload_descriptor_filter")
+    if (descriptor_filter is not None) != (request.ingress_port is not None):
+        raise ValueError("Ingress payload descriptor filter is missing or unexpected.")
     network_filter = value.get("local_network_filter")
     if (network_filter is None) != request.local_network:
         raise ValueError("Local-network filter and request authority differ.")
@@ -94,6 +97,11 @@ def _enter_and_execute(request: Any, value: dict[str, Any]) -> None:
         reservation=_bound_host_file(value, "reservation"),
         tracking=(NATIVE_TRACKING_PATH, (tracking[0], tracking[1]), tracking[2]),
         **({"egress_descriptor": egress_fd} if egress_fd is not None else {}),
+        **(
+            {"payload_descriptor_filter": base64.b64decode(descriptor_filter, validate=True)}
+            if descriptor_filter is not None
+            else {}
+        ),
         **(
             {"local_network_filter": base64.b64decode(network_filter, validate=True)}
             if network_filter is not None

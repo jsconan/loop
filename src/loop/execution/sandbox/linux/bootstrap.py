@@ -24,6 +24,7 @@ from ....constants import MAX_NATIVE_POLICY_MODE_BYTES, MAX_NATIVE_PROFILE_NAME_
 from ....utils.hashing import sha256_digest
 from ..constants import TMPDIR_ENVIRONMENT_VARIABLE
 from .constants import (
+    INGRESS_PORT_ENVIRONMENT_VARIABLE,
     NATIVE_PAYLOAD_MARKER_PREFIX,
     NATIVE_PROFILE_GROUP_HASH_CHARS,
     NATIVE_SCRATCH_PATH,
@@ -33,8 +34,9 @@ from .constants import (
 )
 from .egress import start_namespace_proxy
 from .host import MAX_COMPILED_BYTES, HostFile, read_policy_bytes
+from .ingress import start_namespace_ingress
 from .installation import MAX_RETAINED_BYTES, generation_limits
-from .seccomp import install_local_network_filter
+from .seccomp import install_payload_filter
 
 if TYPE_CHECKING:
     from ..contracts import SandboxRequest
@@ -675,6 +677,7 @@ def execute_payload(
     tracking: tuple[Path, tuple[int, int], str] | None = None,
     egress_descriptor: int | None = None,
     local_network_filter: bytes | None = None,
+    payload_descriptor_filter: bytes | None = None,
 ) -> None:
     """Irreversibly activate the bound payload and replace trusted setup with its shell.
 
@@ -702,6 +705,8 @@ def execute_payload(
         egress_descriptor (int | None): Receiver-owned private socket handed to the scoped
             network-namespace bridge; absent for ordinary commands.
         local_network_filter (bytes | None): Host-prepared filter for a local-network deny.
+        payload_descriptor_filter (bytes | None): Full descriptor-denial filter, mandatory after
+            the trusted ingress worker forks and before the agent shell can execute.
 
     Raises:
         ValueError: Bound paths, cwd or activation authority differ.
@@ -712,6 +717,8 @@ def execute_payload(
     if time.monotonic() >= request.deadline:
         raise TimeoutError("Payload execution deadline expired.")
 
+    if (payload_descriptor_filter is not None) != (request.ingress_port is not None):
+        raise ValueError("Ingress payload descriptor filter is missing or unexpected.")
     if (local_network_filter is None) != request.local_network:
         raise ValueError("Local-network filter and request authority differ.")
 
@@ -737,7 +744,12 @@ def execute_payload(
     if time.monotonic() >= request.deadline:
         raise TimeoutError("Payload execution deadline expired.")
 
-    if isinstance(request.egress_origins, tuple) and request.egress_origins:
+    if request.ingress_port is not None:
+        if egress_descriptor is None:
+            raise ValueError("Ingress requires an inherited private channel.")
+        start_namespace_ingress(egress_descriptor, request.ingress_port)
+        environment[INGRESS_PORT_ENVIRONMENT_VARIABLE] = str(request.ingress_port)
+    elif isinstance(request.egress_origins, tuple) and request.egress_origins:
         if egress_descriptor is None:
             raise ValueError("Mediated egress requires an inherited private channel.")
         proxy_port = start_namespace_proxy(egress_descriptor)
@@ -757,8 +769,10 @@ def execute_payload(
     elif egress_descriptor is not None:
         raise ValueError("Unexpected mediated egress channel.")
 
+    if payload_descriptor_filter is not None:
+        install_payload_filter(payload_descriptor_filter)
     if local_network_filter is not None:
-        install_local_network_filter(local_network_filter)
+        install_payload_filter(local_network_filter)
 
     os.umask(request.file_creation_mask)
     os.execve(

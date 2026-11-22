@@ -31,23 +31,33 @@ class SQLiteSessionStore:
     Args:
         path (Path | str): SQLite database path. Its parent is created on the first save.
         workspace_id (str): Durable identity of the workspace owning the database.
+        scratch_roots (tuple[Path, ...]): Trusted private namespaces in preference order.
+            An empty tuple uses the database's own namespace.
 
     Raises:
         ValueError: If the workspace identifier is empty.
     """
 
     _path: Path
+    _scratch_roots: tuple[Path, ...]
     _workspace_id: str
 
-    def __init__(self, path: Path | str, *, workspace_id: str) -> None:
+    def __init__(
+        self,
+        path: Path | str,
+        *,
+        workspace_id: str,
+        scratch_roots: tuple[Path, ...] = (),
+    ) -> None:
         self._path = Path(path).resolve()
         if not workspace_id:
             raise ValueError("Workspace identifier must not be empty.")
         self._workspace_id = workspace_id
+        self._scratch_roots = scratch_roots
 
     @property
     def temporary_root(self) -> Path:
-        """Return durable session working storage beside the database.
+        """Return the durable namespace for ownership locks and legacy working storage.
 
         Returns:
             Path: Database- and workspace-specific root preserved across store instances and
@@ -57,6 +67,15 @@ class SQLiteSessionStore:
             "utf-8", errors="surrogatepass"
         )
         return self._path.parent / "scratch" / sha256_digest(identity)
+
+    @property
+    def scratch_roots(self) -> tuple[Path, ...]:
+        """Return the trusted namespaces in preference order for new working generations.
+
+        Returns:
+            tuple[Path, ...]: Private namespaces or an empty tuple for database-adjacent storage.
+        """
+        return self._scratch_roots
 
     def working_binding(self, session_id: str) -> WorkingDirectoryBinding | None:
         """Validate the existing namespace and read identity without changing the conversation.

@@ -1089,6 +1089,7 @@ def test_activate_payload_preserves_only_a_valid_private_egress_bridge(
 def test_execute_payload_configures_only_requested_private_proxy(monkeypatch, case):
     """The shell receives an attempt-private proxy only after mediated activation."""
     request = Mock(
+        ingress_port=None,
         deadline=20,
         cwd=Path("/work"),
         execution_source="printf safe",
@@ -1164,6 +1165,7 @@ def test_load_cached_payload_enforces_smaller_reserved_byte_limit(cache):
 def test_execute_payload_requires_activation_and_original_deadline(monkeypatch, failure):
     """Run source only after exact authority validation and successful activation."""
     request = Mock(
+        ingress_port=None,
         deadline=20,
         cwd=Path("/work"),
         execution_source="printf safe",
@@ -1245,6 +1247,7 @@ def test_execute_payload_requires_activation_and_original_deadline(monkeypatch, 
 def test_execute_payload_preserves_opaque_shell_source(monkeypatch):
     """Pass quoted strings and embedded source unchanged to the activated shell."""
     request = Mock(
+        ingress_port=None,
         deadline=20,
         cwd=Path("/work"),
         execution_source="cat '/tmp/bound/r0/file'; printf '%s' /tmp/bound/r0-other",
@@ -1278,6 +1281,7 @@ def test_execute_payload_preserves_opaque_shell_source(monkeypatch):
 def test_execute_payload_requires_and_installs_local_filter(monkeypatch):
     """A local deny cannot enter the shell until the precompiled filter is installed."""
     request = Mock(
+        ingress_port=None,
         deadline=20,
         cwd=Path("/work"),
         execution_source="printf safe",
@@ -1293,7 +1297,7 @@ def test_execute_payload_requires_and_installs_local_filter(monkeypatch):
     monkeypatch.setattr(linux_bootstrap.time, "monotonic", lambda: 10)
     monkeypatch.setattr(linux_bootstrap, "activate_payload", Mock())
     installer = Mock()
-    monkeypatch.setattr(linux_bootstrap, "install_local_network_filter", installer)
+    monkeypatch.setattr(linux_bootstrap, "install_payload_filter", installer)
     monkeypatch.setattr(linux_bootstrap.os, "umask", Mock())
     monkeypatch.setattr(linux_bootstrap.os, "execve", Mock())
     with pytest.raises(ValueError, match="filter and request authority"):
@@ -1328,6 +1332,7 @@ def test_execute_payload_requires_and_installs_local_filter(monkeypatch):
 def test_payload_environment_maps_generated_paths_to_namespace_scratch():
     """All generated paths stay inside the request's unique namespace scratch mount."""
     request = Mock(
+        ingress_port=None,
         generated_environment=("TMPDIR", "HOME", "XDG_CACHE_HOME", "COVERAGE_FILE"),
         shell_environment=Mock(
             return_value={
@@ -1354,6 +1359,7 @@ def test_payload_environment_maps_generated_paths_to_namespace_scratch():
 def test_payload_environment_maps_direct_request_tmpdir():
     """Direct Linux requests also receive only their private namespace scratch spelling."""
     request = Mock(
+        ingress_port=None,
         generated_environment=(),
         shell_environment=Mock(return_value={"PATH": "/usr/bin:/bin", "TMPDIR": "/tmp/direct"}),
     )
@@ -1385,8 +1391,70 @@ def test_payload_environment_maps_direct_request_tmpdir():
 def test_payload_environment_refuses_invalid_generated_paths(environment, generated, message):
     """Malformed generated scratch values cannot point outside the private bind."""
     request = Mock(
-        generated_environment=generated, shell_environment=Mock(return_value=environment)
+        ingress_port=None,
+        generated_environment=generated,
+        shell_environment=Mock(return_value=environment),
     )
 
     with pytest.raises(ValueError, match=message):
         linux_bootstrap._payload_environment(request)
+
+
+@pytest.mark.parametrize(
+    "case", ["valid", "missing-filter", "unexpected-filter", "missing-channel", "filter-fails"]
+)
+def test_ingress_forks_trusted_worker_then_restores_descriptor_denial(monkeypatch, case):
+    """No payload executes before the full filter, and only the worker retains handoff authority."""
+    request = Mock(
+        ingress_port=None if case == "unexpected-filter" else 8123,
+        egress_origins=(),
+        deadline=20,
+        cwd=Path("/work"),
+        execution_source="exec server",
+        file_creation_mask=0o027,
+        attempt_id="1248c892-42dc-4b68-a3fb-30d2a70a93a7",
+        generated_environment=(),
+        local_network=True,
+    )
+    request.shell_environment.return_value = {"PATH": "/usr/bin:/bin"}
+    request.paths_are_current.return_value = True
+    monkeypatch.setattr(Path, "cwd", lambda: Path("/work"))
+    monkeypatch.setattr(linux_bootstrap.time, "monotonic", lambda: 10)
+    monkeypatch.setattr(linux_bootstrap, "activate_payload", Mock())
+    monkeypatch.setattr(linux_bootstrap.os, "umask", Mock())
+    events = []
+    worker = Mock(side_effect=lambda *args: events.append(("worker", args)))
+    monkeypatch.setattr(linux_bootstrap, "start_namespace_ingress", worker)
+
+    def install(value):
+        """Observe the mandatory filter boundary or refuse it before exec."""
+        events.append(("filter", value))
+        if case == "filter-fails":
+            raise OSError("filter refused")
+
+    monkeypatch.setattr(linux_bootstrap, "install_payload_filter", install)
+    replacement = Mock(side_effect=lambda *args: events.append(("exec", args)))
+    monkeypatch.setattr(linux_bootstrap.os, "execve", replacement)
+    expected = (
+        RuntimeError if case == "valid" else OSError if case == "filter-fails" else ValueError
+    )
+    with pytest.raises(expected):
+        linux_bootstrap.execute_payload(
+            request,
+            "library",
+            "bootstrap",
+            "lock",
+            b"compiled",
+            "profile",
+            "generation",
+            1000,
+            reservation="budget",
+            egress_descriptor=None if case == "missing-channel" else 9,
+            payload_descriptor_filter=None if case == "missing-filter" else b"full-filter",
+        )
+    if case == "valid":
+        assert [event[0] for event in events] == ["worker", "filter", "exec"]
+        worker.assert_called_once_with(9, 8123)
+        assert replacement.call_args.args[2]["LOOP_INGRESS_PORT"] == "8123"
+    else:
+        replacement.assert_not_called()

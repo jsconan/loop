@@ -5,25 +5,22 @@ from __future__ import annotations
 import os
 import re
 import stat
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_core import PydanticCustomError
 
 from .. import constants
 from ..errors import safe_error_detail
+from ..sandbox_catalog import managed_directory, validate_sandbox_options
 from ..utils import has_extended_access_acl, load_unique_json, sha256_digest
 from .models import Decision, PermissionRule
+from .protection import validate_hard_denied_paths
 
 _MAX_POLICY_BYTES = 65_536
 _EXPECTATION_NAME = f"{constants.APP_NAME}.managed.expect.json"
 _POLICY_NAME = "managed-policy.json"
-_SYSTEM_DIRECTORIES = {
-    "darwin": Path("/Library") / constants.APP_DISPLAY_NAME,
-    "linux": Path("/etc") / constants.APP_NAME,
-}
 _OPEN_DIRECTORY = (
     getattr(os, "O_SEARCH", getattr(os, "O_PATH", os.O_RDONLY))
     | os.O_DIRECTORY
@@ -63,7 +60,9 @@ class ManagedPolicy(BaseModel):
         require_sandbox (bool): Reject host process execution.
         forbid_host (bool): Reject host process execution independently of user limits.
         deny_local_networks (bool): Forbid sandbox-attempt loopback even when user policy allows it.
+        forbidden_backend_options (tuple[str, ...]): Prohibited optional backend authorities.
         forbid_yolo (bool): Prevent automatic no-prompt mode from becoming active.
+        hard_denied_paths (tuple[str, ...]): Exact absolute protected file/directory paths.
         rules (tuple[PermissionRule, ...]): Deny or fresh-human rules for typed operations.
     """
 
@@ -75,8 +74,14 @@ class ManagedPolicy(BaseModel):
     require_sandbox: bool = False
     forbid_host: bool = False
     deny_local_networks: bool = False
+    forbidden_backend_options: tuple[str, ...] = ()
     forbid_yolo: bool = False
+    hard_denied_paths: tuple[str, ...] = ()
     rules: tuple[PermissionRule, ...] = ()
+
+    _validate_hard_paths = field_validator("hard_denied_paths")(validate_hard_denied_paths)
+
+    _validate_options = field_validator("forbidden_backend_options")(validate_sandbox_options)
 
     @model_validator(mode="after")
     def validate_rules(self) -> ManagedPolicy:
@@ -140,9 +145,7 @@ class ManagedPolicyStore:
         owner_uid: int = 0,
     ) -> None:
         self._system_default = directory is None
-        self._directory = (
-            directory if directory is not None else _SYSTEM_DIRECTORIES.get(sys.platform)
-        )
+        self._directory = directory if directory is not None else managed_directory()
         self._trust_anchor = trust_anchor
         self._owner_uid = owner_uid
 

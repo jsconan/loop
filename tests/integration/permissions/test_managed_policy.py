@@ -230,7 +230,6 @@ def test_native_root_policy_is_authoritative_for_yolo_and_host(tmp_path):
                             "print(error.errno)')"
                         ),
                         "cwd": str(tmp_path),
-                        "read_only": True,
                     }
                 ),
             )

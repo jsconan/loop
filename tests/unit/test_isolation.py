@@ -49,6 +49,22 @@ def test_environment_and_current_directory_are_disposable(tmp_path):
     assert "SSH_AUTH_SOCK" not in os.environ
 
 
+def test_private_names_are_classified_relative_to_the_owned_case(tmp_path):
+    """Host scratch ancestors cannot change synthetic public or private path decisions."""
+    from loop.permissions.protection import is_hard_resource, is_protected_external_read
+
+    assert not is_protected_external_read(tmp_path / "public")
+    assert is_protected_external_read(tmp_path / ".ssh" / "key")
+    assert is_protected_external_read(tmp_path / "Library" / "value")
+    assert is_protected_external_read(Path("/outside/Library/value"))
+    scope = {"workspace": tmp_path / "workspace", "scratch": tmp_path / "scratch"}
+    assert not is_hard_resource(tmp_path / "public", **scope)
+    assert is_hard_resource(tmp_path / ".ssh" / "key", **scope)
+    assert is_hard_resource(tmp_path / ".env", **scope)
+    assert not is_hard_resource(scope["scratch"] / ".ssh" / "key", **scope, scratch_data=True)
+    assert is_hard_resource(Path("/outside/Library/value"), **scope)
+
+
 def test_unowned_output_is_blocked_before_creation(tmp_path):
     """Writes and directory creation outside test ownership leave no output behind."""
     target = tmp_path.parent.parent / f"loop-forbidden-{uuid4().hex}"

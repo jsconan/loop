@@ -14,8 +14,10 @@ The project defaults to a local server at `http://localhost:8000/v1` running `nv
 - Responses API function-call handling
 - A decorator-based registry for synchronous and asynchronous Python tools
 - Built-in tools for filesystem access, shell commands, and the current date and time
+- Native command confinement and separate [direct-host authorization](docs/permissions.md#direct-host-authorization), disabled by default and requiring a trusted setting plus exact consent
 - Confirmation for file writes, destructive workspace commands, Git changes, and commands that expand the default workspace sandbox
 - File edits checked against the source snapshots supplied to the model, with reread warnings when files change during generation
+- Native commands and direct file tools deny environment-value files and trusted private designations while allowing public environment templates; cached file continuations recheck current policy
 - Hierarchical project instructions from `AGENTS.md` files
 - Progressive discovery and activation of Agent Skills from `SKILL.md` files
 
@@ -81,3 +83,5 @@ If installed as a `uv` tool, run `loop` from any directory. Use `/stop` to settl
 - [Use built-in tools and the command sandbox](docs/tools.md)
 - [Use value holders from Python](docs/library.md)
 - [Develop and test Loop](docs/development.md)
+
+Ask Loop to run the tests from the project directory. It follows the project’s instructions and presents the command, its write scope and any additional access in one approval. Commands use private scratch for writes by default. The owner can enable ordinary checkout writes or request specific output paths. Saved verification commands retain their declared scope. Account lookup and process pools start off and can be requested independently when supported. [Saved verification tasks](docs/tools.md#saved-verification-tasks) · [Command permissions](docs/permissions.md#optional-sandbox-capabilities).

@@ -11,6 +11,7 @@ from hashlib import file_digest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import RLock
+from typing import BinaryIO
 from uuid import UUID, uuid4
 
 from .. import constants
@@ -134,6 +135,25 @@ def decode_content_cursor(cursor: str, handle: str) -> int:
     return start_byte
 
 
+def _cached_command_continuation(handle: str, start_byte: int) -> dict:
+    """Keep a command preview's cache cursor and next tool call at the same byte offset."""
+    cursor = encode_content_cursor(handle, start_byte)
+    return {
+        "handle": handle,
+        "next_cursor": cursor,
+        "next_tool_call": {
+            "name": "read_cached_content",
+            "arguments": {
+                "handle": handle,
+                "cursor": cursor,
+                "start_line": None,
+                "max_lines": None,
+                "max_bytes": constants.MAX_TOOL_CONTENT_BYTES,
+            },
+        },
+    }
+
+
 def validate_content_handle(handle: str) -> None:
     """Validate an opaque content-read capability.
 
@@ -152,7 +172,12 @@ def validate_content_handle(handle: str) -> None:
 
 
 def register_cached_metadata(
-    handle: str, source: str, reloadable: bool, *, allow_nul: bool = False
+    handle: str,
+    source: str,
+    reloadable: bool,
+    *,
+    allow_nul: bool = False,
+    file_sources: tuple[str, ...] | None = (),
 ) -> None:
     """Register artifact metadata loaded from a tool result or newly cached source.
 
@@ -161,6 +186,8 @@ def register_cached_metadata(
         source (str): Human-readable source for the content.
         reloadable (bool): Whether the source can recreate an expired artifact.
         allow_nul (bool): Whether the cached text may contain NUL characters.
+        file_sources (tuple[str, ...] | None): Exact physical sources for policy rechecks,
+            an empty tuple for content without file authority, or None for legacy unknown origins.
 
     Raises:
         ValueError: If the handle or metadata values are invalid.
@@ -170,12 +197,19 @@ def register_cached_metadata(
         not isinstance(source, str)
         or not isinstance(reloadable, bool)
         or not isinstance(allow_nul, bool)
-    ):
-        raise ValueError(  # noqa: TRY004 - cached metadata has one validation contract.
-            "Invalid cached content metadata."
+        or file_sources is not None
+        and (
+            not isinstance(file_sources, tuple)
+            or any(
+                not isinstance(path, str) or not Path(path).is_absolute() for path in file_sources
+            )
         )
+    ):
+        raise ValueError("Invalid cached content metadata.")
     with _LOCK:
         metadata = CachedContentMetadata(source=source, reloadable=reloadable)
+        if file_sources or file_sources is None and not reloadable:
+            metadata["file_sources"] = file_sources
         if allow_nul:
             metadata["allow_nul"] = True
         _METADATA[handle] = metadata
@@ -311,9 +345,8 @@ class _ContentSpool:
         }
         if included < captured or not capture_complete:
             result.update(
-                handle=self.handle,
-                next_cursor=encode_content_cursor(self.handle, included),
                 continuation="Use read_cached_content with this handle and cursor.",
+                **_cached_command_continuation(self.handle, included),
             )
             if capture_complete and captured > included:
                 result["tail"] = self.read_tail(_COMMAND_TAIL_BYTES)
@@ -636,7 +669,6 @@ def _bound_command_result(output: str, source: str) -> tuple[str, str] | None:
         handle = previous or uuid4().hex
         page = target[name]
         page.update(
-            handle=handle,
             truncated=True,
             continuation=page.get(
                 "continuation", "Continue this stream using its handle and cursor."
@@ -652,7 +684,7 @@ def _bound_command_result(output: str, source: str) -> tuple[str, str] | None:
             page.update(
                 content=prefix,
                 included_bytes=included,
-                next_cursor=encode_content_cursor(handle, included),
+                **_cached_command_continuation(handle, included),
             )
             try:
                 candidate = json.dumps(bounded, ensure_ascii=False)
@@ -669,16 +701,19 @@ def _bound_command_result(output: str, source: str) -> tuple[str, str] | None:
                 store_content(content, f"{source} {stream_name}", handle=content_handle)
             store_content(output, source, handle=snapshot)
             return best, snapshot
-        page.update(content="", included_bytes=0, next_cursor=encode_content_cursor(handle, 0))
+        page.update(content="", included_bytes=0, **_cached_command_continuation(handle, 0))
     return None
 
 
-def bound_tool_result(output: str, source: str) -> tuple[str, str | None]:
+def bound_tool_result(
+    output: str, source: str, *, file_sources: tuple[str, ...] = ()
+) -> tuple[str, str | None]:
     """Bound a serialized result while preserving file and command continuations.
 
     Args:
         output (str): Complete serialized tool result.
         source (str): Human-readable origin for the cached content.
+        file_sources (tuple[str, ...]): Physical file sources for later hard-policy checks.
 
     Returns:
         tuple[str, str | None]: Bounded result and its original-output cache handle, or the
@@ -688,10 +723,12 @@ def bound_tool_result(output: str, source: str) -> tuple[str, str | None]:
     if len(encoded) <= constants.MAX_TOOL_RESULT_BYTES:
         return output, None
     if file_result := _bound_file_result(output, source):
+        register_cached_metadata(file_result[1], source, False, file_sources=file_sources)
         return file_result
     if command_result := _bound_command_result(output, source):
         return command_result
     handle = store_content(encoded, source)
+    register_cached_metadata(handle, source, False, file_sources=file_sources)
     preview_bytes = min(constants.MAX_TOOL_CONTENT_BYTES // 2, len(encoded))
     while True:
         preview = encoded[:preview_bytes].decode("utf-8", errors="ignore")
@@ -736,8 +773,8 @@ def _validate_boundaries(
     max_bytes: int,
 ) -> tuple[int | None, int | None]:
     """Validate and normalize byte and line boundaries."""
-    if start_byte == 0 and start_line == 1:
-        if max_lines is None:
+    if start_byte == 0 and start_line is not None:
+        if start_line == 1 and max_lines is None:
             start_line = None
         else:
             start_byte = None
@@ -798,108 +835,171 @@ def read_bounded_text(
             versioned source changes.
         TypeError: If ``allow_nul`` is not a boolean.
     """
+    with path.open("rb") as stream:
+        result = read_bounded_text_stream(
+            stream,
+            start_byte=start_byte,
+            start_line=start_line,
+            max_lines=max_lines,
+            max_bytes=max_bytes,
+            preserve_line_boundaries=preserve_line_boundaries,
+            include_version=include_version,
+            allow_nul=allow_nul,
+        )
+        if include_version:
+            bound, current = os.fstat(stream.fileno()), path.stat()
+            if any(
+                getattr(bound, field) != getattr(current, field)
+                for field in ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+            ):
+                raise ValueError("File changed while reading; read it again before editing.")
+        return result
+
+
+def read_bounded_text_stream(
+    stream: BinaryIO,
+    *,
+    start_byte: int | None = None,
+    start_line: int | None = 1,
+    max_lines: int | None = None,
+    max_bytes: int = constants.MAX_TOOL_CONTENT_BYTES,
+    preserve_line_boundaries: bool = False,
+    include_version: bool = False,
+    allow_nul: bool = False,
+) -> BoundedTextContent:
+    """Read a UTF-8 text range subject to independent byte and line ceilings.
+
+    Args:
+        stream (BinaryIO): Caller-owned seekable regular file opened in binary mode.
+            The stream remains open; reading starts at the requested absolute position.
+        start_byte (int | None): Zero-based byte offset for direct access. Mutually exclusive with
+            a non-default ``start_line``. At the shared byte-zero/line-one origin, an explicit
+            ``max_lines`` selects line mode and otherwise ``start_byte`` selects byte mode.
+        start_line (int | None): One-based starting line, or ``None`` for byte-oriented access.
+        max_lines (int | None): Optional maximum lines returned from either starting mode.
+            Defaults to no line limit. When both ceilings are set, the first reached stops reading.
+        max_bytes (int): Requested encoded byte ceiling, capped by the application hard limit.
+            If the first character cannot fit, the reader includes that one character instead.
+        preserve_line_boundaries (bool): Whether line-oriented reads prefer whole lines. The
+            requested byte ceiling expands as needed for the first line, up to the hard limit;
+            larger lines return a byte-resumable fragment. Defaults to ``False``.
+        include_version (bool): Whether to hash the complete source through the read descriptor
+            and reject changes during capture. Defaults to ``False``.
+        allow_nul (bool): Whether to treat NUL characters as text instead of binary content.
+            Defaults to ``False``.
+
+    Returns:
+        BoundedTextContent: Text, exact byte range, continuation metadata, and the complete source
+            digest when ``include_version`` is enabled. When the first character or line
+            exceeds the requested ceiling, requested and effective limits identify the adjustment.
+
+    Raises:
+        ValueError: If ranges are invalid, both starting modes are selected, the offset is beyond
+            the source or splits a UTF-8 character, selected content is not UTF-8 text, or a
+            versioned source changes.
+        TypeError: If ``allow_nul`` is not a boolean.
+    """
     start_byte, start_line = _validate_boundaries(start_byte, start_line, max_lines, max_bytes)
     if not isinstance(allow_nul, bool):
         raise TypeError("allow_nul must be a boolean.")
 
     version = None
-    size = path.stat().st_size
-    with path.open("rb") as stream:
-        before = os.fstat(stream.fileno()) if include_version else None
-        if before is not None:
-            size = before.st_size
-        if start_byte is not None and start_byte > size:
-            raise ValueError("start_byte is beyond the end of the content.")
-        probe = stream.read(min(size, _SCAN_CHUNK_BYTES))
-        if not allow_nul and b"\0" in probe:
-            raise ValueError("Content appears to be binary.")
-        stream.seek(0)
-        current_line = 1
-        if start_byte is not None:
-            stream.seek(start_byte)
-            start = start_byte
-        else:
-            current_line = _seek_to_line(stream, start_line)
-            start = stream.tell()
+    size = os.fstat(stream.fileno()).st_size
+    before = os.fstat(stream.fileno()) if include_version else None
+    if before is not None:
+        size = before.st_size
+    if start_byte is not None and start_byte > size:
+        raise ValueError("start_byte is beyond the end of the content.")
+    probe = stream.read(min(size, _SCAN_CHUNK_BYTES))
+    if not allow_nul and b"\0" in probe:
+        raise ValueError("Content appears to be binary.")
+    stream.seek(0)
+    current_line = 1
+    if start_byte is not None:
+        stream.seek(start_byte)
+        start = start_byte
+    else:
+        current_line = _seek_to_line(stream, start_line)
+        start = stream.tell()
 
-        chunks = []
-        remaining = max_bytes
-        lines_read = 0
-        stopped_by_lines = False
-        split_line = False
-        adjusted_limit = None
-        while remaining:
-            if max_lines is not None and lines_read >= max_lines:
-                stopped_by_lines = True
-                break
-            chunk = stream.readline(remaining + 1)
-            if not chunk:
-                break
-            if len(chunk) > remaining:
-                if start_line is not None and preserve_line_boundaries:
-                    if chunks:
-                        stream.seek(-len(chunk), 1)
-                        break
-                    stream.seek(start)
-                    chunk = stream.readline(constants.MAX_TOOL_CONTENT_BYTES + 1)
-                    split_line = len(chunk) > constants.MAX_TOOL_CONTENT_BYTES
-                    if split_line:
-                        stream.seek(-1, 1)
-                        chunk = chunk[:-1]
-                    chunks.append(chunk)
-                    adjusted_limit = len(chunk) if len(chunk) > max_bytes else None
-                    lines_read = 0 if split_line else 1
-                    stopped_by_lines = max_lines is not None and lines_read >= max_lines
+    chunks = []
+    remaining = max_bytes
+    lines_read = 0
+    stopped_by_lines = False
+    split_line = False
+    adjusted_limit = None
+    while remaining:
+        if max_lines is not None and lines_read >= max_lines:
+            stopped_by_lines = True
+            break
+        chunk = stream.readline(remaining + 1)
+        if not chunk:
+            break
+        if len(chunk) > remaining:
+            if start_line is not None and preserve_line_boundaries:
+                if chunks:
+                    stream.seek(-len(chunk), 1)
                     break
-                stream.seek(-(len(chunk) - remaining), 1)
-                chunk = chunk[:remaining]
-            chunks.append(chunk)
-            remaining -= len(chunk)
-            if chunk.endswith((b"\n", b"\r")) or remaining:
-                lines_read += 1
-
-        end = stream.tell()
-        encoded = b"".join(chunks)
-        if not allow_nul and b"\0" in encoded:
-            raise ValueError("Content appears to be binary.")
-        try:
-            content = encoded.decode("utf-8")
-        except UnicodeDecodeError as exc:
-            if exc.end != len(encoded) or exc.reason != "unexpected end of data":
-                raise ValueError("Selected range is not valid UTF-8 text.") from exc
-            if exc.start:
-                if end == size:
-                    raise ValueError("Selected range is not valid UTF-8 text.") from exc
-                omitted = len(encoded) - exc.start
-                encoded = encoded[: exc.start]  # pylint: disable=invalid-slice-index
-                end -= omitted
-                content = encoded.decode("utf-8")
-            else:
                 stream.seek(start)
-                decoder = getincrementaldecoder("utf-8")()
-                encoded, content = b"", ""
-                while not content:
-                    byte = stream.read(1)
-                    if not byte:
-                        raise ValueError("Selected range is not valid UTF-8 text.") from exc
-                    encoded += byte
-                    try:
-                        content = decoder.decode(byte)
-                    except UnicodeDecodeError as error:
-                        raise ValueError("Selected range is not valid UTF-8 text.") from error
-                end = start + len(encoded)
-                adjusted_limit = len(encoded)
-        more = end < size
-        if before is not None:
-            stream.seek(0)
-            version = f"sha256:{file_digest(stream, 'sha256').hexdigest()}"
-            fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
-            if any(
-                getattr(before, field) != getattr(current, field)
-                for current in (os.fstat(stream.fileno()), path.stat())
-                for field in fields
-            ):
-                raise ValueError("File changed while reading; read it again before editing.")
+                chunk = stream.readline(constants.MAX_TOOL_CONTENT_BYTES + 1)
+                split_line = len(chunk) > constants.MAX_TOOL_CONTENT_BYTES
+                if split_line:
+                    stream.seek(-1, 1)
+                    chunk = chunk[:-1]
+                chunks.append(chunk)
+                adjusted_limit = len(chunk) if len(chunk) > max_bytes else None
+                lines_read = 0 if split_line else 1
+                stopped_by_lines = max_lines is not None and lines_read >= max_lines
+                break
+            stream.seek(-(len(chunk) - remaining), 1)
+            chunk = chunk[:remaining]
+        chunks.append(chunk)
+        remaining -= len(chunk)
+        if chunk.endswith((b"\n", b"\r")) or remaining:
+            lines_read += 1
+
+    end = stream.tell()
+    encoded = b"".join(chunks)
+    if not allow_nul and b"\0" in encoded:
+        raise ValueError("Content appears to be binary.")
+    try:
+        content = encoded.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        if exc.end != len(encoded) or exc.reason != "unexpected end of data":
+            raise ValueError("Selected range is not valid UTF-8 text.") from exc
+        if exc.start:
+            if end == size:
+                raise ValueError("Selected range is not valid UTF-8 text.") from exc
+            omitted = len(encoded) - exc.start
+            encoded = encoded[: exc.start]  # pylint: disable=invalid-slice-index
+            end -= omitted
+            content = encoded.decode("utf-8")
+        else:
+            stream.seek(start)
+            decoder = getincrementaldecoder("utf-8")()
+            encoded, content = b"", ""
+            while not content:
+                byte = stream.read(1)
+                if not byte:
+                    raise ValueError("Selected range is not valid UTF-8 text.") from exc
+                encoded += byte
+                try:
+                    content = decoder.decode(byte)
+                except UnicodeDecodeError as error:
+                    raise ValueError("Selected range is not valid UTF-8 text.") from error
+            end = start + len(encoded)
+            adjusted_limit = len(encoded)
+    more = end < size
+    if before is not None:
+        stream.seek(0)
+        version = f"sha256:{file_digest(stream, 'sha256').hexdigest()}"
+        fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+        if any(
+            getattr(before, field) != getattr(current, field)
+            for current in (os.fstat(stream.fileno()),)
+            for field in fields
+        ):
+            raise ValueError("File changed while reading; read it again before editing.")
 
     result = BoundedTextContent(
         content=content,

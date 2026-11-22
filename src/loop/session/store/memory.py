@@ -31,6 +31,7 @@ class MemorySessionStore:
     _references: dict[str, bytes]
     _reference_handles: dict[str, str]
     _session_references: dict[str, set[str]]
+    scratch_roots: tuple[Path, ...] = ()
 
     def __init__(self) -> None:
         temporary = tempfile.TemporaryDirectory(prefix=f"{constants.APP_NAME}-sessions-")

@@ -29,7 +29,7 @@ def runtime_factory(create):
 
 
 @pytest.fixture(autouse=True)
-def isolate_main(monkeypatch):
+def isolate_main(monkeypatch, tmp_path):
     """Replace filesystem discovery and composition with isolated doubles."""
     monkeypatch.setattr(application, "load_dotenv", Mock())
     workspace = Workspace(Path("/project"), Path("/project"))
@@ -41,6 +41,8 @@ def isolate_main(monkeypatch):
     paths.for_workspace.return_value = Mock()
     monkeypatch.setattr(application, "ApplicationPaths", Mock(discover=Mock(return_value=paths)))
     configuration = Mock()
+    configuration.path = tmp_path / "config.toml"
+    configuration.path.write_text("# existing fixture")
     configuration.load.return_value = ApplicationSettings()
 
     async def load_interactively(interaction):

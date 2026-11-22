@@ -1,6 +1,7 @@
 """Verify bound AppArmor authority, protected names and literal policy rendering."""
 
 from dataclasses import replace
+from fnmatch import fnmatchcase
 from pathlib import Path
 
 import pytest
@@ -8,7 +9,14 @@ import pytest
 from loop.execution.sandbox.contracts import SandboxRequest
 from loop.execution.sandbox.linux import paths as linux_paths
 from loop.execution.sandbox.linux import policy as linux_policy
-from loop.execution.sandbox.linux.policy import _literal, payload_policy, payload_profile
+from loop.execution.sandbox.linux.host import MAX_SOURCE_BYTES, RUNTIME_READ_FILES
+from loop.execution.sandbox.linux.policy import (
+    _literal,
+    environment_value_patterns,
+    payload_policy,
+    payload_profile,
+)
+from loop.permissions.protection import is_environment_value
 
 from ..helpers import logical_private_name
 
@@ -27,6 +35,12 @@ def bound(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(linux_paths, "NATIVE_SCRATCH_PATH", _TEST_NATIVE_SCRATCH)
     monkeypatch.setattr(linux_policy, "NATIVE_SCRATCH_PATH", _TEST_NATIVE_SCRATCH)
+    monkeypatch.setattr(
+        linux_paths, "NATIVE_CONVENTIONAL_TMP_PATH", Path("/unit-conventional-temp")
+    )
+    monkeypatch.setattr(
+        linux_policy, "NATIVE_CONVENTIONAL_TMP_PATH", Path("/unit-conventional-temp")
+    )
     monkeypatch.setattr(
         linux_policy,
         "is_protected_external_read",
@@ -77,6 +91,7 @@ def test_payload_policy_retains_native_composition_denials(bound):
         assert rule in policy
     assert "change_profile" not in policy
     assert "allow file" not in policy
+    assert 'link subset "/dev/shm/sem.*" -> "/dev/shm/sem.*",' in policy
 
 
 def test_payload_policy_limits_conventional_temporary_to_fresh_session_scratch(bound, monkeypatch):
@@ -90,6 +105,21 @@ def test_payload_policy_limits_conventional_temporary_to_fresh_session_scratch(b
 
     assert f'allow rwlkmix "{_literal(str(destination))}/{{,**}}"' in fresh
     assert _literal(str(destination)) not in restricted
+
+
+def test_payload_policy_limits_ca_listing_to_the_synthetic_directory(bound):
+    """The directory listing rule grants no descendant reads or writes and retains hard denials."""
+    create, _, scratch = bound
+    store = Path("/etc/ssl/certs")
+    bundle = store / "ca-certificates.crt"
+    policy = render(create(hard_denied_paths=(store,)), scratch)
+    rules = [line.strip() for line in policy.splitlines() if _literal(str(store)) in line]
+
+    assert set(rules) == {
+        f'allow r "{_literal(str(store))}/",',
+        f'allow r "{_literal(str(bundle))}",',
+        f'deny "{_literal(str(store))}{{,/**}}" rwklmx,',
+    }
 
 
 def test_explicit_conventional_path_keeps_private_name_guards(bound, monkeypatch, tmp_path):
@@ -121,6 +151,17 @@ def test_payload_policy_read_only_changes_only_authorized_workspace_writes(bound
     assert sum('/{,**/}*",' in line for line in writable_rules) == 2
     assert sum('/{,**/}*",' in line for line in readonly_rules) == 1
     assert writable.count("allow rmix") == readonly.count("allow rmix")
+
+
+def test_payload_policy_grants_exact_file_without_parent_or_link_permissions(bound):
+    """Bind native writes to the file spelling and retain existing protected-path denials."""
+    create, workspace, scratch = bound
+    target = workspace / "artifact [out]"
+    policy = render(create(write_roots=(), write_files=(target,)), scratch)
+    allow_lines = [line for line in policy.splitlines() if "allow rwk" in line]
+    assert allow_lines == [f'  allow rwk "{_literal(str(target))}",']
+    assert len([line for line in policy.splitlines() if "allow rwlkmix" in line]) == 2
+    assert 'deny "' + _literal(str(workspace)) + "/{,**/}" + _literal("AGENTS.md") in policy
 
 
 def test_payload_policy_deduplicates_only_exact_authorized_roots(bound):
@@ -303,8 +344,11 @@ def test_payload_policy_preserves_bound_aliases_without_writable_parent_grants(b
     )
     assert policy.count("allow rmix") == 7
     assert policy.count("allow rwlkmix") == 4
-    # Resolver/trust inputs add exact read-only files, never a containing-tree grant.
-    assert policy.count('allow r "') == 9
+    metadata_rules = {line.strip() for line in policy.splitlines() if 'allow r "' in line}
+    assert metadata_rules == {
+        *(f'allow r "{_literal(str(path))}",' for path in RUNTIME_READ_FILES),
+        f'allow r "{_literal("/etc/ssl/certs")}/",',
+    }
 
 
 @pytest.mark.parametrize("name", ['RULES [*]? "é"\nline.md', "} profile injected {", "@{HOME}.md"])
@@ -346,14 +390,13 @@ def test_payload_policy_denies_private_names_in_every_granted_root(bound):
         scratch,
         runtime_roots=runtime_roots,
     )
+    private = r".{[sS],\xc5\xbf}{[sS],\xc5\xbf}[hH]"
     for root in (*runtime_roots, workspace, external):
         prefix = _literal(str(root))
-        assert f'deny "{prefix}/{{,**/}}.[sS][sS][hH]" rwklmx,' in policy
+        assert f'deny "{prefix}/{{,**/}}{private}" rwklmx,' in policy
         assert f'deny "{prefix}/{{,**/}}.[cC][oO][nN][fF][iI][gG]/{{,**}}" rwklmx,' in policy
-    assert 'deny "/{,**/}.[sS][sS][hH]" rwklmx,' not in policy
-    assert (
-        f'deny "{_literal(str(_TEST_NATIVE_SCRATCH))}/{{,**/}}.[sS][sS][hH]" rwklmx,' not in policy
-    )
+    assert f'deny "/{{,**/}}{private}" rwklmx,' not in policy
+    assert f'deny "{_literal(str(_TEST_NATIVE_SCRATCH))}/{{,**/}}{private}" rwklmx,' not in policy
     assert _literal(str(scratch)) not in policy
 
 
@@ -497,3 +540,116 @@ def test_fresh_session_data_policy_keeps_private_guards_outside_scratch(bound):
     policy = render(value, scratch)
     assert 'deny "' + _literal(str(_TEST_NATIVE_SCRATCH)) + "/{,**/}" not in policy
     assert _literal(str(workspace)) + "/{,**/}[lL][iI][bB][rR][aA][rR][yY]" in policy
+
+
+def test_payload_hard_policy_refuses_runtime_overlap_and_denies_scratch_aliases(bound):
+    """Exact hard policy dominates every data grant and refuses unaccounted baseline aliases."""
+    create, workspace, scratch = bound
+    with pytest.raises(ValueError, match="encompassing runtime root"):
+        render(create(hard_denied_paths=(Path("/usr/share/secret"),)), scratch)
+    conventional = scratch / linux_policy.SESSION_CONVENTIONAL_TMP_NAME
+    protected = conventional / "secret"
+    policy = render(
+        create(
+            scratch_root=scratch,
+            scratch_data=True,
+            hard_denied_paths=(protected, workspace / "secret"),
+        ),
+        scratch,
+    )
+    assert (
+        f'deny "{_literal(str(linux_policy.NATIVE_CONVENTIONAL_TMP_PATH / "secret"))}{{,/**}}"'
+        in policy
+    )
+    assert (
+        f'deny "{_literal(str(_TEST_NATIVE_SCRATCH / protected.relative_to(scratch)))}{{,/**}}"'
+        in policy
+    )
+    assert ".[eE][nN][vV]." in policy
+    assert _literal(str(workspace)) in policy
+
+
+@pytest.mark.parametrize("agent_data", [False, True])
+@pytest.mark.parametrize("placement", ["parent", "scratch", "child"])
+def test_application_protection_keeps_control_state_outside_agent_scratch(
+    bound, agent_data, placement
+):
+    """Physical application parents stay denied while only fresh scratch gets its own mount."""
+    create, _, scratch = bound
+    protected = {"parent": scratch.parent, "scratch": scratch, "child": scratch / "child"}[
+        placement
+    ]
+    value = create(scratch_root=scratch, scratch_data=agent_data, protected_host_roots=(protected,))
+    policy = render(value, scratch)
+    native = _literal(str(_TEST_NATIVE_SCRATCH))
+    assert f'deny "{native}{{,/**}}" rwklmx' not in policy
+    assert f'deny "{native}/{{,**}}" rwklmx' not in policy
+    explicit = render(replace(value, hard_denied_paths=(scratch.parent,)), scratch)
+    assert f'deny "{native}{{,/**}}" rwklmx' in explicit
+    if agent_data:
+        assert (
+            f'deny "{_literal(str(linux_policy.NATIVE_CONVENTIONAL_TMP_PATH))}{{,/**}}"' in explicit
+        )
+
+
+def test_environment_policy_compaction_retains_the_native_source_bound(bound, tmp_path):
+    """Several long runtime roots remain representable without raising the compiler ceiling."""
+    create, workspace, scratch = bound
+    roots = tuple(tmp_path / (f"runtime-{index}-" + "x" * 48) for index in range(4))
+    for root in roots:
+        root.mkdir()
+    # Compilation capacity is measured against fixed logical native path lengths, not the
+    # enclosing test runner's potentially long application-data scratch ancestry.
+    logical = Path("/fixture") / ("parent-" + "x" * 80)
+    value = replace(
+        create(read_roots=roots),
+        workspace=logical,
+        cwd=logical,
+        read_roots=tuple(logical / root.name for root in roots),
+        write_roots=(logical,),
+        environment=(("TMPDIR", str(logical / "scratch")), ("PATH", "/usr/bin:/bin")),
+    )
+    source = render(value, logical / "scratch")
+    assert len(source.encode()) <= MAX_SOURCE_BYTES
+    assert 'deny "/{' in source
+    assert 'deny "{/' not in source
+    single = render(
+        create(scratch_root=scratch, scratch_data=True), scratch, runtime_roots=(workspace,)
+    )
+    assert f'deny "{_literal(str(workspace))}/{{,**/}}{{.[eE][nN][vV],' in single
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        ".env",
+        ".env.",
+        ".env.local",
+        ".ENV.PRODUCTION",
+        ".env.example",
+        ".env.production.example",
+        ".env.sample",
+        ".env.template",
+        ".env.ſample",
+        ".env.Ŀample",
+        ".env.\nexample",
+        ".env.éexample",
+        ".env.\texample",
+        ".env.template.local",
+        ".env.xsample",
+        ".env.examplex",
+        ".env.sampl",
+        "ordinary",
+    ],
+)
+def test_native_value_patterns_preserve_the_shared_basename_language(name):
+    """Native suffix partitions preserve exact templates, including UTF-8 case-fold edges."""
+    patterns = environment_value_patterns()
+    matched = any(
+        fnmatchcase(
+            name.encode("utf-8").decode("latin1"),
+            pattern.encode("ascii").decode("unicode_escape").replace("[^", "[!"),
+        )
+        for pattern in patterns
+    )
+    assert bool(matched) is is_environment_value(name)

@@ -419,6 +419,10 @@ class Loop:
         """
         if path == "app.debug":
             self._agent_runner.debug = settings.app.debug
+        elif path == "app.allow_direct_host_execution":
+            self.permission_manager.set_direct_host_execution(
+                settings.app.allow_direct_host_execution
+            )
         elif path == "app.yolo":
             self.permission_manager.set_yolo(settings.app.yolo)
         elif path == "app.stream":
@@ -433,6 +437,10 @@ class Loop:
             self._compaction.threshold = settings.app.compaction_threshold
         elif path == "web.user_agent":
             self.tool_registry.settings.user_agent = settings.web.user_agent
+        elif path == "tools.sandbox_environment":
+            self.tool_registry.settings.sandbox_environment = settings.tools.sandbox_environment
+        elif path == "tools.sandbox_path_aliases":
+            self.tool_registry.settings.sandbox_path_aliases = settings.tools.sandbox_path_aliases
         elif path == "tools.command_job_runtime_limit_seconds":
             self.tool_registry.settings.command_job_runtime_limit_seconds = (
                 settings.tools.command_job_runtime_limit_seconds

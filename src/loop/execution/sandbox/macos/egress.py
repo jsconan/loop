@@ -1,4 +1,4 @@
-"""Mediate one macOS sandbox attempt through an exact Unix SOCKS endpoint."""
+"""Mediate scoped network connections for one macOS sandbox attempt."""
 
 from __future__ import annotations
 
@@ -16,6 +16,12 @@ from typing import TYPE_CHECKING, Self
 from urllib.parse import urlsplit
 
 from ..contracts import SandboxRequest, normalize_egress_origin
+from .ingress import (
+    INGRESS_ENDPOINT_NOT_READY,
+    INGRESS_PEER_MISMATCH,
+    INGRESS_SOCKET_ENVIRONMENT_VARIABLE,
+    connector_arguments,
+)
 
 if TYPE_CHECKING:
     from ....permissions.manager import PermissionManager
@@ -28,6 +34,7 @@ _RESOLUTION_SLOTS = threading.BoundedSemaphore(MAX_PENDING_RESOLUTIONS)
 MAX_BODY_BYTES = 16 * 1024 * 1024
 MAX_ROUTE_BYTES = 4096
 ROUTE_TOOL = "/sbin/route"
+_INGRESS_FAILURE = "The native macOS ingress connector failed."
 _FORWARDED_METHODS = frozenset({"GET", "HEAD", "POST"})
 _HOP_HEADERS = frozenset(
     {
@@ -90,15 +97,15 @@ def _external_route(address: ipaddress.IPv4Address) -> bool:
         return False
 
 
-class MacOSEgressBroker:
-    """Own a private Unix SOCKS listener and checked upstreams for one approved attempt.
+class MacOSNetworkBroker:
+    """Own one approved Unix egress proxy or host-loopback ingress route.
 
     The broker lives in the application process. If that process exits, it loses every broker
     descriptor, while a runnable but stalled policy authority loses its two-second lease.
 
     Args:
-        request (SandboxRequest): Exact approved origins and command deadline.
-        path (Path): Socket path in an isolated, sandbox-nonwritable volume directory.
+        request (SandboxRequest): Approved direction, exact endpoint and command deadline.
+        path (Path): Fresh sealed egress socket or attempt-private ingress service endpoint.
         authority (PermissionManager): Manager that approved the request.
         revision (int): Active policy revision captured with approval.
     """
@@ -125,6 +132,12 @@ class MacOSEgressBroker:
     _revoked_revision: int | None
     _revocation_confirmed: bool
     _interrupted: bool
+    _service_id: int | None
+    _service_events: object | None
+    _connectors: set[subprocess.Popen]
+    _origin_cancel: threading.Event | None
+    cancellation_event: threading.Event
+    failure_detail: str
 
     def __init__(
         self,
@@ -133,7 +146,11 @@ class MacOSEgressBroker:
         authority: PermissionManager,
         revision: int,
     ) -> None:
-        if not request.egress_origins or request.network or revision < 0:
+        if (
+            (not request.egress_origins and request.ingress_port is None)
+            or request.network
+            or revision < 0
+        ):
             raise ValueError("The macOS broker requires one mediated-only approved grant.")
         self.request = request
         self.path = path
@@ -157,6 +174,12 @@ class MacOSEgressBroker:
         self._revoked_revision = None
         self._revocation_confirmed = False
         self._interrupted = False
+        self._service_id = None
+        self._service_events = None
+        self._connectors = set()
+        self._origin_cancel = None
+        self.cancellation_event = threading.Event()
+        self.failure_detail = "Mediated network authority ended during this command."
 
     def __enter__(self) -> Self:
         parent = self.path.parent.lstat()
@@ -168,20 +191,27 @@ class MacOSEgressBroker:
             or self.path.is_symlink()
         ):
             raise OSError("Unsafe macOS mediator socket directory.")
-        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener = socket.socket(
+            socket.AF_INET if self.request.ingress_port is not None else socket.AF_UNIX,
+            socket.SOCK_STREAM,
+        )
         try:
             self._listener = listener
-            listener.bind(str(self.path))
-            listener.listen(16)
-            listener.setblocking(False)
             with self._lock:
                 self._active = True
                 self._last_heartbeat = time.monotonic()
             self.authority.bind_egress(self.revision, self)
             self._bound = True
             with self._lock:
-                if not self._active:
-                    raise OSError("Mediated egress authority ended during activation.")
+                if not self._active or self._paused:
+                    raise OSError("Mediated network authority ended during activation.")
+                listener.bind(
+                    ("127.0.0.1", self.request.ingress_port)
+                    if self.request.ingress_port is not None
+                    else str(self.path)
+                )
+                listener.listen(16)
+                listener.setblocking(False)
             self._acceptor = threading.Thread(target=self._accept, daemon=True)
             self._watcher = threading.Thread(target=self._watch, daemon=True)
             self._acceptor.start()
@@ -200,7 +230,7 @@ class MacOSEgressBroker:
             self.authority.unbind_egress(self)
             self._bound = False
         if not confirmed:
-            raise OSError("MacOS mediated egress closure could not be confirmed.")
+            raise OSError("MacOS mediated network closure could not be confirmed.")
 
     @property
     def interrupted(self) -> bool:
@@ -297,7 +327,44 @@ class MacOSEgressBroker:
             bool: Whether covered forwarding may continue.
         """
         with self._lock:
-            return self._active and self._lease_current()
+            if self._active and not self._lease_current():
+                self._interrupted = True
+                return False
+            return self._active
+
+    def bind_service(self, process_id: int, cancellation: threading.Event | None) -> None:
+        """Retain the unreaped foreground identity until publication closes before cleanup.
+
+        Args:
+            process_id (int): Newly spawned foreground PID, never polled or reaped yet.
+            cancellation (threading.Event | None): Original command cancellation signal.
+
+        Raises:
+            OSError: The process cannot be observed or publication authority has ended.
+        """
+        with self._lock:
+            if not self._active or self._service_id is not None:
+                raise OSError("Ingress foreground identity cannot be rebound.")
+            queue = select.kqueue()
+            try:
+                queue.control(
+                    [
+                        select.kevent(
+                            process_id,
+                            filter=select.KQ_FILTER_PROC,
+                            flags=select.KQ_EV_ADD | select.KQ_EV_ENABLE,
+                            fflags=select.KQ_NOTE_EXIT,
+                        )
+                    ],
+                    0,
+                    0,
+                )
+            except BaseException:
+                queue.close()
+                raise
+            self._service_events = queue
+            self._service_id = process_id
+            self._origin_cancel = cancellation
 
     def _lease_current(self) -> bool:
         """Evaluate a lease while the broker lock is held."""
@@ -326,6 +393,15 @@ class MacOSEgressBroker:
                 listener = self._listener
                 sockets = tuple(self._sockets)
                 workers = tuple(self._workers)
+                self._service_id = None
+                if self._service_events is not None:
+                    self._service_events.close()
+                    self._service_events = None
+                for connector in self._connectors:
+                    try:
+                        connector.kill()
+                    except ProcessLookupError:
+                        pass
         if waiting:
             return self._closed.wait(AUTHORITY_SECONDS) and self._confirmed
         if listener is not None:
@@ -344,6 +420,7 @@ class MacOSEgressBroker:
             worker is threading.current_thread() or not worker.is_alive() for worker in workers
         )
         with self._lock:
+            confirmed = confirmed and not self._connectors
             self._confirmed = confirmed
             self._closed.set()
         return confirmed
@@ -355,6 +432,13 @@ class MacOSEgressBroker:
                 with self._lock:
                     if not self._active:
                         return
+                with self._lock:
+                    if self._service_events is not None and self._service_events.control(
+                        None, 1, 0
+                    ):
+                        break
+                    if self._origin_cancel is not None and self._origin_cancel.is_set():
+                        self.cancellation_event.set()
                 try:
                     current = self.authority.try_egress_policy_revision()
                 except OSError:
@@ -375,6 +459,8 @@ class MacOSEgressBroker:
                 self._interrupted = True
             raise
         finally:
+            if self.request.ingress_port is not None and self.interrupted:
+                self.cancellation_event.set()
             self.close()
 
     def _accept(self) -> None:
@@ -402,7 +488,13 @@ class MacOSEgressBroker:
                         self._sockets.discard(client)
                         client.close()
                         continue
-                    worker = threading.Thread(target=self._serve, args=(client,), daemon=True)
+                    worker = threading.Thread(
+                        target=self._serve_ingress
+                        if self.request.ingress_port is not None
+                        else self._serve,
+                        args=(client,),
+                        daemon=True,
+                    )
                     self._workers.add(worker)
                     worker.start()
             except (OSError, ValueError, RuntimeError):
@@ -501,6 +593,98 @@ class MacOSEgressBroker:
                 self._release(upstream)
         return None
 
+    def _fail_ingress(self, detail: str) -> None:
+        """Fail live publication without reclassifying shutdown or owner cancellation."""
+        with self._lock:
+            if self._active and not self.cancellation_event.is_set():
+                self.failure_detail = detail
+                self._interrupted = True
+                self._active = False
+                self.cancellation_event.set()
+
+    def _read_ingress_outcome(self, connector: subprocess.Popen) -> None:
+        """Distinguish successful and not-yet-ready exchanges from connector failures."""
+        try:
+            code = connector.wait(timeout=AUTHORITY_SECONDS)
+        except (OSError, subprocess.SubprocessError):
+            self._fail_ingress(_INGRESS_FAILURE)
+        else:
+            if code == INGRESS_PEER_MISMATCH:
+                self._fail_ingress(
+                    "macOS ingress requires exec of the live foreground Unix service at "
+                    f"{INGRESS_SOCKET_ENVIRONMENT_VARIABLE}; descendant services are unsupported."
+                )
+            elif code not in (0, INGRESS_ENDPOINT_NOT_READY):
+                self._fail_ingress(_INGRESS_FAILURE)
+
+    def _serve_ingress(self, client: socket.socket) -> None:
+        """Exchange client bytes only through a native-confined authenticated connector."""
+        connector = None
+        try:
+            try:
+                with self._lock:
+                    if not self._active or self._service_id is None or self._paused:
+                        return
+                    connector = subprocess.Popen(
+                        connector_arguments(self.path, self._service_id),
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL,
+                        close_fds=True,
+                        env={"PATH": "/usr/bin:/bin", "LANG": "C"},
+                    )
+                    self._connectors.add(connector)
+            except (OSError, ValueError, subprocess.SubprocessError):
+                self._fail_ingress(_INGRESS_FAILURE)
+                return
+            client.settimeout(AUTHORITY_SECONDS)
+            reading_client = True
+            while self.active():
+                ready, _, _ = select.select(
+                    [connector.stdout, *([client] if reading_client else [])], [], [], POLL_SECONDS
+                )
+                if connector.stdout in ready:
+                    try:
+                        data = os.read(connector.stdout.fileno(), 65536)
+                    except OSError:
+                        self._fail_ingress(_INGRESS_FAILURE)
+                        return
+                    if not data:
+                        self._read_ingress_outcome(connector)
+                        return
+                    client.sendall(data)
+                if client in ready:
+                    data = client.recv(65536)
+                    try:
+                        if not data:
+                            connector.stdin.close()
+                            reading_client = False
+                        else:
+                            connector.stdin.write(data)
+                            connector.stdin.flush()
+                    except BrokenPipeError:
+                        self._read_ingress_outcome(connector)
+                        return
+        except (OSError, ValueError):
+            pass
+        finally:
+            if connector is not None:
+                try:
+                    connector.kill()
+                    connector.wait(timeout=AUTHORITY_SECONDS)
+                except (OSError, subprocess.SubprocessError):
+                    with self._lock:
+                        self._interrupted = True
+                else:
+                    with self._lock:
+                        self._connectors.discard(connector)
+                finally:
+                    connector.stdin.close()
+                    connector.stdout.close()
+            self._release(client)
+            with self._lock:
+                self._workers.discard(threading.current_thread())
+
     def _serve(self, client: socket.socket) -> None:
         """Handle one bounded SOCKS request and relay only approved HTTP(S) bytes."""
         upstream = None
@@ -553,13 +737,13 @@ class SocksHttpHandler(BaseHTTPRequestHandler):
     Args:
         request (socket.socket): Connected sandbox client.
         client_address (tuple[str, int]): Non-authoritative local display address.
-        server (MacOSEgressBroker): Attempt broker that owns the pinned upstream.
+        server (MacOSNetworkBroker): Attempt broker that owns the pinned upstream.
         origin (str): Exact approved HTTP origin.
         upstream (socket.socket): Already checked numeric transport.
     """
 
     protocol_version = "HTTP/1.1"
-    server: MacOSEgressBroker
+    server: MacOSNetworkBroker
     origin: str
     upstream: socket.socket
 
@@ -567,7 +751,7 @@ class SocksHttpHandler(BaseHTTPRequestHandler):
         self,
         request: socket.socket,
         client_address: tuple[str, int],
-        server: MacOSEgressBroker,
+        server: MacOSNetworkBroker,
         origin: str,
         upstream: socket.socket,
     ) -> None:

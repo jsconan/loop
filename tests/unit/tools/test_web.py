@@ -603,3 +603,42 @@ def test_fetch_content_rejects_malformed_urls(monkeypatch):
     assert "Invalid arguments for tool 'fetch_content'" in result
     confirm.assert_not_called()
     stream.assert_not_called()
+
+
+def test_cached_content_rejects_unknown_restored_file_authority():
+    """A legacy nonreloadable artifact without provenance cannot bypass current policy."""
+    handle = store_content("old secret", "old file result")
+    register_cached_metadata(handle, "old file result", False, file_sources=None)
+    result = problem(read_cached_content(handle))
+    assert result["code"] == "tool.planning_failed"
+    assert "authority is unknown" in result["detail"]
+
+
+def test_cached_content_rechecks_hard_policy_at_execution(tmp_path, monkeypatch, caplog):
+    """Cached reads fail without an owner and on policy tightening before or during reading."""
+    source = tmp_path / ".env"
+    source.write_text("secret", encoding="utf-8")
+    handle = store_content("secret", "file result")
+    register_cached_metadata(handle, "file result", False, file_sources=(str(source),))
+    missing = web_module.read_cached_content(ToolContext(None, "read_cached_content"), handle)
+    assert missing.code == "content.read_failed"
+    assert "permission authority is unavailable" in missing.detail
+    assert "Could not read cached content" in caplog.text
+    context = ToolContext(
+        None, "read_cached_content", permission_manager=PermissionManager(tmp_path)
+    )
+    assert web_module.read_cached_content(context, handle).code == "tool.denied"
+    public = tmp_path / "public"
+    public.write_text("public", encoding="utf-8")
+    register_cached_metadata(handle, "file result", False, file_sources=(str(public),))
+    original_read = web_module.read_bounded_text_stream
+
+    def tighten_during_read(stream, **kwargs):
+        """Rebind the source to a protected resource before returning the cached bytes."""
+        result = original_read(stream, **kwargs)
+        public.unlink()
+        public.symlink_to(source)
+        return result
+
+    monkeypatch.setattr(web_module, "read_bounded_text_stream", tighten_during_read)
+    assert web_module.read_cached_content(context, handle).code == "tool.denied"

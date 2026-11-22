@@ -166,15 +166,15 @@ def test_local_network_filter_rejects_invalid_export_and_expired_budget(host):
 
 def test_local_network_filter_install_validates_program_and_kernel_result(monkeypatch):
     """The isolated payload installs only a bounded BPF program and fails closed on refusal."""
-    with pytest.raises(ValueError, match="inherited local-network filter"):
-        linux_seccomp.install_local_network_filter(b"bad")
+    with pytest.raises(ValueError, match="inherited payload filter"):
+        linux_seccomp.install_payload_filter(b"bad")
     library = SimpleNamespace(prctl=Mock(return_value=0))
     monkeypatch.setattr(linux_seccomp.ctypes, "CDLL", Mock(return_value=library))
-    linux_seccomp.install_local_network_filter(b"\x06\0\0\0\0\0\xff\x7f")
+    linux_seccomp.install_payload_filter(b"\x06\0\0\0\0\0\xff\x7f")
     assert library.prctl.call_args.args[0:2] == (22, 2)
     library.prctl.return_value = -1
     with pytest.raises(OSError, match="filter installation failed"):
-        linux_seccomp.install_local_network_filter(b"\x06\0\0\0\0\0\xff\x7f")
+        linux_seccomp.install_payload_filter(b"\x06\0\0\0\0\0\xff\x7f")
 
 
 @pytest.mark.parametrize(
@@ -304,3 +304,21 @@ def test_descriptor_filter_shares_preparation_deadline(host, monkeypatch, expire
         assert linux_seccomp.descriptor_filter(deadline=15)
     host.candidates.assert_called_once_with("libseccomp", deadline=15)
     host.library.seccomp_release.assert_called_once_with(123)
+
+
+def test_trusted_ingress_worker_retains_only_receipt_until_payload_filter(host):
+    """Only the trusted worker omits recvmsg denial; the full payload filter always restores it."""
+    library = host.library
+    library.seccomp_syscall_resolve_name_arch.side_effect = None
+    library.seccomp_syscall_resolve_name_arch.return_value = 45
+    linux_seccomp.descriptor_filter(ingress_worker=True)
+    names = [call.args[1] for call in library.seccomp_syscall_resolve_name_arch.call_args_list]
+    assert b"recvmsg" not in names
+    assert b"recvmmsg" in names and b"io_uring_setup" in names
+    library.seccomp_syscall_resolve_name_arch.reset_mock()
+    linux_seccomp.descriptor_filter()
+    assert b"recvmsg" in [
+        call.args[1] for call in library.seccomp_syscall_resolve_name_arch.call_args_list
+    ]
+    with pytest.raises(TypeError, match="ingress-worker mode"):
+        linux_seccomp.descriptor_filter(ingress_worker=1)

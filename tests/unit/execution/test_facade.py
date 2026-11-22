@@ -4,7 +4,7 @@ import json
 import os
 import shlex
 import tempfile
-from contextlib import nullcontext
+from contextlib import closing, nullcontext
 from dataclasses import replace
 from pathlib import Path
 from threading import Event, Thread
@@ -26,22 +26,194 @@ from loop.execution.sandbox import (
 )
 from loop.execution.sandbox.linux.backend import LinuxNativeBackend
 from loop.instructions import InstructionsManager, RuntimeEnvironment, Skill, SkillManager
-from loop.models import ToolCall
+from loop.models import SandboxOutputPath, ToolCall
 from loop.permissions import (
     Action,
+    ApprovalChoice,
+    Decision,
     FileTarget,
     Operation,
     PermissionManager,
-    PolicyScope,
     ProcessBoundary,
     ProcessTarget,
 )
 from loop.session import SessionManager
 from loop.telemetry import MemoryTelemetryAdapter, Telemetry, set_telemetry
-from loop.tooling import ToolContext
+from loop.tooling import ToolContext, ToolRuntimeSettings
 from loop.utils import PathHolder, VirtualPath, cached_path
+from loop.workspace import Workspace, WorkspaceRepository
 
 from .sandbox.helpers import logical_private_name
+
+
+def automatic_process_policy(root, *, allow_direct_host_execution=False):
+    """Explicitly allow processes while retaining resource approvals for facade tests."""
+    manager = PermissionManager(root, allow_direct_host_execution=allow_direct_host_execution)
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
+    return manager
+
+
+@pytest.mark.parametrize(
+    "variable", ["MODE", "REPORT_FILE", "HOME", "IFS", "LOOP_SYNC_SOCKET", "bad-name", "nul"]
+)
+def test_configured_sandbox_environment_is_applied_inside_the_boundary(tmp_path, variable):
+    """Use the declared search order and assign only valid variables inside confinement."""
+    backend = Mock()
+    backend.system_read_roots = ()
+    backend.run.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
+    tool = tmp_path / "fixture-tool"
+    tool.write_text("test tool")
+    tool.chmod(0o755)
+    command = "fixture-tool; printf done"
+    literal = "\x00" if variable == "nul" else "value; ' $(other)"
+    value = SandboxOutputPath(output=literal) if variable == "REPORT_FILE" else literal
+    context = ToolContext(
+        Mock(),
+        "run_command",
+        operations=(
+            Operation(
+                tool_id="run_command",
+                action=Action.PROCESS_EXECUTE,
+                target=ProcessTarget(
+                    argv=("/bin/sh", "-c", command),
+                    cwd=str(tmp_path),
+                    boundary=ProcessBoundary.SANDBOXED,
+                ),
+            ),
+        ),
+        permission_manager=automatic_process_policy(tmp_path),
+        settings=ToolRuntimeSettings(
+            sandbox_environment={"PATH": str(tmp_path), variable: value},
+        ),
+    )
+    service = CommandExecutionService(backend, Mock())
+    assert service.resolve_executable(context, tool.name)["status"] == "installed_on_host"
+
+    result = service.run_command(context, command)
+
+    if variable not in {"MODE", "REPORT_FILE"}:
+        assert result.code == "sandbox.invalid"
+        backend.run.assert_not_called()
+        return
+    assert result["exit_code"] == 0
+    request = backend.run.call_args.args[0]
+    assert request.source == command
+    prefix = '"${LOOP_OUTPUT_DIR:?}"/' if variable == "REPORT_FILE" else ""
+    assert (
+        request.execution_source == f"export {variable}={prefix}{shlex.quote(literal)}\n{command}"
+    )
+    assert request.shell_environment()["PATH"] == str(tmp_path)
+    assert variable not in request.shell_environment()
+    assert not request.write_roots and not request.network
+
+
+def test_sandbox_executable_lookup_rejects_a_generated_path(tmp_path):
+    """Direct settings composition still requires a literal lookup path."""
+    service = CommandExecutionService(Mock(), Mock())
+    context = ToolContext(
+        None,
+        "resolve_executable",
+        settings=ToolRuntimeSettings(sandbox_environment={"PATH": SandboxOutputPath(output="bin")}),
+        permission_manager=automatic_process_policy(tmp_path),
+    )
+
+    with pytest.raises(ValueError, match="Sandbox PATH must be a literal string"):
+        service.resolve_executable(context, "sh")
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "approved",
+        "relative",
+        "traversal",
+        "directory",
+        "outside",
+        "broken",
+        "file",
+        "workspace",
+        "named",
+        "absolute",
+    ],
+)
+def test_configured_directory_alias_requires_a_separate_read_grant(shebang_policy_root, case):
+    """Dormant aliases leave unrelated commands usable and selected aliases need read scope."""
+    root, _ = shebang_policy_root
+    workspace = root / "project"
+    workspace.mkdir()
+    runtime = root / "runtime"
+    runtime.mkdir()
+    tool = runtime / "fixture-tool"
+    tool.write_text("fixture", encoding="utf-8")
+    tool.chmod(0o755)
+    alias = root / "stable"
+    alias.symlink_to(runtime, target_is_directory=True)
+    broken = root / "broken"
+    broken.symlink_to(root / "absent", target_is_directory=True)
+    file_alias = root / "file-alias"
+    file_alias.symlink_to(tool)
+    workspace_alias = root / "workspace-alias"
+    workspace_alias.symlink_to(workspace, target_is_directory=True)
+    spelling = {
+        "approved": str(alias),
+        "relative": "stable",
+        "traversal": str(workspace / ".." / alias.name),
+        "directory": str(runtime),
+        "outside": str(alias),
+        "broken": str(broken),
+        "file": str(file_alias),
+        "workspace": str(workspace_alias),
+        "named": str(alias),
+        "absolute": str(alias),
+    }[case]
+    command = {
+        "named": tool.name,
+        "absolute": shlex.quote(str(alias / tool.name)),
+    }.get(case, "printf ready")
+    interaction = Mock()
+    interaction.prompt.return_value = "approve"
+    context = ToolContext(
+        interaction,
+        "run_command",
+        operations=(
+            Operation(
+                tool_id="run_command",
+                action=Action.PROCESS_EXECUTE,
+                target=ProcessTarget(
+                    argv=("/bin/sh", "-c", command),
+                    cwd=str(workspace),
+                    boundary=ProcessBoundary.SANDBOXED,
+                ),
+            ),
+        ),
+        permission_manager=automatic_process_policy(workspace),
+        settings=ToolRuntimeSettings(
+            sandbox_environment={"PATH": str(alias)},
+            sandbox_path_aliases=(spelling,),
+        ),
+    )
+    backend = Mock()
+    backend.system_read_roots = ()
+    backend.run.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
+
+    reads = (
+        []
+        if case in {"outside", "named", "absolute"}
+        else [str(workspace if case == "workspace" else runtime)]
+    )
+    result = CommandExecutionService(backend, Mock()).run_command(
+        context, command, read_roots=reads
+    )
+
+    if case in {"named", "absolute"}:
+        assert result.code == "sandbox.invalid"
+        assert "canonical runtime directory" in result.detail
+        backend.run.assert_not_called()
+    else:
+        assert result["exit_code"] == 0
+        request = backend.run.call_args.args[0]
+        assert request.read_aliases == ((alias,) if case == "approved" else ())
+        assert request.read_roots == ((runtime,) if reads == [str(runtime)] else ())
 
 
 @pytest.fixture(autouse=True)
@@ -77,7 +249,7 @@ def shebang_policy_root(tmp_path, shebang_root, monkeypatch):
 def command_session(tmp_path):
     """Bind one real selected session to permission scratch for detached job checks."""
     sessions = SessionManager()
-    permissions = PermissionManager(tmp_path)
+    permissions = automatic_process_policy(tmp_path)
     permissions.bind_temporary_directory(sessions.temporary_directory)
     return sessions, permissions
 
@@ -97,7 +269,7 @@ def command_operation(tmp_path):
 def _host_request_context(tmp_path):
     """Build the freshly approved explicit-host context used by output-spool tests."""
     manager = PermissionManager(tmp_path)
-    manager.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    manager.set_direct_host_execution(True)
     interaction = Mock()
     interaction.supports_fresh_host_approval = True
     interaction.prompt.return_value = "approve"
@@ -158,6 +330,41 @@ def test_executable_lookup_resolves_project_selected_tools_independently(tmp_pat
     assert formatter["candidate_read_roots"] == [str(second)]
     assert builder["grant_reference"] != formatter["grant_reference"]
     assert missing["status"] == "absent_from_host_path"
+    backend.run.assert_not_called()
+
+
+@pytest.mark.parametrize("covered", ["both", "spelling", "target"])
+def test_executable_lookup_reuses_distinct_system_runtime_roots(tmp_path, monkeypatch, covered):
+    """A system alias needs no new grant only when both endpoints have runtime coverage."""
+    binaries, libraries = tmp_path / "bin", tmp_path / "lib"
+    binaries.mkdir()
+    libraries.mkdir()
+    executable = libraries / "tool"
+    executable.write_text("fixture")
+    executable.chmod(0o755)
+    (binaries / "tool").symlink_to(executable)
+    monkeypatch.setenv("PATH", str(binaries))
+    backend = Mock()
+    backend.system_read_roots = (
+        (binaries, libraries)
+        if covered == "both"
+        else (binaries,)
+        if covered == "spelling"
+        else (libraries,)
+    )
+    backend.installed_tool_roots.return_value = ((libraries,), ())
+    backend.managed_tool_root.return_value = False
+
+    result = CommandExecutionService(backend, Mock()).resolve_executable(
+        ToolContext(None, "resolve_executable"), "tool", str(tmp_path)
+    )
+
+    assert result["sandbox_access"] == (
+        "default_read" if covered == "both" else "external_read_grant_required"
+    )
+    assert ("grant_reference" in result) is (covered != "both")
+    if covered == "both":
+        backend.installed_tool_roots.assert_not_called()
     backend.run.assert_not_called()
 
 
@@ -260,12 +467,12 @@ def test_automatic_discovery_preserves_existing_executable_references(
         ),
     )
     interaction = Mock()
-    interaction.prompt.return_value = "approve"
+    interaction.prompt.return_value = "session"
     context = ToolContext(
         interaction,
         "run_command",
         operations=(operation,),
-        permission_manager=PermissionManager(workspace),
+        permission_manager=automatic_process_policy(workspace),
     )
 
     first = service.run_command(context, "builder")
@@ -273,7 +480,9 @@ def test_automatic_discovery_preserves_existing_executable_references(
 
     assert first["boundary"] == result["boundary"] == "sandbox"
     assert backend.run.call_count == 2
-    assert interaction.prompt.call_count == (0 if managed else 1)
+    assert interaction.prompt.call_count == 1
+    if managed:
+        assert backend.run.call_args_list[0].args[0].read_roots == (tools,)
 
 
 def test_backend_refresh_during_discovery_preserves_current_execution(tmp_path, monkeypatch):
@@ -316,11 +525,13 @@ def test_backend_refresh_during_discovery_preserves_current_execution(tmp_path, 
             boundary=ProcessBoundary.SANDBOXED,
         ),
     )
+    interaction = Mock()
+    interaction.prompt.return_value = "approve"
     context = ToolContext(
-        None,
+        interaction,
         "run_command",
         operations=(operation,),
-        permission_manager=PermissionManager(workspace),
+        permission_manager=automatic_process_policy(workspace),
     )
 
     result = service.run_command(context, "builder", executable_grant=reference)
@@ -501,7 +712,7 @@ def test_explicit_host_request_reports_results_and_invalidates_effects(
 ):
     """Host outcomes stay separate and possible effects invalidate instruction state."""
     manager = PermissionManager(tmp_path)
-    manager.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    manager.set_direct_host_execution(True)
     interaction = Mock()
     interaction.supports_fresh_host_approval = True
     interaction.prompt.return_value = "approve"
@@ -648,7 +859,7 @@ def test_explicit_host_request_observer_surfaces_spool_failure(tmp_path, monkeyp
 def test_explicit_host_exception_invalidates_instructions(tmp_path, invalidation_fails):
     """A host execution error invalidates possible effects without hiding the original error."""
     manager = PermissionManager(tmp_path)
-    manager.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    manager.set_direct_host_execution(True)
     interaction = Mock()
     interaction.supports_fresh_host_approval = True
     interaction.prompt.return_value = "approve"
@@ -724,7 +935,7 @@ def test_unsupported_native_backend_offers_host_retry_without_launching_it(tmp_p
         None,
         "run_command",
         operations=(operation,),
-        permission_manager=PermissionManager(tmp_path),
+        permission_manager=automatic_process_policy(tmp_path, allow_direct_host_execution=True),
     )
 
     result = service.run_command(context, "pwd")
@@ -784,21 +995,26 @@ def test_execution_invalidates_instructions_after_possible_effects(tmp_path, sce
     host.run_host_command.side_effect = run_host
     instructions.invalidate.side_effect = lambda _path: events.append("invalidate")
     permissions = PermissionManager(tmp_path)
-    permissions.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    permissions.set_direct_host_execution(True)
     instructions.virtual_paths = VirtualPath(
         workspace=tmp_path, temporary_directory=permissions.temporary_directory
     )
+    tool_name = "run_command" if scenario == "sandbox_effects" else "request_host_command"
     context = ToolContext(
         interaction,
-        "run_command",
+        tool_name,
         operations=(
             Operation(
-                tool_id="run_command",
+                tool_id=tool_name,
                 action=Action.PROCESS_EXECUTE,
                 target=ProcessTarget(
                     argv=("/bin/sh", "-c", "pwd"),
                     cwd=str(tmp_path),
-                    boundary=ProcessBoundary.SANDBOXED,
+                    boundary=(
+                        ProcessBoundary.SANDBOXED
+                        if scenario == "sandbox_effects"
+                        else ProcessBoundary.HOST
+                    ),
                 ),
             ),
         ),
@@ -808,7 +1024,9 @@ def test_execution_invalidates_instructions_after_possible_effects(tmp_path, sce
 
     if scenario == "host_error":
         with pytest.raises(RuntimeError, match="host execution failed"):
-            CommandExecutionService(backend, host).run_command(context, "pwd")
+            CommandExecutionService(backend, host).request_host_command(
+                context, "pwd", str(tmp_path), "Native incompatible"
+            )
     elif scenario == "sandbox_effects":
         result = CommandExecutionService(backend, host).run_command(context, "pwd")
         assert result.code == "sandbox.denied"
@@ -816,7 +1034,9 @@ def test_execution_invalidates_instructions_after_possible_effects(tmp_path, sce
         assert result.metadata["sandbox_diagnostics"]["possible_effects"] is True
         host.run_host_command.assert_not_called()
     else:
-        result = CommandExecutionService(backend, host).run_command(context, "pwd")
+        result = CommandExecutionService(backend, host).request_host_command(
+            context, "pwd", str(tmp_path), "Native incompatible"
+        )
         assert result.code == (
             "host_command.unavailable" if scenario == "host_capture" else "host_command.cancelled"
         )
@@ -902,21 +1122,24 @@ def test_execution_exception_invalidates_instructions_and_preserves_error(
         instructions.invalidate.side_effect = ValueError("invalidation failed")
     permissions = PermissionManager(tmp_path)
     if boundary == "host":
-        permissions.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+        permissions.set_direct_host_execution(True)
     instructions.virtual_paths = VirtualPath(
         workspace=tmp_path, temporary_directory=permissions.temporary_directory
     )
+    tool_name = "request_host_command" if boundary == "host" else "run_command"
     context = ToolContext(
         interaction,
-        "run_command",
+        tool_name,
         operations=(
             Operation(
-                tool_id="run_command",
+                tool_id=tool_name,
                 action=Action.PROCESS_EXECUTE,
                 target=ProcessTarget(
                     argv=("/bin/sh", "-c", "pwd"),
                     cwd=str(tmp_path),
-                    boundary=ProcessBoundary.SANDBOXED,
+                    boundary=ProcessBoundary.HOST
+                    if boundary == "host"
+                    else ProcessBoundary.SANDBOXED,
                 ),
             ),
         ),
@@ -925,7 +1148,11 @@ def test_execution_exception_invalidates_instructions_and_preserves_error(
     )
 
     with pytest.raises(RuntimeError, match="execution failed") as error:
-        CommandExecutionService(backend, host).run_command(context, "pwd")
+        service = CommandExecutionService(backend, host)
+        if boundary == "host":
+            service.request_host_command(context, "pwd", str(tmp_path), "Native unavailable")
+        else:
+            service.run_command(context, "pwd")
 
     instructions.invalidate.assert_called_once_with(None)
     if invalidation_fails:
@@ -959,7 +1186,7 @@ def test_command_result_reports_sandbox_diagnostics_without_asserting_cause(tmp_
                 ),
             ),
         ),
-        permission_manager=PermissionManager(tmp_path),
+        permission_manager=automatic_process_policy(tmp_path),
     )
     result = CommandExecutionService(backend, Mock()).run_command(context, "pwd")
 
@@ -1036,7 +1263,7 @@ def test_successful_command_reports_buffered_candidate_without_implying_failure(
                 ),
             ),
         ),
-        permission_manager=PermissionManager(tmp_path),
+        permission_manager=automatic_process_policy(tmp_path),
     )
     host = Mock()
 
@@ -1073,7 +1300,7 @@ def test_unsupported_denial_collection_is_reported_as_unavailable(tmp_path, monk
                 ),
             ),
         ),
-        permission_manager=PermissionManager(tmp_path),
+        permission_manager=automatic_process_policy(tmp_path),
     )
 
     result = CommandExecutionService(backend, Mock()).run_command(context, "exit 7")
@@ -1112,7 +1339,7 @@ def test_completed_command_keeps_unattributed_denial_in_trace(tmp_path, output_m
                 ),
             ),
         ),
-        permission_manager=PermissionManager(tmp_path),
+        permission_manager=automatic_process_policy(tmp_path),
     )
 
     adapter = MemoryTelemetryAdapter()
@@ -1152,6 +1379,247 @@ def test_completed_command_keeps_unattributed_denial_in_trace(tmp_path, output_m
     }
 
 
+@pytest.mark.parametrize(
+    "case",
+    [
+        "ordinary",
+        "preserve_granted_files",
+        "file_count_limit",
+        "generated",
+        "generated_sidecar",
+        "journal_sidecar",
+        "generated_siblings",
+        "repeated_creation_denial",
+        "unrelated_creations",
+        "creation_without_suffix",
+        "creations_in_separate_directories",
+        "different_parent",
+        "same_prefix_without_delimiter",
+        "already_granted",
+        "no_support",
+        "protected",
+        "directory",
+        "success",
+        "unrelated",
+        "permission_text",
+        "read_denial",
+    ],
+)
+def test_write_denial_guides_same_command_retry(tmp_path, monkeypatch, case):
+    """Guide a failed command toward an eligible fixed file or a dedicated output directory."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    possible_sidecar = {
+        "generated_sidecar": ".coverage.worker.123",
+        "journal_sidecar": ".coverage-journal",
+        "different_parent": "archive/.coverage-worker",
+        "same_prefix_without_delimiter": ".coverageExtra",
+    }.get(case)
+    other_created = {
+        "generated_siblings": ".report.002.fill",
+        "repeated_creation_denial": ".report.001.fill",
+        "unrelated_creations": ".other.002.fill",
+        "creation_without_suffix": "report",
+        "creations_in_separate_directories": "archive/.report.002.fill",
+    }.get(case)
+    generated_name = ".report.001.fill" if other_created else possible_sidecar
+    target = workspace / (generated_name or (".env" if case == "protected" else ".coverage"))
+    target.parent.mkdir(exist_ok=True)
+    if case == "directory":
+        target.mkdir()
+    elif case != "generated" and not generated_name:
+        target.touch()
+    write_files = {
+        "already_granted": [str(target)],
+        "preserve_granted_files": ["existing-report"],
+        "file_count_limit": [
+            f"report-{index}" for index in range(execution_facade.constants.MAX_COMMAND_PATH_COUNT)
+        ],
+    }.get(case)
+    operation = "file-write-unlink"
+    if generated_name or case == "generated":
+        operation = "file-write-create"
+    elif case == "read_denial":
+        operation = "file-read-data"
+    backend = Mock(
+        capabilities=frozenset()
+        if case == "no_support"
+        else frozenset({SandboxCapability.WRITE_FILES})
+    )
+    denial = (
+        ""
+        if case in {"unrelated", "permission_text"}
+        else f"Sandbox: tool(1) deny(1) {operation} {target}"
+    )
+    if generated_name:
+        if possible_sidecar:
+            write_files = [".coverage"]
+        if other_created:
+            second_target = workspace / other_created
+            second_target.parent.mkdir(exist_ok=True)
+            denial += f"\nSandbox: tool(3) deny(1) file-write-create {second_target}"
+        cache = workspace / "known-cache"
+        cache.touch()
+        denial += f"\nSandbox: tool(2) deny(1) file-write-data {cache}"
+        monkeypatch.setattr(
+            type(backend),
+            "classify_denial_candidates",
+            lambda _self, observed: (
+                tuple((line, False) for line in observed.splitlines()),
+                "unavailable",
+            ),
+            raising=False,
+        )
+    backend.run.return_value = CommandProcessResult(
+        SandboxOutcome.COMPLETED,
+        exit_code=0 if case == "success" else 1,
+        stderr="open: Permission denied" if case in {"permission_text", "read_denial"} else "",
+        observed_denial=denial,
+        diagnostic_status="available",
+        diagnostic_source="macos-kernel-log" if denial else "unknown",
+    )
+    manager = automatic_process_policy(workspace)
+    for action in (Action.FILESYSTEM_CREATE, Action.FILESYSTEM_REPLACE, Action.FILESYSTEM_DELETE):
+        manager.set_default(action, Decision.ALLOW)
+    context = ToolContext(
+        None,
+        "run_command",
+        operations=(
+            Operation(
+                tool_id="run_command",
+                action=Action.PROCESS_EXECUTE,
+                target=ProcessTarget(
+                    argv=("/bin/sh", "-c", "false"),
+                    cwd=str(workspace),
+                    boundary=ProcessBoundary.SANDBOXED,
+                ),
+            ),
+        ),
+        permission_manager=manager,
+    )
+
+    with closing(CommandExecutionService(backend, Mock())) as service:
+        result = service.run_command(
+            context,
+            "false",
+            write_files=write_files,
+        )
+
+    backend.run.assert_called_once()
+    if case == "success":
+        assert "retry" not in result["write_scope"]
+        return
+    if case == "unrelated":
+        assert "retry" not in result.metadata["write_scope"]
+        return
+    retry = result.metadata["write_scope"]["retry"]
+    assert retry["tool"] == "run_command"
+    assert not result.retryable
+    assert "Keep the requested command and its options" in retry["guidance"]
+    assert '"$LOOP_OUTPUT_DIR"' in retry["guidance"]
+    assert "Follow the user's retry instructions" in retry["guidance"]
+    if case in {"ordinary", "preserve_granted_files"}:
+        expected = ["$WORKSPACE_ROOT/.coverage"]
+        if case == "preserve_granted_files":
+            expected.insert(0, "$WORKSPACE_ROOT/existing-report")
+        assert retry["arguments_to_merge"] == {"write_files": expected}
+    elif case in {"different_parent", "same_prefix_without_delimiter"}:
+        assert retry["arguments_to_merge"] == {
+            "write_files": ["$WORKSPACE_ROOT/.coverage", "$WORKSPACE_ROOT/known-cache"],
+        }
+    elif other_created and case != "generated_siblings":
+        assert retry["arguments_to_merge"] == {"write_files": ["$WORKSPACE_ROOT/known-cache"]}
+    else:
+        assert "arguments_to_merge" not in retry
+    if "arguments_to_merge" in retry:
+        assert "each required workspace write uses a listed fixed filename" in retry["guidance"]
+        assert "no access to generated siblings" in retry["guidance"]
+    if case in {"generated_sidecar", "journal_sidecar", "generated_siblings"}:
+        assert "sidecar" in retry["guidance"]
+        assert "configure the tool's output directory" in retry["guidance"]
+
+
+@pytest.fixture
+def enrolled_command_permissions(tmp_path):
+    """Provide the normal trusted workspace policy used for human command-resource decisions."""
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    catalog = tmp_path / "state" / "workspaces.sqlite"
+    identity = WorkspaceRepository(catalog).initialize(Workspace.discover(workspace)).id
+    manager = PermissionManager(
+        workspace,
+        workspace_id=identity,
+        namespace_catalog_path=catalog,
+        configuration_path=catalog.parent / identity / "permissions.yaml",
+        user_configuration_path=catalog.parent / "permissions.yaml",
+        user_namespace_identity=str(catalog.parent),
+        bootstrap_pristine_policy=True,
+    )
+    return workspace, manager
+
+
+@pytest.mark.parametrize(
+    "enrolled", [(), ("account_lookup",), ("process_pools",), ("account_lookup", "process_pools")]
+)
+def test_project_launcher_prepares_owner_enabled_services_in_one_approval(
+    enrolled_command_permissions, enrolled
+):
+    """Prepare the owner's runtime services without expanding the default write scope."""
+    workspace, permissions = enrolled_command_permissions
+    for name in enrolled:
+        permissions.set_sandbox_option(name, True)
+    program = workspace / "checks"
+    program.write_text("#!/bin/sh\nexit 0\n")
+    program.chmod(0o700)
+    choices = []
+
+    def approve(question, *, index, **kwargs):
+        """Use the regular session approval and record every available choice."""
+        choices.append(kwargs["choices"])
+        return "session"
+
+    interaction = Mock()
+    interaction.prompt.side_effect = approve
+    backend = Mock(backend_options=("account_lookup", "process_pools"), system_read_roots=())
+    backend.run.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
+    context = ToolContext(
+        interaction,
+        "run_command",
+        permission_manager=permissions,
+        instructions_manager=InstructionsManager(
+            runtime_environment=RuntimeEnvironment(workspace, permissions.temporary_directory)
+        ),
+        operations=(
+            Operation(
+                tool_id="run_command",
+                action=Action.PROCESS_EXECUTE,
+                target=ProcessTarget(
+                    argv=("/bin/sh", "-c", "./checks"),
+                    cwd=str(workspace),
+                    boundary=ProcessBoundary.SANDBOXED,
+                ),
+            ),
+        ),
+    )
+    service = CommandExecutionService(backend, Mock())
+    assert service.run_command(context, "./checks 2>&1; echo done")["exit_code"] == 0
+    request = backend.run.call_args.args[0]
+    assert request.backend_options == enrolled
+    assert request.write_roots == () and not request.network and not request.git_create
+    assert len(choices) == 1 and set(choices[0]) == {
+        "deny",
+        "approve",
+        "session",
+        "workspace",
+        "user",
+        "details",
+    }
+    assert not permissions.configuration.workspace_command_writes
+    assert service.run_command(context, "printf ready")["exit_code"] == 0
+    strict = backend.run.call_args.args[0]
+    assert strict.backend_options == () and strict.write_roots == ()
+
+
 def test_command_candidates_keep_startup_matches_and_unclassified_denials(tmp_path, monkeypatch):
     """Both observed resources reach the original result with explicit uncertainty."""
     startup = "Sandbox: sh(1) deny(1) file-read-data /system/cache"
@@ -1184,7 +1652,7 @@ def test_command_candidates_keep_startup_matches_and_unclassified_denials(tmp_pa
                 ),
             ),
         ),
-        permission_manager=PermissionManager(tmp_path),
+        permission_manager=automatic_process_policy(tmp_path),
     )
     host = Mock()
 
@@ -1251,7 +1719,7 @@ def test_linux_journal_candidates_are_redacted_unclassified_and_bounded(tmp_path
                 ),
             ),
         ),
-        permission_manager=PermissionManager(tmp_path),
+        permission_manager=automatic_process_policy(tmp_path),
     )
 
     result = CommandExecutionService(backend, Mock()).run_command(context, "exit 7")
@@ -1313,7 +1781,7 @@ def test_denial_candidates_hide_protected_resources_from_results_and_traces(
                 ),
             ),
         ),
-        permission_manager=PermissionManager(tmp_path),
+        permission_manager=automatic_process_policy(tmp_path),
     )
 
     result = CommandExecutionService(backend, Mock()).run_command(context, "exit 7")
@@ -1357,7 +1825,10 @@ def test_interrupted_sandbox_result_warns_only_when_effects_are_possible(
         ),
     )
     context = ToolContext(
-        None, "run_command", operations=(operation,), permission_manager=PermissionManager(tmp_path)
+        None,
+        "run_command",
+        operations=(operation,),
+        permission_manager=automatic_process_policy(tmp_path),
     )
 
     result = CommandExecutionService(backend, host).run_command(context, ":")
@@ -1371,11 +1842,7 @@ def test_interrupted_sandbox_result_warns_only_when_effects_are_possible(
     )
     assert diagnostics["cause_confidence"] == "unknown"
     assert diagnostics["sandbox_approval_supported"] is None
-    assert diagnostics["next_request"] == (
-        "request_host_command"
-        if not possible_effects and outcome in {SandboxOutcome.DENIED, SandboxOutcome.UNAVAILABLE}
-        else None
-    )
+    assert diagnostics["next_request"] is None
     if possible_effects:
         assert "not retried" in result.metadata["recovery_hint"]
         assert "inspect" in result.metadata["recovery_hint"].lower()
@@ -1403,7 +1870,7 @@ def test_sandbox_reader_failure_preserves_partial_output_without_host_retry(tmp_
     interaction = Mock()
     interaction.prompt.return_value = "approve"
     permissions = PermissionManager(tmp_path)
-    permissions.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    permissions.set_direct_host_execution(True)
     operation = Operation(
         tool_id="run_command",
         action=Action.PROCESS_EXECUTE,
@@ -1438,8 +1905,8 @@ def test_unsupported_capability_never_offers_host_retry(tmp_path):
     host = Mock()
     interaction = Mock()
     interaction.prompt.return_value = "approve"
-    permissions = PermissionManager(tmp_path)
-    permissions.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    permissions = automatic_process_policy(tmp_path)
+    permissions.set_direct_host_execution(True)
     context = ToolContext(
         interaction,
         "run_command",
@@ -1476,8 +1943,8 @@ def test_host_retry_preserves_diagnostic_from_boundary_failure(tmp_path):
     interaction = Mock()
     interaction.supports_fresh_host_approval = True
     interaction.prompt.return_value = "approve"
-    permissions = PermissionManager(tmp_path)
-    permissions.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    permissions = automatic_process_policy(tmp_path)
+    permissions.set_direct_host_execution(True)
     context = ToolContext(
         interaction,
         "run_command",
@@ -1497,11 +1964,11 @@ def test_host_retry_preserves_diagnostic_from_boundary_failure(tmp_path):
 
     result = CommandExecutionService(backend, host).run_command(context, "pwd")
 
-    assert result["boundary"] == "host"
-    assert "repeat effects" in result["authority_notice"]
-    assert result["possible_effects"] is True
-    assert result["sandbox_attempt"]["observed_denial"] == "file-read-data /outside"
-    host.run_host_command.assert_called_once()
+    assert result.code == "sandbox.unavailable"
+    assert result.metadata["sandbox_diagnostic"] == "file-read-data /outside"
+    assert result.metadata["sandbox_diagnostics"]["next_request"] == "request_host_command"
+    host.run_host_command.assert_not_called()
+    interaction.prompt.assert_not_called()
 
 
 def test_sandbox_diagnostic_metadata_redacts_external_paths(tmp_path, monkeypatch):
@@ -1605,7 +2072,7 @@ def test_model_diagnostic_hides_ungranted_external_denial_path(tmp_path, monkeyp
     )
     trace = Mock()
     monkeypatch.setattr(execution_facade, "telemetry_trace_event", trace)
-    permissions = PermissionManager(workspace)
+    permissions = automatic_process_policy(workspace)
     instructions = Mock()
     instructions.agents_filenames = ()
     instructions.virtual_paths = VirtualPath(
@@ -1711,7 +2178,7 @@ def test_selected_executable_alias_uses_only_approved_scope(tmp_path, monkeypatc
         interaction,
         "run_command",
         operations=(operation,),
-        permission_manager=PermissionManager(workspace),
+        permission_manager=automatic_process_policy(workspace),
     )
 
     requested = workspace if scope == "inside" else other if scope == "other" else installation
@@ -2036,7 +2503,7 @@ def test_workspace_script_interpreter_discovery_respects_existing_scope(
         interaction,
         "run_command",
         operations=(operation,),
-        permission_manager=PermissionManager(workspace),
+        permission_manager=automatic_process_policy(workspace),
     )
 
     requested = (
@@ -2147,7 +2614,7 @@ def test_nested_forwarders_discover_only_literal_selected_targets(
         interaction,
         "run_command",
         operations=(operation,),
-        permission_manager=PermissionManager(workspace),
+        permission_manager=automatic_process_policy(workspace),
     )
 
     result = CommandExecutionService(backend, Mock()).run_command(context, command)
@@ -2157,343 +2624,6 @@ def test_nested_forwarders_discover_only_literal_selected_targets(
     assert backend.run.call_args.args[0].cleanup_proof is True
     assert backend.run.call_args.args[0].read_roots == ((installation,) if expected else ())
     assert interaction.prompt.call_count == int(expected)
-
-
-@pytest.mark.parametrize(
-    ("retarget", "available", "fault", "selection"),
-    [
-        (False, True, None, "project"),
-        (True, True, None, "project"),
-        (False, False, None, "project"),
-        (False, True, ValueError, "project"),
-        (False, True, OSError, "project"),
-        (False, True, TimeoutError, "project"),
-        (False, True, "irrelevant", "project"),
-        (False, True, "inside", "project"),
-        (False, True, "contextless", "project"),
-        (False, True, None, "direct"),
-        (True, True, None, "direct"),
-        (False, False, None, "direct"),
-    ],
-)
-def test_selected_project_runtime_is_validated_and_approved_in_original_call(
-    shebang_policy_root, monkeypatch, retarget, available, fault, selection
-):
-    """An identified off-PATH runtime is scoped and checked again after approval."""
-    tmp_path, _ = shebang_policy_root
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    environment = workspace / ".venv"
-    commands = environment / "bin"
-    commands.mkdir(parents=True)
-    (workspace / "pyproject.toml").write_text('[project]\nname = "fixture"\n', encoding="utf-8")
-    runtime = tmp_path / "runtime"
-    runtime.mkdir()
-    alias = tmp_path / "runtime-alias"
-    alias.symlink_to(runtime, target_is_directory=True)
-    (environment / "pyvenv.cfg").write_text(
-        f"home = {alias}\nimplementation = CPython\nversion_info = 3.14.2\n", encoding="utf-8"
-    )
-    selected = runtime / "engine"
-    selected.write_text("fixture", encoding="utf-8")
-    selected.chmod(0o755)
-    interpreter = commands / "python"
-    interpreter.symlink_to(selected)
-    alternative = runtime / "other"
-    alternative.write_text("fixture", encoding="utf-8")
-    alternative.chmod(0o755)
-    tools = tmp_path / "tools"
-    tools.mkdir()
-    executable = tools / "uv"
-    executable.write_text("fixture", encoding="utf-8")
-    executable.chmod(0o755)
-    monkeypatch.setenv("PATH", str(tools))
-    backend = Mock()
-    backend.system_read_roots = ()
-    backend.run.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
-    inspected = []
-
-    def runtime_reader(_self, _workspace, roots, identities):
-        """Return a candidate only for the selected off-PATH environment."""
-        inspected.append((roots, identities))
-        identified = any(identity[1] == interpreter for identity in identities)
-        if identified and isinstance(fault, type):
-            raise fault("fixture metadata unavailable")
-        if identified and fault == "irrelevant":
-            return (tmp_path / "unrelated",)
-        if identified and fault == "inside":
-            return (workspace,)
-        return (runtime,) if identified else ()
-
-    if available:
-        monkeypatch.setattr(
-            type(backend), "automatic_tool_read_roots", runtime_reader, raising=False
-        )
-    interaction = Mock()
-
-    def approve(*_args, **_kwargs):
-        """Change the selected interpreter only in the retargeting control."""
-        if retarget:
-            interpreter.unlink()
-            interpreter.symlink_to(alternative)
-        return "approve"
-
-    interaction.prompt.side_effect = approve
-    command = "uv run --no-sync pytest" if selection == "project" else "./.venv/bin/python -c pass"
-    operation = Operation(
-        tool_id="run_command",
-        action=Action.PROCESS_EXECUTE,
-        target=ProcessTarget(
-            argv=("/bin/sh", "-c", command), cwd=str(workspace), boundary=ProcessBoundary.SANDBOXED
-        ),
-    )
-    context = ToolContext(
-        interaction,
-        "run_command",
-        operations=(operation,),
-        permission_manager=PermissionManager(workspace),
-    )
-    if fault == "contextless":
-        monkeypatch.setattr(PermissionManager, "describe_sandbox_reads", lambda *_args: None)
-
-    result = CommandExecutionService(backend, Mock()).run_command(context, command)
-
-    assert bool(inspected) is available
-    if available:
-        assert (commands, commands) in inspected[-1][0]
-    approved = not available or fault in {None, "contextless"}
-    assert interaction.prompt.call_count == int(approved)
-    if retarget:
-        assert result.code == "sandbox.stale"
-        backend.run.assert_not_called()
-    elif fault is TimeoutError:
-        assert result.code == "sandbox.unavailable"
-        backend.run.assert_not_called()
-    elif approved:
-        assert result["boundary"] == "sandbox"
-        request = backend.run.call_args.args[0]
-        assert request.read_roots == (runtime,)
-        assert request.read_aliases == (alias,)
-        assert request.workspace_executable_identities[0][1:3] == (interpreter, selected)
-        assert dict(request.environment)["PATH"] == str(tools)
-        assert request.shell_environment()["HOME"] == str(
-            context.permission_manager.temporary_directory
-        )
-        assert "UV_CACHE_DIR" not in request.shell_environment()
-        assert "including neighboring files" in request.read_context
-    else:
-        assert result["boundary"] == "sandbox"
-        assert backend.run.call_args.args[0].read_roots == ()
-
-
-@pytest.mark.parametrize(
-    "case",
-    [
-        "approved",
-        "denied",
-        "stale",
-        "bound-method",
-        "single",
-        "wrong-root",
-        "too-many",
-        "unmanaged",
-        "protected",
-        "bad-alias",
-        "wrong-target",
-        "missing-alias",
-        "invalid-metadata",
-        "metadata-error",
-        "veto-direct",
-        "veto-wrapped",
-    ],
-)
-def test_selected_runtime_package_dependencies_require_approval(tmp_path, monkeypatch, case):
-    """Only verified dependencies of a selected runtime join its reviewed scope."""
-    workspace = tmp_path / "workspace"
-    commands = workspace / ".venv/bin"
-    commands.mkdir(parents=True)
-    runtime = tmp_path / "runtime"
-    runtime.mkdir()
-    alias = tmp_path / "runtime-alias"
-    alias.symlink_to(runtime, target_is_directory=True)
-    selected = runtime / "engine"
-    selected.write_text("fixture")
-    selected.chmod(0o755)
-    interpreter = commands / "python"
-    interpreter.symlink_to(selected)
-    (commands.parent / "pyvenv.cfg").write_text(
-        f"home = {alias}\nimplementation = CPython\nversion_info = 3.14\n"
-    )
-    dependency = tmp_path / (".ssh" if case == "protected" else "dependency")
-    dependency.mkdir()
-    dependency_alias = tmp_path / "dependency-alias"
-    dependency_alias.symlink_to(dependency, target_is_directory=True)
-    details = dependency_alias.lstat()
-    target = runtime if case == "wrong-target" else dependency
-    binding = (dependency_alias, details.st_dev, details.st_ino, target)
-    if case == "bad-alias":
-        binding = (dependency_alias, details.st_dev, details.st_ino + 1, target)
-    if case == "missing-alias":
-        dependency_alias.unlink()
-    monkeypatch.setenv("PATH", "/usr/bin:/bin")
-    backend = Mock()
-    backend.system_read_roots = ()
-    backend.run.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
-
-    def runtime_reader(_self, _workspace, _roots, identities):
-        """Select only the workspace interpreter's linked runtime."""
-        return (runtime,) if any(identity[1] == interpreter for identity in identities) else ()
-
-    def package_roots(_selected):
-        """Return managed package metadata or a selected invalid form."""
-        if case == "metadata-error":
-            raise OSError("package metadata unavailable")
-        if case == "invalid-metadata":
-            return None
-        if case == "veto-direct":
-            raise PermissionError("package metadata veto")
-        if case == "veto-wrapped":
-            raise ValueError("package metadata unavailable") from PermissionError(
-                "package metadata veto"
-            )
-        if case == "single":
-            return (runtime,), ()
-        if case == "wrong-root":
-            return (dependency, runtime), ()
-        if case == "too-many":
-            return (runtime,) * 129, ()
-        return (runtime, dependency), (binding,)
-
-    monkeypatch.setattr(type(backend), "automatic_tool_read_roots", runtime_reader, raising=False)
-    monkeypatch.setattr(
-        type(backend), "installed_tool_roots", staticmethod(package_roots), raising=False
-    )
-    monkeypatch.setattr(
-        type(backend),
-        "managed_tool_root",
-        staticmethod(lambda root: case != "unmanaged"),
-        raising=False,
-    )
-    if case == "bound-method":
-        monkeypatch.setattr(
-            type(backend), "installed_tool_roots", lambda _self, selected: package_roots(selected)
-        )
-        monkeypatch.setattr(type(backend), "managed_tool_root", lambda _self, _root: True)
-    interaction = Mock()
-
-    def decide(*_args, **_kwargs):
-        """Retarget a reviewed package alias only in the stale-selection control."""
-        if case == "stale":
-            dependency_alias.unlink()
-            dependency_alias.symlink_to(runtime, target_is_directory=True)
-        return "deny" if case == "denied" else "approve"
-
-    interaction.prompt.side_effect = decide
-    command = "./.venv/bin/python -c pass"
-    context = ToolContext(
-        interaction,
-        "run_command",
-        operations=(
-            Operation(
-                tool_id="run_command",
-                action=Action.PROCESS_EXECUTE,
-                target=ProcessTarget(
-                    argv=("/bin/sh", "-c", command),
-                    cwd=str(workspace),
-                    boundary=ProcessBoundary.SANDBOXED,
-                ),
-            ),
-        ),
-        permission_manager=PermissionManager(workspace),
-    )
-    result = CommandExecutionService(backend, Mock()).run_command(context, command)
-
-    if case in {"veto-direct", "veto-wrapped", "metadata-error", "missing-alias"}:
-        assert result.code == "sandbox.unavailable"
-        backend.run.assert_not_called()
-        return
-    if case in {"denied", "stale"}:
-        assert result.code == ("tool.denied" if case == "denied" else "sandbox.stale")
-        backend.run.assert_not_called()
-        return
-    assert result["boundary"] == "sandbox"
-    request = backend.run.call_args.args[0]
-    assert interaction.prompt.call_count == 1
-    assert (dependency in request.read_roots) is (case in {"approved", "bound-method"})
-    assert (dependency_alias in request.read_aliases) is (case in {"approved", "bound-method"})
-    assert dependency not in request.automatic_tool_reads
-
-
-def test_runtime_package_discovery_requires_a_known_home(tmp_path, monkeypatch):
-    """Package hints cannot broaden scope when the account home cannot be determined."""
-    backend = Mock()
-    monkeypatch.setattr(
-        type(backend), "installed_tool_roots", staticmethod(lambda _: None), raising=False
-    )
-    monkeypatch.setattr(
-        type(backend), "managed_tool_root", staticmethod(lambda _: True), raising=False
-    )
-    monkeypatch.setattr(
-        execution_facade,
-        "pwd",
-        SimpleNamespace(getpwuid=Mock(side_effect=KeyError("unknown account"))),
-    )
-
-    assert execution_facade._installed_runtime_packages(backend, (object(),), tmp_path, ()) == (
-        (),
-        (),
-    )
-
-
-def test_protected_runtime_is_rejected_before_package_inspection(tmp_path, monkeypatch):
-    """A forbidden runtime cannot cause host-side package metadata reads."""
-    workspace = tmp_path / "workspace"
-    commands = workspace / ".venv/bin"
-    commands.mkdir(parents=True)
-    private = tmp_path / ".ssh"
-    private.mkdir()
-    selected = private / "python"
-    selected.write_text("fixture")
-    selected.chmod(0o755)
-    interpreter = commands / "python"
-    interpreter.symlink_to(selected)
-    details = selected.stat()
-    candidate = execution_facade.RuntimeCandidate(
-        (str(interpreter), interpreter, selected, details.st_dev, details.st_ino), selected
-    )
-    monkeypatch.setattr(execution_facade, "discover_workspace_runtimes", lambda *_: (candidate,))
-    backend = Mock()
-    backend.system_read_roots = ()
-    resolver = Mock(side_effect=AssertionError("protected package must not be inspected"))
-    monkeypatch.setattr(
-        type(backend), "installed_tool_roots", staticmethod(resolver), raising=False
-    )
-    monkeypatch.setattr(
-        type(backend), "managed_tool_root", staticmethod(lambda _: True), raising=False
-    )
-    command = "./.venv/bin/python -c pass"
-    context = ToolContext(
-        Mock(),
-        "run_command",
-        operations=(
-            Operation(
-                tool_id="run_command",
-                action=Action.PROCESS_EXECUTE,
-                target=ProcessTarget(
-                    argv=("/bin/sh", "-c", command),
-                    cwd=str(workspace),
-                    boundary=ProcessBoundary.SANDBOXED,
-                ),
-            ),
-        ),
-        permission_manager=PermissionManager(workspace),
-    )
-    result = CommandExecutionService(backend, Mock()).run_command(
-        context, command, read_roots=[str(private)]
-    )
-    assert result.code == "sandbox.unavailable"
-    resolver.assert_not_called()
-    backend.run.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -2741,7 +2871,7 @@ def test_forwarded_workspace_script_requests_identified_runtime_scope(
         interaction,
         "run_command",
         operations=(operation,),
-        permission_manager=PermissionManager(workspace),
+        permission_manager=automatic_process_policy(workspace),
     )
     if body == "legacy":
         analysis = replace(
@@ -2879,7 +3009,7 @@ def test_workspace_executable_link_requests_identified_scope(tmp_path, monkeypat
         interaction,
         "run_command",
         operations=(operation,),
-        permission_manager=PermissionManager(workspace),
+        permission_manager=automatic_process_policy(workspace),
     )
 
     result = CommandExecutionService(backend, Mock()).run_command(
@@ -2993,7 +3123,7 @@ def test_invalid_automatic_tool_name_does_not_create_a_grant(tmp_path, monkeypat
                 ),
             ),
         ),
-        permission_manager=PermissionManager(tmp_path),
+        permission_manager=automatic_process_policy(tmp_path),
     )
     result = CommandExecutionService(backend, Mock()).run_command(context, command)
     assert result["boundary"] == "sandbox"
@@ -3011,7 +3141,7 @@ def test_makefile_candidate_already_in_system_scope_needs_no_extra_grant(tmp_pat
     executable.chmod(0o755)
     monkeypatch.setenv("PATH", str(tools))
     monkeypatch.setattr(
-        execution_facade, "discover_makefile_commands", lambda *_: ("fixture-tool",)
+        execution_facade, "discover_makefile_commands", lambda *_args, **_kwargs: ("fixture-tool",)
     )
     original_selection = execution_facade._selected_executable
 
@@ -3043,7 +3173,7 @@ def test_makefile_candidate_already_in_system_scope_needs_no_extra_grant(tmp_pat
                 ),
             ),
         ),
-        permission_manager=PermissionManager(workspace),
+        permission_manager=automatic_process_policy(workspace),
     )
     result = CommandExecutionService(backend, Mock()).run_command(context, command)
     assert result["boundary"] == "sandbox"
@@ -3260,108 +3390,12 @@ def test_timeout_ambiguous_arguments_do_not_request_child_authority(tmp_path, mo
         instructions_manager=InstructionsManager(
             runtime_environment=RuntimeEnvironment(workspace, None)
         ),
-        permission_manager=PermissionManager(workspace),
+        permission_manager=automatic_process_policy(workspace),
     )
     result = CommandExecutionService(backend, Mock()).run_command(context, command)
     assert result["boundary"] == "sandbox"
     assert installation not in backend.run.call_args.args[0].read_roots
     interaction.prompt.assert_not_called()
-
-
-@pytest.mark.parametrize(("direct", "retarget"), [(False, False), (True, False), (True, True)])
-def test_makefile_prepares_selected_off_path_runtime_in_original_call(
-    shebang_policy_root, monkeypatch, direct, retarget
-):
-    """A build recipe and its selected runtime share the same authorization and launch."""
-    root, _ = shebang_policy_root
-    workspace = root / "workspace"
-    workspace.mkdir()
-    recipe = (
-        './.venv/bin/python -c "print(1)"' if direct else "PYTHONDONTWRITEBYTECODE=1 uv run pytest"
-    )
-    (workspace / "Makefile").write_text(f".PHONY: test\ntest:\n\t{recipe}\n")
-    (workspace / "pyproject.toml").write_text('[project]\nname = "fixture"\n')
-    commands = workspace / ".venv/bin"
-    commands.mkdir(parents=True)
-    runtime = root / "runtime"
-    runtime.mkdir()
-    interpreter = runtime / "engine"
-    interpreter.write_text("fixture")
-    interpreter.chmod(0o755)
-    (commands / "python").symlink_to(interpreter)
-    alternative = runtime / "other"
-    alternative.write_text("other")
-    alternative.chmod(0o755)
-    (commands.parent / "pyvenv.cfg").write_text(
-        f"home = {runtime}\nimplementation = CPython\nversion_info = 3.14.2\n"
-    )
-    tools = root / "tools"
-    tools.mkdir()
-    uv = tools / "uv"
-    uv.write_text("fixture")
-    uv.chmod(0o755)
-    monkeypatch.setenv("PATH", str(tools))
-    monkeypatch.setattr(
-        "loop.execution.runtime_discovery._system_make_selected", lambda *_args: True
-    )
-    backend = Mock()
-    backend.system_read_roots = ()
-    monkeypatch.setattr(
-        type(backend), "trusted_system_path", lambda *_args, **_kw: True, raising=False
-    )
-    backend.managed_tool_root.return_value = False
-    backend.installed_tool_roots.return_value = ((tools,), ())
-    backend.run.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
-
-    def runtime_reader(_self, _workspace, _roots, identities):
-        """Recognize only the selected workspace interpreter."""
-        return (runtime,) if any(item[1] == commands / "python" for item in identities) else ()
-
-    monkeypatch.setattr(type(backend), "automatic_tool_read_roots", runtime_reader, raising=False)
-    interaction = Mock()
-
-    def approve(*_args, **_kwargs):
-        """Retarget the selected interpreter during approval when requested."""
-        if retarget:
-            (commands / "python").unlink()
-            (commands / "python").symlink_to(alternative)
-        return "approve"
-
-    interaction.prompt.side_effect = approve
-    command = "/usr/bin/make test"
-    context = ToolContext(
-        interaction,
-        "run_command",
-        operations=(
-            Operation(
-                tool_id="run_command",
-                action=Action.PROCESS_EXECUTE,
-                target=ProcessTarget(
-                    argv=("/bin/sh", "-c", command),
-                    cwd=str(workspace),
-                    boundary=ProcessBoundary.SANDBOXED,
-                ),
-            ),
-        ),
-        permission_manager=PermissionManager(workspace),
-    )
-
-    result = CommandExecutionService(backend, Mock()).run_command(context, command)
-
-    if retarget:
-        assert result.code == "sandbox.stale"
-        backend.run.assert_not_called()
-        interaction.prompt.assert_called_once()
-        return
-    assert result["boundary"] == "sandbox"
-    request = backend.run.call_args.args[0]
-    assert set(request.read_roots) == ({runtime} if direct else {tools, runtime})
-    assert request.source == command
-    assert request.shell_environment()["HOME"] == str(
-        context.permission_manager.temporary_directory
-    )
-    assert "UV_CACHE_DIR" not in request.shell_environment()
-    interaction.prompt.assert_called_once()
 
 
 def test_repeated_make_recipes_share_bounded_workspace_script_discovery(tmp_path, monkeypatch):
@@ -3408,9 +3442,12 @@ def test_repeated_make_recipes_share_bounded_workspace_script_discovery(tmp_path
                 ),
             ),
         ),
-        permission_manager=PermissionManager(workspace),
+        permission_manager=automatic_process_policy(workspace),
     )
-    result = CommandExecutionService(backend, Mock()).run_command(context, command, read_only=True)
+    result = CommandExecutionService(backend, Mock()).run_command(
+        context,
+        command,
+    )
     assert result["boundary"] == "sandbox"
     assert len(inspected) <= 64
     assert len(set(inspected)) == 32
@@ -3446,7 +3483,7 @@ def test_unavailable_backend_does_not_request_makefile_candidates(tmp_path, monk
                 ),
             ),
         ),
-        permission_manager=PermissionManager(workspace),
+        permission_manager=automatic_process_policy(workspace),
     )
 
     result = CommandExecutionService(backend, Mock()).run_command(context, command)
@@ -3588,7 +3625,9 @@ def test_makefile_discovery_falls_back_without_unrelated_authority(tmp_path, mon
         recipes = tuple(f"sh -c candidate-{number}" for number in range(128))
     elif case == "combined-identity-limit":
         recipes = tuple(f"tool-{number}" for number in range(128))
-    monkeypatch.setattr(execution_facade, "discover_makefile_commands", lambda *_args: recipes)
+    monkeypatch.setattr(
+        execution_facade, "discover_makefile_commands", lambda *_args, **_kwargs: recipes
+    )
     backend = Mock()
     backend.system_read_roots = (Path("/usr/bin"),)
     checks = []
@@ -3729,7 +3768,7 @@ def test_makefile_discovery_falls_back_without_unrelated_authority(tmp_path, mon
                 ),
             ),
         ),
-        permission_manager=PermissionManager(workspace),
+        permission_manager=automatic_process_policy(workspace),
     )
 
     result = CommandExecutionService(backend, Mock()).run_command(context, command)
@@ -3761,7 +3800,7 @@ def test_system_alias_preflight_uses_the_same_requested_roots(tmp_path, monkeypa
     workspace.mkdir()
     requested = workspace / "requested"
     requested.mkdir()
-    permission = PermissionManager(workspace)
+    permission = automatic_process_policy(workspace)
     instructions = Mock()
     instructions.agents_filenames = ()
     instructions.virtual_paths = VirtualPath(
@@ -3776,7 +3815,7 @@ def test_system_alias_preflight_uses_the_same_requested_roots(tmp_path, monkeypa
     checker = Mock(return_value=False)
     monkeypatch.setattr(type(backend), "system_executable_requires_alias", checker, raising=False)
     monkeypatch.setattr(
-        execution_facade, "discover_makefile_commands", lambda *_args: ("/usr/bin/awk",)
+        execution_facade, "discover_makefile_commands", lambda *_args, **_kwargs: ("/usr/bin/awk",)
     )
     make = Path("/usr/bin/make").resolve()
 
@@ -3807,7 +3846,8 @@ def test_system_alias_preflight_uses_the_same_requested_roots(tmp_path, monkeypa
         permission_manager=permission,
         instructions_manager=instructions,
     )
-    root = "$WORKSPACE_ROOT/requested" if virtual_root else os.path.relpath(requested, Path.cwd())
+    monkeypatch.chdir(tmp_path)
+    root = "$WORKSPACE_ROOT/requested" if virtual_root else "requested"
     result = CommandExecutionService(backend, Mock()).run_command(
         context, "make test", read_roots=[root]
     )
@@ -3836,6 +3876,7 @@ def test_managed_executable_lookup_after_directory_change(tmp_path, monkeypatch,
     backend.installed_tool_roots.return_value = ((installation,), ())
     backend.run.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
     interaction = Mock()
+    interaction.prompt.return_value = "approve"
     command = "cd child; fixture"
     operation = Operation(
         tool_id="run_command",
@@ -3848,15 +3889,16 @@ def test_managed_executable_lookup_after_directory_change(tmp_path, monkeypatch,
         interaction,
         "run_command",
         operations=(operation,),
-        permission_manager=PermissionManager(workspace),
+        permission_manager=automatic_process_policy(workspace),
     )
 
     result = CommandExecutionService(backend, Mock()).run_command(context, command)
 
     assert result["boundary"] == "sandbox"
     request = backend.run.call_args.args[0]
-    assert request.automatic_tool_reads == ((installation,) if absolute_path else ())
-    interaction.prompt.assert_not_called()
+    assert request.automatic_tool_reads == ()
+    assert request.read_roots == ((installation,) if absolute_path else ())
+    assert interaction.prompt.call_count == int(absolute_path)
 
 
 @pytest.mark.parametrize(
@@ -3926,7 +3968,7 @@ def test_workspace_env_shebang_uses_only_unambiguous_inherited_selection(
         interaction,
         "run_command",
         operations=(operation,),
-        permission_manager=PermissionManager(workspace),
+        permission_manager=automatic_process_policy(workspace),
     )
 
     result = CommandExecutionService(backend, Mock()).run_command(context, command)
@@ -4215,7 +4257,7 @@ def test_direct_workspace_script_requests_identified_runtime_scope(
         interaction,
         "run_command",
         operations=(operation,),
-        permission_manager=PermissionManager(workspace),
+        permission_manager=automatic_process_policy(workspace),
     )
     if case == "extra-broad-context":
         monkeypatch.setattr(
@@ -4357,7 +4399,7 @@ def test_indirect_alias_order_preserves_a_remembered_scope(tmp_path, monkeypatch
     backend.run.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
     interaction = Mock()
     interaction.prompt.return_value = "session"
-    manager = PermissionManager(workspace)
+    manager = automatic_process_policy(workspace)
     operation = Operation(
         tool_id="run_command",
         action=Action.PROCESS_EXECUTE,
@@ -4403,7 +4445,8 @@ def test_indirect_alias_order_preserves_a_remembered_scope(tmp_path, monkeypatch
     assert interaction.prompt.call_count == 2
 
 
-def test_selected_executable_alias_uses_an_existing_grant(tmp_path, monkeypatch):
+@pytest.mark.parametrize("configure_alias", [False, True])
+def test_selected_executable_alias_uses_an_existing_grant(tmp_path, monkeypatch, configure_alias):
     """An identity-bound executable grant also supplies its already-approved alias scope."""
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -4444,6 +4487,7 @@ def test_selected_executable_alias_uses_an_existing_grant(tmp_path, monkeypatch)
         "run_command",
         operations=(operation,),
         permission_manager=PermissionManager(workspace),
+        settings=ToolRuntimeSettings(sandbox_path_aliases=(str(alias),) if configure_alias else ()),
     )
 
     result = service.run_command(context, "fixture-tool", executable_grant=grant["grant_reference"])
@@ -4496,7 +4540,7 @@ def test_public_command_budget_starts_after_sandbox_approval(tmp_path, monkeypat
         return CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
 
     backend.run.side_effect = execute
-    result = service.run_command(context, "printf text >victim")
+    result = service.run_command(context, "printf text >victim", write_roots=[str(tmp_path)])
     assert result["boundary"] == "sandbox"
     assert backend.run.call_args.args[0].deadline == 4203.0
     assert backend.run.call_args.args[0].runtime_timeout == 3600.0
@@ -4600,12 +4644,151 @@ def test_facade_binds_scoped_external_write_and_rejects_broad_control_root(tmp_p
     denied = service.run_command(context, "printf safe", write_roots=[str(tmp_path.parent)])
     assert denied.code == "sandbox.unavailable"
     assert "external write root" in denied.detail.lower()
-    read_only = service.run_command(
-        context, "printf safe", read_only=True, write_roots=[str(external)]
-    )
-    assert read_only.code == "sandbox.unavailable"
-    assert "Read-only workspace commands" in read_only.detail
     backend.run.assert_called_once()
+
+
+def test_facade_rejects_read_scope_revoked_during_command_preparation(
+    tmp_path, monkeypatch, command_operation
+):
+    """A scratch-only command cannot launch with a policy read removed after scope selection."""
+    runtime = tmp_path.parent / "permitted-runtime"
+    runtime.mkdir()
+    manager = PermissionManager(tmp_path)
+    manager.update_sandbox_paths(ApprovalChoice.SESSION, {str(runtime): Decision.ALLOW})
+    select_roots = manager.sandbox_path_read_roots
+
+    def select_then_revoke(*args, **kwargs):
+        """Withdraw the captured read grant before the facade can submit it for approval."""
+        roots, revision = select_roots(*args, **kwargs)
+        assert roots == (runtime,)
+        manager.update_sandbox_paths(ApprovalChoice.SESSION, {str(runtime): None})
+        return roots, revision
+
+    monkeypatch.setattr(manager, "sandbox_path_read_roots", select_then_revoke)
+    backend = Mock()
+    interaction = Mock()
+    context = ToolContext(
+        interaction,
+        "run_command",
+        operations=(command_operation,),
+        permission_manager=manager,
+        settings=ToolRuntimeSettings(sandbox_environment={"PATH": str(tmp_path)}),
+    )
+    result = CommandExecutionService(backend, Mock()).run_command(context, ":", write_roots=[])
+
+    assert result.code == "sandbox.unavailable"
+    assert "Sandbox path policy changed during preparation" in result.detail
+    interaction.prompt.assert_not_called()
+    backend.run.assert_not_called()
+
+
+@pytest.mark.parametrize("scope", ["ordinary", "scratch", "directory", "file"])
+def test_facade_selects_ordinary_workspace_write_or_explicit_scope(tmp_path, scope):
+    """Ordinary requests inherit workspace writes while explicit scopes reach native dispatch."""
+    output = tmp_path / "output"
+    output.mkdir()
+    manager = PermissionManager(tmp_path)
+    manager.set_workspace_command_writes(True)
+    interaction = Mock()
+    interaction.prompt.return_value = "approve"
+    backend = Mock(capabilities=frozenset({SandboxCapability.WRITE_FILES}))
+    backend.run.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
+    context = ToolContext(
+        interaction,
+        "run_command",
+        operations=(
+            Operation(
+                tool_id="run_command",
+                action=Action.PROCESS_EXECUTE,
+                target=ProcessTarget(
+                    argv=("/bin/sh", "-c", "printf ready"),
+                    cwd=str(tmp_path),
+                    boundary=ProcessBoundary.SANDBOXED,
+                ),
+            ),
+        ),
+        permission_manager=manager,
+    )
+    arguments, roots, files = {
+        "ordinary": ({}, (tmp_path,), ()),
+        "scratch": ({"write_roots": []}, (), ()),
+        "directory": ({"write_roots": [str(output)]}, (output,), ()),
+        "file": ({"write_files": ["report"]}, (), (tmp_path / "report",)),
+    }[scope]
+
+    result = CommandExecutionService(backend, Mock()).run_command(
+        context, "printf ready", **arguments
+    )
+
+    assert result["boundary"] == "sandbox"
+    request = backend.run.call_args.args[0]
+    assert request.write_roots == roots
+    assert request.write_files == files
+    interaction.prompt.assert_called_once()
+    choices = interaction.prompt.call_args.kwargs["choices"]
+    assert set(choices) == {"deny", "approve", "session", "details"}
+
+
+def test_saved_command_keeps_declared_scratch_scope(tmp_path, command_operation):
+    """Keep an owner-saved command read-only even when ordinary project commands may write."""
+    manager = PermissionManager(tmp_path)
+    manager.set_workspace_command_writes(True)
+    interaction = Mock()
+    interaction.prompt.return_value = "approve"
+    context = ToolContext(
+        interaction,
+        "run_command",
+        operations=(command_operation,),
+        permission_manager=manager,
+        sandbox_output_only=True,
+    )
+    backend = Mock(backend_options=(), system_read_roots=())
+    backend.run.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
+    service = CommandExecutionService(backend, Mock())
+    assert service.run_command(context, ":", write_roots=[])["exit_code"] == 0
+    assert not backend.run.call_args.args[0].write_roots
+    assert set(interaction.prompt.call_args.kwargs["choices"]) == {
+        "deny",
+        "approve",
+        "session",
+        "details",
+    }
+
+
+@pytest.mark.parametrize("ancestor", [False, True])
+def test_facade_refuses_saved_output_scope_with_workspace_directory_identity(
+    tmp_path, monkeypatch, command_operation, ancestor
+):
+    """Saved output scopes cannot cover the checkout through a different spelling."""
+    alias = tmp_path.parent / "alternate-spelling"
+    alias.mkdir()
+    target = tmp_path.parent if ancestor else tmp_path
+    samefile = Path.samefile
+
+    def same_directory(path, other):
+        """Model a filesystem alias that path resolution leaves in its original spelling."""
+        return (path, other) == (alias, target) or samefile(path, other)
+
+    monkeypatch.setattr(Path, "samefile", same_directory)
+    interaction = Mock()
+    interaction.prompt.return_value = "approve"
+    backend = Mock()
+    backend.run.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
+    context = ToolContext(
+        interaction,
+        "run_command",
+        operations=(command_operation,),
+        permission_manager=PermissionManager(tmp_path),
+        sandbox_output_only=True,
+    )
+
+    result = CommandExecutionService(backend, Mock()).run_command(
+        context, ":", write_roots=[str(alias)]
+    )
+
+    backend.run.assert_not_called()
+    interaction.prompt.assert_not_called()
+    assert "bounded output directories" in result.detail
 
 
 @pytest.mark.parametrize("interactive", [False, True])
@@ -4665,7 +4848,7 @@ def test_empty_executable_grant_does_not_block_sandbox_execution(tmp_path):
         None,
         "run_command",
         operations=(operation,),
-        permission_manager=PermissionManager(tmp_path),
+        permission_manager=automatic_process_policy(tmp_path),
     )
 
     result = service.run_command(context, ":", executable_grant="")
@@ -4899,7 +5082,7 @@ def test_run_command_binds_an_unmanaged_path_tool_as_one_exact_file(tmp_path, mo
         None,
         "run_command",
         operations=(operation,),
-        permission_manager=PermissionManager(workspace),
+        permission_manager=automatic_process_policy(workspace),
     )
 
     result = service.run_command(context, "tool --version", cwd=str(workspace))
@@ -4912,122 +5095,6 @@ def test_run_command_binds_an_unmanaged_path_tool_as_one_exact_file(tmp_path, mo
     assert request.read_roots == ()
     assert request.automatic_tool_reads == ()
     assert request.file_creation_mask == 0o022
-
-
-@pytest.mark.parametrize("decision", ["approve", "deny", "unselected", "changed"])
-@pytest.mark.parametrize(
-    "launcher_name", ["fixture-builder", "fixture-analyzer", "fixture-compiler"]
-)
-def test_run_command_requires_approval_for_selected_workspace_interpreter_runtime(
-    tmp_path, monkeypatch, decision, launcher_name
-):
-    """Arbitrary launchers need a selected interpreter before its runtime is reviewed."""
-    home = tmp_path / "home"
-    home.mkdir()
-    workspace = tmp_path / "workspace"
-    venv_bin = workspace / ".venv/bin"
-    venv_bin.mkdir(parents=True)
-    runtime_parent = home / "runtime-store"
-    runtime_parent.mkdir()
-    runtime_alias = runtime_parent / "cpython-3.14"
-    runtime_root = runtime_parent / "cpython-3.14.1"
-    (runtime_root / "bin").mkdir(parents=True)
-    (runtime_root / "lib/python3.14").mkdir(parents=True)
-    interpreter = runtime_root / "bin/python3.14"
-    interpreter.write_text("interpreter", encoding="utf-8")
-    interpreter.chmod(0o755)
-    runtime_alias.symlink_to(runtime_root, target_is_directory=True)
-    (venv_bin / "python").symlink_to(runtime_alias / "bin/python3.14")
-    (venv_bin.parent / "pyvenv.cfg").write_text(
-        f"home = {runtime_alias / 'bin'}\nimplementation = CPython\nversion_info = 3.14\n",
-        encoding="utf-8",
-    )
-    unrelated_entry = venv_bin / "other-command"
-    unrelated_entry.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    unrelated_entry.chmod(0o755)
-    tools = tmp_path / "tools"
-    tools.mkdir()
-    launcher = tools / launcher_name
-    launcher.write_text("launcher", encoding="utf-8")
-    launcher.chmod(0o755)
-    monkeypatch.setenv("PATH", f"{venv_bin}{os.pathsep}{tools}")
-    monkeypatch.setattr(
-        "loop.execution.sandbox.linux.paths.pwd.getpwuid",
-        lambda _uid: SimpleNamespace(pw_dir=str(home)),
-    )
-    monkeypatch.setattr("loop.execution.sandbox.linux.backend.runtime_read_roots", lambda: ())
-    backend = LinuxNativeBackend(tmp_path / "management.json")
-    monkeypatch.setattr(type(backend), "file_creation_mask", 0o077)
-    backend.capability_failure = Mock(return_value=None)
-    backend.run = Mock(return_value=CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0))
-    service = CommandExecutionService(backend, Mock())
-    command = f"{launcher_name} execute fixture-task"
-    operation = Operation(
-        tool_id="run_command",
-        action=Action.PROCESS_EXECUTE,
-        target=ProcessTarget(
-            argv=("/bin/sh", "-c", command),
-            cwd=str(workspace),
-            boundary=ProcessBoundary.SANDBOXED,
-        ),
-    )
-    interaction = Mock()
-
-    def decide(*_args, **_kwargs):
-        """Change the interpreter during review only for the stale-identity control."""
-        if decision == "changed":
-            replacement = runtime_root / "bin/replacement"
-            replacement.write_text("replacement", encoding="utf-8")
-            replacement.chmod(0o755)
-            (venv_bin / "python").unlink()
-            (venv_bin / "python").symlink_to(replacement)
-            return "approve"
-        return decision
-
-    interaction.prompt.side_effect = decide
-    context = ToolContext(
-        interaction,
-        "run_command",
-        operations=(operation,),
-        permission_manager=PermissionManager(workspace),
-    )
-
-    lookup = (
-        service.resolve_executable(context, "python", cwd=str(workspace))
-        if decision != "unselected"
-        else None
-    )
-    result = service.run_command(
-        context,
-        command,
-        cwd=str(workspace),
-        executable_grant=lookup["grant_reference"] if lookup is not None else None,
-    )
-
-    if decision == "unselected":
-        request = backend.run.call_args.args[0]
-        assert result["exit_code"] == 0
-        assert request.read_roots == () and request.automatic_tool_reads == ()
-        interaction.prompt.assert_not_called()
-    elif decision == "approve":
-        interaction.prompt.assert_called_once()
-        request = backend.run.call_args.args[0]
-        assert result["exit_code"] == 0
-        assert set(request.read_roots) == {runtime_root, interpreter.parent}
-        assert request.automatic_tool_reads == ()
-        assert request.file_creation_mask == 0o077
-        scope = json.loads(
-            interaction.info.call_args.args[0].split("\nScope: ", 1)[1].split("\n", 1)[0]
-        )
-        assert str(runtime_root) in scope["read_roots"]
-    elif decision == "deny":
-        interaction.prompt.assert_called_once()
-        assert result.code == "tool.denied"
-        backend.run.assert_not_called()
-    else:
-        interaction.prompt.assert_called_once()
-        assert result.code == "sandbox.stale"
-        backend.run.assert_not_called()
 
 
 def test_run_command_ignores_unidentified_environment_metadata(tmp_path, monkeypatch):
@@ -5059,11 +5126,13 @@ def test_run_command_ignores_unidentified_environment_metadata(tmp_path, monkeyp
         interaction,
         "run_command",
         operations=(operation,),
-        permission_manager=PermissionManager(workspace),
+        permission_manager=automatic_process_policy(workspace),
     )
 
     result = CommandExecutionService(backend, Mock()).run_command(
-        context, executable.name, cwd=str(workspace), read_only=True
+        context,
+        executable.name,
+        cwd=str(workspace),
     )
 
     assert result["exit_code"] == 0
@@ -5356,7 +5425,7 @@ def test_command_output_is_preserved_in_preview_and_continuation_storage(
     scratch_parent.mkdir(parents=True, mode=0o700)
     with monkeypatch.context() as patch:
         patch.setattr(tempfile, "tempdir", str(scratch_parent))
-        permissions = PermissionManager(workspace)
+        permissions = automatic_process_policy(workspace)
     scratch = permissions.temporary_directory
     instructions = InstructionsManager(runtime_environment=RuntimeEnvironment(workspace, scratch))
     variants = [
@@ -5471,7 +5540,7 @@ def test_large_command_output_includes_a_truthful_final_excerpt(tmp_path, discar
             None,
             "run_command",
             operations=(operation,),
-            permission_manager=PermissionManager(tmp_path),
+            permission_manager=automatic_process_policy(tmp_path),
         ),
         ":",
     )
@@ -5500,7 +5569,7 @@ def test_scratch_shell_script_prepares_its_selected_managed_tool(tmp_path, monke
     executable.write_text("fixture")
     executable.chmod(0o755)
     monkeypatch.setenv("PATH", os.pathsep.join((str(tools), os.defpath)))
-    permissions = PermissionManager(workspace)
+    permissions = automatic_process_policy(workspace)
     if overflow:
         analyze = permissions.analyze_command
 
@@ -5528,8 +5597,10 @@ def test_scratch_shell_script_prepares_its_selected_managed_tool(tmp_path, monke
     backend.managed_tool_root.return_value = True
     backend.run.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
     command = 'sh "$TMPDIR/task.sh"'
+    interaction = Mock()
+    interaction.prompt.return_value = "approve"
     context = ToolContext(
-        None,
+        interaction,
         "run_command",
         operations=(
             Operation(
@@ -5551,7 +5622,8 @@ def test_scratch_shell_script_prepares_its_selected_managed_tool(tmp_path, monke
     assert result["exit_code"] == 0
     request = backend.run.call_args.args[0]
     assert request.execution_source == command
-    assert request.automatic_tool_reads == (() if overflow else (tools,))
+    assert request.automatic_tool_reads == ()
+    assert interaction.prompt.call_count == int(not overflow)
     assert request.read_roots == (() if overflow else (tools,))
     host.run_host_command.assert_not_called()
 
@@ -5588,7 +5660,7 @@ def test_command_output_reports_conservative_decoding_loss(tmp_path, content, di
             None,
             "run_command",
             operations=(operation,),
-            permission_manager=PermissionManager(tmp_path),
+            permission_manager=automatic_process_policy(tmp_path),
         ),
         ":",
     )
@@ -5622,7 +5694,7 @@ def test_command_result_reports_only_verified_descendant_cleanup(tmp_path, clean
                 ),
             ),
         ),
-        permission_manager=PermissionManager(tmp_path),
+        permission_manager=automatic_process_policy(tmp_path),
     )
     result = CommandExecutionService(backend, Mock()).run_command(context, ":")
     assert result["lifecycle"] == {
@@ -5641,7 +5713,7 @@ def test_scratch_data_classification_cannot_transfer_to_a_different_runtime_root
     workspace.mkdir()
     sessions = SessionManager()
     scratch = Path(sessions.temporary_directory)
-    permissions = PermissionManager(workspace)
+    permissions = automatic_process_policy(workspace)
     permissions.bind_temporary_directory(
         PathHolder(scratch if same_root else permissions.temporary_directory),
         ordinary_names=lambda: True,
@@ -5684,7 +5756,7 @@ def test_workspace_environment_keeps_its_mounted_path_beneath_restricted_scratch
     scratch = Path(sessions.temporary_directory)
     workspace = scratch / "project"
     workspace.mkdir()
-    permissions = PermissionManager(workspace)
+    permissions = automatic_process_policy(workspace)
     permissions.bind_temporary_directory(PathHolder(scratch))
     instructions = InstructionsManager(runtime_environment=RuntimeEnvironment(workspace, scratch))
     operation = Operation(
@@ -5726,7 +5798,7 @@ def test_only_referenced_active_skill_roots_enter_command_authority(tmp_path, re
     skill_root.mkdir()
     location = skill_root / "SKILL.md"
     location.write_text("---\nname: guide\ndescription: Guide\n---\nGuide instructions")
-    permissions = PermissionManager(workspace)
+    permissions = automatic_process_policy(workspace)
     instructions = InstructionsManager(
         runtime_environment=RuntimeEnvironment(workspace, permissions.temporary_directory),
         skill_manager=SkillManager([Skill("guide", "Guide", location)]),
@@ -5774,7 +5846,7 @@ def test_host_fallback_rechecks_used_skill_at_authorization(tmp_path, monkeypatc
     location = root / "SKILL.md"
     location.write_text("---\nname: guide\ndescription: Guide\n---\nGuide instructions")
     permissions = PermissionManager(workspace)
-    permissions.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    permissions.set_direct_host_execution(True)
     instructions = InstructionsManager(
         runtime_environment=RuntimeEnvironment(workspace, permissions.temporary_directory),
         skill_manager=SkillManager([Skill("guide", "Guide", location)]),
@@ -5830,12 +5902,8 @@ def test_host_fallback_rechecks_used_skill_at_authorization(tmp_path, monkeypatc
             source,
         )
         assert backend.run.call_count == 1
-        if revoked:
-            assert result.code == "sandbox.unavailable"
-            host.run_host_command.assert_not_called()
-        else:
-            assert result["exit_code"] == 0
-            host.run_host_command.assert_called_once()
+        assert result.code == "sandbox.unavailable"
+        host.run_host_command.assert_not_called()
     finally:
         service.close()
         permissions.close()
@@ -5850,7 +5918,7 @@ def test_deactivated_skill_cannot_be_granted_from_captured_command_paths(tmp_pat
     skill_root.mkdir()
     location = skill_root / "SKILL.md"
     location.write_text("---\nname: guide\ndescription: Guide\n---\nGuide instructions")
-    permissions = PermissionManager(workspace)
+    permissions = automatic_process_policy(workspace)
     instructions = InstructionsManager(
         runtime_environment=RuntimeEnvironment(workspace, permissions.temporary_directory),
         skill_manager=SkillManager([Skill("guide", "Guide", location)]),
@@ -6134,6 +6202,18 @@ def test_interactive_command_refuses_unsupported_backend_and_egress(tmp_path):
     assert (
         service.run_command(context, ":", interactive=True).code == "command_terminal.unavailable"
     )
+    assert service.run_command(context, ":", local_ipc=True).code == "sandbox.unsupported"
+    assert (
+        service.run_command(context, ":", backend_options=("account_lookup",)).code
+        == "sandbox.unsupported"
+    )
+    assert (
+        service.run_command(context, ":", backend_options=("process_pools",)).code
+        == "sandbox.unsupported"
+    )
+    assert service.run_command(context, ":", write_files=[".coverage"]).code == (
+        "sandbox.unsupported"
+    )
     backend.capabilities = frozenset({SandboxCapability.TERMINAL})
     assert (
         service.run_command(
@@ -6141,6 +6221,10 @@ def test_interactive_command_refuses_unsupported_backend_and_egress(tmp_path):
         ).code
         == "command_terminal.unavailable"
     )
+    backend.requestable_capabilities = frozenset({SandboxCapability.LOCAL_IPC})
+    combined = service.run_command(context, ":", local_ipc=True, network=True)
+    assert combined.code == "sandbox.unsupported"
+    assert "cannot share a general network grant" in combined.detail
     backend.run.assert_not_called()
 
 
@@ -6195,6 +6279,8 @@ def test_command_rejects_invalid_initial_wait_before_launch(
     assert (
         "between 0 and 60 seconds, as configured by tools.command_max_wait_seconds" in result.detail
     )
+    assert "Use JSON null for the default wait" in result.detail
+    assert "Poll any returned job handle for completion" in result.detail
     backend.run.assert_not_called()
     assert not service._jobs.has_active()
 
@@ -6277,7 +6363,7 @@ def test_sandbox_failure_after_handoff_does_not_request_host_approval(
 ):
     """An eligible failure after handoff remains a separate host offer, without a prompt."""
     sessions, permissions = command_session
-    permissions.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    permissions.set_direct_host_execution(True)
     backend, host = Mock(), Mock()
     backend.run.return_value = CommandProcessResult(SandboxOutcome.UNAVAILABLE, detail="no sandbox")
     interaction = Mock(supports_fresh_host_approval=True)
@@ -6332,7 +6418,7 @@ def test_origin_stop_at_host_admission_prevents_the_host_launch(
 ):
     """A stop at the final approved host boundary settles as cancelled without effects."""
     sessions, permissions = command_session
-    permissions.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    permissions.set_direct_host_execution(True)
     stopped = Event()
     backend, host = Mock(), Mock()
     backend.run.return_value = CommandProcessResult(SandboxOutcome.UNAVAILABLE, detail="no sandbox")
@@ -6374,7 +6460,9 @@ def test_origin_stop_at_host_admission_prevents_the_host_launch(
     monkeypatch.setattr(command_jobs.threading, "Thread", Worker)
     result = service.run_command(context, ":")
 
-    assert result.code == "sandbox.cancelled"
+    assert result.code == "sandbox.unavailable"
+    assert not stopped.is_set()
+    interaction.prompt.assert_not_called()
     host.run_host_command.assert_not_called()
     backend.run.assert_called_once()
 
@@ -6663,3 +6751,194 @@ def test_interrupted_command_handoff_cancels_its_unreturned_job(
         assert service.run_command(context, ":", wait_seconds=0).code == "command_job.unavailable"
 
     assert job.cancellation_event.is_set()
+
+
+@pytest.mark.parametrize("mode", ["unsupported", "broad", "egress", "terminal"])
+def test_ingress_refuses_unqualified_or_shared_network_requests(mode):
+    """Unsupported publication never reaches approval, preparation or native launch."""
+    backend = Mock(
+        capabilities=frozenset()
+        if mode == "unsupported"
+        else frozenset({SandboxCapability.INGRESS, SandboxCapability.TERMINAL})
+    )
+    service = CommandExecutionService(backend, Mock())
+    context = ToolContext(None, "run_command")
+    result = service.run_command(
+        context,
+        ":",
+        ingress_port=8123,
+        network=mode == "broad",
+        egress_origins=["https://example.com"] if mode == "egress" else [],
+        interactive=mode == "terminal",
+    )
+    assert result.code == "sandbox.unsupported"
+    backend.run.assert_not_called()
+
+
+@pytest.mark.parametrize("guidance", [None, {"ingress": "Use the owned endpoint."}])
+def test_backend_capability_guidance_is_owned_and_copied(guidance):
+    """Only native-owned guidance reaches consumers, without shared mutable mappings."""
+    backend = Mock(capability_guidance=guidance)
+    service = CommandExecutionService(backend, Mock())
+    actual = service.backend_capability_guidance
+    assert actual == (guidance or {})
+    actual.clear()
+    assert service.backend_capability_guidance == (guidance or {})
+
+
+@pytest.mark.parametrize(
+    "selection",
+    [
+        "active",
+        "inactive",
+        "scratch",
+        "already-reviewed",
+        "prohibited",
+        "changed",
+        "removed",
+        "saved-explicit",
+        "saved-strict",
+    ],
+)
+def test_project_launcher_prepares_only_active_eligible_installations(
+    tmp_path, command_operation, selection, monkeypatch
+):
+    """Prepare active project tools before approval and preserve strict or denied paths."""
+    installation = tmp_path.parent / f"{tmp_path.name}-installation"
+    binary = installation / "bin" / "example"
+    binary.parent.mkdir(parents=True)
+    (installation / "lib").mkdir()
+    binary.write_text("program")
+    binary.chmod(0o700)
+    stable = installation.parent / "runtime-links" / "current"
+    stable.parent.mkdir()
+    stable.symlink_to(installation, target_is_directory=True)
+    tools = tmp_path / "local-environment" / "bin"
+    tools.mkdir(parents=True)
+    (tools / "program").symlink_to(stable / "bin" / "example")
+    (tools / "missing").symlink_to(tmp_path / "does-not-exist")
+    (tools / "unrelated").symlink_to(tmp_path / "check")
+    launcher = tmp_path / "check"
+    launcher.write_text("#!/bin/sh\n:")
+    launcher.chmod(0o700)
+    manager = PermissionManager(tmp_path)
+    if selection in {"already-reviewed", "prohibited"}:
+        manager.update_sandbox_paths(
+            ApprovalChoice.SESSION,
+            {
+                str(installation): Decision.ALLOW
+                if selection == "already-reviewed"
+                else Decision.DENY
+            },
+        )
+    if selection == "changed":
+        eligibility = manager.sandbox_access_for_review
+
+        def disappear_while_reviewing(request, tool):
+            """Lose an optional executable while the ordinary strict request stays valid."""
+            binary.unlink(missing_ok=True)
+            return eligibility(request, tool)
+
+        monkeypatch.setattr(manager, "sandbox_access_for_review", disappear_while_reviewing)
+    if selection == "removed":
+        discover = execution_facade.linked_project_installations
+
+        def remove_after_discovery(*args):
+            """Withdraw the optional installation before the command can bind its identity."""
+            result = discover(*args)
+            installation.rename(installation.with_name("retired-installation"))
+            return result
+
+        monkeypatch.setattr(
+            execution_facade, "linked_project_installations", remove_after_discovery
+        )
+    interaction = Mock()
+    interaction.prompt.return_value = "approve"
+    backend = Mock()
+    backend.system_read_roots = ()
+    backend.run.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
+    instructions = InstructionsManager(
+        runtime_environment=RuntimeEnvironment(tmp_path, manager.temporary_directory)
+    )
+    context = ToolContext(
+        interaction,
+        "run_command",
+        operations=(command_operation,),
+        permission_manager=manager,
+        instructions_manager=instructions,
+        sandbox_output_only=selection.startswith("saved-"),
+        settings=ToolRuntimeSettings(
+            sandbox_environment={"PATH": "/bin" if selection == "inactive" else f"{tools}:/bin"}
+        ),
+    )
+    explicit_scope = {"write_roots": [], "write_files": []} if selection == "scratch" else {}
+    if selection == "saved-explicit":
+        explicit_scope["read_roots"] = [str(installation)]
+    result = CommandExecutionService(backend, Mock()).run_command(
+        context, "./check", **explicit_scope
+    )
+    assert result["exit_code"] == 0
+    approved = backend.run.call_args.args[0]
+    assert (installation in approved.read_roots) is (
+        selection in {"active", "inactive", "scratch", "already-reviewed", "saved-explicit"}
+    )
+    assert (stable in approved.read_aliases) is (
+        selection in {"active", "inactive", "scratch", "already-reviewed", "saved-explicit"}
+    )
+    assert tmp_path not in approved.write_roots
+    assert not manager.configuration.workspace_command_writes
+
+
+@pytest.mark.parametrize("directory, narrow", [("bin", False), ("personal", False), ("bin", True)])
+def test_project_launcher_program_gets_a_reviewed_installed_directory(
+    tmp_path, command_operation, directory, narrow
+):
+    """A script's user-installed child is offered through ordinary scope review and identity binding."""
+    bin_dir = tmp_path.parent / "installation" / directory
+    bin_dir.mkdir(parents=True)
+    program = bin_dir / "project-helper"
+    program.write_text("installed program")
+    program.chmod(0o700)
+    launcher = tmp_path / "verify"
+    launcher.write_text('#!/bin/sh\nproject-helper "$@"\n')
+    launcher.chmod(0o700)
+    manager = PermissionManager(tmp_path)
+    manager.set_workspace_command_writes(True)
+    interaction = Mock()
+    extra = {}
+    if narrow:
+        extra = {"write_roots": [], "write_files": []}
+    interaction.prompt.return_value = "approve"
+    backend = Mock(
+        capabilities=frozenset({SandboxCapability.WRITE_FILES}),
+        system_read_roots=(Path("/bin"), Path("/usr/bin")),
+    )
+    backend.run.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
+    context = ToolContext(
+        interaction,
+        "run_command",
+        operations=(command_operation,),
+        permission_manager=manager,
+        settings=ToolRuntimeSettings(sandbox_environment={"PATH": str(bin_dir)}),
+        instructions_manager=InstructionsManager(
+            runtime_environment=RuntimeEnvironment(tmp_path, manager.temporary_directory)
+        ),
+    )
+    result = CommandExecutionService(backend, Mock()).run_command(context, "./verify", **extra)
+    assert result["exit_code"] == 0
+    request = backend.run.call_args.args[0]
+    assert request.read_roots == ((bin_dir,) if directory == "bin" else ())
+    if directory == "bin":
+        assert request.executable_identities[0][:3] == (program.name, program, program)
+    else:
+        assert not request.executable_identities
+    assert request.write_roots == (() if narrow else (tmp_path,))
+    assert request.write_files == () and not request.git_create
+    assert execution_facade.SandboxRequest.from_wire(request.to_wire()) == request
+    interaction.prompt.assert_called_once()
+    assert set(interaction.prompt.call_args.kwargs["choices"]) == {
+        "deny",
+        "approve",
+        "session",
+        "details",
+    }

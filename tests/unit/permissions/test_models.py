@@ -10,12 +10,79 @@ from loop import (
     NetworkTarget,
     Operation,
     PermissionConfiguration,
+    PolicyLimits,
     ProcessTarget,
     SessionTarget,
     UserPermissionConfiguration,
 )
 from loop import constants as app_constants
-from loop.permissions import HostCommandRule, PermissionPreset, PolicyLimitClassifications
+from loop.permissions import (
+    HostCommandRule,
+    NetworkAccessTarget,
+    NetworkIngressTarget,
+    PermissionPreset,
+    PolicyLimitClassifications,
+    SandboxPathAccess,
+)
+
+
+@pytest.mark.parametrize(
+    "path, level, error",
+    [
+        ("/tmp/fixture", "ask", "read-only"),
+        ("/", "allow", "Sandbox paths require an exact path"),
+        ("//tmp", "deny", "Sandbox paths require an exact path"),
+    ],
+)
+def test_sandbox_path_policy_requires_exact_access_level(path, level, error):
+    """The persisted path map cannot express a broad allow or an ambiguous decision."""
+    with pytest.raises(ValueError, match=error):
+        PermissionConfiguration(sandbox_paths={path: level})
+
+
+def test_sandbox_path_policy_preserves_legacy_read_grants():
+    """Original scalar allow entries load as read grants and serialize canonically."""
+    config = PermissionConfiguration(version=6, sandbox_paths={"/tools": "allow", "/a": "deny"})
+    assert config.sandbox_paths == {"/tools": SandboxPathAccess.READ, "/a": SandboxPathAccess.DENY}
+    assert config.model_dump(mode="json")["sandbox_paths"] == {"/tools": "read", "/a": "deny"}
+
+
+def test_workspace_write_preference_requires_an_explicit_boolean():
+    """Existing policies remain scratch-only and ambiguous new values are rejected."""
+    assert not PermissionConfiguration().workspace_command_writes
+    with pytest.raises(ValidationError, match="valid boolean"):
+        PermissionConfiguration.model_validate({"workspace_command_writes": "off"})
+
+
+@pytest.mark.parametrize(
+    ("scopes", "error"),
+    [
+        (["user"], "require workspace scope"),
+        (["workspace", "workspace"], "identifiers must be unique"),
+    ],
+)
+def test_workspace_command_approvals_reject_invalid_scope_and_duplicate_ids(scopes, error):
+    """Only uniquely identified workspace approvals can be stored in workspace policy."""
+    rules = [
+        {"id": "shared-id", "signature": "bound", "source": "printf safe", "scope": scope}
+        for scope in scopes
+    ]
+    assert not PermissionConfiguration().sandboxed_command_rules
+    with pytest.raises(ValidationError, match=error):
+        PermissionConfiguration.model_validate({"sandboxed_command_rules": rules})
+
+
+def test_workspace_backend_options_default_off_and_require_a_selection():
+    """Workspace selection starts empty and cannot be set to an ambiguous boolean."""
+    assert not PermissionConfiguration().backend_options
+    with pytest.raises(ValidationError, match="valid tuple"):
+        PermissionConfiguration.model_validate({"backend_options": True})
+
+
+def test_hard_paths_reject_patterns_in_persisted_workspace_limits():
+    """Workspace designation parsing enforces the exact-path native compiler contract."""
+    with pytest.raises(ValidationError, match="normalized absolute exact paths"):
+        PolicyLimits(hard_denied_paths=("/tmp/*.secret",))
 
 
 @pytest.fixture(autouse=True)
@@ -28,10 +95,14 @@ def test_actions_map_to_distinct_prompt_icons():
     assert {action: action.icon for action in Action} == {
         Action.FILESYSTEM_LIST: "📂",
         Action.FILESYSTEM_READ: "📖",
+        Action.FILESYSTEM_EXECUTE: "⚙️",
         Action.FILESYSTEM_CREATE: "📝",
         Action.FILESYSTEM_REPLACE: "✏️",
         Action.FILESYSTEM_DELETE: "🗑️",
         Action.NETWORK_REQUEST: "🌐",
+        Action.NETWORK_LOCAL: "🔌",
+        Action.NETWORK_BROAD: "🌐",
+        Action.NETWORK_INGRESS: "🔌",
         Action.PROCESS_EXECUTE: "⚙️",
         Action.SESSION_MUTATE: "💾",
     }
@@ -147,9 +218,17 @@ def test_policy_configuration_has_a_versioned_complete_default():
     """The editable YAML schema exposes a version and every action fallback."""
     configuration = PermissionConfiguration()
 
-    assert configuration.version == 2
+    assert configuration.version == 10
     assert set(configuration.defaults) == set(Action)
     assert configuration.defaults[Action.FILESYSTEM_READ] is Decision.ALLOW
+
+
+def test_durable_policy_rejects_missing_backend_option_revocation_marker():
+    """A present but incomplete marker map cannot restore an older optional-service approval."""
+    values = PermissionConfiguration(namespace_generation="1" * 32).model_dump()
+    del values["backend_option_revisions"]["account_lookup"]
+    with pytest.raises(ValueError, match="revocation markers are incomplete"):
+        PermissionConfiguration.model_validate(values)
 
 
 def test_user_permission_configuration_rejects_duplicate_rule_identifiers():
@@ -337,7 +416,7 @@ def test_preset_directory_failure_is_reported(monkeypatch, tmp_path, missing):
 
 
 @pytest.mark.parametrize("model", [PermissionConfiguration, UserPermissionConfiguration])
-@pytest.mark.parametrize("version", [0, 3, "2", True, False, 1.0])
+@pytest.mark.parametrize("version", [0, 999, "2", True, False, 1.0])
 def test_permission_policy_rejects_unsupported_schema_versions(model, version):
     """Both persisted policy scopes reject unknown or malformed schema versions."""
     with pytest.raises(ValidationError):
@@ -350,3 +429,88 @@ def test_permission_preset_rejects_boolean_version():
     values["version"] = True
     with pytest.raises(ValidationError, match="version"):
         PermissionPreset.model_validate(values)
+
+
+def test_legacy_defaults_retain_process_asks_and_reject_malformed_mappings():
+    """Adding native exec policy preserves saved decisions and rejects corrupted defaults."""
+    old = PermissionConfiguration.model_validate({"version": 3})
+    assert old.defaults[Action.PROCESS_EXECUTE] is Decision.ASK
+    assert old.defaults[Action.FILESYSTEM_EXECUTE] is Decision.ALLOW
+    current = PermissionConfiguration()
+    assert current.defaults[Action.PROCESS_EXECUTE] is Decision.ASK
+    for decision in (Decision.ASK, Decision.DENY):
+        retained = PermissionConfiguration.model_validate(
+            {"version": 3, "defaults": {"process.execute": decision}}
+        )
+        assert retained.defaults[Action.PROCESS_EXECUTE] is decision
+    with pytest.raises(ValidationError, match="defaults"):
+        PermissionConfiguration.model_validate({"version": 3, "defaults": []})
+
+
+@pytest.mark.parametrize("scope", ["local", "broad"])
+def test_native_network_targets_keep_distinct_action_and_resource(scope):
+    """Native capability targets cannot masquerade as HTTP destinations or another scope."""
+    operation = Operation(
+        tool_id="run_command",
+        action=Action("network." + scope),
+        target=NetworkAccessTarget(scope=scope),
+    )
+    assert operation.resource == "network:" + scope
+    assert Operation.model_validate(operation.model_dump(exclude={"resource"})) == operation
+    with pytest.raises(ValueError, match="action and capability scope must agree"):
+        Operation(
+            tool_id="run_command",
+            action=Action.NETWORK_BROAD if scope == "local" else Action.NETWORK_LOCAL,
+            target=NetworkAccessTarget(scope=scope),
+        )
+
+
+@pytest.mark.parametrize("model", [PermissionConfiguration, UserPermissionConfiguration])
+def test_saved_unscoped_egress_allows_require_renewal(model):
+    """Migration retains destinations and denials while making legacy unconstrained allows ask."""
+    policy = model.model_validate(
+        {
+            "version": 4,
+            "rules": [
+                {"id": "wide", "action": "network.request", "decision": "allow"},
+                {
+                    "id": "exact",
+                    "action": "network.request",
+                    "decision": "allow",
+                    "resource": "https://example.test/*",
+                },
+                {"id": "deny", "action": "network.request", "decision": "deny"},
+            ],
+        }
+    )
+    assert [rule.decision for rule in policy.rules] == [Decision.ASK, Decision.ALLOW, Decision.DENY]
+    if isinstance(policy, PermissionConfiguration):
+        assert policy.defaults[Action.NETWORK_LOCAL] is Decision.ALLOW
+        assert policy.defaults[Action.NETWORK_BROAD] is Decision.ASK
+    with pytest.raises(ValidationError, match="rules"):
+        model.model_validate({"version": 4, "rules": {}})
+    with pytest.raises(ValidationError, match="rules"):
+        model.model_validate({"version": 4, "rules": [0]})
+
+
+def test_legacy_network_default_is_reviewed_and_old_preset_is_complete():
+    """Old HTTP defaults cannot silently widen native networking when separate scopes arrive."""
+    policy = PermissionConfiguration.model_validate(
+        {"version": 4, "defaults": {"network.request": "allow"}}
+    )
+    assert policy.defaults[Action.NETWORK_REQUEST] is Decision.ASK
+    preset = PermissionPreset.builtin_presets()[0].model_dump(mode="json")
+    del preset["defaults"]["network.local"]
+    del preset["defaults"]["network.broad"]
+    del preset["defaults"]["network.ingress"]
+    migrated = PermissionPreset.model_validate(preset)
+    assert migrated.defaults[Action.NETWORK_BROAD] is Decision.ASK
+    assert migrated.defaults[Action.NETWORK_LOCAL] is Decision.ALLOW
+
+
+def test_ingress_operation_resource_is_exact_host_loopback():
+    """The independent ingress action matches only its canonical publication resource."""
+    operation = Operation(
+        tool_id="run_command", action=Action.NETWORK_INGRESS, target=NetworkIngressTarget(port=8123)
+    )
+    assert operation.resource == "tcp://127.0.0.1:8123"

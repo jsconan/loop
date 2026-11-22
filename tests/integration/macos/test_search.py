@@ -12,7 +12,7 @@ from unittest.mock import Mock
 import pytest
 
 from loop.execution.sandbox.macos.backend import MacOSSeatbeltBackend
-from loop.utils.process import read_bounded_stream, supervise_process
+from loop.utils.process import supervise_process
 
 _RIPGREP_CANDIDATES = tuple(
     Path(root) / "rg" for root in os.environ.get("PATH", "").split(os.pathsep)
@@ -230,37 +230,38 @@ def test_public_native_search_keeps_selected_files_isolated(
 def test_native_selected_helper_bounds_a_running_child(
     public_command, native_workspace, native_search_helper, monkeypatch
 ):
-    """A fake deadline stops a qualified helper after its real preprocessor produces output."""
+    """A deadline stops a running native helper while retaining exactly its output budget."""
     selected = native_workspace / "selected"
     selected.write_text("selected input\n")
     descriptor = os.open(selected, os.O_RDONLY)
-    entered = threading.Event()
-    first_output = []
+    limit = 65_536
+    filled = threading.Event()
+    produced = 0
 
-    def read_after_entry(process, deadline, **kwargs):
-        """Observe the real helper's first byte before the synthetic deadline expires."""
+    def observe(stream, chunk):
+        """Signal when the real helper has produced more than its retained output limit."""
+        nonlocal produced
+        if stream == "stdout":
+            produced += len(chunk)
+            if produced > limit:
+                filled.set()
 
-        def reader(stream, chunks, *, maximum):
-            """Signal only after the helper's stdout pipe delivers a byte or EOF."""
-            if stream is process.stdout:
-                first = stream.read(1)
-                first_output.append(first)
-                chunks.append(first)
-                entered.set()
-                return read_bounded_stream(stream, chunks, maximum=maximum - len(first))
-            return read_bounded_stream(stream, chunks, maximum=maximum)
-
-        return supervise_process(process, deadline, reader=reader, **kwargs)
+    def supervise_with_observer(process, deadline, **kwargs):
+        """Observe output without replacing the production pipe reader."""
+        return supervise_process(process, deadline, output_observer=observe, **kwargs)
 
     def expired_after_output():
-        """Release the fake deadline once native output or EOF establishes entry."""
-        entered.wait()
+        """Expire once the helper fills the budget, with a bounded wait for startup failure."""
+        filled.wait(timeout=10)
         return 200.0
 
+    monkeypatch.setattr("loop.execution.sandbox.macos.backend.constants.MAX_OUTPUT_CHARS", limit)
     monkeypatch.setattr(
         "loop.execution.sandbox.macos.backend.time", SimpleNamespace(monotonic=lambda: 100.0)
     )
-    monkeypatch.setattr("loop.execution.sandbox.macos.backend.supervise_process", read_after_entry)
+    monkeypatch.setattr(
+        "loop.execution.sandbox.macos.backend.supervise_process", supervise_with_observer
+    )
     monkeypatch.setattr("loop.utils.process.time", SimpleNamespace(monotonic=expired_after_output))
     try:
         capture = public_command.backend.run_read_only_argv(
@@ -280,6 +281,6 @@ def test_native_selected_helper_bounds_a_running_child(
     finally:
         os.close(descriptor)
     assert capture.status.value == "timed_out", capture
-    assert first_output and first_output[0]
-    assert len(capture.stdout) <= 65536
+    assert produced > limit
+    assert len(capture.stdout) == limit
     public_command.host.run_host_command.assert_not_called()

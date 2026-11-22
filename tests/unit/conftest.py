@@ -484,3 +484,39 @@ def telemetry_writer(unit_patch):
         "loop.telemetry.telemetry.queue", SimpleNamespace(**{**vars(queue), "Queue": Queue})
     )
     return SimpleNamespace(run=run, empty_reads=empty_reads)
+
+
+@pytest.fixture(autouse=True)
+def isolated_private_path_classifier(unit_patch, tmp_path):
+    """Apply real private-name rules below the synthetic case, independent of host ancestry."""
+    from loop.permissions.protection import is_hard_resource, is_protected_external_read
+
+    original = is_protected_external_read
+    root = tmp_path.parent
+
+    def logical(path):
+        """Map an owned case path without changing outside identities or private children."""
+        if path.is_relative_to(root):
+            return Path("/test-fixture") / path.relative_to(root)
+        return path
+
+    def classify(path):
+        """Preserve private fixture children while excluding the enclosing host storage path."""
+        return original(logical(path))
+
+    def hard_resource(path, *, workspace, scratch, scratch_data=False):
+        """Keep relative workspace and scratch semantics on the same synthetic path tree."""
+        return is_hard_resource(
+            logical(path),
+            workspace=logical(workspace) if workspace is not None else None,
+            scratch=logical(scratch),
+            scratch_data=scratch_data,
+        )
+
+    for name, module in tuple(sys.modules.items()):
+        if module is not None and name.startswith(("loop.", "tests.unit.")):
+            for alias, value in tuple(vars(module).items()):
+                if value is original:
+                    unit_patch.setattr(module, alias, classify)
+                elif value is is_hard_resource:
+                    unit_patch.setattr(module, alias, hard_resource)

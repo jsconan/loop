@@ -28,6 +28,7 @@ def run_scratch_probe(root, *, temporary=False):
             "-m",
             "pytest",
             "tests/unit/test_isolation.py::test_environment_and_current_directory_are_disposable",
+            "tests/unit/test_isolation.py::test_private_names_are_classified_relative_to_the_owned_case",
             "-q",
         ],
         cwd=Path(__file__).resolve().parents[2],

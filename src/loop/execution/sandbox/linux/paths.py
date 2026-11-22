@@ -11,8 +11,6 @@ from __future__ import annotations
 import errno
 import fcntl
 import os
-import pwd
-import re
 import stat
 import time
 from collections.abc import Generator
@@ -22,20 +20,22 @@ from typing import TYPE_CHECKING
 
 from .... import constants
 from ....constants import GIT_DIRECTORY
-from ....permissions.protection import PRIVATE_READ_COMPONENTS, is_protected_external_read
-from ..constants import (
-    CPYTHON_EXECUTABLE_NAME,
-    PYTHON_BIN_DIRECTORY_NAME,
-    PYTHON_ENVIRONMENT_CONFIG_NAME,
-    PYTHON_LIBRARY_DIRECTORY_NAME,
-    TMPDIR_ENVIRONMENT_VARIABLE,
+from ....permissions.protection import (
+    PRIVATE_READ_COMPONENTS,
+    IncompleteHardlinkAliases,
+    inspect_hardlink_aliases,
+    is_environment_value,
+    is_protected_external_read,
 )
+from ....sandbox_catalog import hardlink_source_paths
+from ..constants import TMPDIR_ENVIRONMENT_VARIABLE
 from .constants import (
     NATIVE_ALIAS_PATH,
     NATIVE_CONVENTIONAL_TMP_PATH,
     NATIVE_SCRATCH_PATH,
     SESSION_CONVENTIONAL_TMP_NAME,
 )
+from .mountinfo import MINIMUM_MOUNTINFO_FIELDS, read_mountinfo
 
 if TYPE_CHECKING:
     from ..contracts import SandboxRequest
@@ -43,7 +43,6 @@ if TYPE_CHECKING:
 _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _PRIVATE_NAMES = frozenset(name.casefold() for name in PRIVATE_READ_COMPONENTS)
 _MAX_HARDLINK_MOUNTS = 2_000
-_MAX_VENV_CONFIG_BYTES = 64 * 1024
 
 
 def _check_deadline(deadline: float) -> None:
@@ -70,244 +69,11 @@ def payload_path(path: Path, scratch: Path) -> Path:
     return NATIVE_SCRATCH_PATH / path.relative_to(scratch) if path.is_relative_to(scratch) else path
 
 
-def _python_environment_values(config: Path) -> dict[str, str] | None:
-    """Read bounded, identity-checked environment metadata without following its leaf."""
-    try:
-        before = config.lstat()
-    except FileNotFoundError:
-        return None
-    if (
-        not stat.S_ISREG(before.st_mode)
-        or before.st_nlink != 1
-        or before.st_uid != os.getuid()
-        or before.st_mode & constants.OTHER_WRITE_MODE_BIT
-        or before.st_mode & constants.GROUP_WRITE_MODE_BIT
-        and before.st_gid != os.getgid()
-        or before.st_size > _MAX_VENV_CONFIG_BYTES
-    ):
-        raise ValueError("Workspace Python environment metadata is unsafe.")
-    descriptor = os.open(config, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
-    try:
-        bound = os.fstat(descriptor)
-        if (before.st_dev, before.st_ino) != (bound.st_dev, bound.st_ino):
-            raise ValueError("Workspace Python environment metadata changed.")
-        content = os.read(descriptor, _MAX_VENV_CONFIG_BYTES + 1)
-        latest = os.fstat(descriptor)
-        if len(content) > _MAX_VENV_CONFIG_BYTES or (
-            bound.st_dev,
-            bound.st_ino,
-            bound.st_size,
-            bound.st_mtime_ns,
-        ) != (latest.st_dev, latest.st_ino, latest.st_size, latest.st_mtime_ns):
-            raise ValueError("Workspace Python environment metadata changed.")
-    finally:
-        os.close(descriptor)
-    try:
-        lines = content.decode("utf-8").splitlines()
-    except UnicodeDecodeError as error:
-        raise ValueError("Workspace Python environment metadata is invalid.") from error
-    values = {}
-    ambiguous = set()
-    for line in lines:
-        key, separator, value = line.partition("=")
-        if not separator:
-            continue
-        key = key.strip().casefold()
-        if key in {"home", "implementation", "version_info", "version", "executable"}:
-            if key in values:
-                if key in {"home", "implementation", "version_info"}:
-                    raise ValueError("Workspace Python environment metadata is ambiguous.")
-                ambiguous.add(key)
-            values[key] = value.strip()
-    for key in ambiguous:
-        values.pop(key)
-    return values
-
-
-def python_runtime_mounts(
-    workspace: Path,
-    path_roots: tuple[tuple[Path, Path], ...],
-    executable_identities: tuple[tuple[str, Path, Path, int, int], ...],
-    *,
-    system_roots: tuple[Path, ...] = (),
-) -> tuple[tuple[Path, Path], ...]:
-    """Discover the user-local CPython runtime for a selected workspace interpreter.
-
-    Args:
-        workspace (Path): Canonical workspace containing the active virtual environment.
-        path_roots (tuple[tuple[Path, Path], ...]): Bound PATH spellings and canonical roots.
-        executable_identities (tuple[tuple[str, Path, Path, int, int], ...]): Exact executable
-            names, spellings, canonical files, and device/inode identities for this command.
-        system_roots (tuple[Path, ...]): Authenticated system runtime roots already mounted.
-
-    Returns:
-        tuple[tuple[Path, Path], ...]: Candidate runtime roots and their configured path aliases,
-            or an empty tuple when no selected interpreter needs an external runtime. A caller
-            must separately authorize each returned root before use. Unsafe metadata that
-            cannot identify a selected interpreter contributes no runtime authority.
-
-    Raises:
-        ValueError: An identified interpreter's home, metadata, or runtime path is unsafe.
-        OSError: Required identified-runtime metadata cannot be inspected, or preparation times out.
-    """
-    if not executable_identities:
-        return ()
-    candidates = []
-    for spelling_root, path_root in path_roots:
-        if not path_root.is_relative_to(workspace) or path_root.name != PYTHON_BIN_DIRECTORY_NAME:
-            continue
-        try:
-            anchor = (path_root / CPYTHON_EXECUTABLE_NAME).resolve(strict=True)
-        except FileNotFoundError:
-            anchor = None
-        except (OSError, RuntimeError):
-            continue
-        for _, spelling, resolved, device, inode in executable_identities:
-            if spelling.parent != spelling_root:
-                continue
-            try:
-                interpreter = spelling.resolve(strict=True)
-                details = interpreter.stat()
-            except (OSError, RuntimeError):
-                continue
-            if (
-                resolved != interpreter
-                or anchor is not None
-                and anchor != interpreter
-                or (device, inode) != (details.st_dev, details.st_ino)
-            ):
-                continue
-            candidates.append((path_root, spelling, interpreter, device, inode, anchor is None))
-    home = None
-    runtimes = []
-    for path_root, spelling, selected_interpreter, device, inode, needs_anchor in candidates:
-        config = path_root.parent / PYTHON_ENVIRONMENT_CONFIG_NAME
-        try:
-            values = _python_environment_values(config)
-        except (OSError, ValueError) as error:
-            # Without an interpreter anchor, unusable metadata cannot identify this executable.
-            if needs_anchor and not isinstance(error, TimeoutError):
-                continue
-            raise
-        if values is None:
-            continue
-        standard = (
-            "implementation" not in values
-            and "version_info" not in values
-            and "version" in values
-            and "executable" in values
-        )
-        version = re.match(
-            r"^(\d+)\.(\d+)(?:\.|$)",
-            values.get("version" if standard else "version_info", ""),
-        )
-        home_value = values.get("home", "")
-        if (
-            not standard
-            and values.get("implementation", "").casefold() != "cpython"
-            or version is None
-            or not home_value
-            or "\x00" in home_value
-        ):
-            continue
-        configured_home = Path(home_value)
-        if not configured_home.is_absolute() or configured_home.name != PYTHON_BIN_DIRECTORY_NAME:
-            if needs_anchor:
-                continue
-            raise ValueError("Workspace Python runtime path is invalid.")
-        if is_protected_external_read(configured_home):
-            if needs_anchor:
-                continue
-            raise ValueError("Workspace Python runtime root is outside the safe user-local scope.")
-        try:
-            canonical_home = configured_home.resolve(strict=True)
-            runtime_root = canonical_home.parent
-            interpreter = spelling.resolve(strict=True)
-            versioned_name = f"{CPYTHON_EXECUTABLE_NAME}{version.group(1)}.{version.group(2)}"
-            stdlib = runtime_root / PYTHON_LIBRARY_DIRECTORY_NAME / versioned_name
-            if (needs_anchor or standard) and (canonical_home / versioned_name).resolve(
-                strict=True
-            ) != interpreter:
-                continue
-            if standard:
-                if "\x00" in values["executable"]:
-                    continue
-                executable_path = Path(values["executable"])
-                if (
-                    not executable_path.is_absolute()
-                    or is_protected_external_read(executable_path)
-                    or executable_path.resolve(strict=True) != interpreter
-                ):
-                    continue
-        except (OSError, RuntimeError):
-            continue
-        if (
-            not canonical_home.is_dir()
-            or interpreter != selected_interpreter
-            or (interpreter.stat().st_dev, interpreter.stat().st_ino) != (device, inode)
-            or not interpreter.is_relative_to(canonical_home)
-            or not stat.S_ISREG(interpreter.stat().st_mode)
-            or not interpreter.stat().st_mode & constants.EXECUTE_MODE_MASK
-            or not stdlib.is_dir()
-            or not stdlib.resolve(strict=True).is_relative_to(runtime_root)
-            or configured_home.parent.resolve(strict=True) != runtime_root
-        ):
-            continue
-        if any(runtime_root.is_relative_to(root) for root in system_roots):
-            continue
-        if home is None:
-            try:
-                home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve(strict=True)
-            except (KeyError, OSError, RuntimeError) as error:
-                raise ValueError(
-                    "Current account home is unavailable for Python runtime binding."
-                ) from error
-            home_details = home.stat()
-            if (
-                not home.is_dir()
-                or home_details.st_uid != os.getuid()
-                or home_details.st_mode & constants.OTHER_WRITE_MODE_BIT
-                or home_details.st_mode & constants.GROUP_WRITE_MODE_BIT
-                and home_details.st_gid != os.getgid()
-            ):
-                raise ValueError("Current account home is unsafe for Python runtime binding.")
-        if (
-            not runtime_root.is_relative_to(home)
-            or runtime_root == home
-            or is_protected_external_read(runtime_root)
-            or is_protected_external_read(configured_home)
-            or runtime_root.is_relative_to(workspace)
-        ):
-            raise ValueError("Workspace Python runtime root is outside the safe user-local scope.")
-
-        current = runtime_root
-        while current != home:
-            details = current.lstat()
-            if (
-                not stat.S_ISDIR(details.st_mode)
-                or details.st_uid not in (0, os.getuid())
-                or details.st_mode & constants.OTHER_WRITE_MODE_BIT
-                or details.st_mode & constants.GROUP_WRITE_MODE_BIT
-                and details.st_gid != os.getgid()
-            ):
-                raise ValueError("Workspace Python runtime directory is unsafe.")
-            current = current.parent
-        interpreter_details = interpreter.stat()
-        if (
-            interpreter_details.st_uid not in (0, os.getuid())
-            or interpreter_details.st_nlink != 1
-            or interpreter_details.st_mode & constants.OTHER_WRITE_MODE_BIT
-            or interpreter_details.st_mode & constants.GROUP_WRITE_MODE_BIT
-            and interpreter_details.st_gid != os.getgid()
-        ):
-            raise ValueError("Workspace Python interpreter is unsafe.")
-        alias_root = configured_home.parent
-        runtimes.append((runtime_root, alias_root))
-    return tuple(dict.fromkeys(runtimes))
-
-
 def conventional_tmp_available(
-    request: SandboxRequest, scratch: Path, *, runtime_roots: tuple[Path, ...] = ()
+    request: SandboxRequest,
+    scratch: Path,
+    *,
+    runtime_roots: tuple[Path, ...] = (),
 ) -> bool:
     """Check whether a session-private conventional temporary mount avoids other authority.
 
@@ -337,16 +103,6 @@ def conventional_tmp_available(
             for path in (spelling, resolved)
         ),
         *runtime_roots,
-        *(
-            path
-            for root, alias in python_runtime_mounts(
-                request.workspace,
-                request.path_roots,
-                request.executable_identities,
-                system_roots=runtime_roots,
-            )
-            for path in (root, alias)
-        ),
     )
     return not any(
         path.is_relative_to(root) or root.is_relative_to(path)
@@ -357,7 +113,8 @@ def conventional_tmp_available(
 
 @contextmanager
 def _conventional_tmp_source(
-    request: SandboxRequest, scratch: Path
+    request: SandboxRequest,
+    scratch: Path,
 ) -> Generator[tuple[Path, int, tuple[int, ...]], None, None]:
     """Create and pin the exact private session subtree without following links."""
     path = scratch / SESSION_CONVENTIONAL_TMP_NAME
@@ -474,6 +231,13 @@ def _scan(
         and str(root) == request.shell_environment().get(TMPDIR_ENVIRONMENT_VARIABLE)
     ):
         raise ValueError("Linux path root includes private data.")
+    if root != request.scratch_root and any(
+        is_environment_value(part)
+        for part in (
+            root.relative_to(request.workspace) if root.is_relative_to(request.workspace) else root
+        ).parts
+    ):
+        raise ValueError("Linux path root includes environment values.")
     protection = request.protected_paths
     git_granted = request.git_create or request.workspace / GIT_DIRECTORY in request.write_roots
     protected, private, hardlinked, sensitive_inodes = set(), set(), {}, set()
@@ -501,9 +265,16 @@ def _scan(
                             or entry.name in (*protection.instruction_names, *protection.files)
                         )
                     )
-                    is_private = private_parent or (
-                        not (request.scratch_data and root == request.scratch_root)
-                        and entry.name.casefold() in _PRIVATE_NAMES
+                    is_private = (
+                        private_parent
+                        or request.denies_path(path)
+                        or (
+                            not (request.scratch_data and root == request.scratch_root)
+                            and (
+                                entry.name.casefold() in _PRIVATE_NAMES
+                                or is_environment_value(entry.name)
+                            )
+                        )
                     )
                     inode = (details.st_dev, details.st_ino)
                     if stat.S_ISREG(details.st_mode) and (is_protected or is_private):
@@ -512,7 +283,11 @@ def _scan(
                         if request.scratch_data and root == request.scratch_root:
                             raise ValueError("Session scratch contains a shared inode.")
                         hardlinked[path] = inode
-                    if (is_protected or is_private) and stat.S_ISLNK(details.st_mode):
+                    if (
+                        (is_protected or is_private)
+                        and stat.S_ISLNK(details.st_mode)
+                        and not (private_parent and request.denies_path(current))
+                    ):
                         raise ValueError("Linux protected or private entry is a symlink.")
                     if is_protected and not protected_parent:
                         protected.add(path)
@@ -533,9 +308,101 @@ def _scan(
     return protected, private, hardlinked, sensitive_inodes
 
 
+def _hardlink_mounts(roots: tuple[Path, ...], source: Path) -> frozenset[tuple[str, ...]]:
+    """Identify nested mounts and refuse a cache rooted at a mount or aliased subtree."""
+    mounts = set()
+    for fields in read_mountinfo():
+        if len(fields) < MINIMUM_MOUNTINFO_FIELDS or "-" not in fields:
+            raise ValueError("Ambiguous Linux hardlink source mount authority.")
+        mount = Path(fields[4])
+        if mount == source or (
+            mount != Path("/") and source.is_relative_to(mount) and fields[3] != "/"
+        ):
+            raise ValueError("Linux hardlink source has a mounted alias.")
+        if any(mount.is_relative_to(root) for root in (*roots, source)):
+            mounts.add(tuple(fields))
+    return frozenset(mounts)
+
+
+def _inspect_cache_aliases(
+    request: SandboxRequest,
+    roots: tuple[Path, ...],
+    scratch: Path,
+    unaccounted: set[Path],
+) -> None:
+    """Verify unresolved visible links against the owner-bound cache metadata."""
+    sources = request.hardlink_sources
+    (source,) = sources
+    details = source.lstat()
+    uid = os.getuid()
+
+    def controlled(details: os.stat_result) -> bool:
+        """Check owner and effective write access, including the POSIX ACL group mask."""
+        return details.st_uid in (uid, 0) and not (
+            details.st_mode & constants.GROUP_AND_OTHER_WRITE_MODE_MASK
+        )
+
+    if (
+        source.resolve(strict=True) != source
+        or not stat.S_ISDIR(details.st_mode)
+        or details.st_uid != uid
+        or not controlled(details)
+        or source.parent.lstat().st_uid != uid
+        or request.denies_path(source)
+    ):
+        raise ValueError("Linux hardlink source is not an owner-controlled account cache.")
+    for directory in source.parents:
+        parent = directory.lstat()
+        if not controlled(parent) and not (
+            directory != source.parent and parent.st_uid == 0 and parent.st_mode & stat.S_ISVTX
+        ):
+            raise ValueError("Linux hardlink source has unsafe account ancestry.")
+    mounts = _hardlink_mounts(roots, source)
+    mounted = {Path(fields[4]) for fields in mounts}
+    protection = request.protected_paths
+    owner_only = set()
+
+    def denied_peer(path: Path) -> bool:
+        """Apply policy and stop at native mount boundaries, including mounted files."""
+        if (
+            path in mounted
+            or request.denies_path(path)
+            or protection.protects_write_file(path.relative_to(source))
+        ):
+            return True
+        details = path.lstat()
+        if details.st_uid not in (0, uid) or (
+            not owner_only.intersection(path.parents) and not controlled(details)
+        ):
+            return True
+        if stat.S_ISDIR(details.st_mode) and not details.st_mode & (stat.S_IXGRP | stat.S_IXOTH):
+            owner_only.add(path)
+        return False
+
+    aliases = inspect_hardlink_aliases(
+        roots,
+        request.deadline,
+        unaccounted=unaccounted,
+        scratch=scratch,
+        hardlink_sources=sources,
+        denied_peer=denied_peer,
+    )
+    for path, group in aliases.items():
+        if (
+            path.is_relative_to(source)
+            and not any(path.is_relative_to(root) for root in roots)
+            and any(name.is_relative_to(mount) for name in group for mount in mounted)
+        ):
+            raise ValueError("Linux shared dependency has a mounted alias.")
+    if _hardlink_mounts(roots, source) != mounts:
+        raise ValueError("Linux hardlink source mounts changed.")
+
+
 def prepare_paths(
     request: SandboxRequest,
     scratch: Path,
+    *,
+    runtime_roots: tuple[Path, ...] = (),
 ) -> tuple[tuple[Path, ...], tuple[Path, ...], tuple[Path, ...], tuple[Path, ...]]:
     """Inspect all approved roots and return deterministic protected mount preparation inputs.
 
@@ -543,9 +410,12 @@ def prepare_paths(
     Collect multiply linked regular files for read-only bind mounts, preserving reads and
     execution while preventing writes through those paths. Small sets use individual file mounts;
     larger sets use containing directories to stay below Bubblewrap's argument ceiling, which also
-    makes other files in those directories read-only. Refuse hardlinks that alias a protected or
-    private file found in the approved roots. Skip ordinary symlinks while rejecting symlinks
-    within protected/private entries. Return ancestor directories for self-bind mountpoints so
+    makes other files in those directories read-only. Refuse visible hardlinks that alias a
+    protected or private file or whose alias set is incomplete. If a visible group is incomplete,
+    the authorized account cache may supply missing names without becoming a mount. Conceal
+    hardlinks already under private directory masks without denying an unrelated command. Skip
+    ordinary symlinks while rejecting symlinks within protected/private entries. Return ancestor
+    directories for self-bind mountpoints so
     protected entries cannot escape through relocation; their unrelated contents retain the
     approved write semantics. Future protected filenames still require the production filename
     policy. Explicit top-level Git authority does not exempt nested Git, instructions, controls or
@@ -555,6 +425,8 @@ def prepare_paths(
         request (SandboxRequest): Approved command with current canonical and alias identities
             and its execution deadline. Opaque source is never inspected or executed.
         scratch (Path): Live private real directory bound as the request's TMPDIR.
+        runtime_roots (tuple[Path, ...]): Already authenticated read-only runtime roots. Exact
+            duplicate read grants retain their runtime treatment; workspace/write roots do not.
 
     Returns:
         tuple[tuple[Path, ...], tuple[Path, ...], tuple[Path, ...], tuple[Path, ...]]: Sorted
@@ -574,6 +446,8 @@ def prepare_paths(
     _check_deadline(request.deadline)
     if not request.paths_are_current():
         raise ValueError("Linux approved path authority changed.")
+    if any(path.is_relative_to(scratch) for path in request.write_files):
+        raise ValueError("Linux exact file scopes cannot overlap the writable scratch view.")
     details = scratch.lstat()
     if (
         request.shell_environment().get(TMPDIR_ENVIRONMENT_VARIABLE) != str(scratch)
@@ -585,7 +459,23 @@ def prepare_paths(
     protected, private, anchors, hardlinked = set(), set(), set(), {}
     sensitive_inodes = set()
     inspected = {}
-    roots = dict.fromkeys((request.workspace, *request.read_roots, *request.write_roots, scratch))
+    roots = dict.fromkeys(
+        (
+            request.workspace,
+            *(root for root in request.read_roots if root not in runtime_roots),
+            *request.write_roots,
+            scratch,
+        )
+    )
+    unaccounted: set[Path] = set()
+    if request.hardlink_sources and (
+        request.permission_revision is None
+        or request.hardlink_sources != hardlink_source_paths(("shared_dependencies",), "linux")
+    ):
+        raise ValueError("Unapproved Linux hardlink source.")
+    inspect_hardlink_aliases(
+        tuple(roots), request.deadline, unaccounted=unaccounted, scratch=scratch
+    )
     for root in roots:
         root_protected, root_private, root_hardlinked, root_sensitive = _scan(
             root, request, inspected
@@ -599,8 +489,45 @@ def prepare_paths(
             while anchor != root:
                 anchors.add(anchor)
                 anchor = anchor.parent
-    if set(hardlinked.values()) & sensitive_inodes:
+    directory_masks = {path for path in private if path.is_dir()}
+
+    def is_concealed(path: Path) -> bool:
+        """Check whether a directory mask prevents every access to this descendant."""
+        return not directory_masks.isdisjoint(path.parents)
+
+    if request.hardlink_sources and any(not is_concealed(path) for path in unaccounted):
+        unaccounted.clear()
+        _inspect_cache_aliases(request, tuple(roots), scratch, unaccounted)
+    if any(not is_concealed(path) for path in unaccounted):
+        raise IncompleteHardlinkAliases(
+            "Some links have names outside the verified scope or in protected data."
+        )
+    if any(
+        inode in sensitive_inodes and not is_concealed(path) for path, inode in hardlinked.items()
+    ):
         raise ValueError("Linux hardlinked file aliases protected or private data.")
+
+    required_paths = (
+        request.cwd,
+        *roots,
+        *request.write_files,
+        *request.read_aliases,
+        *request.read_alias_targets,
+        *(
+            path
+            for _, spelling, resolved, _, _ in (
+                *request.executable_identities,
+                *request.workspace_executable_identities,
+            )
+            for path in (spelling, resolved)
+        ),
+    )
+    if any(path in directory_masks or is_concealed(path) for path in required_paths):
+        raise ValueError("A required Linux sandbox path is inside a denied directory.")
+
+    protected = {path for path in protected - private if not is_concealed(path)}
+    private = {path for path in private if not is_concealed(path)}
+    anchors = {path for path in anchors if not is_concealed(path)}
     # An earlier subtree can change while another approved root is scanned. Keep the first
     # observation of overlapping directories and recheck the whole request before returning.
     for current, before in inspected.items():
@@ -611,7 +538,9 @@ def prepare_paths(
         raise ValueError("Linux approved path authority changed.")
     _check_deadline(request.deadline)
     read_only_mounts = _hardlink_mount_sources(
-        hardlinked, (*request.write_roots, scratch), request.deadline
+        {path: identity for path, identity in hardlinked.items() if not is_concealed(path)},
+        (*request.write_roots, scratch),
+        request.deadline,
     )
     _check_deadline(request.deadline)
     return (
@@ -640,6 +569,8 @@ def _source_state(details: os.stat_result) -> tuple[int, ...]:
 def bind_paths(
     request: SandboxRequest,
     scratch: Path,
+    *,
+    runtime_roots: tuple[Path, ...] = (),
 ) -> Generator[
     tuple[
         tuple[tuple[Path, ...], tuple[Path, ...], tuple[Path, ...], tuple[Path, ...]],
@@ -663,6 +594,8 @@ def bind_paths(
     Args:
         request (SandboxRequest): Approved command authority and execution deadline.
         scratch (Path): Live private directory bound as the request's TMPDIR.
+        runtime_roots (tuple[Path, ...]): Already authenticated read-only runtime roots, passed
+            to data-root inspection without exempting workspace or write authority.
 
     Yields:
         tuple[tuple[tuple[Path, ...], tuple[Path, ...], tuple[Path, ...], tuple[Path, ...]],
@@ -682,13 +615,14 @@ def bind_paths(
     path_flag = getattr(os, "O_PATH", None)
     if path_flag is None:
         raise OSError(errno.ENOTSUP, "Linux inode-bound mount preparation requires O_PATH.")
-    inventories = prepare_paths(request, scratch)
+    inventories = prepare_paths(request, scratch, runtime_roots=runtime_roots)
     hardlinked = inventories[3]
     sources = dict.fromkeys(
         (
             request.workspace,
             *request.read_roots,
             *request.write_roots,
+            *(path.parent for path in request.write_files),
             scratch,
             *(canonical for _, canonical in request.path_roots),
             *(alias.parent for alias in request.read_aliases),
@@ -734,12 +668,14 @@ def mount_arguments(
     skip_path_roots: tuple[Path, ...] = (),
     skip_executable_roots: tuple[Path, ...] = (),
     runtime_roots: tuple[Path, ...] = (),
-) -> Generator[tuple[tuple[str, ...], tuple[int, ...]], None, None]:
+) -> Generator[tuple[tuple[str, ...], tuple[int, ...], SandboxRequest], None, None]:
     """Prepare descriptor-backed request mounts without granting native launch authority.
 
     Bind approved roots at their canonical spellings, outer roots before nested roots. A path
-    under any approved write root or private scratch remains writable; other roots and ancestors
-    are read-only. Bind the fresh host scratch at its original spelling for trusted identity
+    under any approved write root or private scratch remains writable. Exact-file parents also
+    need writable mounts for creation and deletion; only the independently enforced filename
+    layer grants writes within those parents. Other roots and ancestors are read-only. Bind
+    the fresh host scratch at its original spelling for trusted identity
     checks and at a stable namespace path for payload access. Apply ancestor mountpoints before
     protected read-only binds, then hide private directories with empty tmpfs mounts and private
     regular files with the supplied empty inode. Mirror every restrictive scratch overlay;
@@ -765,13 +701,14 @@ def mount_arguments(
             authenticated runtime mount, whose duplicate directory mounts and aliases are omitted.
         skip_executable_roots (tuple[Path, ...]): Authenticated runtime roots that already supply
             named executable files, so no duplicate exact-file mount is needed.
-        runtime_roots (tuple[Path, ...]): Authenticated runtime roots checked for overlap with
-            the optional conventional temporary mount.
+        runtime_roots (tuple[Path, ...]): Authenticated read-only runtime roots whose exact
+            duplicates are omitted from the data census, and which must not overlap the
+            optional conventional temporary mount. Workspace and write roots remain scanned.
 
     Yields:
-        tuple[tuple[str, ...], tuple[int, ...]]: Bubblewrap filesystem argument fragment and
-            descriptors held only for this context, to pass to trusted native setup. Private
-            original-target descriptors are withheld from the returned inheritance list.
+        tuple[tuple[str, ...], tuple[int, ...], SandboxRequest]: Bubblewrap filesystem arguments,
+            descriptors held only for this context, and the request with masked PATH roots
+            removed. Private original-target descriptors are withheld from inheritance.
 
     Raises:
         ValueError: Request/source authority is unsafe or stale, a root covers the filesystem or
@@ -781,7 +718,8 @@ def mount_arguments(
         TimeoutError: Preparation reaches the approved command deadline.
         OSError: Linux O_PATH is unavailable or source/mask descriptors cannot be inspected.
     """
-    roots = {request.workspace, *request.read_roots, *request.write_roots, scratch}
+    file_parents = {path.parent for path in request.write_files}
+    roots = {request.workspace, *request.read_roots, *request.write_roots, *file_parents, scratch}
     skipped_paths = set(skip_path_roots)
     path_roots = tuple(
         (spelling, canonical)
@@ -819,7 +757,9 @@ def mount_arguments(
             else None
         )
         temporary_state = conventional[2] if conventional else None
-        inventories, descriptors = owned.enter_context(bind_paths(request, scratch))
+        inventories, descriptors = owned.enter_context(
+            bind_paths(request, scratch, runtime_roots=runtime_roots)
+        )
         protected, private, anchors, hardlinked = inventories
         arguments, scratch_mounts, inherited = [], [], set()
 
@@ -840,7 +780,7 @@ def mount_arguments(
             _check_deadline(request.deadline)
             option = (
                 "--bind-fd"
-                if any(path.is_relative_to(root) for root in writable)
+                if (path in file_parents or any(path.is_relative_to(root) for root in writable))
                 and not (
                     request.workspace.is_relative_to(scratch)
                     and path.is_relative_to(request.workspace)
@@ -860,17 +800,18 @@ def mount_arguments(
             inherited.add(descriptors[path])
         for path in protected:
             _check_deadline(request.deadline)
-            if not any(path.is_relative_to(mask) for mask in private):
-                mount("--ro-bind-fd", descriptors[path], path)
-                inherited.add(descriptors[path])
+            mount("--ro-bind-fd", descriptors[path], path)
+            inherited.add(descriptors[path])
         mask_descriptor = None
+        masked_directories = []
         for path in private:
             _check_deadline(request.deadline)
             if stat.S_ISDIR(os.fstat(descriptors[path]).st_mode):
-                arguments.extend(("--tmpfs", str(path)))
+                masked_directories.append(path)
+                arguments.extend(("--tmpfs", str(path), "--remount-ro", str(path)))
                 native = payload_path(path, scratch)
                 if native != path:
-                    scratch_mounts.extend(("--tmpfs", str(native)))
+                    scratch_mounts.extend(("--tmpfs", str(native), "--remount-ro", str(native)))
             else:
                 if mask_descriptor is None:
                     if empty_mask is None:
@@ -967,4 +908,8 @@ def mount_arguments(
         if not request.paths_are_current():
             raise ValueError("Linux approved path authority changed.")
         _check_deadline(request.deadline)
-        yield tuple(arguments), tuple(sorted(inherited))
+        yield (
+            tuple(arguments),
+            tuple(sorted(inherited)),
+            request.without_hidden_search_paths(tuple(masked_directories)),
+        )

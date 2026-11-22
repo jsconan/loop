@@ -42,10 +42,135 @@ def request(tmp_path, **changes):
     return SandboxRequest.create(**values)
 
 
+@pytest.mark.parametrize("agent_data", [False, True])
+def test_application_protection_exempts_only_bound_agent_data(tmp_path, agent_data):
+    """Wire roundtrips preserve scratch isolation without overriding explicit hard denials."""
+    data = tmp_path.parent / "data"
+    scratch = data / "scratch"
+    scratch.mkdir(parents=True, mode=0o700)
+    approved = request(
+        tmp_path,
+        scratch_root=scratch,
+        scratch_data=agent_data,
+        environment={"TMPDIR": str(scratch)},
+        protected_host_roots=(data,),
+        hard_denied_paths=(scratch / "withheld",),
+    )
+    restored = SandboxRequest.from_wire(approved.to_wire())
+    assert restored.protected_host_roots == (data,)
+    assert restored.denies_path(data / "policy")
+    assert restored.denies_path(scratch / "withheld/future")
+    assert not restored.denies_path(scratch / "ordinary")
+    assert not restored.denies_path(tmp_path / "ordinary")
+    unbound = request(tmp_path, protected_host_roots=(data,))
+    assert unbound.denies_path(scratch / "ordinary")
+
+
 def test_native_wire_field_declaration_matches_request():
     """Protocol capability discovery describes every serialized request field exactly once."""
     assert len(NATIVE_REQUEST_FIELDS) == len(set(NATIVE_REQUEST_FIELDS))
-    assert set(NATIVE_REQUEST_FIELDS) == {field.name for field in fields(SandboxRequest)}
+    assert set(NATIVE_REQUEST_FIELDS) == {field.name for field in fields(SandboxRequest)} - {
+        "policy_read_roots",
+        "backend_options",
+        "reviewed_backend_options",
+    }
+
+
+def test_hardlink_source_identity_is_bound_but_grants_no_mount(tmp_path):
+    """Metadata-only consent pins the source and invalidates a changed directory."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    strict = request(tmp_path, permission_revision=2)
+    scoped = strict.with_backend_options(("test_option",), (cache,))
+    assert scoped.hardlink_sources == (cache,)
+    assert scoped.read_roots == strict.read_roots and scoped.write_roots == strict.write_roots
+    assert scoped.sandbox_command_signature("id") != strict.sandbox_command_signature("id")
+    assert scoped.with_backend_options(scoped.backend_options, (cache,)) == scoped
+    transport = replace(scoped, backend_options=())
+    wire = transport.to_wire()
+    assert SandboxRequest.from_wire(wire) == transport
+    for value in (None, [], [None], [{}]):
+        data = json.loads(wire)
+        data["request"]["hardlink_source_identities"] = value
+        with pytest.raises(ValueError, match="Invalid hardlink source"):
+            SandboxRequest.from_wire(json.dumps(data).encode())
+    data = json.loads(wire)
+    data["request"]["hardlink_source_identities"] *= 2
+    with pytest.raises(ValueError, match="Duplicate hardlink source"):
+        SandboxRequest.from_wire(json.dumps(data).encode())
+    data = json.loads(wire)
+    del data["request"]["permission_revision"]
+    with pytest.raises(ValueError, match="Invalid hardlink source"):
+        SandboxRequest.from_wire(json.dumps(data).encode())
+    cache.rename(tmp_path / "previous")
+    cache.mkdir()
+    assert not scoped.paths_are_current()
+    with pytest.raises(ValueError, match="differs from current authority"):
+        SandboxRequest.from_wire(wire)
+
+
+def test_wire_preserves_configured_reads_without_client_policy_classification(tmp_path):
+    """The installed backend receives ordinary bound roots and never treats them as trusted."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    approved = request(
+        tmp_path,
+        read_roots=(outside,),
+        policy_read_roots=(outside,),
+        permission_revision=3,
+    )
+
+    transferred = SandboxRequest.from_wire(approved.to_wire())
+
+    assert transferred.read_roots == (outside,)
+    assert transferred.policy_read_roots == ()
+    assert transferred.permission_revision == 3
+
+
+@pytest.mark.parametrize("name", ["account_lookup", "process_pools"])
+def test_macos_compatibility_requires_boolean_capabilities(tmp_path, name):
+    """Strings cannot enable either host capability."""
+    with pytest.raises(TypeError, match="sandbox options must be a tuple"):
+        request(tmp_path, backend_options=name)
+
+
+@pytest.mark.parametrize("options", [(False,), ("oops!",), ("some", "some")])
+def test_native_option_keys_must_be_unique_identifiers(tmp_path, options):
+    """Reject malformed resource requests before the native boundary."""
+    with pytest.raises(ValueError, match="valid and unique"):
+        request(tmp_path, backend_options=options)
+
+
+def test_macos_compatibility_binds_scope_and_stays_out_of_linux_transport(tmp_path):
+    """Each native grant changes approval identity and cannot enter a Linux receiver."""
+    strict = request(tmp_path)
+    strict_wire = strict.to_wire()
+    assert SandboxRequest.from_wire(strict_wire) == strict
+    assert b"account_lookup" not in strict_wire and b"process_pools" not in strict_wire
+    signatures = {strict.sandbox_command_signature("scope")}
+    for lookup, pools in ((True, False), (False, True), (True, True)):
+        value = request(
+            tmp_path,
+            backend_options=tuple(
+                name
+                for name, enabled in (
+                    ("account_lookup", lookup),
+                    ("process_pools", pools),
+                )
+                if enabled
+            ),
+        )
+        signatures.add(value.sandbox_command_signature("scope"))
+        with pytest.raises(ValueError, match="receiver cannot enforce"):
+            value.to_wire()
+    assert len(signatures) == 4
+
+
+@pytest.mark.parametrize("revision", [None, 0])
+def test_configured_reads_require_approved_roots_and_a_policy_revision(tmp_path, revision):
+    """Policy classification cannot mint an unbound root or an unversioned grant."""
+    with pytest.raises(ValueError, match="current policy snapshot and bound roots"):
+        request(tmp_path, policy_read_roots=(tmp_path,), permission_revision=revision)
 
 
 def test_cleanup_evidence_requires_a_negotiated_exact_result_wire_field(tmp_path):
@@ -183,6 +308,8 @@ def test_egress_grant_binds_wire_and_remembered_signature(tmp_path):
     origin = "https://example.com"
     scoped = request(tmp_path, egress_origins=(origin,))
     plain = request(tmp_path)
+    local_denied = request(tmp_path, local_network=False)
+    assert local_denied.host_command_runtime_signature() != plain.host_command_runtime_signature()
     assert SandboxRequest.from_wire(scoped.to_wire()) == scoped
     assert "egress_origins" not in json.loads(plain.to_wire())["request"]
     assert scoped.sandbox_command_signature("workspace") != plain.sandbox_command_signature(
@@ -224,6 +351,68 @@ def test_request_binds_exact_environment_and_directory_identity(tmp_path):
     tmp_path.rename(tmp_path.with_name("old-workspace"))
     tmp_path.mkdir()
     assert not approved.paths_are_current()
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_exact_write_file_binds_leaf_state_through_wire(tmp_path, existing):
+    """Require the approved leaf state and parent before transport to the native receiver."""
+    target = tmp_path / ".coverage"
+    replacement = tmp_path / "candidate"
+    if existing:
+        target.touch()
+    granted = request(tmp_path, write_roots=(), write_files=(target,))
+    assert granted.write_paths == (target,)
+    wire = granted.to_wire()
+    assert SandboxRequest.from_wire(wire) == granted
+    baseline = request(tmp_path, write_roots=())
+    assert baseline.sandbox_command_signature("workspace") != granted.sandbox_command_signature(
+        "workspace"
+    )
+    assert baseline.host_command_runtime_signature() != granted.host_command_runtime_signature()
+
+    replacement.touch()
+    replacement.replace(target)
+    assert not granted.paths_are_current()
+    with pytest.raises(ValueError, match="differs from current authority"):
+        SandboxRequest.from_wire(wire)
+
+
+@pytest.mark.parametrize("entry", ["directory", "symlink", "hardlink"])
+def test_exact_write_file_refuses_non_regular_or_aliased_leaf(tmp_path, entry):
+    """A saved slot never admits a directory or a link in place of an ordinary file."""
+    target = tmp_path / "target"
+    if entry == "directory":
+        target.mkdir()
+    else:
+        source = tmp_path / "source"
+        source.touch()
+        if entry == "symlink":
+            target.symlink_to(source)
+        else:
+            target.hardlink_to(source)
+    with pytest.raises(ValueError, match="single-link regular file"):
+        request(tmp_path, write_files=(target,))
+
+
+def test_exact_write_file_revalidates_without_following_links(tmp_path):
+    """A formerly empty approved slot cannot acquire alias authority while awaiting launch."""
+    target = tmp_path / "target"
+    granted = request(tmp_path, write_files=(target,))
+    target.symlink_to(tmp_path / "missing")
+    assert not granted.paths_are_current()
+
+
+@pytest.mark.parametrize("path", [".git/config", "nested/AGENTS.md", "nested/.gitignore"])
+def test_exact_write_files_refuse_workspace_controls(tmp_path, path):
+    """A literal grant cannot supersede built-in control-file protection."""
+    with pytest.raises(ValueError, match="protected workspace control"):
+        request(tmp_path, write_files=(tmp_path / path,))
+
+
+def test_exact_write_file_refuses_outside_workspace(tmp_path):
+    """The exact write-file request accepts workspace paths only."""
+    with pytest.raises(ValueError, match="inside the workspace"):
+        request(tmp_path, write_files=(tmp_path.parent / "outside",))
 
 
 def test_request_binds_workspace_selected_executable_through_wire(tmp_path):
@@ -464,6 +653,21 @@ def test_generated_environment_signatures_bind_relative_values(tmp_path, suffix)
         assert first.sandbox_command_signature("session") != second.sandbox_command_signature(
             "session"
         )
+
+
+@pytest.mark.parametrize("scope", ["workspace", "user"])
+def test_sandbox_command_signature_binds_replaced_directory(tmp_path, scope):
+    """Recreating an approved directory at the same path changes remembered authority."""
+    root = tmp_path / "toolchain"
+    root.mkdir()
+    approved = request(tmp_path, read_roots=(root,))
+    root.rename(tmp_path / "original-toolchain")
+    root.mkdir()
+    current = request(tmp_path, read_roots=(root,))
+
+    assert not approved.paths_are_current()
+    assert current.paths_are_current()
+    assert approved.sandbox_command_signature(scope) != current.sandbox_command_signature(scope)
 
 
 @pytest.mark.parametrize("spelling", ["trailing", "dot"])
@@ -1007,6 +1211,31 @@ def test_missing_git_creation_target_is_bound_until_launch(tmp_path):
         request(tmp_path, git_create=True, write_roots=())
 
 
+@pytest.mark.parametrize("retain_entries", [False, True])
+def test_request_projects_search_paths_hidden_in_the_native_view(tmp_path, retain_entries):
+    """Masking an inherited PATH entry keeps the original identity of everything still visible."""
+    hidden = tmp_path / "runtime"
+    hidden.mkdir()
+    alias = tmp_path / "runtime-link"
+    alias.symlink_to(hidden, target_is_directory=True)
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    remaining = ("tools", "now-missing", "tools") if retain_entries else ()
+    path = os.pathsep.join((str(alias), "runtime", *remaining))
+    original = request(tmp_path, environment={"PATH": path})
+    assert original.without_hidden_search_paths((tools / "other",)) is original
+    projected = original.without_hidden_search_paths((hidden,))
+    assert projected.attempt_id == original.attempt_id
+    assert projected.write_roots == original.write_roots
+    assert projected.shell_environment()["PATH"] == (
+        os.pathsep.join(remaining) if retain_entries else os.devnull
+    )
+    wire = projected.to_wire()
+    hidden.rename(tmp_path / "unmounted")
+    assert SandboxRequest.from_wire(wire) == projected
+    assert original.shell_environment()["PATH"] == path
+
+
 def test_request_wire_roundtrip_preserves_all_authority_and_correlation(tmp_path):
     """Canonical snapshots restore exact source, grants, identities, deadline and attempt ID."""
     approved = request(
@@ -1523,3 +1752,50 @@ def test_session_data_binding_rejects_ambiguous_authority(tmp_path, change):
         changes["scratch_data"] = "true"
     with pytest.raises(ValueError, match="explicit and disjoint"):
         request(tmp_path, **changes)
+
+
+def test_native_hard_paths_survive_exact_wire_roundtrip(tmp_path):
+    """Frozen future hard designations cannot disappear from authenticated transport."""
+    denied = tmp_path / "future"
+    value = request(tmp_path, hard_denied_paths=(denied, denied), permission_revision=7)
+    assert value.hard_denied_paths == (denied,)
+    restored = SandboxRequest.from_wire(value.to_wire())
+    assert restored.hard_denied_paths == (denied,)
+    assert restored.permission_revision == 7
+    with pytest.raises(ValueError, match="nonnegative integer"):
+        request(tmp_path, permission_revision=-1)
+    with pytest.raises(ValueError, match="normalized absolute exact paths"):
+        request(tmp_path, hard_denied_paths=(Path("relative"),))
+
+
+@pytest.mark.parametrize("port", [True, 0, -1, 65536, "8080", 8080.0])
+def test_ingress_rejects_invalid_publication_ports(tmp_path, port):
+    """Malformed ports cannot acquire an unintended listener or use implicit port allocation."""
+    with pytest.raises(ValueError, match="Ingress requires"):
+        request(tmp_path, ingress_port=port)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"network": True},
+        {"egress_origins": ("http://example.com",)},
+        {"terminal": True},
+        {"local_network": False},
+    ],
+)
+def test_ingress_requires_isolated_nonterminal_service(tmp_path, changes):
+    """A publication cannot compose an unqualified general, proxy or terminal transport."""
+    with pytest.raises(ValueError, match="Ingress requires"):
+        request(tmp_path, ingress_port=8080, **changes)
+
+
+def test_ingress_roundtrip_binds_exact_port_and_attempt(tmp_path):
+    """Wire transport preserves publication authority and remembered grants cannot cross attempts."""
+    first = request(tmp_path, ingress_port=8080)
+    restored = SandboxRequest.from_wire(first.to_wire())
+    second = request(tmp_path, ingress_port=8080)
+    assert restored.ingress_port == first.ingress_port == 8080
+    assert restored.attempt_id == first.attempt_id
+    assert restored.sandbox_command_signature("scope") == first.sandbox_command_signature("scope")
+    assert second.sandbox_command_signature("scope") != first.sandbox_command_signature("scope")

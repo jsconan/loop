@@ -321,3 +321,22 @@ def close_command_managers(monkeypatch, isolated_environment):
     yield
     for manager in reversed(managers):
         manager.close()
+
+
+@pytest.fixture
+def native_mount_point(isolated_environment):
+    """Register exact future native mount paths and require their owner to remove them."""
+    paths = []
+
+    def reserve(path):
+        """Retain the output guard while permitting one verified native owner to mount here."""
+        path = Path(path)
+        assert path.is_absolute() and path.parent.resolve(strict=True) == path.parent
+        assert not path.exists() and not path.is_symlink()
+        _NATIVE_OUTPUT_ROOTS.append(str(path))
+        paths.append(path)
+
+    yield reserve
+    for path in paths:
+        assert not path.exists() and not path.is_symlink(), f"Native owner retained {path}"
+        _NATIVE_OUTPUT_ROOTS.remove(str(path))

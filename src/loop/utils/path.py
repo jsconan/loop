@@ -5,7 +5,7 @@ import errno
 import os
 import stat
 import sys
-from collections.abc import Generator, Iterable, Iterator, Sequence
+from collections.abc import Callable, Generator, Iterable, Iterator, Sequence
 from contextlib import ExitStack, contextmanager
 from importlib import import_module
 from pathlib import Path
@@ -325,29 +325,36 @@ def find_project_root(working_directory: Path | str) -> Path | None:
     return None
 
 
-def _load_ignore_rules(directory: Path, rules: IgnoreRules) -> None:
+def _read_ignore_file(path: Path) -> str | None:
+    """Read an existing ignore file for a caller with its own filesystem authority."""
+    return path.read_text(encoding="utf-8") if path.is_file() else None
+
+
+def _load_ignore_rules(
+    directory: Path, rules: IgnoreRules, read_ignore: Callable[[Path], str | None]
+) -> None:
     """Add ignore files in a directory to their active hierarchical rule sets."""
     for filename in constants.IGNORE_FILENAMES:
         ignore_file = directory / filename
-        if ignore_file.is_file():
+        if (content := read_ignore(ignore_file)) is not None:
             rules[filename].append(
                 (
                     directory,
-                    GitIgnoreSpec.from_lines(ignore_file.read_text(encoding="utf-8").splitlines()),
+                    GitIgnoreSpec.from_lines(content.splitlines()),
                 )
             )
 
 
-def _initial_ignore_rules(folder: Path) -> IgnoreRules:
+def _initial_ignore_rules(folder: Path, read_ignore: Callable[[Path], str | None]) -> IgnoreRules:
     """Load ignore rules in scope from the Git project root through a folder."""
     rules = {filename: [] for filename in constants.IGNORE_FILENAMES}
     root = find_project_root(folder) or folder
     relative_folder = folder.relative_to(root)
     directory = root
-    _load_ignore_rules(directory, rules)
+    _load_ignore_rules(directory, rules, read_ignore)
     for part in relative_folder.parts:
         directory /= part
-        _load_ignore_rules(directory, rules)
+        _load_ignore_rules(directory, rules, read_ignore)
     return rules
 
 
@@ -378,7 +385,12 @@ def _is_ignored(path: Path, is_directory: bool, rules: IgnoreRules) -> bool:
     return _ignore_decision(path, is_directory, rules[constants.GIT_IGNORE_FILENAME]) is True
 
 
-def is_path_ignored(path: Path | str, root: Path | str | None = None) -> bool:
+def is_path_ignored(
+    path: Path | str,
+    root: Path | str | None = None,
+    *,
+    read_ignore: Callable[[Path], str | None] = _read_ignore_file,
+) -> bool:
     """Return whether an explicit path is excluded by scoped ignore files.
 
     Rules are loaded from the supplied root through the path's parent. When no
@@ -389,6 +401,8 @@ def is_path_ignored(path: Path | str, root: Path | str | None = None) -> bool:
     Args:
         path (Path | str): File or directory to evaluate.
         root (Path | str | None): Optional boundary for hierarchical ignore-file discovery.
+        read_ignore (Callable[[Path], str | None]): Read one allowed ignore file or skip it.
+            By default, read existing files under the caller's filesystem authority.
 
     Returns:
         bool: Whether ``.gitignore``, higher-priority ``.agentignore``, or Git metadata
@@ -403,7 +417,7 @@ def is_path_ignored(path: Path | str, root: Path | str | None = None) -> bool:
     relative_path = path.relative_to(root)
     rules = {filename: [] for filename in constants.IGNORE_FILENAMES}
     directory = root
-    _load_ignore_rules(directory, rules)
+    _load_ignore_rules(directory, rules, read_ignore)
 
     for index, part in enumerate(relative_path.parts):
         candidate = directory / part
@@ -412,24 +426,38 @@ def is_path_ignored(path: Path | str, root: Path | str | None = None) -> bool:
             return True
         directory = candidate
         if index < len(relative_path.parts) - 1 and is_directory:
-            _load_ignore_rules(directory, rules)
+            _load_ignore_rules(directory, rules, read_ignore)
     return False
 
 
-def _iter_visible_paths(folder: Path, recursive: bool, rules: IgnoreRules) -> Iterator[Path]:
+def _iter_visible_paths(
+    folder: Path,
+    recursive: bool,
+    rules: IgnoreRules,
+    read_ignore: Callable[[Path], str | None],
+    allowed: Callable[[Path], bool] | None,
+) -> Iterator[Path]:
     """Yield visible child paths, pruning ignored directories during recursion."""
     for entry in folder.iterdir():
+        if allowed is not None and not allowed(entry):
+            continue
         is_directory = entry.is_dir()
         if _is_ignored(entry, is_directory, rules):
             continue
         yield entry
         if recursive and is_directory and not entry.is_symlink():
             nested_rules = {name: active.copy() for name, active in rules.items()}
-            _load_ignore_rules(entry, nested_rules)
-            yield from _iter_visible_paths(entry, recursive=True, rules=nested_rules)
+            _load_ignore_rules(entry, nested_rules, read_ignore)
+            yield from _iter_visible_paths(entry, True, nested_rules, read_ignore, allowed)
 
 
-def iter_visible_paths(folder: Path | str, recursive: bool = False) -> Iterator[Path]:
+def iter_visible_paths(
+    folder: Path | str,
+    recursive: bool = False,
+    *,
+    read_ignore: Callable[[Path], str | None] = _read_ignore_file,
+    allowed: Callable[[Path], bool] | None = None,
+) -> Iterator[Path]:
     """Yield non-ignored paths immediately below a folder or throughout its tree.
 
     Hierarchical ``.gitignore`` and ``.agentignore`` files use Git pattern syntax,
@@ -440,12 +468,18 @@ def iter_visible_paths(folder: Path | str, recursive: bool = False) -> Iterator[
     Args:
         folder (Path | str): Directory whose visible children should be discovered.
         recursive (bool): Whether to traverse visible child directories recursively.
+        read_ignore (Callable[[Path], str | None]): Read one allowed ignore file or skip it.
+            By default, read existing files under the caller's filesystem authority.
+        allowed (Callable[[Path], bool] | None): Limit the entries inspected and directories
+            traversed. None uses the caller's existing filesystem authority.
 
     Yields:
         Path: Visible files and directories as absolute paths.
     """
     folder = Path(folder).resolve()
-    yield from _iter_visible_paths(folder, recursive, _initial_ignore_rules(folder))
+    yield from _iter_visible_paths(
+        folder, recursive, _initial_ignore_rules(folder, read_ignore), read_ignore, allowed
+    )
 
 
 def filter_paths_by_globs(

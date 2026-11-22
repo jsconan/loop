@@ -4,18 +4,20 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from contextlib import AbstractContextManager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from threading import Event
 from typing import TYPE_CHECKING, Literal
 
 from ..errors import Problem, ProblemException
 from ..interaction import Interaction, require_async_interaction
+from ..models import SandboxEnvironment
 from ..utils import VirtualPath, content_digest
 from .models import ToolRuntimeSettings
 
 if TYPE_CHECKING:
     from ..execution import CommandExecutionService
+    from ..execution.sandbox import SandboxRequest
     from ..instructions import InstructionsManager
     from ..permissions import OperationPlan, Operations, PermissionManager
     from ..permissions.manager import EgressRevocationLease
@@ -87,6 +89,41 @@ def _confirmation_decision(value: object, tool_name: str) -> bool:
 
 
 @dataclass(frozen=True)
+class VerificationScope:
+    """Bind the owner's saved environment and definition identity to one sandbox launch.
+
+    Args:
+        environment (SandboxEnvironment): Task-specific environment overrides.
+        admission_check (Callable[[], str | None]): Recheck the saved record after approval.
+        backend_options (tuple[str, ...]): Optional native resources requested by the owner.
+    """
+
+    environment: SandboxEnvironment
+    admission_check: Callable[[], str | None]
+    backend_options: tuple[str, ...]
+
+    def bind(self, context: ToolContext) -> ToolContext:
+        """Apply this task's output limits and admission check to the normal command context.
+
+        Args:
+            context (ToolContext): The invocation's active policy and command services.
+
+        Returns:
+            ToolContext: Scoped context for this command alone.
+        """
+        return replace(
+            context,
+            settings=replace(
+                context.settings,
+                sandbox_environment={**context.settings.sandbox_environment, **self.environment},
+            ),
+            sandbox_admission_check=self.admission_check,
+            sandbox_backend_options=self.backend_options,
+            sandbox_output_only=True,
+        )
+
+
+@dataclass(frozen=True)
 class ToolContext:
     """Provide runtime services and metadata to a context-aware tool.
 
@@ -105,8 +142,8 @@ class ToolContext:
         additional_authorizer_async (AdditionalAuthorizerAsync | None): Native asynchronous
             callback for runtime-discovered effects, or ``None`` when unavailable.
         settings (ToolRuntimeSettings): Scoped settings available to tool implementations.
-        permission_manager (PermissionManager | None): Authority for a native command's one-off
-            approval, or None outside registry dispatch.
+        permission_manager (PermissionManager | None): Authority for native command admission
+            and direct-file boundaries, or None when no policy owner is available.
         execution_service (CommandExecutionService | None): Registry-injected facade for tools
             with native execution authorization, or ``None`` otherwise.
         session_manager (SessionManager | None): Selected session whose native ownership lease
@@ -118,6 +155,7 @@ class ToolContext:
             complete inspected source versions, including the source of a committed edit, or
             ``None`` for observed absence; cache handles map to
             ``None`` and retain their existing immutable reference identity.
+        file_read_paths (set[str]): Physical sources retained privately for cached-result policy.
         cancellation_event (Event | None): Run or async-dispatch signal set on interruption,
             or ``None`` when no signal is supplied to a synchronous dispatch.
         execution_mode (Literal["sync", "async"]): Callback mode selected by the owning registry.
@@ -128,6 +166,8 @@ class ToolContext:
             for work that outlives its originating async dispatch.
         egress_authority (CommandEgressAuthority | None): Thread-safe, limited policy authority
             for a mediated command that outlives its originating async dispatch.
+        host_recovery_detached (Callable[[], int | None] | None): Thread-safe hint eligibility
+            reader for jobs that outlive their initial event loop.
         audit_host_detached (Callable[..., None] | None): Thread-safe host-boundary audit callback
             for work that outlives its originating async dispatch.
         command_admission (Callable[[], AbstractContextManager[None]] | None): Registry gate
@@ -137,6 +177,13 @@ class ToolContext:
         command_paths (VirtualPath | None): Immutable command root snapshot, if captured.
         admit_skills_detached (Callable[..., bool] | None): Thread-safe skill admission on the
             original instructions manager for detached command workers.
+        sandbox_attempt_detached (Callable[..., AbstractContextManager[SandboxRequest | None]] |
+            None): Thread-safe native admission and cancellation registration, retained across
+            owner-loop handoff. Accepts the request, approving revision and cancellation event.
+        sandbox_admission_check (Callable[[], str | None] | None): Trusted authority recheck
+            returning a refusal detail after approval or None if current.
+        sandbox_output_only (bool): Refuse directory write scopes that include the whole checkout.
+        sandbox_backend_options (tuple[str, ...]): Optional native resources selected by the owner.
     """
 
     interaction: Interaction | None
@@ -152,6 +199,7 @@ class ToolContext:
     session_manager: SessionManager | None = None
     file_versions: dict[str, str | None] = field(default_factory=dict)
     read_versions: dict[str, str | None] = field(default_factory=dict)
+    file_read_paths: set[str] = field(default_factory=set)
     cancellation_event: Event | None = None
     additional_authorizer_async: AdditionalAuthorizerAsync | None = None
     execution_mode: Literal["sync", "async"] = "sync"
@@ -159,10 +207,17 @@ class ToolContext:
     invalidate_detached: Callable[[], None] | None = None
     egress_authority: CommandEgressAuthority | None = None
     audit_host_detached: Callable[..., None] | None = None
+    host_recovery_detached: Callable[[], int | None] | None = None
     command_admission: Callable[[], AbstractContextManager[None]] | None = None
     command_authorities: tuple[object, ...] | None = None
     command_paths: VirtualPath | None = None
     admit_skills_detached: Callable[..., bool] | None = None
+    sandbox_attempt_detached: (
+        Callable[..., AbstractContextManager[SandboxRequest | None]] | None
+    ) = None
+    sandbox_admission_check: Callable[[], str | None] | None = None
+    sandbox_output_only: bool = False
+    sandbox_backend_options: tuple[str, ...] = ()
 
     def record_file_read(self, path: Path, version: str | None) -> None:
         """Attest to the source version actually inspected by a file reader.

@@ -11,14 +11,25 @@ from pathlib import Path
 from typing import Annotated, Any, Literal, Protocol
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
+from pydantic import (
+    AfterValidator,
+    BaseModel,
+    ConfigDict,
+    Field,
+    computed_field,
+    field_validator,
+    model_validator,
+)
 from pydantic_core import PydanticCustomError
 
 from ..errors import safe_error_detail
+from ..sandbox_catalog import SANDBOX_OPTIONS, validate_sandbox_options
 from ..utils import VirtualPath, YAMLError, load_yaml, sha256_digest
+from .protection import validate_hard_denied_paths
 
 type FileKind = Literal["file", "directory", "symlink"]
 type Operations = tuple[Operation, ...]
+PERMISSION_POLICY_VERSION = 10
 
 
 class Action(StrEnum):
@@ -26,10 +37,14 @@ class Action(StrEnum):
 
     FILESYSTEM_LIST = "filesystem.list"
     FILESYSTEM_READ = "filesystem.read"
+    FILESYSTEM_EXECUTE = "filesystem.execute"
     FILESYSTEM_CREATE = "filesystem.create"
     FILESYSTEM_REPLACE = "filesystem.replace"
     FILESYSTEM_DELETE = "filesystem.delete"
     NETWORK_REQUEST = "network.request"
+    NETWORK_LOCAL = "network.local"
+    NETWORK_BROAD = "network.broad"
+    NETWORK_INGRESS = "network.ingress"
     PROCESS_EXECUTE = "process.execute"
     SESSION_MUTATE = "session.mutate"
 
@@ -46,10 +61,14 @@ class Action(StrEnum):
 _ACTION_ICONS = {
     Action.FILESYSTEM_LIST: "📂",
     Action.FILESYSTEM_READ: "📖",
+    Action.FILESYSTEM_EXECUTE: "⚙️",
     Action.FILESYSTEM_CREATE: "📝",
     Action.FILESYSTEM_REPLACE: "✏️",
     Action.FILESYSTEM_DELETE: "🗑️",
     Action.NETWORK_REQUEST: "🌐",
+    Action.NETWORK_LOCAL: "🔌",
+    Action.NETWORK_BROAD: "🌐",
+    Action.NETWORK_INGRESS: "🔌",
     Action.PROCESS_EXECUTE: "⚙️",
     Action.SESSION_MUTATE: "💾",
 }
@@ -61,6 +80,35 @@ class Decision(StrEnum):
     ALLOW = "allow"
     ASK = "ask"
     DENY = "deny"
+
+
+class SandboxPathAccess(StrEnum):
+    """Identify a stored sandbox path grant or restriction."""
+
+    READ = "read"
+    WRITE = "write"
+    WRITE_FILE = "write-file"
+    READ_ONLY = "read-only"
+    DENY = "deny"
+
+    @classmethod
+    def _missing_(cls, value: object) -> SandboxPathAccess | None:
+        """Interpret the original persisted read grant without changing its authority."""
+        return cls.READ if value == "allow" else None
+
+
+def _validate_sandbox_paths(value: dict[str, SandboxPathAccess]) -> dict[str, SandboxPathAccess]:
+    """Validate exact directory grants and hard path denials for commands."""
+    validate_hard_denied_paths(tuple(value))
+    if any(
+        Path(path).anchor != "/" or (access is not SandboxPathAccess.DENY and path == "/")
+        for path, access in value.items()
+    ):
+        raise ValueError("Sandbox paths require an exact path and a valid access level.")
+    return value
+
+
+type SandboxPaths = Annotated[dict[str, SandboxPathAccess], AfterValidator(_validate_sandbox_paths)]
 
 
 class CommandReviewStatus(StrEnum):
@@ -123,6 +171,8 @@ class FileManifestEntry(BaseModel):
         inode (int): Inode identity where exposed by the platform.
         size (int): Byte size reported by ``lstat``.
         mtime_ns (int): Nanosecond modification time reported by ``lstat``.
+        ctime_ns (int | None): Change timestamp, or None for a legacy persisted manifest.
+        link_count (int | None): Accounted inode names, or None for a legacy manifest.
         mode (int): Permission and type bits reported by ``lstat``.
         digest (str | None): SHA-256 file-content or symbolic-link-target digest when applicable.
     """
@@ -136,6 +186,8 @@ class FileManifestEntry(BaseModel):
     size: int
     mtime_ns: int
     mode: int
+    ctime_ns: int | None = None
+    link_count: int | None = None
     digest: str | None = None
 
 
@@ -152,6 +204,8 @@ class FileTarget(BaseModel):
         expected_inode (int | None): Expected inode identity where exposed by the platform.
         expected_size (int | None): Expected byte size for a regular file.
         expected_mtime_ns (int | None): Expected nanosecond modification time.
+        expected_ctime_ns (int | None): Change timestamp binding a read against inode reuse.
+        expected_link_count (int | None): Link count from the authorized alias snapshot.
         expected_mode (int | None): Expected permission and type bits.
         expected_parent_device (int | None): Expected parent-directory device identity.
         expected_parent_inode (int | None): Expected parent-directory inode identity.
@@ -170,6 +224,8 @@ class FileTarget(BaseModel):
     expected_inode: int | None = None
     expected_size: int | None = None
     expected_mtime_ns: int | None = None
+    expected_ctime_ns: int | None = None
+    expected_link_count: int | None = None
     expected_mode: int | None = None
     expected_parent_device: int | None = None
     expected_parent_inode: int | None = None
@@ -197,6 +253,34 @@ class NetworkTarget(BaseModel):
     addresses: tuple[str, ...] = ()
     method: str = "GET"
     sends_body: bool = False
+
+
+class NetworkAccessTarget(BaseModel):
+    """Identify a native network capability separately from an HTTP destination.
+
+    Args:
+        kind (Literal["network_access"]): Target discriminator.
+        scope (Literal["local", "broad"]): Attempt-local peers or unrestricted networking.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    kind: Literal["network_access"] = "network_access"
+    scope: Literal["local", "broad"]
+
+
+class NetworkIngressTarget(BaseModel):
+    """Identify one host-loopback publication independently of outbound grants.
+
+    Args:
+        kind (Literal["network_ingress"]): Target discriminator.
+        port (int): Exact IPv4 loopback TCP port; wildcard interfaces are unavailable.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    kind: Literal["network_ingress"] = "network_ingress"
+    port: int = Field(strict=True, ge=1, le=65535)
 
 
 class ProcessTarget(BaseModel):
@@ -232,7 +316,12 @@ class SessionTarget(BaseModel):
 
 
 OperationTarget = Annotated[
-    FileTarget | NetworkTarget | ProcessTarget | SessionTarget,
+    FileTarget
+    | NetworkTarget
+    | NetworkAccessTarget
+    | NetworkIngressTarget
+    | ProcessTarget
+    | SessionTarget,
     Field(discriminator="kind"),
 ]
 
@@ -269,6 +358,10 @@ class Operation(BaseModel):
             if self.action.value.startswith("filesystem.")
             else NetworkTarget
             if self.action is Action.NETWORK_REQUEST
+            else NetworkAccessTarget
+            if self.action in {Action.NETWORK_LOCAL, Action.NETWORK_BROAD}
+            else NetworkIngressTarget
+            if self.action is Action.NETWORK_INGRESS
             else ProcessTarget
             if self.action is Action.PROCESS_EXECUTE
             else SessionTarget
@@ -277,6 +370,10 @@ class Operation(BaseModel):
             raise ValueError(  # noqa: TRY004 - Pydantic wraps ValueError as ValidationError.
                 f"Action '{self.action.value}' requires a {expected_type.__name__}."
             )
+        if isinstance(self.target, NetworkAccessTarget) and (
+            self.action.value != "network." + self.target.scope
+        ):
+            raise ValueError("Network action and capability scope must agree.")
         return self
 
     @computed_field
@@ -291,6 +388,10 @@ class Operation(BaseModel):
             return self.target.path
         if isinstance(self.target, NetworkTarget):
             return self.target.url
+        if isinstance(self.target, NetworkIngressTarget):
+            return f"tcp://127.0.0.1:{self.target.port}"
+        if isinstance(self.target, NetworkAccessTarget):
+            return "network:" + self.target.scope
         if isinstance(self.target, ProcessTarget):
             return " ".join(self.target.argv)
         if isinstance(self.target, SessionTarget):
@@ -409,11 +510,20 @@ class SandboxedCommandRule(BaseModel):
     scope: ApprovalChoice = ApprovalChoice.SESSION
 
 
+def _validate_sandboxed_rule_ids(rules: list[SandboxedCommandRule]) -> None:
+    """Reject repeated identifiers in a persisted sandbox approval collection."""
+    if len({rule.id for rule in rules}) != len(rules):
+        raise PydanticCustomError(
+            "loop_sandbox_rule_ids", "Sandbox command rule identifiers must be unique."
+        )
+
+
 class HostCommandRule(BaseModel):
     """Remember an exact host approval with virtual working-directory context.
 
     Args:
         id (str): Identifier used to list and revoke the approval.
+        authorization_version (int): Approval semantics; version one stays inactive.
         signature (str): Digest of virtual workspace coordinates and safe command shape only.
         cwd (str): Virtual workspace working directory; never a host path.
         source (str): Path-free command label for listing and revocation.
@@ -423,6 +533,7 @@ class HostCommandRule(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     id: str = Field(default_factory=lambda: str(uuid4()))
+    authorization_version: int = Field(default=1, ge=1, le=2, strict=True)
     signature: str
     cwd: str
     source: str
@@ -600,6 +711,30 @@ class PermissionPreset(BaseModel):
     defaults: dict[Action, Decision]
     rules: tuple[PresetRule, ...]
 
+    @field_validator("defaults")
+    @classmethod
+    def add_network_scopes(cls, value: dict[Action, Decision]) -> dict[Action, Decision]:
+        """Normalize the complete historical action set without repairing missing restrictions.
+
+        Args:
+            value (dict[Action, Decision]): Parsed defaults from the preset artifact.
+
+        Returns:
+            dict[Action, Decision]: Complete defaults with separate local and broad decisions.
+        """
+        if set(value) == set(Action) - {
+            Action.NETWORK_LOCAL,
+            Action.NETWORK_BROAD,
+            Action.NETWORK_INGRESS,
+        }:
+            return {
+                **value,
+                Action.NETWORK_LOCAL: Decision.ALLOW,
+                Action.NETWORK_BROAD: Decision.ASK,
+                Action.NETWORK_INGRESS: Decision.ASK,
+            }
+        return value
+
     @model_validator(mode="after")
     def validate_contents(self) -> PermissionPreset:
         """Require a complete default map and unique rule identifiers.
@@ -748,6 +883,8 @@ class PolicyLimits(BaseModel):
     """Define user-configurable limits that ordinary policy rules cannot override.
 
     Args:
+        hard_denied_paths (tuple[str, ...]): Exact absolute file/directory designations that
+            ordinary approvals cannot override. Empty by default.
         readable_roots (tuple[str, ...]): Allowed filesystem read roots. ``workspace`` and
             ``app-temp`` are special runtime roots.
         writable_roots (tuple[str, ...]): Allowed mutation roots. ``workspace`` and
@@ -756,17 +893,18 @@ class PolicyLimits(BaseModel):
             an empty tuple denies every origin.
         deny_private_networks (bool): Whether literal private and local IP targets are forbidden.
         deny_local_networks (bool): Whether sandbox-attempt loopback communication is forbidden.
-        allow_host_processes (bool): Whether policy may approve a host process.
     """
 
     model_config = ConfigDict(extra="forbid")
 
+    hard_denied_paths: tuple[str, ...] = ()
     readable_roots: tuple[str, ...] = ("workspace", "app-temp")
     writable_roots: tuple[str, ...] = ("workspace", "app-temp")
     network_origins: tuple[str, ...] = ("*",)
     deny_private_networks: bool = True
     deny_local_networks: bool = False
-    allow_host_processes: bool = False
+
+    _validate_hard_paths = field_validator("hard_denied_paths")(validate_hard_denied_paths)
 
 
 class LimitClassification(StrEnum):
@@ -823,12 +961,43 @@ def _default_decisions() -> dict[Action, Decision]:
     return {
         Action.FILESYSTEM_LIST: Decision.ALLOW,
         Action.FILESYSTEM_READ: Decision.ALLOW,
+        Action.FILESYSTEM_EXECUTE: Decision.ALLOW,
         Action.FILESYSTEM_CREATE: Decision.ASK,
         Action.FILESYSTEM_REPLACE: Decision.ASK,
         Action.FILESYSTEM_DELETE: Decision.ASK,
         Action.NETWORK_REQUEST: Decision.ASK,
+        Action.NETWORK_LOCAL: Decision.ALLOW,
+        Action.NETWORK_BROAD: Decision.ASK,
+        Action.NETWORK_INGRESS: Decision.ASK,
         Action.PROCESS_EXECUTE: Decision.ASK,
         Action.SESSION_MUTATE: Decision.ASK,
+    }
+
+
+def _review_legacy_network_grants(value: Any) -> Any:
+    """Require renewed consent for saved unconstrained egress allows from older schemas."""
+    if (
+        not isinstance(value, dict)
+        or not isinstance(value.get("version", 5), int)
+        or isinstance(value.get("version", 5), bool)
+        or value.get("version", 5) >= 5
+    ):
+        return value
+    rules = value.get("rules", [])
+    if not isinstance(rules, list):
+        return value
+    return {
+        **value,
+        "rules": [
+            {**rule, "decision": Decision.ASK}
+            if isinstance(rule, dict)
+            and rule.get("decision") == Decision.ALLOW
+            and rule.get("action") == Action.NETWORK_REQUEST
+            and rule.get("resource") in (None, "*")
+            and rule.get("target") is None
+            else rule
+            for rule in rules
+        ],
     }
 
 
@@ -844,11 +1013,23 @@ class PermissionConfiguration(BaseModel):
         namespace_generation (str | None): Durable policy namespace marker when bound to the
             application registry; markerless valid policies are migrated conservatively.
         rules (list[PermissionRule]): Composed explicit policy rules.
+        sandboxed_command_rules (list[SandboxedCommandRule]): Remembered approvals for this
+            workspace only.
+        sandbox_paths (SandboxPaths): Exact sandbox directory grants and path denials.
+        workspace_command_writes (bool): Include the checkout in ordinary command write requests
+            unless the invocation supplies a scope.
+        backend_options (tuple[str, ...]): Optional backend authorities enabled by the owner.
+        command_backend_options (dict[str, tuple[str, ...]]): Exact workspace command signatures
+            whose optional authority selection the owner has asked to reuse.
+        backend_option_revisions (dict[str, str]): Workspace revocation markers for exact
+            command approvals that include a backend option.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    version: int = Field(default=2, ge=1, le=2, strict=True)
+    version: int = Field(
+        default=PERMISSION_POLICY_VERSION, ge=1, le=PERMISSION_POLICY_VERSION, strict=True
+    )
     defaults: dict[Action, Decision] = Field(default_factory=_default_decisions)
     limits: PolicyLimits = Field(default_factory=PolicyLimits)
     limit_classifications: PolicyLimitClassifications = Field(
@@ -856,6 +1037,88 @@ class PermissionConfiguration(BaseModel):
     )
     namespace_generation: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
     rules: list[PermissionRule] = Field(default_factory=list)
+    sandboxed_command_rules: list[SandboxedCommandRule] = Field(default_factory=list)
+    sandbox_paths: SandboxPaths = Field(default_factory=dict)
+    workspace_command_writes: bool = Field(default=False, strict=True)
+    backend_options: tuple[str, ...] = ()
+    command_backend_options: dict[
+        Annotated[str, Field(pattern=r"^[0-9a-f]{64}$")],
+        Annotated[tuple[str, ...], AfterValidator(validate_sandbox_options)],
+    ] = Field(default_factory=dict)
+    backend_option_revisions: dict[str, Annotated[str, Field(pattern=r"^[0-9a-f]{32}$")]] = Field(
+        default_factory=dict
+    )
+
+    _validate_options = field_validator("backend_options")(validate_sandbox_options)
+
+    @field_validator("backend_option_revisions")
+    @classmethod
+    def validate_backend_option_revisions(cls, value: dict[str, str]) -> dict[str, str]:
+        """Validate the capability keys in persisted revocation markers.
+
+        Args:
+            value (dict[str, str]): Capability keys and their workspace revocation markers.
+
+        Returns:
+            dict[str, str]: Validated markers.
+
+        Raises:
+            ValueError: A capability key is unknown.
+        """
+        validate_sandbox_options(tuple(value))
+        return value
+
+    @model_validator(mode="after")
+    def _initialize_backend_option_revisions(self) -> PermissionConfiguration:
+        """Give new durable policies fresh markers and require a complete saved set."""
+        if self.namespace_generation is not None:
+            if "backend_option_revisions" not in self.model_fields_set:
+                self.backend_option_revisions = {name: uuid4().hex for name in SANDBOX_OPTIONS}
+            elif self.backend_option_revisions.keys() != SANDBOX_OPTIONS.keys():
+                raise ValueError("Workspace backend option revocation markers are incomplete.")
+        return self
+
+    @model_validator(mode="before")
+    @classmethod
+    def preserve_legacy_defaults(cls, value: Any) -> Any:
+        """Retain ambiguous saved process asks and add the newly explicit exec capability.
+
+        Args:
+            value (Any): Persisted policy mapping or already validated configuration.
+
+        Returns:
+            Any: Policy input with conservative legacy defaults.
+        """
+        value = _review_legacy_network_grants(value)
+        if (
+            isinstance(value, dict)
+            and isinstance(value.get("version", 5), int)
+            and not isinstance(value.get("version", 5), bool)
+            and value.get("version", 5) < 5
+        ):
+            value = dict(value)
+            defaults = value.get("defaults", _default_decisions())
+            if isinstance(defaults, dict):
+                defaults = dict(defaults)
+                defaults.setdefault(Action.NETWORK_LOCAL, Decision.ALLOW)
+                defaults.setdefault(Action.NETWORK_BROAD, Decision.ASK)
+                defaults.setdefault(Action.NETWORK_INGRESS, Decision.ASK)
+                if defaults.get(Action.NETWORK_REQUEST) == Decision.ALLOW:
+                    defaults[Action.NETWORK_REQUEST] = Decision.ASK
+                value["defaults"] = defaults
+        if (
+            isinstance(value, dict)
+            and isinstance(value.get("version", 4), int)
+            and not isinstance(value.get("version", 4), bool)
+            and value.get("version", 4) < 4
+        ):
+            value = dict(value)
+            defaults = value.get("defaults", _default_decisions())
+            if isinstance(defaults, dict):
+                defaults = dict(defaults)
+                defaults.setdefault(Action.FILESYSTEM_EXECUTE, Decision.ALLOW)
+                value["defaults"] = defaults
+        return value
 
     @model_validator(mode="after")
     def validate_rule_ids(self) -> PermissionConfiguration:
@@ -865,12 +1128,18 @@ class PermissionConfiguration(BaseModel):
             PermissionConfiguration: This validated configuration.
 
         Raises:
-            ValueError: If multiple rules use the same identifier.
+            ValueError: If multiple rules share an identifier or a sandbox approval has a
+                non-workspace scope.
         """
         identifiers = [rule.id for rule in self.rules]
         if len(identifiers) != len(set(identifiers)):
             raise PydanticCustomError(
                 "loop_rule_ids", "Permission rule identifiers must be unique."
+            )
+        _validate_sandboxed_rule_ids(self.sandboxed_command_rules)
+        if any(rule.scope is not ApprovalChoice.WORKSPACE for rule in self.sandboxed_command_rules):
+            raise PydanticCustomError(
+                "loop_sandbox_rule_scope", "Workspace sandbox approvals require workspace scope."
             )
         return self
 
@@ -878,24 +1147,30 @@ class PermissionConfiguration(BaseModel):
 class UserPermissionConfiguration(BaseModel):
     """Store remembered exact approvals shared by every workspace.
 
-    User policy contains reviewed approvals only. Application-wide defaults and enforcement limits
-    would widen authority beyond a single reviewed approval and require their own management flow.
+    User policy contains reviewed approvals and explicitly managed sandbox paths.
 
     Args:
         version (int): Persisted schema version.
         rules (list[PermissionRule]): Exact user-approved operation rules.
-        sandboxed_command_rules (list[SandboxedCommandRule]): User-persisted sandbox-only approvals.
+        sandboxed_command_rules (list[SandboxedCommandRule]): User approvals and legacy
+            workspace-scoped approvals stored by earlier versions.
         trusted_host_command_rules (list[HostCommandRule]): Human-approved durable host grants.
         namespace_generation (str | None): Durable user-data-scoped policy namespace marker.
+        sandbox_paths (SandboxPaths): User-wide native path grants and denials.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    version: int = Field(default=2, ge=1, le=2, strict=True)
+    version: int = Field(
+        default=PERMISSION_POLICY_VERSION, ge=1, le=PERMISSION_POLICY_VERSION, strict=True
+    )
     rules: list[PermissionRule] = Field(default_factory=list)
     sandboxed_command_rules: list[SandboxedCommandRule] = Field(default_factory=list)
     trusted_host_command_rules: list[HostCommandRule] = Field(default_factory=list)
     namespace_generation: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
+    sandbox_paths: SandboxPaths = Field(default_factory=dict)
+
+    _review_network_grants = model_validator(mode="before")(_review_legacy_network_grants)
 
     @model_validator(mode="after")
     def validate_rule_ids(self) -> UserPermissionConfiguration:
@@ -908,16 +1183,12 @@ class UserPermissionConfiguration(BaseModel):
             ValueError: If multiple rules use the same identifier.
         """
         identifiers = [rule.id for rule in self.rules]
-        sandbox_identifiers = [rule.id for rule in self.sandboxed_command_rules]
         host_identifiers = [rule.id for rule in self.trusted_host_command_rules]
         if len(identifiers) != len(set(identifiers)):
             raise PydanticCustomError(
                 "loop_rule_ids", "Permission rule identifiers must be unique."
             )
-        if len(sandbox_identifiers) != len(set(sandbox_identifiers)):
-            raise PydanticCustomError(
-                "loop_sandbox_rule_ids", "Sandbox command rule identifiers must be unique."
-            )
+        _validate_sandboxed_rule_ids(self.sandboxed_command_rules)
         if len(host_identifiers) != len(set(host_identifiers)) or any(
             rule.scope not in {ApprovalChoice.WORKSPACE, ApprovalChoice.USER}
             for rule in self.trusted_host_command_rules
@@ -937,7 +1208,6 @@ class PolicyLimitOverrides(BaseModel):
         network_origins (tuple[str, ...] | None): Replacement network origins, or inheritance.
         deny_private_networks (bool | None): Private-network override, or inheritance.
         deny_local_networks (bool | None): Sandbox-local override, or inheritance.
-        allow_host_processes (bool | None): Host-process override, or inheritance.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -947,7 +1217,6 @@ class PolicyLimitOverrides(BaseModel):
     network_origins: tuple[str, ...] | None = None
     deny_private_networks: bool | None = None
     deny_local_networks: bool | None = None
-    allow_host_processes: bool | None = None
 
 
 class SessionPolicyOverrides(BaseModel):
@@ -962,6 +1231,7 @@ class SessionPolicyOverrides(BaseModel):
         sandboxed_command_rules (list[SandboxedCommandRule]): Session-only sandbox approvals.
         host_command_rules (list[HostCommandRule]): Session-only exact host retry approvals.
         trusted_host_command_rules (list[HostCommandRule]): Human-installed session host grants.
+        sandbox_paths (SandboxPaths): Process-local native path grants and denials.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -973,6 +1243,7 @@ class SessionPolicyOverrides(BaseModel):
     sandboxed_command_rules: list[SandboxedCommandRule] = Field(default_factory=list)
     host_command_rules: list[HostCommandRule] = Field(default_factory=list)
     trusted_host_command_rules: list[HostCommandRule] = Field(default_factory=list)
+    sandbox_paths: SandboxPaths = Field(default_factory=dict)
 
 
 class PolicyDecision(BaseModel):

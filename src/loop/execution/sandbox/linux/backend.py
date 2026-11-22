@@ -22,12 +22,15 @@ from typing import TYPE_CHECKING
 
 from .... import constants
 from ....constants import NATIVE_FILE_READ_CHUNK_BYTES, NATIVE_INSTALLATION_DIRECTORY
+from ....permissions.protection import IncompleteHardlinkAliases
+from ....sandbox_catalog import hardlink_source_paths
 from ....utils.process import ProcessCapture, ProcessCaptureStatus, is_finite_deadline
 from ....utils.virtual_path import VirtualPath
 from ..constants import (
     COMMAND_SANDBOX_SCRATCH_PREFIX,
     LC_ALL_ENVIRONMENT_VARIABLE,
     MINIMAL_SYSTEM_PATH,
+    OUTPUT_DIRECTORY_ENVIRONMENT_VARIABLE,
     PATH_ENVIRONMENT_VARIABLE,
     SYSTEM_LOCALE,
     TMPDIR_ENVIRONMENT_VARIABLE,
@@ -41,6 +44,7 @@ from ..contracts import (
 )
 from .commands import LinuxSandboxCommands
 from .constants import (
+    INGRESS_PORT_ENVIRONMENT_VARIABLE,
     MANAGEMENT_RECORD_NAME,
     NATIVE_POLICY_VERSION,
     NATIVE_RESERVATIONS_DIRECTORY_NAME,
@@ -59,12 +63,13 @@ from .host import (
 )
 from .management import boot_activation_state
 from .namespace import _runtime_executable_aliases
-from .paths import python_runtime_mounts
+from .paths import prepare_paths
 from .runtime import (
     NativeFeatureUnavailable,
     NativeRepairRequired,
     exchange_installed_request,
     execution_authority,
+    installed_optional_support,
 )
 from .transport import EgressLease
 
@@ -103,17 +108,37 @@ class LinuxNativeBackend:
             location. Alternate records are for owned native qualification fixtures.
     """
 
+    @property
+    def capability_guidance(self) -> dict[str, str]:
+        """Describe usable transports without exposing platform selection to the model.
+
+        Returns:
+            dict[str, str]: Instructions for this backend's declared capabilities.
+        """
+        return {
+            SandboxCapability.INGRESS: (
+                f"Start the service on 127.0.0.1:${INGRESS_PORT_ENVIRONMENT_VARIABLE} "
+                "in this command."
+            ),
+            SandboxCapability.MEDIATED_EGRESS: (
+                "HTTP_PROXY and HTTPS_PROXY select the private HTTP proxy automatically. Use "
+                "proxy-aware HTTP(S) clients such as curl, Git or uv."
+            ),
+        }
+
     _record: Path
     _authority_seen: bool
     capabilities = frozenset(
         {
             SandboxCapability.TERMINAL,
             SandboxCapability.MEDIATED_EGRESS,
+            SandboxCapability.INGRESS,
             SandboxCapability.INNER_SECCOMP,
             SandboxCapability.LOCAL_NETWORK,
         }
     )
     qualification_capabilities = frozenset({SandboxCapability.LOCAL_NETWORK})
+    backend_options: tuple[str, ...] = ()
 
     def __init__(self, record: Path = _RECORD) -> None:
         self._record = record
@@ -335,38 +360,33 @@ class LinuxNativeBackend:
         """
         return runtime_read_roots()
 
-    def automatic_tool_read_roots(
-        self,
-        workspace: Path,
-        path_roots: tuple[tuple[Path, Path], ...],
-        executable_identities: tuple[tuple[str, Path, Path, int, int], ...],
-    ) -> tuple[Path, ...]:
-        """Discover candidate runtime roots for selected workspace interpreters.
+    def inferred_options(self, request: SandboxRequest) -> tuple[str, ...]:
+        """Offer cache metadata only when strict admission finds visible unresolved hardlinks.
+
+        Use the receiver's path checks with no cache authority. The receiver repeats those checks
+        after approval and refuses incomplete, denied, or changed paths before command entry.
 
         Args:
-            workspace (Path): Canonical selected workspace.
-            path_roots (tuple[tuple[Path, Path], ...]): Bound PATH spellings and directories.
-            executable_identities (tuple[tuple[str, Path, Path, int, int], ...]): Bound named
-                executable files and their device/inode identities.
+            request (SandboxRequest): Bound command scope with current file protections.
 
         Returns:
-            tuple[Path, ...]: Candidate Python runtime roots requiring separate read approval.
-
-        Raises:
-            ValueError: A referenced user-local runtime is unsafe or ambiguous.
-            OSError: Runtime path metadata cannot be inspected.
+            tuple[str, ...]: Optional metadata authority to propose, or an empty strict scope.
         """
-        return tuple(
-            dict.fromkeys(
-                root
-                for root, _ in python_runtime_mounts(
-                    workspace,
-                    path_roots,
-                    executable_identities,
-                    system_roots=self.system_read_roots,
-                )
+        if "shared_dependencies" not in self.backend_options or request.scratch_root is None:
+            return ()
+        try:
+            strict = replace(
+                request,
+                deadline=min(
+                    request.deadline, time.monotonic() + constants.COMMAND_PREPARATION_SECONDS
+                ),
             )
-        )
+            prepare_paths(strict, request.scratch_root, runtime_roots=self.system_read_roots)
+        except IncompleteHardlinkAliases:
+            return ("shared_dependencies",)
+        except (OSError, RuntimeError, ValueError):
+            pass
+        return ()
 
     @property
     def policy_version(self) -> str:
@@ -412,7 +432,7 @@ class LinuxNativeBackend:
         return value
 
     def managed_tool_root(self, root: Path) -> bool:
-        """Accept automatic narrow tool authority only for protected canonical directories.
+        """Recognize protected canonical installation directories as runtime candidates.
 
         Args:
             root (Path): Canonical candidate installed-tool directory.
@@ -542,12 +562,16 @@ class LinuxNativeBackend:
         return self.run(request)
 
     def complete_qualification(self, request: SandboxRequest) -> None:
-        """Retain installed capabilities after the selector verifies enforcement.
+        """Advertise optional filesystem authorities supported by the authenticated receiver.
 
         Args:
             request (SandboxRequest): Owned request whose denied effects were verified.
         """
         del request
+        write_files, shared_dependencies = installed_optional_support(self._record)
+        if write_files:
+            self.capabilities |= {SandboxCapability.WRITE_FILES}
+        self.backend_options = ("shared_dependencies",) if shared_dependencies else ()
 
     def run(
         self,
@@ -593,8 +617,10 @@ class LinuxNativeBackend:
                 SandboxOutcome.INVALID,
                 detail="Interactive terminal requires its original bounded output channel.",
             )
-        egress_requested = isinstance(request.egress_origins, tuple) and bool(
-            request.egress_origins
+        egress_requested = (
+            isinstance(request.egress_origins, tuple)
+            and bool(request.egress_origins)
+            or request.ingress_port is not None
         )
         if request.terminal and egress_requested:
             return CommandProcessResult(
@@ -613,10 +639,37 @@ class LinuxNativeBackend:
             )
 
         try:
+            transport_request = request
+            if request.backend_options or request.hardlink_sources:
+                if (
+                    request.backend_options != ("shared_dependencies",)
+                    or request.backend_options != self.backend_options
+                    or request.permission_revision is None
+                    or request.hardlink_sources
+                    != hardlink_source_paths(request.backend_options, "linux")
+                ):
+                    return CommandProcessResult(
+                        SandboxOutcome.UNSUPPORTED, detail="Shared dependency scope is unavailable."
+                    )
+                transport_request = replace(request, backend_options=())
+            if request.scratch_root is not None:
+                environment = request.shell_environment()
+                environment[OUTPUT_DIRECTORY_ENVIRONMENT_VARIABLE] = str(
+                    request.output_directory(request.scratch_root)
+                )
+                transport_request = replace(
+                    transport_request,
+                    environment=tuple(sorted(environment.items())),
+                    generated_environment=tuple(
+                        dict.fromkeys(
+                            (*request.generated_environment, OUTPUT_DIRECTORY_ENVIRONMENT_VARIABLE)
+                        )
+                    ),
+                )
             payload = (
-                replace(request, stream_output=True).to_wire()
+                replace(transport_request, stream_output=True).to_wire()
                 if output_observer is not None
-                else request.to_wire()
+                else transport_request.to_wire()
             )
         except ValueError:
             return CommandProcessResult(

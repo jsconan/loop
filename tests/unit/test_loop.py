@@ -103,7 +103,7 @@ def output_interaction() -> MagicMock:
     interaction = MagicMock(spec=Interaction)
     interaction.response_context.return_value = nullcontext()
     interaction.confirm.return_value = True
-    interaction.prompt.return_value = ApprovalChoice.ONCE
+    interaction.prompt.return_value = ApprovalChoice.SESSION
     return interaction
 
 
@@ -467,6 +467,7 @@ def test_loop_applies_live_settings_through_owning_components(tmp_path):
             "app": {
                 "debug": True,
                 "yolo": True,
+                "allow_direct_host_execution": True,
                 "stream": False,
                 "max_agent_turns": 7,
                 "prompt_on_recoverable_error": False,
@@ -477,6 +478,8 @@ def test_loop_applies_live_settings_through_owning_components(tmp_path):
             },
             "web": {"user_agent": "updated"},
             "tools": {
+                "sandbox_environment": {"MODE": "test"},
+                "sandbox_path_aliases": ["/opt/tools/stable"],
                 "command_job_runtime_limit_seconds": 42,
                 "command_default_initial_wait_seconds": 0.25,
                 "command_default_poll_wait_seconds": 0.1,
@@ -488,6 +491,7 @@ def test_loop_applies_live_settings_through_owning_components(tmp_path):
     for path in (
         "app.debug",
         "app.yolo",
+        "app.allow_direct_host_execution",
         "app.stream",
         "app.max_agent_turns",
         "app.prompt_on_recoverable_error",
@@ -496,12 +500,15 @@ def test_loop_applies_live_settings_through_owning_components(tmp_path):
         "app.temperature",
         "app.reasoning_effort",
         "web.user_agent",
+        "tools.sandbox_environment",
+        "tools.sandbox_path_aliases",
         "tools.command_default_initial_wait_seconds",
         "tools.command_default_poll_wait_seconds",
         "tools.command_max_wait_seconds",
         "tools.command_job_runtime_limit_seconds",
     ):
         assert loop.apply_runtime_settings(path, settings) == "applied now"
+    assert loop.permission_manager.direct_host_execution_enabled
     assert loop.apply_runtime_settings("telemetry.batch_size", settings) == (
         "saved; restart required"
     )
@@ -513,6 +520,8 @@ def test_loop_applies_live_settings_through_owning_components(tmp_path):
     assert loop.agent.hyperparameters.temperature == 0.2
     assert loop.agent.hyperparameters.reasoning_effort == "medium"
     assert loop.tool_registry.settings.user_agent == "updated"
+    assert loop.tool_registry.settings.sandbox_environment == {"MODE": "test"}
+    assert loop.tool_registry.settings.sandbox_path_aliases == ("/opt/tools/stable",)
     assert loop.tool_registry.settings.command_default_initial_wait_seconds == 0.25
     assert loop.tool_registry.settings.command_job_runtime_limit_seconds == 42
     assert loop.tool_registry.settings.command_default_poll_wait_seconds == 0.1
@@ -608,7 +617,7 @@ def test_loop_continues_with_supervised_defaults_after_permission_load_failure(t
     """An explicit choice enables interactive fallback during Loop construction."""
     path = tmp_path / ".loop" / "permissions.yaml"
     path.parent.mkdir()
-    path.write_text("version: 3\n", "utf-8")
+    path.write_text("version: 999\n", "utf-8")
     interaction = output_interaction()
     interaction.prompt.return_value = "continue"
 
@@ -627,7 +636,7 @@ def test_loop_resets_invalid_permission_policy_only_after_user_selection(tmp_pat
     """The reset choice delegates archival and default activation to PermissionManager."""
     path = tmp_path / ".loop" / "permissions.yaml"
     path.parent.mkdir()
-    path.write_text("version: 3\n", "utf-8")
+    path.write_text("version: 999\n", "utf-8")
     interaction = output_interaction()
     interaction.prompt.return_value = "reset"
 
@@ -647,7 +656,7 @@ def test_loop_can_exit_when_permission_recovery_is_declined(tmp_path, choice):
     """The recovery prompt can stop startup without changing the invalid policy file."""
     path = tmp_path / ".loop" / "permissions.yaml"
     path.parent.mkdir()
-    path.write_text("version: 3\n", "utf-8")
+    path.write_text("version: 999\n", "utf-8")
     interaction = output_interaction()
     interaction.prompt.return_value = choice
 
@@ -656,7 +665,7 @@ def test_loop_can_exit_when_permission_recovery_is_declined(tmp_path, choice):
             backend=loop_backend(), interaction=interaction, working_directory=tmp_path
         )
 
-    assert path.read_text("utf-8") == "version: 3\n"
+    assert path.read_text("utf-8") == "version: 999\n"
 
 
 def test_loop_reports_presets_excluded_by_permission_manager(tmp_path, monkeypatch):
@@ -3482,6 +3491,7 @@ def test_loop_does_not_mark_a_message_accepted_before_sync_persistence(tmp_path)
     store = Mock(spec=MemorySessionStore)
     store.save.side_effect = OSError("store unavailable")
     store.temporary_root = tmp_path / "scratch"
+    store.scratch_roots = ()
     sessions = SessionManager(interaction=interaction, session_store=store)
     adapter = MemoryTelemetryAdapter()
     telemetry = Telemetry(adapter, flush_seconds=0.01)

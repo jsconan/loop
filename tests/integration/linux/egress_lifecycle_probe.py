@@ -36,9 +36,8 @@ class _RefusingHost:
         raise AssertionError("Mediated egress offered host execution.")
 
 
-def _probe(mode: str) -> None:
+def _probe(mode: str, root: Path) -> None:
     """Start one public streaming attempt and expose its owned ready marker."""
-    root = Path(f"/tmp/loop-egress-{mode}-probe")
     root.mkdir(mode=0o700)
     workspace = root / "workspace"
     workspace.mkdir()
@@ -53,9 +52,11 @@ def _probe(mode: str) -> None:
             f'curl -kfsS --no-buffer --max-time 20 {_ORIGIN}/slow > "$WORKSPACE_ROOT/stream"'
         ),
         "cwd": str(workspace),
-        "read_only": False,
+        "write_roots": [str(workspace)],
         "egress_origins": [_ORIGIN],
     }
+    if mode == "suspend":
+        request["wait_seconds"] = 25
     try:
         with ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(
@@ -73,7 +74,12 @@ def _probe(mode: str) -> None:
             if mode == "suspend":
                 result = future.result(timeout=25)
                 assert result["ok"], result
-                assert "finished" in stream.read_text()
+                terminal = result["result"]
+                assert terminal.get("boundary") == "sandbox" and terminal.get("exit_code") == 0, (
+                    result
+                )
+                assert terminal["lifecycle"]["descendant_cleanup"] == "verified_absent", result
+                assert stream.read_text() == "started\nfinished\n"
                 print("PASS resumed stream completed", flush=True)
             else:
                 time.sleep(60)
@@ -89,9 +95,8 @@ def _active_socket() -> bool:
     return any("11.0.0.2:18443" in line for line in result.stdout.splitlines())
 
 
-def _control_death() -> None:
+def _control_death(root: Path) -> None:
     """Kill the ordinary authority and independently time receiver and route closure."""
-    root = Path("/tmp/loop-egress-death-probe")
     deadline = time.monotonic() + 20
     while not (root / "ready").is_file() and time.monotonic() < deadline:
         time.sleep(0.02)
@@ -136,9 +141,10 @@ def _control_death() -> None:
 
 
 if __name__ == "__main__":
-    if sys.argv[1:] == ["control-death"]:
-        _control_death()
-    elif sys.argv[1:] in (["suspend"], ["death"]):
-        _probe(sys.argv[1])
+    if len(sys.argv) != 3 or sys.argv[1] not in {"suspend", "death", "control-death"}:
+        raise SystemExit("Usage: egress_lifecycle_probe.py suspend|death|control-death OWNED_ROOT")
+    root = Path(sys.argv[2])
+    if sys.argv[1] == "control-death":
+        _control_death(root)
     else:
-        raise SystemExit("Usage: egress_lifecycle_probe.py suspend|death|control-death")
+        _probe(sys.argv[1], root)

@@ -34,6 +34,30 @@ def test_shell_inspection_exposes_exact_tokens_and_literal_classification():
         shell_tokens("tool 'unfinished")
 
 
+@pytest.mark.parametrize(
+    ("source", "read_only"),
+    [
+        ('printf report > "$TMPDIR/report"; cat "$TMPDIR/report"', True),
+        ("cat source | cat", True),
+        ("printf report > report", False),
+        ("printf 'unfinished", False),
+        ("printf $(task)", False),
+        ("printf $value", False),
+        ("test -e '$TMPDIR/report'", True),
+        ("[ -e source ]", True),
+        ("./build", False),
+    ],
+)
+def test_workspace_write_review_recognizes_only_literal_reads_and_scratch(source, read_only):
+    """Opaque invocations and checkout redirects need scope preparation before approval."""
+    assert (
+        CommandInspection().uses_only_scratch_writes(
+            source, temporary_roots=(), read_only_program=lambda argv: argv[0] == "cat"
+        )
+        is read_only
+    )
+
+
 def test_command_inspection_collects_every_default_finding_from_nested_shell():
     """Default matchers classify nested Git and destructive effects in stable order."""
     findings = CommandInspection().inspect("sh -c 'rm file && git add file'")
@@ -388,6 +412,25 @@ def test_safe_redirect_cannot_hide_other_mutation_or_unknown_output(source):
     assert CommandInspection().inspect(source)
 
 
+@pytest.mark.parametrize(
+    ("destination", "needs_review"),
+    [
+        ('"$TMPDIR/report"', False),
+        ('"${LOOP_OUTPUT_DIR}/report.txt"', False),
+        ("$LOOP_OUTPUT_DIR/reports/status", False),
+        ("'$TMPDIR/report'", True),
+        ('"$TMPDIR/../outside"', True),
+        ('"$LOOP_OUTPUT_DIR/$FILE"', True),
+    ],
+)
+def test_scratch_only_redirections_use_supported_variable_spellings(destination, needs_review):
+    """Only simple scratch variable redirections qualify under native scratch-only writes."""
+    inspection = CommandInspection()
+    source = f"printf report > {destination}"
+    assert bool(inspection.inspect(source, scratch_only=True)) is needs_review
+    assert inspection.inspect(source)
+
+
 @pytest.mark.parametrize("operator", [">", ">>", ">|", "<>", "&>", "&>>"])
 def test_literal_managed_temporary_outputs_need_no_review(tmp_path, operator):
     """Bound temporary destinations are exempt for each destination-bearing write form."""
@@ -449,10 +492,19 @@ def test_analysis_carries_git_reads_and_tool_names_from_nested_commands():
     [
         ("git status", False),
         ("git status && echo done", False),
+        ("git --no-optional-locks status --short", False),
+        ("git --no-pager diff --check", False),
+        ("git --no-optional-locks -C repository diff --cached", False),
+        ("git -C repository --no-optional-locks status", False),
+        ("git --no-optional-locks", False),
         ("cd $WORKSPACE_ROOT && git diff --cached", False),
         ("git --version", False),
         ("git", False),
         ("git -C repository add file", True),
+        ("git --no-optional-locks add file", True),
+        ("git --no-optional-locks diff --output=changes.patch", True),
+        ("git --no-pager diff --ext-diff", True),
+        ("git --no-optional-locks -c alias.status=!touch status", True),
         ("git add file", True),
         ("command git add file", True),
         ("cd $WORKSPACE_ROOT && env git add file", True),

@@ -403,7 +403,10 @@ class ConfigurationCommands:
             return
         if action == "reset":
             selected_scope = await self._select_scope_async(
-                context, "session" if path == "app.yolo" and scope is None else scope
+                context,
+                "session"
+                if path in {"app.yolo", "app.allow_direct_host_execution"} and scope is None
+                else scope,
             )
             if selected_scope is not None and await self._confirm_reset_async(
                 context,
@@ -419,7 +422,10 @@ class ConfigurationCommands:
         if value is None:
             raise CommandArgumentError("The set operation requires a value.")
         selected_scope = await self._select_scope_async(
-            context, "session" if path == "app.yolo" and scope is None else scope
+            context,
+            "session"
+            if path in {"app.yolo", "app.allow_direct_host_execution"} and scope is None
+            else scope,
         )
         if selected_scope is not None:
             async with self._mutation_async():
@@ -757,6 +763,11 @@ class ConfigurationCommands:
         allow_secret: bool = False,
     ) -> None:
         """Validate, store, and apply one setting."""
+        if path == "app.allow_direct_host_execution" and value.strip().lower() == "true":
+            context.interaction.warning(
+                "Host commands run unrestricted. With YOLO enabled, eligible host requests "
+                "run without a prompt; sandbox resource denials do not apply."
+            )
         if self._is_secret(path) and not allow_secret:
             raise CommandArgumentError(
                 "Use the secret operation to update secret configuration fields."

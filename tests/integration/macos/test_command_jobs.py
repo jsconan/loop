@@ -11,8 +11,10 @@ import subprocess
 import sys
 import time
 from array import array
+from contextlib import contextmanager
 from pathlib import Path
-from unittest.mock import Mock
+from queue import Queue
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -33,6 +35,7 @@ from loop.tools.system import (
     read_command_output,
     run_command,
 )
+from loop.tools.web import read_cached_content
 from loop.utils.content import encode_content_cursor
 
 pytestmark = [pytest.mark.integration, pytest.mark.e2e, pytest.mark.macos]
@@ -48,6 +51,7 @@ def _registry(
     """Compose public command tools with one real native backend and approval surface."""
     interaction = Mock()
     interaction.prompt.return_value = "approve"
+    interaction.prompt_async = AsyncMock(return_value="approve")
     sessions = SessionManager()
     permissions = PermissionManager(workspace)
     permissions.bind_temporary_directory(sessions.temporary_directory)
@@ -60,6 +64,7 @@ def _registry(
             inspect_command_jobs,
             poll_command_job,
             read_command_output,
+            read_cached_content,
             cancel_command_job,
             control_command_terminal,
         ],
@@ -153,7 +158,6 @@ def test_native_terminal_keeps_streaming_after_final_capture_limit(native_worksp
             "run_command",
             command=command,
             cwd=str(native_workspace),
-            read_only=True,
             interactive=True,
         )
         assert started["ok"], started
@@ -239,6 +243,30 @@ def test_native_command_continuation_retains_output_and_session_ownership(native
         registry.close()
 
 
+def test_native_failed_command_exposes_a_callable_cached_output_continuation(native_workspace):
+    """A failed command's published tool call reads the rest of its completed output."""
+    registry, interaction, _sessions = _registry(native_workspace)
+    count = macos_backend.constants.MAX_TOOL_CONTENT_BYTES
+    expected = " " * count + "failure detail"
+    try:
+        failed = _call(
+            registry,
+            interaction,
+            "run_command",
+            command=f"printf '%{count}s%s' '' 'failure detail'; exit 7",
+            cwd=str(native_workspace),
+        )
+        assert failed["problem"]["code"] == "process.nonzero_exit"
+        output = failed["problem"]["metadata"]["stdout"]
+        continuation = output["next_tool_call"]
+        page = _call(registry, interaction, continuation["name"], **continuation["arguments"])
+        assert page["ok"], page
+        assert output["content"] + page["result"]["content"] == expected
+        assert "next_cursor" not in page["result"]
+    finally:
+        registry.close()
+
+
 def test_native_command_cancel_reports_uncertain_detached_cleanup(native_workspace):
     """Cancellation stops the owned command without claiming detached-child proof."""
     registry, interaction, _sessions = _registry(native_workspace)
@@ -286,6 +314,7 @@ def test_native_command_default_wait_continues_same_process(native_workspace):
             "run_command",
             command="printf x >> continuation-count; sleep 1; printf finished",
             cwd=str(native_workspace),
+            write_roots=[str(native_workspace)],
         )
         assert started["ok"], started
         job = started["result"]
@@ -313,6 +342,7 @@ def test_native_command_hard_deadline_after_continuation(native_workspace):
             "run_command",
             command="printf x >> deadline-count; printf ready; sleep 20",
             cwd=str(native_workspace),
+            write_roots=[str(native_workspace)],
         )
         assert started["ok"], started
         handle = started["result"]["handle"]
@@ -392,7 +422,6 @@ def test_native_terminal_job_accepts_input_and_inner_pty(native_workspace):
             "run_command",
             command=command,
             cwd=str(native_workspace),
-            read_only=True,
             read_roots=[str(runtime)],
             interactive=True,
         )
@@ -445,7 +474,6 @@ def test_native_terminal_eof_and_untrusted_output(native_workspace):
             "run_command",
             command=f"{shlex.quote(str(interpreter))} -B -u -c {shlex.quote(script)}",
             cwd=str(native_workspace),
-            read_only=True,
             read_roots=[str(runtime)],
             interactive=True,
         )
@@ -514,7 +542,6 @@ def test_native_terminal_rejects_foreign_pty_and_workspace_alias(native_workspac
             "run_command",
             command=f"{shlex.quote(str(interpreter))} -B -u -c {shlex.quote(script)}",
             cwd=str(native_workspace),
-            read_only=True,
             read_roots=[str(runtime)],
             interactive=True,
         )
@@ -572,7 +599,6 @@ def test_native_terminal_shell_interrupt_and_close(native_workspace):
             "run_command",
             command=f"{shlex.quote(str(interpreter))} -B -u -c {shlex.quote(script)}",
             cwd=str(native_workspace),
-            read_only=True,
             read_roots=[str(runtime)],
             interactive=True,
         )
@@ -633,13 +659,16 @@ def test_native_terminal_disconnect_stops_owned_main_process(native_workspace):
             "run_command",
             command=f"echo $$ > {shlex.quote(str(marker))}; printf READY; exec sleep 20",
             cwd=str(native_workspace),
+            write_roots=[str(native_workspace)],
             interactive=True,
         )
         assert started["ok"], started
         handle = started["result"]["handle"]
         cursor = None
         deadline = time.monotonic() + 10
-        while not marker.exists() and time.monotonic() < deadline:
+        while time.monotonic() < deadline:
+            if marker.exists() and marker.stat().st_size:
+                break
             page = _read_output_page(registry, interaction, handle, cursor=cursor)
             cursor = page.get("next_cursor")
             time.sleep(0.02)
@@ -660,33 +689,34 @@ def test_native_terminal_disconnect_stops_owned_main_process(native_workspace):
         pytest.fail("The terminal main process outlived client closure.")
 
 
-def test_native_terminal_cannot_open_another_live_job(native_workspace):
+def test_native_terminal_cannot_open_another_live_job(native_workspace, monkeypatch):
     """A second sandboxed job cannot write the first job's live terminal slave."""
     registry, interaction, _sessions = _registry(native_workspace, terminal=True)
-    marker = native_workspace / "first-terminal"
+    allocated = Queue()
+    allocate_terminal = macos_backend._owned_terminal
+
+    @contextmanager
+    def observe_terminal():
+        """Observe the actual slave from its owner before the confined job starts."""
+        with allocate_terminal() as terminal:
+            allocated.put(terminal.path)
+            yield terminal
+
+    monkeypatch.setattr(macos_backend, "_owned_terminal", observe_terminal)
     try:
         first = _call(
             registry,
             interaction,
             "run_command",
-            command=f"tty > {shlex.quote(str(marker))}; read line; printf 'FIRST:%s' \"$line\"",
+            command="read line; printf 'FIRST:%s' \"$line\"",
             cwd=str(native_workspace),
             interactive=True,
         )
         assert first["ok"], first
         handle = first["result"]["handle"]
-        cursor = None
-        deadline = time.monotonic() + 10
-        for _ in range(10):
-            if marker.exists():
-                break
-            page = _read_output_page(registry, interaction, handle, cursor=cursor)
-            cursor = page.get("next_cursor")
-            if time.monotonic() >= deadline:
-                break
-            time.sleep(0.02)
-        assert marker.exists()
-        foreign = marker.read_text(encoding="utf-8").strip()
+        path = allocated.get(timeout=10)
+        assert path.is_char_device()
+        foreign = str(path)
         second = _call(
             registry,
             interaction,
@@ -696,7 +726,6 @@ def test_native_terminal_cannot_open_another_live_job(native_workspace):
                 "then printf OTHER_OPENED; else printf OTHER_DENIED; fi"
             ),
             cwd=str(native_workspace),
-            read_only=True,
             interactive=True,
         )
         assert second["ok"], second
@@ -748,7 +777,6 @@ def test_native_terminal_keeps_host_signals_files_and_descriptors_separate(nativ
             "run_command",
             command=f"{shlex.quote(str(interpreter))} -B -u -c {shlex.quote(script)}",
             cwd=str(native_workspace),
-            read_only=True,
             read_roots=[str(runtime)],
             interactive=True,
         )
@@ -768,7 +796,9 @@ def test_native_terminal_keeps_host_signals_files_and_descriptors_separate(nativ
         registry.close()
 
 
-def test_native_terminal_host_peer_can_transfer_owned_pty_descriptor(native_workspace):
+def test_native_terminal_host_peer_can_transfer_owned_pty_descriptor(
+    native_workspace, local_socket_parent
+):
     """An unsandboxed host peer can deliberately delegate its owned PTY descriptor."""
     registry, interaction, _sessions = _registry(native_workspace, terminal=True)
     runtime = Path(sys.base_prefix).resolve(strict=True)
@@ -806,15 +836,22 @@ def test_native_terminal_host_peer_can_transfer_owned_pty_descriptor(native_work
             command=f"{shlex.quote(str(interpreter))} -B -u -c {shlex.quote(script)}",
             cwd=str(native_workspace),
             read_roots=[str(runtime)],
+            write_roots=[str(native_workspace)],
+            local_ipc=True,
             interactive=True,
         )
         assert started["ok"], started
         handle = started["result"]["handle"]
         deadline = time.monotonic() + 10
-        while not marker.exists() and time.monotonic() < deadline:
+        while time.monotonic() < deadline:
+            if marker.exists() and marker.stat().st_size:
+                break
             _read_output_page(registry, interaction, handle)
             time.sleep(0.02)
-        assert marker.exists(), "The sandboxed listener did not publish its owned path."
+        assert marker.exists(), json.dumps(
+            _call(registry, interaction, "poll_command_job", handle=handle, wait_seconds=0),
+            indent=2,
+        )
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
             peer.settimeout(5)
             peer.connect(marker.read_text(encoding="utf-8"))
@@ -838,7 +875,11 @@ def test_native_terminal_host_peer_can_transfer_owned_pty_descriptor(native_work
 def test_native_command_continues_past_previous_default_deadline(native_workspace, noisy):
     """One retained command completes after five minutes without replay."""
     registry, interaction, _sessions = _registry(native_workspace)
-    command = "printf x >> count; " + ("printf begin; " if noisy else "") + "sleep 301; printf end"
+    command = (
+        "set -e; printf x >> count; "
+        + ("printf begin; " if noisy else "")
+        + "sleep 301; printf end"
+    )
     try:
         started = _call(
             registry,
@@ -847,6 +888,7 @@ def test_native_command_continues_past_previous_default_deadline(native_workspac
             command=command,
             cwd=str(native_workspace),
             wait_seconds=1,
+            write_roots=[str(native_workspace)],
         )
         assert started["ok"], started
         handle = started["result"]["handle"]

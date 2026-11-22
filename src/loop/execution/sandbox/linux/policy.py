@@ -12,11 +12,21 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ....constants import GIT_DIRECTORY, NATIVE_UNIT_PREFIX
-from ....permissions.protection import PRIVATE_READ_COMPONENTS, is_protected_external_read
+from ....permissions.protection import (
+    ENVIRONMENT_TEMPLATE_SUFFIXES,
+    PRIVATE_READ_COMPONENTS,
+    is_protected_external_read,
+    protected_environment_suffixes,
+)
 from ....utils.hashing import sha256_digest
 from ..constants import TMPDIR_ENVIRONMENT_VARIABLE
-from .constants import NATIVE_CONVENTIONAL_TMP_PATH, NATIVE_SCRATCH_PATH, NATIVE_TRACKING_PATH
-from .host import RUNTIME_READ_FILES
+from .constants import (
+    NATIVE_CONVENTIONAL_TMP_PATH,
+    NATIVE_SCRATCH_PATH,
+    NATIVE_TRACKING_PATH,
+    SESSION_CONVENTIONAL_TMP_NAME,
+)
+from .host import RUNTIME_READ_FILES, SYSTEM_CA_DIRECTORY
 from .paths import conventional_tmp_available, payload_path
 
 if TYPE_CHECKING:
@@ -25,6 +35,36 @@ if TYPE_CHECKING:
 _PROFILE_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,127}")
 _SYSTEM_READ_ROOTS = (Path("/usr"), Path("/bin"), Path("/lib"))
 _PROFILE_PLACEHOLDER = "payload_" + "0" * 64
+
+
+def environment_value_patterns() -> tuple[str, ...]:
+    """Render protected environment basenames as byte-oriented AppArmor globs.
+
+    Returns:
+        tuple[str, ...]: Unanchored globs for the native file rules.
+    """
+
+    def variants(char: str) -> str:
+        return char.lower() + char.upper() if char.isascii() else f"\\x{ord(char):02x}"
+
+    def literal(value: str) -> str:
+        return "".join(
+            f"[{variants(char)}]"
+            if char.isascii() and char.isalpha()
+            else char
+            if char.isascii()
+            else variants(char)
+            for char in value
+        )
+
+    words = [suffix[1:] for suffix in ENVIRONMENT_TEMPLATE_SUFFIXES]
+    # The native byte matcher needs the UTF-8 spelling of the long-s fold explicitly.
+    words.append("ſample".encode().decode("latin1"))
+    patterns = [literal(".env")]
+    for tail, excluded in protected_environment_suffixes(words):
+        prefix = "*[^" + "".join(map(variants, excluded)) + "/]" if excluded else ""
+        patterns.append(literal(".env.") + prefix + literal(tail))
+    return tuple(patterns)
 
 
 def _literal(value: str) -> str:
@@ -122,17 +162,28 @@ def payload_policy(
             raise ValueError("Protected private data cannot be an executable.")
         if not any(resolved.is_relative_to(root) for root in (*runtime_roots, *reads, *writes)):
             executable_files.update((spelling, resolved))
+    if any(
+        denied.is_relative_to(root) or root.is_relative_to(denied)
+        for denied in (*request.hard_denied_paths, *request.protected_host_roots)
+        for root in runtime_roots
+    ):
+        raise ValueError("Hard denial requires refusing an encompassing runtime root.")
     lines = [
         "abi <abi/4.0>,",
         f"profile {profile} flags=(attach_disconnected) {{",
         *(f'  allow rmix "{_tree(root)}",' for root in dict.fromkeys(runtime_roots)),
         "  allow r /proc/{,**},",
         "  allow rw /dev/{,**},",
+        # glibc publishes each semaphore from a staging name inside the private tmpfs.
+        '  link subset "/dev/shm/sem.*" -> "/dev/shm/sem.*",',
         *(f'  allow r "{_literal(str(path))}",' for path in RUNTIME_READ_FILES),
+        # TLS clients enumerate this synthetic directory when checking for hashed anchors.
+        f'  allow r "{_literal(str(SYSTEM_CA_DIRECTORY))}/",',
         *(f'  allow rmix "{_tree(root)}",' for root in reads),
         *(f'  allow rmix "{_literal(str(path))}",' for path in sorted(executable_files)),
         *(f'  allow rwlkmix "{_tree(root)}",' for root in writes),
         *(f'  allow rwlkmix "{_literal(str(root).rstrip("/"))}/{{,**/}}*",' for root in writes),
+        *(f'  allow rwk "{_literal(str(path))}",' for path in sorted(set(request.write_files))),
         "  allow network,",
         "  allow unix,",
         "  allow signal,",
@@ -167,12 +218,45 @@ def payload_policy(
     )
     for name in PRIVATE_READ_COMPONENTS:
         pattern = "".join(
-            f"[{char.lower()}{char.upper()}]" if char.isalpha() else char for char in name
+            r"{[sS],\xc5\xbf}"
+            if char.lower() == "s"
+            else f"[{char.lower()}{char.upper()}]"
+            if char.isalpha()
+            else char
+            for char in name
         )
         for root in private_roots:
             prefix = _literal(str(root).rstrip("/"))
             path = (prefix if prefix else "") + "/{,**/}" + pattern
             lines.extend((f'  deny "{path}" rwklmx,', f'  deny "{path}/{{,**}}" rwklmx,'))
+    # Factor the Cartesian product as AARE alternatives instead of repeating long UTF-8
+    # root spellings for every suffix. Retain the compiler's existing source-size ceiling.
+    prefixes = ",".join(_literal(str(root).strip("/")) for root in private_roots)
+    if len(private_roots) > 1:
+        prefixes = "{" + prefixes + "}"
+    values = ",".join(environment_value_patterns())
+    lines.append(f'  deny "/{prefixes}/{{,**/}}{{{values}}}{{,/**}}" rwklmx,')
+    # Scratch is mounted at a disjoint namespace path, so protecting its physical
+    # application parent does not cover the active agent-data mount.
+    for path in request.protected_host_roots:
+        if request.scratch_root is not None and path.is_relative_to(request.scratch_root):
+            continue
+        lines.append(f'  deny "{_literal(str(path))}{{,/**}}" rwklmx,')
+    for path in request.hard_denied_paths:
+        denied = (
+            NATIVE_SCRATCH_PATH if scratch.is_relative_to(path) else payload_path(path, scratch)
+        )
+        lines.append(f'  deny "{_literal(str(denied))}{{,/**}}" rwklmx,')
+        conventional_root = scratch / SESSION_CONVENTIONAL_TMP_NAME
+        if conventional and (
+            path.is_relative_to(conventional_root) or conventional_root.is_relative_to(path)
+        ):
+            alternate = (
+                NATIVE_CONVENTIONAL_TMP_PATH / path.relative_to(conventional_root)
+                if path.is_relative_to(conventional_root)
+                else NATIVE_CONVENTIONAL_TMP_PATH
+            )
+            lines.append(f'  deny "{_literal(str(alternate))}{{,/**}}" rwklmx,')
     return "\n".join((*lines, "}", ""))
 
 

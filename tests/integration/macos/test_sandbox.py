@@ -34,8 +34,9 @@ from tests.scheduling import await_condition, receive_fifo_byte
 pytestmark = [pytest.mark.integration, pytest.mark.macos]
 
 
-def test_owned_ram_device_pin_prevents_forced_detachment():
-    """An open raw descriptor keeps an authenticated RAM image from being replaced."""
+@pytest.mark.parametrize("device_known", [False, True])
+def test_owned_ram_device_pin_prevents_forced_detachment(device_known):
+    """Checked cleanup finds the marked RAM device even without the returned disk name."""
     marker = f"LoopOwned{secrets.token_hex(16)}"
     attached = subprocess.run(
         [
@@ -70,7 +71,16 @@ def test_owned_ram_device_pin_prevents_forced_detachment():
     finally:
         if descriptor is not None:
             os.close(descriptor)
-        macos_backend._remove_local_socket_attachment(device, marker, time.monotonic() + 30)
+        try:
+            macos_backend._remove_local_socket_attachment(
+                device if device_known else None, marker, time.monotonic() + 30
+            )
+            assert macos_backend._local_socket_registry(marker, time.monotonic() + 30) == []
+        finally:
+            if macos_backend._local_socket_attachment_matches(
+                device, marker, time.monotonic() + 30
+            ):
+                macos_backend._remove_local_socket_attachment(device, marker, time.monotonic() + 30)
 
 
 def execute(backend, workspace, source, *, writable=True, scratch=None):
@@ -216,6 +226,7 @@ def test_native_audit_veto_of_diagnostic_spawn_prevents_command(backend, native_
     """A real Python audit veto of the log process cannot launch the sandboxed child."""
     program = """
 import os, sys
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -226,9 +237,10 @@ from loop.execution.sandbox.macos.backend import MacOSSeatbeltBackend
 from loop.execution.sandbox.macos import backend as macos_backend
 from loop.execution.coordinator import CommandExecutionCoordinator
 from loop.utils import process
+from loop.permissions import protection
 clock = SimpleNamespace(monotonic=lambda: 100.0, sleep=lambda _: os.sched_yield(),
     strftime=lambda _format, _value: '2000-01-01 00:00:00+0000', localtime=lambda: None)
-coordinator.time = selection.time = macos_backend.time = process.time = clock
+coordinator.time = selection.time = macos_backend.time = process.time = protection.time = clock
 workspace = Path(sys.argv[1])
 def audit(event, args):
     if event == 'subprocess.Popen' and args[0] == '/usr/bin/log':
@@ -239,7 +251,7 @@ try:
     request = SandboxRequest.create(source='printf changed > audit-marker', cwd=workspace,
         workspace=workspace, read_roots=(), write_roots=(workspace,), network=False,
         environment={'PATH': '/usr/bin:/bin', 'LANG': 'C'}, policy_version=backend.policy_version,
-        deadline=110.0, workspace_id='native-audit-veto')
+        deadline=110.0, workspace_id='native-audit-veto', local_network=False)
     result = backend.run(request)
     if result.outcome is not SandboxOutcome.INVALID or 'synthetic audit veto' not in result.detail:
         raise RuntimeError(repr(result))
@@ -252,6 +264,7 @@ try:
         return True
     permissions.authorize_sandboxed_command.side_effect = approve
     permissions.sandbox_policy_revision_current.return_value = True
+    permissions.sandbox_attempt.side_effect = lambda request, revision, cancellation: nullcontext(request)
     attempt = CommandExecutionCoordinator(backend, Mock(), permissions, None).run_sandboxed(request, 'run_command')
     if attempt.offer is not None or attempt.result.outcome is not SandboxOutcome.INVALID:
         raise RuntimeError('A diagnostic audit veto created a host retry offer')
@@ -276,6 +289,7 @@ def test_native_qualified_backend_honors_later_diagnostic_audit_veto(backend, na
     """A previously qualified backend cannot treat a later real audit veto as log absence."""
     program = """
 import os, sys
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -287,9 +301,10 @@ from loop.execution.sandbox.macos.backend import MacOSSeatbeltBackend
 from loop.execution.sandbox.macos import backend as macos_backend
 from loop.execution.sandbox.macos.backend import SeatbeltDiagnosticService
 from loop.utils import process
+from loop.permissions import protection
 clock = SimpleNamespace(monotonic=lambda: 100.0, sleep=lambda _: os.sched_yield(),
     strftime=lambda _format, _value: '2000-01-01 00:00:00+0000', localtime=lambda: None)
-coordinator.time = selection.time = macos_backend.time = process.time = clock
+coordinator.time = selection.time = macos_backend.time = process.time = protection.time = clock
 workspace = Path(sys.argv[1])
 original = SeatbeltDiagnosticService.monitor
 SeatbeltDiagnosticService.monitor = lambda self, deadline: None
@@ -307,7 +322,7 @@ try:
     request = SandboxRequest.create(source='printf changed > later-audit-marker', cwd=workspace,
         workspace=workspace, read_roots=(), write_roots=(workspace,), network=False,
         environment={'PATH': '/usr/bin:/bin', 'LANG': 'C'}, policy_version=selected.policy_version,
-        deadline=110.0, workspace_id='native-later-audit-veto')
+        deadline=110.0, workspace_id='native-later-audit-veto', local_network=False)
     permissions = Mock()
     def approve(_request, **kwargs):
         '''Bind the mock approval to the revision checked before admission.'''
@@ -315,6 +330,7 @@ try:
         return True
     permissions.authorize_sandboxed_command.side_effect = approve
     permissions.sandbox_policy_revision_current.return_value = True
+    permissions.sandbox_attempt.side_effect = lambda request, revision, cancellation: nullcontext(request)
     attempt = CommandExecutionCoordinator(selected, Mock(), permissions, None).run_sandboxed(request, 'run_command')
     if attempt.result.outcome is not SandboxOutcome.INVALID or attempt.offer is not None:
         raise RuntimeError('A qualified backend ignored the diagnostic audit veto')
@@ -471,6 +487,7 @@ def test_native_cancellation_drains_running_commands_and_retained_pipes(
         read_roots=(),
         write_roots=(native_workspace,),
         network=False,
+        local_network=False,
         environment={"PATH": "/usr/bin:/bin", "LANG": "C"},
         policy_version=backend.policy_version,
         deadline=130.0,
@@ -522,6 +539,38 @@ def test_native_read_only_request_cannot_mutate_workspace(backend, native_worksp
     result = execute(backend, native_workspace, "printf changed > ordinary", writable=False)
     assert result.exit_code != 0
     assert (native_workspace / "ordinary").read_text(encoding="utf-8") == "ordinary-data"
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_native_exact_file_grant_preserves_neighbors(native_command, native_workspace, existing):
+    """Seatbelt enforces regular file creation, deletion, and replacement at one path."""
+    target = native_workspace / ".coverage"
+    if existing:
+        target.write_text("old", encoding="utf-8")
+    protected = native_workspace / ".env"
+    protected.write_text("preserve", encoding="utf-8")
+    result = native_command(
+        """
+        set -eu
+        printf first > .coverage
+        /bin/rm .coverage
+        if /bin/ln ordinary .coverage 2>/dev/null; then exit 10; fi
+        if /bin/ln -s .env .coverage 2>/dev/null; then exit 11; fi
+        if /bin/mkdir .coverage 2>/dev/null; then exit 12; fi
+        if (printf changed > ordinary) 2>/dev/null; then exit 13; fi
+        if (printf changed > .env) 2>/dev/null; then exit 14; fi
+        printf recreated > .coverage
+        printf replaced > "$TMPDIR/replacement"
+        /bin/mv -f "$TMPDIR/replacement" .coverage
+        """,
+        write_roots=(),
+        write_files=(target,),
+        local_network=False,
+    )
+    assert result.outcome is SandboxOutcome.COMPLETED and result.exit_code == 0, result
+    assert target.read_text(encoding="utf-8") == "replaced"
+    assert (native_workspace / "ordinary").read_text(encoding="utf-8") == "ordinary-data"
+    assert protected.read_text(encoding="utf-8") == "preserve"
 
 
 def test_native_hardlink_preflight_preserves_outside_inode(backend, native_workspace):
@@ -974,6 +1023,217 @@ def test_attempt_local_socket_path_is_not_shared_with_a_later_command(native_com
     assert second.stdout == f"{errno.EPERM}\n"
     path.unlink()
     old_directory.rmdir()
+
+
+@pytest.mark.parametrize(
+    ("local_network", "process_pools"), [(False, False), (True, False), (False, True)]
+)
+def test_macos_named_semaphores_remain_outside_socket_authority(
+    native_command, local_network, process_pools
+):
+    """Raw creation needs pool authority and a live test-owned host semaphore stays protected."""
+    from _multiprocessing import SemLock, sem_unlink
+
+    foreign = "/loop-test-" + secrets.token_hex(8)
+    new = "/loop-test-" + secrets.token_hex(8)
+    interpreter = Path(sys.executable).resolve(strict=True)
+    runtime = Path(sys.base_prefix).resolve(strict=True)
+    semaphore = SemLock(1, 0, 1, foreign, False)
+    source = f"""from _multiprocessing import SemLock, sem_unlink
+
+operations = [
+    lambda: SemLock._rebuild(0, 1, 1, {foreign!r}),
+    lambda: sem_unlink({foreign!r}),
+]
+if not {process_pools!r}:
+    operations.insert(0, lambda: SemLock(1, 0, 1, {new!r}, False))
+for operate in operations:
+    try:
+        operate()
+    except PermissionError:
+        pass
+    else:
+        raise AssertionError('named semaphore operation was permitted')
+print('named-semaphores-denied')
+"""
+    try:
+        result = native_command(
+            f"{shlex.quote(str(interpreter))} -IB -c {shlex.quote(source)}",
+            read_roots=(runtime,),
+            local_network=local_network,
+            backend_options=("process_pools",) if process_pools else (),
+        )
+        assert result.outcome is SandboxOutcome.COMPLETED and result.exit_code == 0, result
+        assert result.stdout.strip() == "named-semaphores-denied"
+        SemLock._rebuild(0, 1, 1, foreign)
+        assert not semaphore.acquire(False)
+        with pytest.raises(FileNotFoundError):
+            SemLock._rebuild(0, 1, 1, new)
+    finally:
+        for name in (new, foreign):
+            try:
+                sem_unlink(name)
+            except FileNotFoundError:
+                # Only test-owned names are eligible for teardown, even after a regression.
+                pass
+
+
+@pytest.mark.parametrize("account_lookup", [False, True])
+def test_host_account_lookup_and_direct_network_remain_independent(
+    native_command, native_directory, account_lookup
+):
+    """Host lookup survives an empty HOME and direct TCP requires separate network authority."""
+    interpreter = Path(sys.executable).resolve(strict=True)
+    scratch = native_directory("/private/tmp")
+    homes = []
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        listener.setblocking(False)
+        port = listener.getsockname()[1]
+        source = f"""import json, os, pwd, socket
+from pathlib import Path
+assert os.environ.pop('HOME') == os.environ['TMPDIR']
+try:
+    home = Path.home()
+    resolved = home.is_absolute() and home == Path(pwd.getpwuid(os.getuid()).pw_dir)
+except (KeyError, RuntimeError):
+    resolved = False
+try:
+    with socket.create_connection(('127.0.0.1', {port}), timeout=5) as peer:
+        peer.sendall(b'owned')
+    connected = True
+except PermissionError:
+    connected = False
+print(json.dumps([resolved, connected]))
+"""
+        for network in (False, True):
+            result = native_command(
+                f"{shlex.quote(str(interpreter))} -IB -c {shlex.quote(source)}",
+                read_roots=(Path(sys.base_prefix).resolve(strict=True),),
+                environment={"PATH": "/usr/bin:/bin", "HOME": str(scratch), "TMPDIR": str(scratch)},
+                scratch_root=scratch,
+                write_roots=(),
+                local_network=network,
+                network=network,
+                backend_options=("account_lookup",) if account_lookup else (),
+            )
+            assert result.outcome is SandboxOutcome.COMPLETED, result
+            assert result.exit_code == 0, result.stderr
+            resolved, connected = json.loads(result.stdout)
+            homes.append(resolved)
+            assert connected is network
+            if network:
+                with listener.accept()[0] as peer:
+                    assert peer.recv(16) == b"owned"
+            else:
+                with pytest.raises(BlockingIOError):
+                    listener.accept()
+    # Hosts may know a static account locally even with the directory service disabled.
+    assert homes[0] is homes[1]
+    if account_lookup:
+        assert homes == [True, True]
+
+
+def test_stock_pool_cannot_open_or_unlink_a_live_peer_semaphore(native_command, native_workspace):
+    """Two approved live attempts keep each other's named semaphore inaccessible."""
+    name = "/loop-test-" + secrets.token_hex(8)
+    ready = native_workspace / "owner-ready"
+    release = native_workspace / "release-owner"
+    os.mkfifo(release, 0o600)
+    owner_source = f"""from _multiprocessing import SemLock, sem_unlink
+from pathlib import Path
+handle = SemLock(1, 1, 1, {name!r}, False)
+try:
+    with open({str(release)!r}, 'rb') as gate:
+        Path({str(ready)!r}).touch()
+        assert gate.read(1) == b'x'
+    reopened = SemLock._rebuild(0, 1, 1, {name!r})
+    assert reopened.acquire(False)
+    assert not handle.acquire(False)
+    print("owned semaphore preserved")
+finally:
+    sem_unlink({name!r})
+"""
+    peer_source = f"""from _multiprocessing import SemLock, sem_unlink
+for operation in (lambda: SemLock._rebuild(0, 1, 1, {name!r}), lambda: sem_unlink({name!r})):
+    try:
+        operation()
+    except PermissionError:
+        continue
+    raise AssertionError("live peer semaphore was accessible")
+print("live peer protected")
+"""
+    runtime = Path(sys.base_prefix).resolve(strict=True)
+    python = shlex.quote(str(Path(sys.executable).resolve(strict=True)))
+    options = {
+        "read_roots": (runtime,),
+        "local_network": False,
+        "backend_options": ("process_pools",),
+    }
+    with (
+        open(os.open(release, os.O_RDWR | os.O_NONBLOCK), "wb", buffering=0) as gate,
+        ThreadPoolExecutor(max_workers=1) as workers,
+    ):
+        owner = workers.submit(
+            native_command, f"{python} -IB -c {shlex.quote(owner_source)}", **options
+        )
+        try:
+            await_condition(lambda: ready.exists() or owner.done())
+            assert ready.exists(), owner.result().stderr
+            peer = native_command(
+                f"{python} -IB -c {shlex.quote(peer_source)}", write_roots=(), **options
+            )
+            assert peer.outcome is SandboxOutcome.COMPLETED and peer.exit_code == 0, peer
+            assert peer.stdout.strip() == "live peer protected"
+        finally:
+            gate.write(b"x")
+        result = owner.result(timeout=10)
+    assert result.outcome is SandboxOutcome.COMPLETED and result.exit_code == 0, result
+    assert result.stdout.strip() == "owned semaphore preserved"
+
+
+def test_stock_spawn_reopens_its_semaphore_without_local_ipc(
+    native_command, native_workspace, native_directory
+):
+    """Stock spawned children synchronize using their own named objects and limit query."""
+    script = native_workspace / "pool.py"
+    scratch = native_directory("/private/tmp")
+    script.write_text(
+        "import multiprocessing, os\n"
+        "if __name__ == '__main__':\n"
+        "    os.sysconf('SC_SEM_NSEMS_MAX')\n"
+        "    ctx = multiprocessing.get_context('spawn')\n"
+        "    event = ctx.Event()\n"
+        "    child = ctx.Process(target=event.set)\n"
+        "    child.start()\n"
+        "    try:\n"
+        "        child.join(10)\n"
+        "        assert child.exitcode == 0, (child.exitcode, os.sys.executable)\n"
+        "        assert event.is_set()\n"
+        "    finally:\n"
+        "        if child.is_alive():\n"
+        "            child.kill()\n"
+        "            child.join(5)\n"
+        "    print('spawn-synchronized')\n"
+    )
+    interpreter = Path(sys.executable).resolve(strict=True)
+    prefix = Path(sys.base_prefix)
+    # Framework builds can reopen the stable installation alias when spawning a child.
+    aliases = tuple(path for path in (prefix, *prefix.parents) if path.is_symlink())
+    result = native_command(
+        f"{shlex.quote(str(interpreter))} -IB {script.name}",
+        read_roots=(prefix.resolve(strict=True), *(path.resolve(strict=True) for path in aliases)),
+        read_aliases=aliases,
+        environment={"PATH": "/usr/bin:/bin", "HOME": str(scratch), "TMPDIR": str(scratch)},
+        scratch_root=scratch,
+        write_roots=(),
+        local_network=False,
+        backend_options=("process_pools",),
+    )
+    assert result.outcome is SandboxOutcome.COMPLETED, result
+    assert result.exit_code == 0, result.stderr
+    assert result.stdout.strip() == "spawn-synchronized"
 
 
 def test_unix_ipc_outside_authority_is_denied(native_command, native_workspace):

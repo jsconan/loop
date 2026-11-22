@@ -27,6 +27,11 @@ from loop.utils.process import ProcessCaptureStatus
 from ..helpers import logical_private_name
 
 
+def _command_request(**fields):
+    """Build an ordinary request double with no optional filesystem authorities."""
+    return Mock(spec=SandboxRequest, backend_options=(), hardlink_sources=(), **fields)
+
+
 @pytest.fixture
 def backend(monkeypatch, tmp_path):
     """Isolate installed native collaborators and the shared monotonic budget."""
@@ -58,15 +63,25 @@ def test_backend_declares_nested_seccomp_without_advertising_namespace_controls(
     assert "inner_user_namespace" not in backend.capabilities
 
 
-def test_backend_qualification_uses_installed_run_contract(backend, monkeypatch):
+@pytest.mark.parametrize("write_file_support", [False, True])
+@pytest.mark.parametrize("shared_dependencies", [False, True])
+def test_backend_qualification_uses_installed_run_contract(
+    backend, monkeypatch, write_file_support, shared_dependencies
+):
     """Generic selection probes Linux through the ordinary installed receiver path."""
     expected = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=1)
     run = Mock(return_value=expected)
     monkeypatch.setattr(backend, "run", run)
+    support = Mock(return_value=(write_file_support, shared_dependencies))
+    monkeypatch.setattr(linux, "installed_optional_support", support)
     probe = Mock(spec=SandboxRequest)
     assert backend.qualification_probe(probe) is expected
     backend.complete_qualification(probe)
     run.assert_called_once_with(probe)
+    assert isinstance(backend.capabilities, frozenset)
+    assert (SandboxCapability.WRITE_FILES in backend.capabilities) is write_file_support
+    assert backend.backend_options == (("shared_dependencies",) if shared_dependencies else ())
+    support.assert_called_once()
 
 
 def test_qualification_failure_identifies_denied_loopback_setup(backend):
@@ -289,7 +304,13 @@ def test_backend_reads_live_file_creation_mask(backend, monkeypatch):
 )
 def test_backend_restores_only_original_typed_result(backend, outcome, tmp_path):
     """Every accepted outcome preserves the original attempt and supervised fields."""
-    request = Mock(terminal=False, deadline=20, attempt_id="1248c892-42dc-4b68-a3fb-30d2a70a93a7")
+    request = _command_request(
+        scratch_root=None,
+        ingress_port=None,
+        terminal=False,
+        deadline=20,
+        attempt_id="1248c892-42dc-4b68-a3fb-30d2a70a93a7",
+    )
     request.to_wire.return_value = b"request"
     result = CommandProcessResult(
         outcome,
@@ -329,6 +350,122 @@ def test_backend_streaming_uses_only_original_authenticated_exchange(backend, tm
     arguments = linux.exchange_installed_request.call_args
     assert SandboxRequest.from_wire(arguments.args[1]).stream_output
     assert arguments.kwargs["output_observer"] is observer
+
+
+@pytest.mark.parametrize("view", ["ordinary", "complete", "outside", "masked", "changed"])
+def test_linux_backend_infers_metadata_only_for_visible_unresolved_links(
+    backend, tmp_path, monkeypatch, view
+):
+    """Strict preparation distinguishes complete, masked, unsafe and unresolved alias views."""
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    scratch = tmp_path / "scratch"
+    scratch.mkdir(mode=0o700)
+    masked = workspace / "hidden"
+    masked.mkdir()
+    marker = workspace / "marker" if view == "complete" else tmp_path / "marker"
+    marker.write_text("owned data")
+    if view in {"complete", "outside", "masked"}:
+        os.link(marker, (masked if view == "masked" else workspace) / "link")
+    request = SandboxRequest.create(
+        source=":",
+        cwd=workspace,
+        workspace=workspace,
+        scratch_root=scratch,
+        read_roots=(),
+        write_roots=(),
+        network=False,
+        environment={"PATH": "/usr/bin:/bin", "TMPDIR": str(scratch)},
+        policy_version="linux-v1",
+        deadline=20,
+        workspace_id="workspace",
+        hard_denied_paths=(masked,),
+    )
+    monkeypatch.setattr(linux, "runtime_read_roots", lambda: ())
+    assert backend.inferred_options(request) == ()
+    backend.backend_options = ("shared_dependencies",)
+    assert backend.inferred_options(replace(request, scratch_root=None)) == ()
+    if view == "changed":
+        workspace.rename(tmp_path / "previous")
+        workspace.mkdir()
+    expected = ("shared_dependencies",) if view == "outside" else ()
+    assert backend.inferred_options(request) == expected
+
+
+@pytest.mark.parametrize(
+    "case", ["reviewed", "missing-option", "other-option", "missing-feature", "scope", "revision"]
+)
+def test_linux_backend_binds_only_negotiated_reviewed_cache_option(
+    backend, tmp_path, monkeypatch, case
+):
+    """Only the reviewed option's fixed root and revision enter ordinary native transport."""
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    scratch = tmp_path / "scratch"
+    scratch.mkdir(mode=0o700)
+    options = ("shared_dependencies",)
+    backend.backend_options = () if case == "missing-feature" else options
+    monkeypatch.setattr(linux, "hardlink_source_paths", lambda *_: (cache,))
+    selected = {"missing-option": (), "other-option": ("other",)}.get(case, options)
+    request = SandboxRequest.create(
+        source=":",
+        cwd=workspace,
+        workspace=workspace,
+        read_roots=(),
+        write_roots=(),
+        network=False,
+        environment={"PATH": "/usr/bin:/bin", "TMPDIR": str(scratch)},
+        scratch_root=scratch,
+        policy_version=backend.policy_version,
+        deadline=20,
+        workspace_id="workspace",
+        permission_revision=None if case == "revision" else 3,
+    ).with_backend_options(selected, (workspace if case == "scope" else cache,))
+    expected = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
+    linux.exchange_installed_request.return_value = expected.to_wire(request.attempt_id)
+    result = backend.run(request)
+    if case == "reviewed":
+        assert result == expected
+        restored = SandboxRequest.from_wire(linux.exchange_installed_request.call_args.args[1])
+        assert restored.backend_options == () and restored.hardlink_sources == (cache,)
+        assert restored.read_roots == () and restored.permission_revision == 3
+    else:
+        assert result.outcome is SandboxOutcome.UNSUPPORTED and not result.possible_effects
+        linux.exchange_installed_request.assert_not_called()
+
+
+def test_linux_transport_reuses_generated_path_mapping_for_command_output(backend, tmp_path):
+    """Older receivers map the derived per-attempt path through the existing wire fields."""
+    workspace = tmp_path / "work"
+    scratch = tmp_path / "session scratch"
+    workspace.mkdir()
+    scratch.mkdir(mode=0o700)
+    request = SandboxRequest.create(
+        source=":",
+        cwd=workspace,
+        workspace=workspace,
+        read_roots=(),
+        write_roots=(),
+        network=False,
+        environment={"TMPDIR": str(scratch)},
+        generated_environment=("TMPDIR",),
+        scratch_root=scratch,
+        policy_version="linux-v1",
+        deadline=20,
+        workspace_id="workspace",
+    )
+    expected = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
+    linux.exchange_installed_request.return_value = expected.to_wire(request.attempt_id)
+
+    assert backend.run(request) == expected
+    wire_request = SandboxRequest.from_wire(linux.exchange_installed_request.call_args.args[1])
+    assert "LOOP_OUTPUT_DIR" not in request.shell_environment()
+    assert wire_request.shell_environment()["LOOP_OUTPUT_DIR"] == str(
+        request.output_directory(scratch)
+    )
+    assert wire_request.generated_environment == ("TMPDIR", "LOOP_OUTPUT_DIR")
 
 
 def test_backend_terminal_requires_owned_input_and_output_channels(backend, tmp_path):
@@ -409,7 +546,13 @@ def test_backend_terminal_refuses_mediated_egress(backend, tmp_path):
 
 def test_backend_marks_cleanup_only_after_authenticated_receiver_result(backend):
     """Only an explicit authenticated verdict proves cleanup, including on cancellation."""
-    request = Mock(terminal=False, deadline=20, attempt_id="1248c892-42dc-4b68-a3fb-30d2a70a93a7")
+    request = _command_request(
+        scratch_root=None,
+        ingress_port=None,
+        terminal=False,
+        deadline=20,
+        attempt_id="1248c892-42dc-4b68-a3fb-30d2a70a93a7",
+    )
     request.to_wire.return_value = b"request"
     native = CommandProcessResult(
         SandboxOutcome.CANCELLED,
@@ -431,7 +574,7 @@ def test_backend_marks_cleanup_only_after_authenticated_receiver_result(backend)
 
 def test_backend_requires_approving_authority_for_mediated_egress(backend):
     """A direct backend caller cannot start mediation without a bound policy revision."""
-    request = Mock(terminal=False, deadline=20)
+    request = _command_request(ingress_port=None, terminal=False, scratch_root=None, deadline=20)
     request.egress_origins = ("http://example.com",)
     assert backend.run(request).outcome is SandboxOutcome.UNSUPPORTED
     linux.exchange_installed_request.assert_not_called()
@@ -439,7 +582,13 @@ def test_backend_requires_approving_authority_for_mediated_egress(backend):
 
 def test_backend_passes_exact_mediated_lease_to_original_transport(backend, tmp_path):
     """The approved origin attempt carries its manager and revision only on its own exchange."""
-    request = Mock(terminal=False, deadline=20, attempt_id="1248c892-42dc-4b68-a3fb-30d2a70a93a7")
+    request = _command_request(
+        scratch_root=None,
+        ingress_port=None,
+        terminal=False,
+        deadline=20,
+        attempt_id="1248c892-42dc-4b68-a3fb-30d2a70a93a7",
+    )
     request.egress_origins = ("http://example.com",)
     request.to_wire.return_value = b"request"
     result = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
@@ -455,7 +604,13 @@ def test_backend_passes_exact_mediated_lease_to_original_transport(backend, tmp_
 @pytest.mark.parametrize("outcome", [SandboxOutcome.COMPLETED, SandboxOutcome.TIMED_OUT])
 def test_backend_adds_only_local_observations_to_completed_results(backend, outcome):
     """Receiver results remain authoritative while local evidence stays unattributed."""
-    request = Mock(terminal=False, deadline=20, attempt_id="1248c892-42dc-4b68-a3fb-30d2a70a93a7")
+    request = _command_request(
+        scratch_root=None,
+        ingress_port=None,
+        terminal=False,
+        deadline=20,
+        attempt_id="1248c892-42dc-4b68-a3fb-30d2a70a93a7",
+    )
     request.to_wire.return_value = b"request"
     result = CommandProcessResult(
         outcome, exit_code=7 if outcome is SandboxOutcome.COMPLETED else None
@@ -507,7 +662,13 @@ def test_backend_rejects_unsupported_diagnostic_provenance(
     backend, diagnostic_status, diagnostic_source, observed_denial
 ):
     """Linux cannot claim a macOS diagnostic source or unimplemented collection status."""
-    request = Mock(terminal=False, deadline=20, attempt_id="1248c892-42dc-4b68-a3fb-30d2a70a93a7")
+    request = _command_request(
+        scratch_root=None,
+        ingress_port=None,
+        terminal=False,
+        deadline=20,
+        attempt_id="1248c892-42dc-4b68-a3fb-30d2a70a93a7",
+    )
     request.to_wire.return_value = b"request"
     result = CommandProcessResult(
         SandboxOutcome.COMPLETED,
@@ -530,7 +691,13 @@ def test_backend_rejects_unsupported_diagnostic_provenance(
 
 def test_backend_propagates_cancellation_through_installed_transport(backend, tmp_path):
     """A live cancellation signal uses the receiver control channel and cleanup acknowledgement."""
-    request = Mock(terminal=False, deadline=20, attempt_id="1248c892-42dc-4b68-a3fb-30d2a70a93a7")
+    request = _command_request(
+        scratch_root=None,
+        ingress_port=None,
+        terminal=False,
+        deadline=20,
+        attempt_id="1248c892-42dc-4b68-a3fb-30d2a70a93a7",
+    )
     request.to_wire.return_value = b"request"
     result = CommandProcessResult(SandboxOutcome.CANCELLED, possible_effects=True)
     linux.exchange_installed_request.return_value = result.to_wire(request.attempt_id)
@@ -552,7 +719,7 @@ def test_backend_does_not_open_transport_for_pre_cancelled_request(backend):
     cancellation_event.set()
 
     result = backend.run(
-        Mock(terminal=False, deadline=20),
+        _command_request(ingress_port=None, terminal=False, scratch_root=None, deadline=20),
         cancellation_event=cancellation_event,
     )
 
@@ -563,7 +730,7 @@ def test_backend_does_not_open_transport_for_pre_cancelled_request(backend):
 def test_backend_does_not_open_transport_when_cancelled_during_serialization(backend):
     """Cancellation while building the request prevents any native transport or effects."""
     cancellation_event = Event()
-    request = Mock(terminal=False, deadline=20)
+    request = _command_request(ingress_port=None, terminal=False, scratch_root=None, deadline=20)
 
     def serialize():
         """Cancel before the request bytes become available."""
@@ -590,7 +757,7 @@ def test_backend_does_not_open_transport_when_cancelled_during_serialization(bac
 )
 def test_backend_reports_pretransport_failures_without_possible_effects(backend, error, outcome):
     """A serialization failure cannot have launched a command or lost its output."""
-    request = Mock(terminal=False, deadline=20)
+    request = _command_request(ingress_port=None, terminal=False, scratch_root=None, deadline=20)
     request.to_wire.side_effect = error("private host path")
 
     result = backend.run(request)
@@ -605,7 +772,12 @@ def test_backend_reports_pretransport_failures_without_possible_effects(backend,
 @pytest.mark.parametrize("failure", ["expired", "stale", "timeout", "cancel", "invalid", "io"])
 def test_backend_failure_never_retries_or_discloses_authority(backend, failure):
     """Expiry, stale grants and ambiguous exchanges remain typed and never replay source."""
-    request = Mock(terminal=False, deadline=10 if failure == "expired" else 20)
+    request = _command_request(
+        ingress_port=None,
+        terminal=False,
+        scratch_root=None,
+        deadline=10 if failure == "expired" else 20,
+    )
     request.paths_are_current.return_value = failure != "stale"
     request.to_wire.return_value = b"request"
     error = {
@@ -893,7 +1065,7 @@ def test_checked_repair_is_reported_before_admission(backend, reason):
 
 def test_incompatible_installation_refusal_before_transport_has_no_effects(backend):
     """A direct request detects mismatched authority before any receiver can execute it."""
-    request = Mock(terminal=False, deadline=20)
+    request = _command_request(ingress_port=None, terminal=False, scratch_root=None, deadline=20)
     request.paths_are_current.return_value = True
     request.to_wire.return_value = b"request"
     linux.exchange_installed_request.side_effect = linux.NativeRepairRequired(
@@ -907,7 +1079,7 @@ def test_incompatible_installation_refusal_before_transport_has_no_effects(backe
 
 def test_unsupported_wire_feature_is_unavailable_before_effects(backend):
     """A request rejected by retained capability negotiation never claims command effects."""
-    request = Mock(terminal=False, deadline=20)
+    request = _command_request(ingress_port=None, terminal=False, scratch_root=None, deadline=20)
     request.paths_are_current.return_value = True
     request.to_wire.return_value = b"request"
     linux.exchange_installed_request.side_effect = linux.NativeFeatureUnavailable(

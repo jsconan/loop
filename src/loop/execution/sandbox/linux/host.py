@@ -23,6 +23,7 @@ from typing import NamedTuple
 
 from .... import constants
 from ....constants import MAX_NATIVE_RECEIPT_BYTES, NATIVE_FILE_READ_CHUNK_BYTES
+from ....sandbox_catalog import system_paths
 from ....utils.json import load_unique_json
 from ....utils.process import ProcessCaptureStatus, supervise_process
 from ..constants import (
@@ -157,6 +158,7 @@ def publish_volatile_file(directory: Path, name: str, data: bytes) -> None:
         os.close(parent)
 
 
+SYSTEM_CA_DIRECTORY = Path("/etc/ssl/certs")
 RUNTIME_READ_FILES = tuple(
     Path(name)
     for name in (
@@ -165,7 +167,8 @@ RUNTIME_READ_FILES = tuple(
         "/etc/hosts",
         "/etc/nsswitch.conf",
         "/etc/gai.conf",
-        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/mime.types",
+        SYSTEM_CA_DIRECTORY / "ca-certificates.crt",
         "/etc/pki/tls/certs/ca-bundle.crt",
         "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
         "/etc/ssl/cert.pem",
@@ -286,21 +289,23 @@ def runtime_read_roots() -> tuple[Path, ...]:
         OSError: Required runtime metadata or /usr is unavailable.
     """
     roots = []
-    for spelling in ("/usr", "/bin", "/sbin", "/lib", "/lib64"):
-        path = Path(spelling)
-        if spelling == "/usr" or path.exists():
+    for index, path in enumerate(system_paths("linux")):
+        if index == 0 or path.exists():
             roots.extend((path, protected_path(path, directory=True)))
     return tuple(dict.fromkeys(roots))
 
 
 def runtime_read_files(*, deadline: float | None = None) -> tuple[tuple[Path, HostFile], ...]:
-    """Bind selected system resolver and CA bundles without exposing host configuration trees.
+    """Bind selected resolver, CA bundle and MIME metadata files as read-only inputs.
 
     Follow administrator-protected distribution symlinks, including the fixed systemd resolver
     files authenticated against the service identity in protected /etc/passwd. Missing optional
     spellings are omitted; dangling or unsafe present inputs refuse preparation. Preserve the
     original spelling as the namespace destination, with immutable canonical file authority.
     User configuration, private keys and whole /etc or /run trees are never inferred.
+
+    Args:
+        deadline (float | None): Optional monotonic deadline for binding all inputs.
 
     Returns:
         tuple[tuple[Path, HostFile], ...]: Fixed destination spellings and authenticated inputs.

@@ -22,13 +22,15 @@ from .installation import validate_generation_catalog
 from .managed_bubblewrap import selected_bubblewrap_bytes
 from .policy import runtime_policy_sources
 
-_MODULES = (
+_PACKAGE_FILES = (
     "constants.py",
     "utils/process.py",
     "utils/virtual_path.py",
     "utils/hashing.py",
     "utils/json.py",
     "permissions/protection.py",
+    "sandbox_catalog.py",
+    "execution/sandbox/linux/policy.toml",
     "execution/sandbox/contracts.py",
     "execution/sandbox/constants.py",
     "execution/sandbox/linux/constants.py",
@@ -38,6 +40,7 @@ _MODULES = (
     "execution/sandbox/linux/admission.py",
     "execution/sandbox/linux/transport.py",
     "execution/sandbox/linux/egress.py",
+    "execution/sandbox/linux/ingress.py",
     "execution/sandbox/linux/management.py",
     "execution/sandbox/linux/records.py",
     "execution/sandbox/linux/runtime.py",
@@ -73,7 +76,7 @@ def runtime_member_names() -> tuple[str, ...]:
         tuple[str, ...]: Relative file names installed by the current package catalog.
     """
     return (
-        *(PACKAGE_ARTIFACT_PREFIX + name for name in _MODULES),
+        *(PACKAGE_ARTIFACT_PREFIX + name for name in _PACKAGE_FILES),
         *(PACKAGE_ARTIFACT_PREFIX + prefix + "__init__.py" for prefix in _BARRELS),
         *_RESOURCES,
         "helper",
@@ -91,7 +94,7 @@ def runtime_catalog(
 ) -> tuple[dict[str, bytes], set[str], dict[str, dict[str, bytes]], bytes]:
     """Build a trusted runtime catalog from installed resources.
 
-    Read packaged Python resources, never plans or developer paths. Use passive native package
+    Read packaged source and settings, never plans or developer paths. Use passive native package
     barrels so the retained uninstaller remains independent of application dependencies. Copy the
     authenticated fixed system or reviewed downloaded Bubblewrap bytes into a private helper.
     Do not modify a shared binary/profile.
@@ -125,7 +128,8 @@ def runtime_catalog(
 
     package = files(PACKAGE_NAMESPACE)
     catalog = {
-        PACKAGE_ARTIFACT_PREFIX + name: package.joinpath(name).read_bytes() for name in _MODULES
+        PACKAGE_ARTIFACT_PREFIX + name: package.joinpath(name).read_bytes()
+        for name in _PACKAGE_FILES
     }
     catalog.update({PACKAGE_ARTIFACT_PREFIX + prefix + "__init__.py": b"" for prefix in _BARRELS})
     resources = package.joinpath("execution/sandbox/linux/resources")

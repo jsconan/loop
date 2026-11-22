@@ -17,6 +17,7 @@ from ..models import (
     ReasoningEffort,
     RepetitionDetection,
     RetentionPolicy,
+    SandboxEnvironment,
     StructuredOutputMode,
 )
 
@@ -97,6 +98,11 @@ class AppSettings(BaseModel):
         default=False,
         json_schema_extra={"required_capabilities": [CommandCapability.CONTEXT_UPDATE.value]},
     )
+    allow_direct_host_execution: bool = Field(
+        default=False,
+        description="Allow separately approved unrestricted host commands; disabled by default.",
+        json_schema_extra={"required_capabilities": [CommandCapability.CONTEXT_UPDATE.value]},
+    )
     yolo: bool = Field(
         default=False,
         description="Approve eligible requests without confirmation; "
@@ -152,6 +158,17 @@ class ToolSettings(BaseModel):
     """Configure built-in tool execution."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
+
+    sandbox_environment: SandboxEnvironment = Field(
+        default_factory=dict,
+        description="Literal variables and private output paths for sandboxed commands.",
+        json_schema_extra={"required_capabilities": [CommandCapability.CONTEXT_UPDATE.value]},
+    )
+    sandbox_path_aliases: tuple[str, ...] = Field(
+        default=(),
+        description="Exact directory aliases into already approved readable roots.",
+        json_schema_extra={"required_capabilities": [CommandCapability.CONTEXT_UPDATE.value]},
+    )
 
     command_job_runtime_limit_seconds: float = Field(
         default=constants.DEFAULT_COMMAND_JOB_RUNTIME_LIMIT_SECONDS,

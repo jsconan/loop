@@ -62,7 +62,7 @@ def require_baseline(expected):
     require(baseline() == expected, "host tool baseline changed")
 
 
-def public_call(workspace, source, *, read_only=True, seconds=5):
+def public_call(workspace, source, *, write=False, seconds=5):
     """Dispatch a real public command with host execution forbidden."""
     from loop import PermissionManager, ToolRegistry
     from loop.execution import CommandExecutionService
@@ -89,7 +89,7 @@ def public_call(workspace, source, *, read_only=True, seconds=5):
                     {
                         "command": source,
                         "cwd": str(workspace),
-                        "read_only": read_only,
+                        "write_roots": [str(workspace)] if write else [],
                     }
                 ),
                 interaction=ApprovingInteraction(),
@@ -169,9 +169,7 @@ def live_client():
     """Keep an authorized detached descendant active while the parent tests management refusal."""
     value = json.loads(sys.stdin.read())
     print(
-        json.dumps(
-            public_call(Path(value["workspace"]), value["source"], read_only=False, seconds=90)
-        )
+        json.dumps(public_call(Path(value["workspace"]), value["source"], write=True, seconds=90))
     )
 
 
@@ -244,7 +242,7 @@ else:
             "live policy changed or stopped enforcing",
         )
         require(client.poll() is None, "management killed the admitted child")
-        refused = public_call(workspace, "printf admitted > new-admission", read_only=False)
+        refused = public_call(workspace, "printf admitted > new-admission", write=True)
         require(
             not refused.get("ok") and not (workspace / "new-admission").exists(),
             "closed listener admitted new source",

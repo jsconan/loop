@@ -31,10 +31,15 @@ from typing import TYPE_CHECKING, BinaryIO, NamedTuple, cast
 
 from .... import constants
 from ....permissions.protection import (
+    ENVIRONMENT_TEMPLATE_SUFFIXES,
     PRIVATE_READ_COMPONENTS,
     ProtectedWorkspacePaths,
+    inspect_hardlink_aliases,
+    is_environment_value,
     is_protected_external_read,
+    protected_environment_suffixes,
 )
+from ....sandbox_catalog import installed_paths, package_stores, sandbox_options, system_paths
 from ....telemetry import telemetry_audit
 from ....utils import (
     ProcessCapture,
@@ -49,9 +54,8 @@ from ....utils.process import ProvisionalTextOutput, is_finite_deadline
 from ..constants import (
     LANG_ENVIRONMENT_VARIABLE,
     MINIMAL_SYSTEM_PATH,
+    OUTPUT_DIRECTORY_ENVIRONMENT_VARIABLE,
     PATH_ENVIRONMENT_VARIABLE,
-    PYTHON_BIN_DIRECTORY_NAME,
-    PYTHON_ENVIRONMENT_CONFIG_NAME,
     SYSTEM_LOCALE,
     TMPDIR_ENVIRONMENT_VARIABLE,
 )
@@ -63,48 +67,34 @@ from ..contracts import (
     SandboxOutcome,
     SandboxRequest,
 )
-from .egress import MacOSEgressBroker
+from .egress import MacOSNetworkBroker
+from .ingress import INGRESS_SOCKET_ENVIRONMENT_VARIABLE
+from .synchronization import SynchronizationBroker
 
 if TYPE_CHECKING:
     from ....commands import CommandRegistration
     from ....permissions.manager import PermissionManager
 
 _LAUNCHER = "/usr/bin/sandbox-exec"
+# The bundled Dash feeds here-documents through a pipe inside the sandbox.
+_PAYLOAD_SHELL = "/bin/dash"
 _SHELL_STARTED_TAG = "LOOP_SHELL_STARTED"
 _SHELL_STARTED = f"{_SHELL_STARTED_TAG}\n"
 _SHELL_WRAPPER = (
     f"{constants.SHELL_PRINT_BUILTIN} '{_SHELL_STARTED_TAG}\\n'; exec "
-    f"{shlex.quote(constants.SHELL_COMMAND_PATH)} {shlex.quote(constants.SHELL_COMMAND_OPTION)} "
+    f"{_PAYLOAD_SHELL} {constants.SHELL_COMMAND_OPTION} "
     '"$1"'
 )
-_POLICY_VERSION = "macos-seatbelt-v2"
+_POLICY_VERSION = "macos-seatbelt-v6"
 _PRIVATE_TEMP_ROOT = Path("/private/tmp")
 _LOCAL_SOCKET_DIRECTORY_ENVIRONMENT_VARIABLE = "LOOP_LOCAL_SOCKET_DIR"
+_SYNCHRONIZATION_SOCKET_ENVIRONMENT_VARIABLE = "LOOP_SYNC_SOCKET"
 _LOCAL_SOCKET_VOLUME_SECTORS = 16384
 _LOCAL_SOCKET_VOLUME_SETUP_TIMEOUT_SECONDS = 30
 _LOCAL_SOCKET_REGISTRY_CHARS = 256 * 1024
 _LOCAL_SOCKET_REGISTRY_NODES = 128
-_SYSTEM_READ_ROOTS = tuple(
-    Path(path)
-    for path in (
-        "/System/Library",
-        "/usr/bin",
-        "/usr/lib",
-        "/usr/libexec",
-        "/usr/sbin",
-        "/usr/share",
-        "/bin",
-        "/sbin",
-        "/Library/Developer/CommandLineTools",
-        "/dev",
-        "/etc",
-        "/private/etc/ssl/cert.pem",
-        "/private/etc/ssl/openssl.cnf",
-        "/var/select",
-        "/private/var/select",
-    )
-)
-_MANAGED_TOOLCHAIN_PREFIXES = (Path("/opt/homebrew/Cellar"), Path("/usr/local/Cellar"))
+_SYSTEM_READ_ROOTS = system_paths("darwin")
+_MANAGED_TOOLCHAIN_PREFIXES = package_stores("darwin")
 _MAX_RECEIPT_BYTES = 128 * 1024
 _LOG_LIMIT = 64 * 1024
 _LOG_TAG = re.compile(r"\n(LOOP_SBX_[0-9a-f]{32})$")
@@ -152,6 +142,29 @@ os.execve('/usr/bin/sandbox-exec', ['/usr/bin/sandbox-exec', '-p', *sys.argv[3:]
 """
 
 
+def environment_value_patterns() -> tuple[str, ...]:
+    """Render the protected environment basenames in Seatbelt's pathname regex syntax.
+
+    Returns:
+        tuple[str, ...]: Unanchored expressions for the native file rules.
+    """
+
+    def literal(value: str) -> str:
+        return "".join(
+            f"[{char.lower()}{char.upper()}]" if char.isalpha() else re.escape(char)
+            for char in value
+        )
+
+    patterns = [literal(".env")]
+    words = (suffix[1:] for suffix in ENVIRONMENT_TEMPLATE_SUFFIXES)
+    for tail, excluded in protected_environment_suffixes(words):
+        # Seatbelt requires a range to exclude the adjacent dot and slash together.
+        members = "".join(char.lower() + char.upper() for char in excluded)
+        prefix = "[^/]*[^.-/]" if excluded == "." else f"[^/]*[^{members}/]" if excluded else ""
+        patterns.append(literal(".env.") + prefix + literal(tail))
+    return tuple(patterns)
+
+
 class LocalSocketVolume(NamedTuple):
     """Identify one owned, separate filesystem for attempt-local Unix sockets.
 
@@ -174,14 +187,14 @@ class LocalSocketAttachmentError(OSError):
     """Retain an unverified RAM attachment for checked recovery.
 
     Args:
-        device (str): Device name returned by the original attachment.
+        device (str | None): Device name returned by the original attachment, when known.
         marker (str): Unique registry marker supplied when the image was attached.
     """
 
-    device: str
+    device: str | None
     marker: str
 
-    def __init__(self, device: str, marker: str) -> None:
+    def __init__(self, device: str | None, marker: str) -> None:
         super().__init__("The macOS local socket attachment needs checked cleanup.")
         self.device = device
         self.marker = marker
@@ -398,6 +411,9 @@ def _local_socket_registry(marker: str, deadline: float) -> list[object] | None:
         or inspected.stderr_discarded != 0
     ):
         return None
+    if inspected.stdout == inspected.stderr == "":
+        # ioreg emits no plist when the exact registry key is absent.
+        return []
     try:
         entries = plistlib.loads(inspected.stdout.encode("utf-8"))
     except (plistlib.InvalidFileException, ValueError):
@@ -405,40 +421,48 @@ def _local_socket_registry(marker: str, deadline: float) -> list[object] | None:
     return entries if isinstance(entries, list) else None
 
 
-def _local_socket_attachment_matches(device: str, marker: str, deadline: float) -> bool:
-    """Identify the marked RAM image and its exact whole-disk descendant in the registry."""
-    entries = _local_socket_registry(marker, deadline)
+def _local_socket_attachment_device(entries: list[object] | None, marker: str) -> str | None:
+    """Identify the one whole disk belonging to an exact, current-owner RAM marker."""
     if entries is None or len(entries) != 1 or not isinstance(entries[0], dict):
-        return False
+        return None
     root = entries[0]
     if (
         root.get(marker) != 1
         or root.get("owner-uid") != os.getuid()
         or root.get("Physical Interconnect Location") != "RAM"
     ):
-        return False
+        return None
     pending = [root]
-    matches = 0
+    device = None
     visited = 0
     while pending:
         node = pending.pop()
         visited += 1
         if visited > _LOCAL_SOCKET_REGISTRY_NODES or not isinstance(node, dict):
-            return False
-        if node.get("BSD Name") == Path(device).name:
+            return None
+        name = node.get("BSD Name")
+        if isinstance(name, str) and re.fullmatch(r"disk[0-9]+", name):
             if (
-                node.get("IOObjectClass") != "IOMedia"
+                device is not None
+                or node.get("IOObjectClass") != "IOMedia"
                 or node.get("Whole") is not True
                 or node.get("Writable") is not True
                 or node.get("Size") != _LOCAL_SOCKET_VOLUME_SECTORS * 512
             ):
-                return False
-            matches += 1
+                return None
+            device = f"/dev/{name}"
         children = node.get("IORegistryEntryChildren", [])
         if not isinstance(children, list):
-            return False
+            return None
         pending.extend(children)
-    return matches == 1
+    return device
+
+
+def _local_socket_attachment_matches(device: str, marker: str, deadline: float) -> bool:
+    """Verify that the marked RAM image still owns the expected whole disk."""
+    return (
+        _local_socket_attachment_device(_local_socket_registry(marker, deadline), marker) == device
+    )
 
 
 def _pin_local_socket_attachment(device: str, marker: str, deadline: float) -> int:
@@ -461,8 +485,15 @@ def _pin_local_socket_attachment(device: str, marker: str, deadline: float) -> i
         raise
 
 
-def _remove_local_socket_attachment(device: str, marker: str, deadline: float) -> None:
+def _remove_local_socket_attachment(device: str | None, marker: str, deadline: float) -> None:
     """Remove a partial RAM attachment only after revalidating its original identity."""
+    if device is None:
+        entries = _local_socket_registry(marker, deadline)
+        if entries == []:
+            return
+        device = _local_socket_attachment_device(entries, marker)
+        if device is None:
+            raise OSError("The macOS local socket attachment identity is uncertain.")
     descriptor = _pin_local_socket_attachment(device, marker, deadline)
     os.close(descriptor)
     if not _local_socket_attachment_matches(device, marker, deadline):
@@ -520,6 +551,7 @@ def _mount_local_socket_volume(deadline: float) -> LocalSocketVolume:
     expected_mount = Path("/Volumes") / name
     if expected_mount.exists() or expected_mount.is_symlink():
         raise OSError("Local socket filesystem name is already in use.")
+    timeout = _local_socket_setup_timeout(deadline)
     try:
         attached = subprocess.run(
             [
@@ -532,18 +564,20 @@ def _mount_local_socket_volume(deadline: float) -> LocalSocketVolume:
             ],
             capture_output=True,
             text=True,
-            timeout=_local_socket_setup_timeout(deadline),
+            timeout=timeout,
             check=False,
         )
-    except BaseException:
+    except BaseException as error:
         telemetry_audit("sandbox.local_socket_volume.cleanup_pending", attachment=marker)
+        if isinstance(error, (OSError, subprocess.SubprocessError)):
+            raise LocalSocketAttachmentError(None, marker) from error
         raise
     if (
         attached.returncode
         or (match := re.fullmatch(r"\s*(/dev/disk[0-9]+)\s*", attached.stdout)) is None
     ):
         telemetry_audit("sandbox.local_socket_volume.cleanup_pending", attachment=marker)
-        raise OSError("Unable to attach an owned macOS local socket filesystem.")
+        raise LocalSocketAttachmentError(None, marker)
     device = match.group(1)
     descriptor = None
     detached = False
@@ -1092,6 +1126,8 @@ def _walk_granted_root(
     rename_anchors: set[Path] | None = None,
     protection: ProtectedWorkspacePaths | None = None,
     ordinary_names: bool = False,
+    aliases: dict[Path, tuple[Path, ...]] | None = None,
+    hard_denial: Callable[[Path], bool] | None = None,
 ) -> None:
     """Reject unsafe aliases and bind ancestors of protected entries against relocation."""
     original = root.lstat()
@@ -1115,11 +1151,47 @@ def _walk_granted_root(
             for entry in entries:
                 _check_deadline(deadline)
                 details = entry.stat(follow_symlinks=False)
-                if stat.S_ISREG(details.st_mode) and details.st_nlink > 1:
-                    raise ValueError(f"Granted root contains a hardlinked file: {entry.path}")
+                if stat.S_ISDIR(details.st_mode):
+                    pending.append(Path(entry.path))
+                symbolic = stat.S_ISLNK(details.st_mode)
+                linked_file = stat.S_ISREG(details.st_mode) and details.st_nlink > 1
+                if rename_anchors is None and not symbolic and not linked_file:
+                    continue
+                path = Path(entry.path)
+                relative = path.relative_to(root)
+                hard = (
+                    not ordinary_names
+                    and any(
+                        part.casefold() in private_names or is_environment_value(part)
+                        for part in relative.parts
+                    )
+                    or hard_denial is not None
+                    and hard_denial(path)
+                )
+                if hard and symbolic:
+                    raise ValueError("Granted root contains a hard-protected symlink.")
+                if linked_file:
+                    known = aliases.get(path, ()) if aliases is not None else ()
+                    if (
+                        len(known) != details.st_nlink
+                        or hard
+                        or protection is not None
+                        and (
+                            protection.protects_directory(relative)
+                            or any(part in protected_files for part in relative.parts)
+                        )
+                    ):
+                        raise ValueError(f"Granted root contains an unsafe hardlinked file: {path}")
                 if rename_anchors is not None:
                     name = entry.name
-                    protected = name.casefold() in private_names or name in protected_files
+                    protected = (
+                        name.casefold() in private_names
+                        or not ordinary_names
+                        and is_environment_value(name)
+                        or name in protected_files
+                        or hard_denial is not None
+                        and hard_denial(path)
+                    )
                     if not protected and name in protected_directory_names:
                         relative = Path(entry.path).relative_to(root)
                         protected = any(
@@ -1133,8 +1205,6 @@ def _walk_granted_root(
                         while anchor != root:
                             rename_anchors.add(anchor)
                             anchor = anchor.parent
-                if stat.S_ISDIR(details.st_mode):
-                    pending.append(Path(entry.path))
     latest = root.lstat()
     if (original.st_dev, original.st_ino) != (latest.st_dev, latest.st_ino):
         raise ValueError(f"Granted root changed during preflight: {root}")
@@ -1175,29 +1245,6 @@ def _search_roots(request: SandboxRequest) -> tuple[tuple[Path, Path], ...]:
             continue
         roots.append((path, real))
     return tuple(dict.fromkeys(roots))
-
-
-def _python_environment_configs(request: SandboxRequest) -> tuple[Path, ...]:
-    """Find additional virtual-environment metadata outside existing read roots."""
-    configs = []
-    search_roots = _search_roots(request)
-    read_roots = {*_SYSTEM_READ_ROOTS, request.workspace, *request.read_roots}
-    for _, root in search_roots:
-        if (
-            root.name != PYTHON_BIN_DIRECTORY_NAME
-            or root not in read_roots
-            or not read_roots.isdisjoint(root.parents)
-        ):
-            continue
-        config = root.parent / PYTHON_ENVIRONMENT_CONFIG_NAME
-        try:
-            details = config.lstat()
-        except FileNotFoundError:
-            continue
-        if not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
-            raise ValueError(f"Unsafe Python environment configuration: {config}")
-        configs.append(config)
-    return tuple(configs)
 
 
 def _exact_executable_reads(request: SandboxRequest) -> tuple[Path, ...]:
@@ -1245,17 +1292,24 @@ def _profile(
     request: SandboxRequest,
     scratch: Path,
     tag: str,
-    compatibility_files: tuple[Path, ...] = (),
     rename_anchors: tuple[Path, ...] = (),
     *,
     owned_scratch: bool = False,
     system_directory: Path | None = None,
     local_socket_directory: Path | None = None,
     egress_socket: Path | None = None,
+    synchronization_socket: Path | None = None,
     terminal_slave: Path | None = None,
 ) -> str:
     """Build the reviewed Seatbelt profile from bound roots only."""
     confined_scratch = request.session_scratch or owned_scratch
+    if any(
+        denied.is_relative_to(root) or root.is_relative_to(denied)
+        for denied in (*request.hard_denied_paths, *request.protected_host_roots)
+        for baseline in _SYSTEM_READ_ROOTS
+        for root in (baseline, baseline.resolve())
+    ):
+        raise ValueError("Hard denial requires refusing an encompassing runtime root.")
     for root in (
         request.workspace,
         *request.read_roots,
@@ -1266,6 +1320,15 @@ def _profile(
     ):
         if is_protected_external_read(root) and not (confined_scratch and root == scratch):
             raise ValueError(f"Protected directory cannot be a read root: {root}")
+        if root != scratch and any(
+            is_environment_value(part)
+            for part in (
+                root.relative_to(request.workspace)
+                if root.is_relative_to(request.workspace)
+                else root
+            ).parts
+        ):
+            raise ValueError("Environment values cannot be an admitted root.")
     search_roots = _search_roots(request)
     local_roots = (local_socket_directory,) if local_socket_directory is not None else ()
     reads = (
@@ -1289,8 +1352,6 @@ def _profile(
             for path in reads
         )
         + " "
-        + " ".join(f"(literal {_literal(path)})" for path in compatibility_files)
-        + " "
         + " ".join(f"(literal {_literal(path)})" for path in _exact_executable_reads(request))
     )
     system_metadata = (
@@ -1300,6 +1361,9 @@ def _profile(
         if system_directory is not None
         else ""
     )
+    protected_sockets = tuple(
+        path for path in (egress_socket, synchronization_socket) if path is not None
+    )
     search_metadata = (
         " ".join(f"(literal {_literal(path)})" for path in sorted(ancestors, key=str))
         + " "
@@ -1308,20 +1372,27 @@ def _profile(
         + " ".join(_regex(f"^{re.escape(str(path))}/[^/]+$") for path in limited_search)
         + " "
         + system_metadata
-        + (
-            " "
-            + " ".join(
-                f"(literal {_literal(path)})" for path in (egress_socket, *egress_socket.parents)
-            )
-            if egress_socket is not None
-            else ""
+        + " "
+        + " ".join(
+            f"(literal {_literal(path)})"
+            for endpoint in protected_sockets
+            for path in (endpoint, *endpoint.parents)
         )
     )
     search_metadata_rule = (
         f"(allow file-read-metadata {search_metadata})" if search_metadata.strip() else ""
     )
     write_rules = " ".join(
-        f"(subpath {_literal(path)})" for path in (*request.write_roots, scratch, *local_roots)
+        (
+            *(
+                f"(subpath {_literal(path)})"
+                for path in (*request.write_roots, scratch, *local_roots)
+            ),
+            *(
+                f"(require-all (literal {_literal(path)}) (vnode-type REGULAR-FILE))"
+                for path in request.write_files
+            ),
+        )
     )
     git_granted = (
         request.git_create or request.workspace / constants.GIT_DIRECTORY in request.write_roots
@@ -1330,17 +1401,17 @@ def _profile(
     protection = request.protected_paths
     protected_patterns = [
         (
-            f"^{workspace_pattern}/(.*/)?"
+            f"^{workspace_pattern}/([^/]*/)*"
             f"({'|'.join(re.escape(name) for name in protection.instruction_names)})$"
         )
     ]
     for directory in protection.directories:
-        prefix = "(.*/)?"
+        prefix = "([^/]*/)*"
         if git_granted and directory == constants.GIT_DIRECTORY.as_posix():
-            prefix = ".+/"
-        protected_patterns.append(f"^{workspace_pattern}/{prefix}{re.escape(directory)}(/.*)?$")
+            prefix = "[^/]+/([^/]*/)*"
+        protected_patterns.append(f"^{workspace_pattern}/{prefix}{re.escape(directory)}(/[^/]*)*$")
     protected_patterns.extend(
-        f"^{workspace_pattern}/(.*/)?{re.escape(file)}$" for file in protection.files
+        f"^{workspace_pattern}/([^/]*/)*{re.escape(file)}$" for file in protection.files
     )
     protected = " ".join(_regex(pattern) for pattern in protected_patterns)
     private_names = (
@@ -1376,7 +1447,9 @@ def _profile(
         roots = (*private_roots, *discovered) if system_reads else private_roots
         rules = []
         for root in roots:
-            pattern = _regex(f"^{re.escape(str(root).rstrip('/'))}/(.*/)?{private_names}(/.*)?$")
+            pattern = _regex(
+                f"^{re.escape(str(root).rstrip('/'))}/([^/]*/)*{private_names}(/[^/]*)*$"
+            )
             nested = tuple(path for path in anchors if path != root and path.is_relative_to(root))
             if nested:
                 exclusions = " ".join(f"(subpath {_literal(path)})" for path in nested)
@@ -1388,11 +1461,47 @@ def _profile(
                 f"(require-all (require-not (subpath {_literal(scratch)})) (require-any {result})) "
             )
             if not owned_scratch and not request.scratch_data:
-                result += _regex(f"^{re.escape(str(scratch))}/(.*/)?{private_names}(/.*)?$")
+                result += _regex(f"^{re.escape(str(scratch))}/([^/]*/)*{private_names}(/[^/]*)*$")
         return result
 
     private_reads = private_rules(system_reads=False)
     private_data_reads = private_rules(system_reads=True)
+    hard_rules = []
+    environment_roots = tuple(private_roots)
+    if confined_scratch and not owned_scratch and not request.scratch_data:
+        environment_roots += (scratch,)
+    for root in environment_roots:
+        for pattern in environment_value_patterns():
+            expression = _regex(f"^{re.escape(str(root).rstrip('/'))}/([^/]*/)*{pattern}(/[^/]*)*$")
+            if confined_scratch and root != scratch:
+                expression = (
+                    f"(require-all {expression} (require-not (subpath {_literal(scratch)})))"
+                )
+            hard_rules.append(
+                f'(deny file-read* file-write* process-exec {expression} (with message "{tag}"))'
+            )
+    hard_rules.extend(
+        f"(deny file-read* file-write* process-exec (subpath {_literal(path)}) "
+        f'(with message "{tag}"))'
+        for path in request.hard_denied_paths
+    )
+    for path in request.protected_host_roots:
+        expression = f"(subpath {_literal(path)})"
+        if request.session_scratch:
+            expression = f"(require-all {expression} (require-not (subpath {_literal(scratch)})))"
+        hard_rules.append(
+            f'(deny file-read-data file-write* process-exec {expression} (with message "{tag}"))'
+        )
+        ancestors = " ".join(f"(literal {_literal(parent)})" for parent in scratch.parents)
+        metadata = f"(require-all {expression} (require-not (require-any {ancestors})))"
+        hard_rules.append(f'(deny file-read-metadata {metadata} (with message "{tag}"))')
+    for endpoint in protected_sockets:
+        hard_rules.append(
+            f'(deny file-write* (subpath {_literal(endpoint.parent)}) (with message "{tag}"))'
+        )
+        anchors = " ".join(f"(literal {_literal(path)})" for path in endpoint.parent.parents)
+        hard_rules.append(f'(deny file-write-unlink {anchors} (with message "{tag}"))')
+    hard_denials = "\n".join(hard_rules)
     scratch_ancestors = " ".join(f"(literal {_literal(path)})" for path in scratch.parents)
     private_metadata = (
         f"(require-all (require-any {private_data_reads}) "
@@ -1416,20 +1525,15 @@ def _profile(
                     f"(allow network-outbound (remote unix-socket {socket_path}))",
                 )
             )
-        if egress_socket is not None:
+        for endpoint in protected_sockets:
             network_rules.append(
-                f"(allow network-outbound (remote unix-socket (literal {_literal(egress_socket)})))"
+                f"(allow network-outbound (remote unix-socket (literal {_literal(endpoint)})))"
             )
         network = (
             "(allow system-socket (socket-domain AF_UNIX))\n" + "\n".join(network_rules)
             if network_rules
             else ""
         )
-    resolver_lookup = (
-        '(allow mach-lookup (global-name "com.apple.system.opendirectoryd.libinfo"))'
-        if request.network
-        else ""
-    )
     rename_rule = (
         "(deny file-write-unlink "
         + " ".join(f"(literal {_literal(path)})" for path in rename_anchors)
@@ -1456,25 +1560,36 @@ def _profile(
         if terminal_slave is not None
         else ""
     )
+    account_lookup = (
+        '(allow mach-lookup (global-name "com.apple.system.opendirectoryd.libinfo"))'
+        if "account_lookup" in request.backend_options
+        else ""
+    )
+    process_pools = (
+        "(allow ipc-posix-sem (semaphore-owner same-sandbox))\n"
+        '(allow sysctl-read (sysctl-name "kern.sysv.semmns"))'
+        if "process_pools" in request.backend_options
+        else ""
+    )
     # The directory helper returns shared host temporary paths; denying it lets compatible
     # native tools fall back to the bound TMPDIR without granting shared-directory access.
     return f"""(version 1)
 (deny default (with message "{tag}"))
-(allow process-exec)
 (allow process-fork)
 (allow signal (target same-sandbox))
 (allow process-info* (target same-sandbox))
+{account_lookup}
+{process_pools}
 (allow sysctl-read (sysctl-name-prefix "hw.") (sysctl-name-prefix "kern.proc.")
   (sysctl-name-prefix "kern.os") (sysctl-name "kern.argmax")
   (sysctl-name "kern.hostname") (sysctl-name "kern.maxfilesperproc")
   (sysctl-name "kern.maxproc") (sysctl-name "kern.version")
   (sysctl-name "vm.loadavg"))
-{resolver_lookup}
-(allow file-read* {read_rules})
+(allow file-read* process-exec {read_rules})
 (allow file-read-data (literal "/"))
 {system_directory_rule}
 {search_metadata_rule}
-(deny file-read-data {private_data_reads} (with message "{tag}"))
+(deny file-read-data process-exec {private_data_reads} (with message "{tag}"))
 (deny file-read-metadata {private_metadata} (with message "{tag}"))
 (allow file-write* {write_rules})
 (allow file-write-data (require-all (path "/dev/null") (vnode-type CHARACTER-DEVICE)))
@@ -1488,6 +1603,7 @@ def _profile(
   (vnode-type DIRECTORY)) (with message "{tag}"))
 (deny system-fcntl (fcntl-command 80 110) (with message "{tag}"))
 {network}
+{hard_denials}
 """
 
 
@@ -1536,6 +1652,15 @@ def _denial_records(value: str) -> tuple[str, ...]:
     ):
         return ()
     return tuple(records)
+
+
+def _has_nonstartup_denial(records: str, startup_denials: frozenset[tuple[str, str]]) -> bool:
+    """Identify whether the buffered records include a complete non-startup observation."""
+    return any(
+        fingerprint not in startup_denials
+        for record in _denial_records(records)
+        if (fingerprint := _denial_fingerprint(record)) is not None
+    )
 
 
 def _join_denials(
@@ -1605,17 +1730,20 @@ def _denial_from_log(
     deadline: float,
     startup_denials: frozenset[tuple[str, str]] = frozenset(),
 ) -> str | None:
-    """Retry briefly for a tagged denial while the kernel log catches up."""
+    """Retry briefly for a tagged observation beyond the known startup baseline."""
     limit = min(deadline, time.monotonic() + _DENIAL_LOG_WAIT_SECONDS)
+    observed = None
     for attempt in range(_DENIAL_LOG_ATTEMPTS):
         denial = _read_denial_from_log(tag, started, limit, startup_denials)
         if denial is not None:
-            return denial
+            if _has_nonstartup_denial(denial, startup_denials):
+                return denial
+            observed = denial
         if time.monotonic() + _DENIAL_LOG_RETRY_SECONDS >= limit:
             break
         if attempt < _DENIAL_LOG_ATTEMPTS - 1:
             time.sleep(_DENIAL_LOG_RETRY_SECONDS)
-    return None
+    return observed
 
 
 def _read_denial_from_log(
@@ -1734,6 +1862,31 @@ class MacOSSeatbeltBackend:
             or None to create one owned by this backend.
     """
 
+    @property
+    def capability_guidance(self) -> dict[str, str]:
+        """Describe usable transports without exposing platform selection to the model.
+
+        Returns:
+            dict[str, str]: Instructions for this backend's declared capabilities.
+        """
+        return {
+            SandboxCapability.INGRESS: (
+                "Use exec to start a foreground Unix-socket service at "
+                f"${INGRESS_SOCKET_ENVIRONMENT_VARIABLE}. "
+                "TCP-only and descendant-only servers cannot be published."
+            ),
+            SandboxCapability.LOCAL_IPC: (
+                f"Place Unix socket paths beneath ${_LOCAL_SOCKET_DIRECTORY_ENVIRONMENT_VARIABLE}. "
+                "The harness prepares and retires this private directory automatically. "
+                "Use a separate command for general networking."
+            ),
+            SandboxCapability.MEDIATED_EGRESS: (
+                "Proxy environment variables select the private Unix SOCKS endpoint "
+                "automatically. Use curl or Git for HTTP(S). For uv dependencies, download "
+                "approved wheels with curl and install them with uv --offline."
+            ),
+        }
+
     _diagnostics: SeatbeltDiagnosticService
     _owns_diagnostics: bool
     _enforcement_verified_pid: int | None
@@ -1742,7 +1895,17 @@ class MacOSSeatbeltBackend:
     _pending_local_attachment: LocalSocketAttachmentError | None
     _local_volume_users: int
     _local_volume_closed: bool
-    capabilities: frozenset[SandboxCapability] = frozenset({SandboxCapability.LOCAL_NETWORK})
+    capabilities: frozenset[SandboxCapability] = frozenset()
+    backend_options = tuple(sandbox_options("darwin"))
+    requestable_capabilities = frozenset(
+        {
+            SandboxCapability.LOCAL_NETWORK,
+            SandboxCapability.LOCAL_IPC,
+            SandboxCapability.MEDIATED_EGRESS,
+            SandboxCapability.INGRESS,
+            SandboxCapability.WRITE_FILES,
+        }
+    )
     qualification_capabilities: frozenset[SandboxCapability] = frozenset()
 
     def __init__(self, diagnostics: SeatbeltDiagnosticService | None = None) -> None:
@@ -1820,19 +1983,9 @@ class MacOSSeatbeltBackend:
                     raise pending from error
                 self._pending_local_attachment = None
 
-    def _qualify_local_network(self, request: SandboxRequest) -> None:
-        """Advertise local IPC only after its volume and native socket exchange work."""
+    def _qualify_local_network(self, request: SandboxRequest) -> bool:
+        """Probe local sockets while the approved attempt retains its checked volume lease."""
         try:
-            with self._local_volume_lock:
-                if self._pending_local_attachment is not None:
-                    raise self._pending_local_attachment
-                try:
-                    self._local_volume = _mount_local_socket_volume(
-                        time.monotonic() + _LOCAL_SOCKET_VOLUME_SETUP_TIMEOUT_SECONDS
-                    )
-                except LocalSocketAttachmentError as error:
-                    self._pending_local_attachment = error
-                    raise
             source = "/usr/bin/perl -MSocket -e " + shlex.quote(
                 f'my $path = "$ENV{{{_LOCAL_SOCKET_DIRECTORY_ENVIRONMENT_VARIABLE}}}/probe.sock"; '
                 "socket(my $server, PF_UNIX, SOCK_STREAM, 0) or die $!; "
@@ -1846,51 +1999,40 @@ class MacOSSeatbeltBackend:
                 request,
                 source=source,
                 execution_source=source,
+                network=False,
+                egress_origins=(),
+                ingress_port=None,
+                terminal=False,
+                cleanup_proof=False,
+                runtime_timeout=None,
                 local_network=True,
                 deadline=time.monotonic() + _LOCAL_SOCKET_VOLUME_SETUP_TIMEOUT_SECONDS,
             )
             result = self.qualification_probe(probe)
             if result.outcome is SandboxOutcome.COMPLETED and result.exit_code == 0:
-                return
+                self.capabilities = self.capabilities | {SandboxCapability.LOCAL_NETWORK}
+                return True
         except (OSError, TimeoutError, subprocess.TimeoutExpired):
             pass
-        self.capabilities = frozenset()
-        with self._local_volume_lock:
-            if self._local_volume is not None:
-                try:
-                    _eject_local_socket_volume(self._local_volume)
-                except (OSError, TimeoutError, subprocess.TimeoutExpired):
-                    telemetry_audit(
-                        "sandbox.local_socket_volume.cleanup_pending",
-                        workspace_id=request.workspace_id,
-                        attempt_id=request.attempt_id,
-                    )
-                else:
-                    self._local_volume = None
+        return False
 
-    def _qualify_mediated_egress(self, request: SandboxRequest) -> None:
-        """Advertise mediation only after exact-path native socket enforcement works."""
-        if SandboxCapability.LOCAL_NETWORK not in self.capabilities:
-            return
+    def _qualify_mediated_egress(self, request: SandboxRequest) -> bool:
+        """Probe the sealed mount-free endpoint before activating an approved broker."""
         scratch_value = request.shell_environment().get(TMPDIR_ENVIRONMENT_VARIABLE)
         if scratch_value is None:
-            return
+            return False
         scratch = Path(scratch_value)
         try:
             with (
-                self._local_socket_directory(
-                    request, scratch, prefix=f"{constants.APP_NAME}-egress-probe-"
-                ) as directory,
-                self._local_socket_directory(
-                    request, scratch, prefix=f"{constants.APP_NAME}-egress-other-"
-                ) as other_directory,
+                tempfile.TemporaryDirectory(prefix="le-p-", dir=_PRIVATE_TEMP_ROOT) as probe_root,
+                tempfile.TemporaryDirectory(prefix="le-o-", dir=_PRIVATE_TEMP_ROOT) as other_root,
                 socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener,
                 socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as other,
                 socket.socket(socket.AF_INET, socket.SOCK_STREAM) as host,
-                tempfile.TemporaryDirectory(prefix="le-a-", dir=directory.parent) as alias_root,
+                tempfile.TemporaryDirectory(prefix="le-a-", dir=_PRIVATE_TEMP_ROOT) as alias_root,
             ):
-                allowed = directory / "broker.sock"
-                forbidden = other_directory / "broker.sock"
+                allowed = Path(probe_root).resolve(strict=True) / "broker.sock"
+                forbidden = Path(other_root).resolve(strict=True) / "broker.sock"
                 alias_directory = Path(alias_root)
                 alias = alias_directory / "a.sock"
                 listener.bind(str(allowed))
@@ -1944,8 +2086,10 @@ class MacOSSeatbeltBackend:
                 )
                 if result.returncode == 0:
                     self.capabilities = self.capabilities | {SandboxCapability.MEDIATED_EGRESS}
+                    return True
         except (OSError, ValueError, TimeoutError, subprocess.TimeoutExpired):
-            return
+            pass
+        return False
 
     def _qualify_terminal(self, request: SandboxRequest) -> None:
         """Advertise PTYs only after native ownership and inner-allocation controls pass."""
@@ -2000,8 +2144,15 @@ class MacOSSeatbeltBackend:
                     self._local_volume = _mount_local_socket_volume(request.deadline)
                 except LocalSocketAttachmentError as error:
                     self._pending_local_attachment = error
+                    if error.device is None and isinstance(
+                        error.__cause__, (TimeoutError, subprocess.TimeoutExpired)
+                    ):
+                        raise TimeoutError(str(error)) from error
                     raise
             volume = self._local_volume
+            # Register the lease before validation so a refusal still attempts checked eject.
+            self._local_volume_users += 1
+        try:
             if volume.mount.stat().st_dev != volume.device_id or not volume.mount.is_dir():
                 raise OSError("The macOS local socket filesystem changed.")
             if any(
@@ -2009,19 +2160,22 @@ class MacOSSeatbeltBackend:
                 for root in (*request.write_roots, scratch)
             ):
                 raise OSError("A writable command root shares the local socket filesystem.")
-            self._local_volume_users += 1
-        try:
             with tempfile.TemporaryDirectory(prefix=prefix, dir=volume.mount) as directory:
                 yield Path(directory).resolve(strict=True)
         finally:
             with self._local_volume_lock:
                 self._local_volume_users -= 1
-                if (
-                    self._local_volume is not None
-                    and self._local_volume_closed
-                    and not self._local_volume_users
-                ):
-                    _eject_local_socket_volume(self._local_volume)
+                if self._local_volume is not None and not self._local_volume_users:
+                    try:
+                        _eject_local_socket_volume(self._local_volume)
+                    except (OSError, TimeoutError, subprocess.TimeoutExpired):
+                        self._local_volume_closed = True
+                        telemetry_audit(
+                            "sandbox.local_socket_volume.cleanup_pending",
+                            workspace_id=request.workspace_id,
+                            attempt_id=request.attempt_id,
+                        )
+                        raise
                     self._local_volume = None
 
     def classify_denial_candidates(self, observed: str) -> tuple[tuple[tuple[str, bool], ...], str]:
@@ -2124,6 +2278,15 @@ class MacOSSeatbeltBackend:
         """
         return _SYSTEM_READ_ROOTS
 
+    @staticmethod
+    def installed_read_roots() -> tuple[Path, ...]:
+        """Suggest the shipped installed-runtime preset for command policy.
+
+        Returns:
+            tuple[Path, ...]: Read-only candidates that still require native path checks.
+        """
+        return installed_paths("darwin")
+
     @property
     def policy_version(self) -> str:
         """Return the reviewed Seatbelt policy revision.
@@ -2191,7 +2354,7 @@ class MacOSSeatbeltBackend:
             root (Path): Canonical candidate package directory.
 
         Returns:
-            bool: Whether the root qualifies for automatic read authority.
+            bool: Whether the root is a recognized package candidate; approval remains separate.
 
         Raises:
             OSError: If the package receipt cannot be inspected.
@@ -2471,6 +2634,10 @@ class MacOSSeatbeltBackend:
         Returns:
             CommandProcessResult: Bounded output and exit status or a typed boundary failure.
         """
+        if not set(request.backend_options).issubset(self.backend_options):
+            return CommandProcessResult(
+                SandboxOutcome.UNSUPPORTED, detail="This sandbox option is unavailable."
+            )
         if request.terminal != (terminal_input is not None):
             return CommandProcessResult(
                 SandboxOutcome.INVALID,
@@ -2486,7 +2653,9 @@ class MacOSSeatbeltBackend:
                 SandboxOutcome.UNSUPPORTED,
                 detail="Interactive terminal and mediated egress cannot share this attempt.",
             )
-        if request.egress_origins and (policy_authority is None or approved_revision is None):
+        if (request.egress_origins or request.ingress_port is not None) and (
+            policy_authority is None or approved_revision is None
+        ):
             return CommandProcessResult(
                 SandboxOutcome.UNAVAILABLE,
                 detail="Mediated egress requires active policy authority.",
@@ -2519,8 +2688,7 @@ class MacOSSeatbeltBackend:
             request (SandboxRequest): Owned probe request from the verified native selector.
         """
         self._enforcement_verified_pid = os.getpid()
-        self._qualify_local_network(request)
-        self._qualify_mediated_egress(request)
+        self.capabilities = self.capabilities | {SandboxCapability.WRITE_FILES}
         self._qualify_terminal(request)
 
     def _run(
@@ -2541,20 +2709,6 @@ class MacOSSeatbeltBackend:
                 detail="Unsupported macOS policy.",
                 failure_context="No compatible native sandbox policy is available.",
             )
-        if (
-            request.local_network
-            and not request.network
-            and SandboxCapability.LOCAL_NETWORK not in self.capabilities
-        ):
-            return CommandProcessResult(
-                SandboxOutcome.UNAVAILABLE,
-                detail="Attempt-local Unix sockets are not qualified on this macOS host.",
-            )
-        if request.egress_origins and SandboxCapability.MEDIATED_EGRESS not in self.capabilities:
-            return CommandProcessResult(
-                SandboxOutcome.UNAVAILABLE,
-                detail="Attempt-private mediated egress is not qualified on this macOS host.",
-            )
         if cancellation_event is not None and cancellation_event.is_set():
             return CommandProcessResult(SandboxOutcome.CANCELLED)
         execution_deadline = request.deadline
@@ -2566,6 +2720,7 @@ class MacOSSeatbeltBackend:
         if failure := _request_failure(request):
             return failure
         possible_effects = False
+        result: CommandProcessResult | None = None
         try:
             bound_scratch = request.shell_environment().get(TMPDIR_ENVIRONMENT_VARIABLE)
             scratch_context = (
@@ -2589,14 +2744,47 @@ class MacOSSeatbeltBackend:
                     raise ValueError("Unsafe command scratch directory.")
                 _search_roots(request)
                 rename_anchors = set()
-                for root in dict.fromkeys(
-                    (
-                        request.workspace,
-                        *request.read_roots,
-                        *request.write_roots,
-                        scratch,
+                roots = tuple(
+                    dict.fromkeys(
+                        (
+                            request.workspace,
+                            *request.read_roots,
+                            *request.write_roots,
+                            scratch,
+                        )
                     )
+                )
+                data_roots = tuple(
+                    root
+                    for root in roots
+                    if root not in request.policy_read_roots
+                    or root in (request.workspace, scratch, *request.write_roots)
+                )
+                if request.policy_read_roots and not any(
+                    path.is_relative_to(root) or root.is_relative_to(path)
+                    for path in request.policy_read_roots
+                    for root in data_roots
                 ):
+                    # Each inventory accounts for every link, so a cross-inventory link fails.
+                    aliases = inspect_hardlink_aliases(
+                        data_roots, request.deadline, scratch=scratch
+                    )
+                    aliases.update(
+                        inspect_hardlink_aliases(request.policy_read_roots, request.deadline)
+                    )
+                else:
+                    aliases = inspect_hardlink_aliases(roots, request.deadline, scratch=scratch)
+                for names in set(aliases.values()):
+                    writable = {
+                        path in request.write_files
+                        or any(
+                            path.is_relative_to(root) for root in (*request.write_roots, scratch)
+                        )
+                        for path in names
+                    }
+                    if len(writable) > 1:
+                        raise ValueError("Hardlink aliases cross approved read/write scopes.")
+                for root in roots:
                     _walk_granted_root(
                         root,
                         request.deadline,
@@ -2605,35 +2793,66 @@ class MacOSSeatbeltBackend:
                         else None,
                         protection=request.protected_paths if root == request.workspace else None,
                         ordinary_names=request.scratch_data and root == scratch,
+                        aliases=aliases,
+                        hard_denial=request.denies_path,
                     )
                 guarded_anchors = tuple(sorted(rename_anchors))
                 environment = request.shell_environment()
                 environment[TMPDIR_ENVIRONMENT_VARIABLE] = str(scratch)
+                environment[OUTPUT_DIRECTORY_ENVIRONMENT_VARIABLE] = str(
+                    request.output_directory(scratch)
+                )
                 terminal = (
                     attempt_stack.enter_context(_owned_terminal()) if request.terminal else None
                 )
                 local_socket_directory = None
+                synchronization_socket = None
                 if request.local_network and not request.network:
                     local_socket_directory = attempt_stack.enter_context(
                         self._local_socket_directory(request, scratch)
                     )
+                    if not qualification and not self._qualify_local_network(request):
+                        raise OSError("Attempt-local Unix socket qualification failed.")
                     _walk_granted_root(local_socket_directory, request.deadline)
                     environment[_LOCAL_SOCKET_DIRECTORY_ENVIRONMENT_VARIABLE] = str(
                         local_socket_directory
                     )
+                    if not qualification and request.ingress_port is None:
+                        private = attempt_stack.enter_context(
+                            tempfile.TemporaryDirectory(
+                                prefix="sync-", dir=local_socket_directory.parent
+                            )
+                        )
+                        synchronization_socket = Path(private) / "counter.sock"
+                        attempt_stack.enter_context(SynchronizationBroker(synchronization_socket))
+                        environment[_SYNCHRONIZATION_SOCKET_ENVIRONMENT_VARIABLE] = str(
+                            synchronization_socket
+                        )
                 egress_socket = None
                 broker = None
+                if request.ingress_port is not None:
+                    if (
+                        local_socket_directory is None
+                        or policy_authority is None
+                        or approved_revision is None
+                    ):
+                        raise ValueError("Ingress requires its approved isolated local transport.")
+                    endpoint = local_socket_directory / "service.sock"
+                    environment[INGRESS_SOCKET_ENVIRONMENT_VARIABLE] = str(endpoint)
+                    broker = attempt_stack.enter_context(
+                        MacOSNetworkBroker(request, endpoint, policy_authority, approved_revision)
+                    )
                 if request.egress_origins:
                     if policy_authority is None or approved_revision is None:
                         raise ValueError("Mediated egress authority is unavailable.")
+                    if not self._qualify_mediated_egress(request):
+                        raise OSError("Mount-free mediated egress qualification failed.")
                     directory = attempt_stack.enter_context(
-                        self._local_socket_directory(
-                            request, scratch, prefix=f"{constants.APP_NAME}-egress-"
-                        )
+                        tempfile.TemporaryDirectory(prefix="le-e-", dir=_PRIVATE_TEMP_ROOT)
                     )
-                    egress_socket = directory / "broker.sock"
+                    egress_socket = Path(directory).resolve(strict=True) / "broker.sock"
                     broker = attempt_stack.enter_context(
-                        MacOSEgressBroker(
+                        MacOSNetworkBroker(
                             request, egress_socket, policy_authority, approved_revision
                         )
                     )
@@ -2664,16 +2883,15 @@ class MacOSSeatbeltBackend:
                     monitor is not None and self._diagnostics.directory_probe_pending()
                 ):
                     probe_tag = "LOOP_SBX_" + secrets.token_hex(16)
-                    compatibility_files = _python_environment_configs(request)
                     profile = _profile(
                         request,
                         scratch,
                         probe_tag,
-                        compatibility_files,
                         guarded_anchors,
                         owned_scratch=bound_scratch is None,
                         local_socket_directory=local_socket_directory,
                         egress_socket=egress_socket,
+                        synchronization_socket=synchronization_socket,
                     )
                     try:
                         registered = (
@@ -2734,17 +2952,16 @@ class MacOSSeatbeltBackend:
                 if failure := _request_failure(request):
                     return failure
                 tag = "LOOP_SBX_" + secrets.token_hex(16)
-                compatibility_files = _python_environment_configs(request)
                 profile = _profile(
                     request,
                     scratch,
                     tag,
-                    compatibility_files,
                     guarded_anchors,
                     owned_scratch=bound_scratch is None,
                     system_directory=system_directory,
                     local_socket_directory=local_socket_directory,
                     egress_socket=egress_socket,
+                    synchronization_socket=synchronization_socket,
                     terminal_slave=terminal.path if terminal is not None else None,
                 )
                 try:
@@ -2787,26 +3004,36 @@ class MacOSSeatbeltBackend:
                         **({"output_observer": output_observer} if output_observer else {}),
                     )
                     if broker is not None and broker.interrupted:
-                        return replace(
+                        result = replace(
                             result,
                             outcome=SandboxOutcome.UNAVAILABLE,
                             exit_code=None,
-                            detail="Mediated egress authority ended during this command.",
+                            detail=broker.failure_detail,
                             possible_effects=True,
                         )
                     return result
                 finally:
                     if monitor is not None:
                         monitor.unregister(tag)
-        except (TimeoutError, subprocess.TimeoutExpired) as exc:
-            return CommandProcessResult(
-                SandboxOutcome.TIMED_OUT, detail=str(exc), possible_effects=possible_effects
-            )
         except ValueError as exc:
             return CommandProcessResult(
                 SandboxOutcome.INVALID, detail=str(exc), possible_effects=possible_effects
             )
-        except OSError as exc:
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            if result is not None:
+                cleanup = f"Native sandbox cleanup could not be confirmed. {exc}"
+                return replace(
+                    result,
+                    outcome=SandboxOutcome.UNAVAILABLE,
+                    exit_code=None,
+                    detail=f"{result.detail} {cleanup}" if result.detail else cleanup,
+                    failure_context="Native sandbox cleanup could not be confirmed.",
+                    possible_effects=True,
+                )
+            if isinstance(exc, (TimeoutError, subprocess.TimeoutExpired)):
+                return CommandProcessResult(
+                    SandboxOutcome.TIMED_OUT, detail=str(exc), possible_effects=possible_effects
+                )
             return CommandProcessResult(
                 SandboxOutcome.UNAVAILABLE,
                 detail=str(exc),
@@ -2828,7 +3055,7 @@ class MacOSSeatbeltBackend:
         tag: str,
         monitor: DenialMonitor | None,
         *,
-        broker: MacOSEgressBroker | None = None,
+        broker: MacOSNetworkBroker | None = None,
         startup_denials: frozenset[tuple[str, str]] = frozenset(),
         cancellation_event: threading.Event | None = None,
         output_observer: Callable[[str, str], None] | None = None,
@@ -2860,6 +3087,13 @@ class MacOSSeatbeltBackend:
                 detail="Native command preparation exceeded its deadline.",
                 diagnostic_status=diagnostic_status,
             )
+
+        def terminate_owned(process: subprocess.Popen) -> None:
+            """Close ingress while the service PID is retained, then settle the process group."""
+            if broker is not None and request.ingress_port is not None:
+                broker.close()
+            kill_process_group(process)
+
         if terminal is not None:
             process = _spawn_terminal(request, profile, environment, terminal)
         else:
@@ -2890,11 +3124,18 @@ class MacOSSeatbeltBackend:
                 request,
                 deadline=min(request.deadline, time.monotonic() + request.runtime_timeout),
             )
+        if broker is not None and request.ingress_port is not None:
+            try:
+                broker.bind_service(process.pid, cancellation_event)
+            except OSError:
+                supervise_process(process, time.monotonic(), terminate=terminate_owned)
+                raise
+            cancellation_event = broker.cancellation_event
         if broker is not None and not broker.bind_runtime_deadline(request.deadline):
             supervise_process(
                 process,
                 time.monotonic(),
-                terminate=kill_process_group,
+                terminate=terminate_owned,
                 reader=read_bounded_stream,
                 thread_factory=threading.Thread,
             )
@@ -2913,7 +3154,7 @@ class MacOSSeatbeltBackend:
             supervise_process(
                 process,
                 time.monotonic(),
-                terminate=kill_process_group,
+                terminate=terminate_owned,
                 reader=read_bounded_stream,
                 thread_factory=threading.Thread,
             )
@@ -2997,7 +3238,7 @@ class MacOSSeatbeltBackend:
                 process,
                 request.deadline,
                 stdout_limit=constants.MAX_OUTPUT_CHARS + len(shell_marker),
-                terminate=kill_process_group,
+                terminate=terminate_owned,
                 reader=read_stream if terminal is not None else read_bounded_stream,
                 thread_factory=threading.Thread,
                 cancel_event=cancellation_event,
@@ -3071,19 +3312,22 @@ class MacOSSeatbeltBackend:
                 all_records=True,
                 startup_denials=startup_denials,
             )
+            live = live if isinstance(live, str) else ""
             if not capture.exit_code:
                 snapshot = None
-                live = live if isinstance(live, str) else ""
-            elif isinstance(live, str) and live:
-                snapshot = _read_denial_from_log(
-                    tag,
-                    started,
-                    min(request.deadline, time.monotonic() + _DENIAL_RECORD_WAIT_SECONDS),
-                    startup_denials,
-                )
             else:
-                live = ""
-                snapshot = _denial_from_log(tag, started, request.deadline, startup_denials)
+                remaining = max(0.0, request.deadline - time.monotonic())
+                # log show snapshots records already published when the query starts.
+                time.sleep(min(_DENIAL_LOG_RETRY_SECONDS, remaining))
+                if _has_nonstartup_denial(live, startup_denials):
+                    snapshot = _read_denial_from_log(
+                        tag,
+                        started,
+                        min(request.deadline, time.monotonic() + _DENIAL_LOG_WAIT_SECONDS),
+                        startup_denials,
+                    )
+                else:
+                    snapshot = _denial_from_log(tag, started, request.deadline, startup_denials)
             records = [
                 (priority, record)
                 for record in (

@@ -73,6 +73,7 @@ def test_namespace_preparation_ignores_unrelated_environment_metadata(tmp_path):
         namespace_arguments(request, scratch, empty_mask=empty.fileno()) as (
             arguments,
             descriptors,
+            _,
         ),
     ):
         assert any(
@@ -181,6 +182,7 @@ else:
         namespace_arguments(request, scratch, empty_mask=empty.fileno()) as (
             arguments,
             descriptors,
+            _,
         ),
     ):
         result = subprocess.run(
@@ -202,13 +204,15 @@ else:
 
 
 def test_namespace_scratch_symlink_keeps_read_only_mounts(helper, tmp_path):
-    """Real scratch symlinks preserve restrictive overlays and private masks."""
+    """Real scratch symlinks preserve read-only overlays for accounted aliases and masks."""
     scratch = Path(tempfile.gettempdir()) / "private-scratch"
     scratch.mkdir(mode=0o700)
     selected = scratch / "selected"
     selected.mkdir()
     (selected / "input").write_text("selected-data")
-    outside = tmp_path / "outside"
+    library = tmp_path / "approved-library"
+    library.mkdir()
+    outside = library / "linked-source"
     outside.write_text("preserve-outside")
     os.link(outside, scratch / "linked")
     (scratch / ".ssh").mkdir()
@@ -223,7 +227,7 @@ def test_namespace_scratch_symlink_keeps_read_only_mounts(helper, tmp_path):
             source="native namespace control",
             cwd=selected,
             workspace=selected,
-            read_roots=(),
+            read_roots=(library,),
             write_roots=(),
             network=False,
             environment={"PATH": "/usr/bin:/bin", "TMPDIR": str(scratch)},
@@ -236,6 +240,7 @@ from pathlib import Path
 scratch=Path(sys.argv[1]);alias=Path(sys.argv[2])
 assert alias.resolve()==scratch/'selected'
 assert (alias/'input').read_text()=='selected-data'
+assert (scratch/'linked').read_text()=='preserve-outside'
 for path in (scratch/'selected/input',alias/'input',scratch/'linked'):
  for action in (lambda: path.write_text('bad'),lambda: path.chmod(0o600)):
   try: action()
@@ -253,6 +258,7 @@ print('namespace-boundaries-preserved')
             namespace_arguments(request, scratch, empty_mask=empty.fileno()) as (
                 arguments,
                 descriptors,
+                _,
             ),
         ):
             result = subprocess.run(
@@ -314,6 +320,7 @@ def test_bound_workspace_source_survives_path_replacement(helper, tmp_path):
         namespace_arguments(request, scratch, empty_mask=empty.fileno()) as (
             arguments,
             descriptors,
+            _,
         ),
     ):
         workspace.rename(tmp_path / "bound-original")

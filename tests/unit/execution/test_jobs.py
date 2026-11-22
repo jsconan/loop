@@ -856,3 +856,14 @@ def test_worker_starts_before_shutdown_can_snapshot_it(workers, monkeypatch):
 
     assert isinstance(job, jobs.CommandJob)
     assert observed == [True]
+
+
+def test_command_cancellation_accepts_its_own_policy_revocation_after_handoff():
+    """A native policy cancellation remains active after origin cancellation is detached."""
+    handed_off = Event()
+    handed_off.set()
+    signal = jobs.CommandCancellation(Event(), Event(), handed_off, jobs.threading.Lock())
+    assert not signal.is_set()
+    signal.set()
+    assert signal.is_set()
+    assert signal.wait(0)

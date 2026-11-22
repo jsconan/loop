@@ -3,6 +3,7 @@
 import ipaddress
 import socket
 import stat
+import subprocess
 import threading
 import time
 from email.message import Message
@@ -37,9 +38,9 @@ def broker(tmp_path, monkeypatch):
     authority = Mock()
     authority.try_egress_policy_revision.return_value = 7
     request = SimpleNamespace(
-        egress_origins=(HTTP_ORIGIN, HTTPS_ORIGIN), network=False, deadline=30.0
+        ingress_port=None, egress_origins=(HTTP_ORIGIN, HTTPS_ORIGIN), network=False, deadline=30.0
     )
-    owner = egress.MacOSEgressBroker(request, tmp_path / "proxy.sock", authority, 7)
+    owner = egress.MacOSNetworkBroker(request, tmp_path / "proxy.sock", authority, 7)
     owner.__enter__()
     return owner, listener, authority, clock, thread
 
@@ -51,9 +52,9 @@ def test_broker_requires_one_scoped_approved_revision(tmp_path):
         ((HTTP_ORIGIN,), True, 0),
         ((HTTP_ORIGIN,), False, -1),
     ):
-        request = SimpleNamespace(egress_origins=origins, network=network)
+        request = SimpleNamespace(ingress_port=None, egress_origins=origins, network=network)
         with pytest.raises(ValueError, match="mediated-only"):
-            egress.MacOSEgressBroker(request, tmp_path / "proxy", Mock(), revision)
+            egress.MacOSNetworkBroker(request, tmp_path / "proxy", Mock(), revision)
 
 
 def test_broker_bounds_stalled_resolutions_across_closed_instances(tmp_path, monkeypatch):
@@ -108,10 +109,13 @@ def test_broker_bounds_stalled_resolutions_across_closed_instances(tmp_path, mon
     authority = Mock()
     authority.try_egress_policy_revision.return_value = 7
     request = SimpleNamespace(
-        egress_origins=(HTTP_ORIGIN,), network=False, deadline=time.monotonic() + 10
+        ingress_port=None,
+        egress_origins=(HTTP_ORIGIN,),
+        network=False,
+        deadline=time.monotonic() + 10,
     )
     owners = [
-        egress.MacOSEgressBroker(request, tmp_path / f"{n}.sock", authority, 7) for n in range(3)
+        egress.MacOSNetworkBroker(request, tmp_path / f"{n}.sock", authority, 7) for n in range(3)
     ]
     entered = []
     try:
@@ -198,6 +202,7 @@ def test_broker_binds_runtime_ceiling_only_before_preparation_expires(broker):
     assert owner.active()
     clock[0] = 40.0
     assert not owner.active()
+    assert owner.interrupted
     owner.__exit__(None, None, None)
 
 
@@ -217,8 +222,10 @@ def test_broker_cannot_activate_after_concurrent_policy_revocation(tmp_path, mon
     monkeypatch.setattr(egress.socket, "socket", Mock(return_value=listener))
     authority = Mock()
     authority.bind_egress.side_effect = lambda _revision, lease: lease.revoke_revision(8)
-    request = SimpleNamespace(egress_origins=(HTTP_ORIGIN,), network=False, deadline=30.0)
-    owner = egress.MacOSEgressBroker(request, tmp_path / "proxy.sock", authority, 7)
+    request = SimpleNamespace(
+        ingress_port=None, egress_origins=(HTTP_ORIGIN,), network=False, deadline=30.0
+    )
+    owner = egress.MacOSNetworkBroker(request, tmp_path / "proxy.sock", authority, 7)
     with pytest.raises(OSError, match="authority ended during activation"):
         owner.__enter__()
     assert not owner.active()
@@ -246,7 +253,9 @@ def test_broker_requires_timely_revocation_confirmation(broker, monkeypatch):
 def test_broker_refuses_unsafe_or_failed_setup(tmp_path, monkeypatch, case):
     """An untrusted endpoint or failed setup closes its listener without a grant."""
     tmp_path.chmod(0o700)
-    request = SimpleNamespace(egress_origins=(HTTP_ORIGIN,), network=False, deadline=30.0)
+    request = SimpleNamespace(
+        ingress_port=None, egress_origins=(HTTP_ORIGIN,), network=False, deadline=30.0
+    )
     authority = Mock()
     listener = Mock()
     monkeypatch.setattr(egress.socket, "socket", Mock(return_value=listener))
@@ -264,7 +273,7 @@ def test_broker_refuses_unsafe_or_failed_setup(tmp_path, monkeypatch, case):
         authority.bind_egress.side_effect = OSError("policy changed")
     else:
         thread.return_value.start.side_effect = RuntimeError("thread failed")
-    owner = egress.MacOSEgressBroker(request, path, authority, 7)
+    owner = egress.MacOSNetworkBroker(request, path, authority, 7)
     with pytest.raises((OSError, RuntimeError)):
         owner.__enter__()
     assert not owner.allow_new()
@@ -304,8 +313,10 @@ def test_broker_waits_for_concurrent_close(broker, monkeypatch):
 
 def test_broker_without_a_listener_closes_before_binding(tmp_path):
     """An unstarted broker has no descriptor or policy grant to retain."""
-    request = SimpleNamespace(egress_origins=(HTTP_ORIGIN,), network=False, deadline=30.0)
-    owner = egress.MacOSEgressBroker(request, tmp_path / "proxy.sock", Mock(), 7)
+    request = SimpleNamespace(
+        ingress_port=None, egress_origins=(HTTP_ORIGIN,), network=False, deadline=30.0
+    )
+    owner = egress.MacOSNetworkBroker(request, tmp_path / "proxy.sock", Mock(), 7)
     assert owner.close()
     assert owner.pause()
     owner.__exit__(None, None, None)
@@ -893,3 +904,191 @@ def test_https_relay_stops_at_eof(broker, monkeypatch):
     owner._relay(client, upstream)
     upstream.sendall.assert_not_called()
     owner.__exit__(None, None, None)
+
+
+@pytest.fixture
+def ingress(broker, monkeypatch):
+    """Bind a mocked unreaped process to the public publication lifecycle."""
+    owner, listener, authority, clock, thread = broker
+    owner.request.ingress_port = 8123
+    owner.request.egress_origins = ()
+    queue = Mock()
+    queue.control.return_value = []
+    monkeypatch.setattr(egress.select, "kqueue", Mock(return_value=queue), raising=False)
+    monkeypatch.setattr(egress.select, "kevent", Mock(), raising=False)
+    for name in ("KQ_FILTER_PROC", "KQ_EV_ADD", "KQ_EV_ENABLE", "KQ_NOTE_EXIT"):
+        monkeypatch.setattr(egress.select, name, 1, raising=False)
+    return owner, listener, authority, clock, thread, queue
+
+
+@pytest.mark.parametrize("failure", ["none", "closed", "rebound", "observe"])
+def test_ingress_binds_live_foreground_identity_once(ingress, failure):
+    """Dead or repeated foreground bindings cannot replace the approved peer identity."""
+    owner, _listener, _authority, _clock, _thread, queue = ingress
+    if failure == "closed":
+        owner.close()
+    elif failure == "rebound":
+        owner.bind_service(12, None)
+    elif failure == "observe":
+        queue.control.side_effect = OSError("process absent")
+    if failure == "none":
+        owner.bind_service(12, None)
+        assert queue.control.call_count == 1
+    else:
+        with pytest.raises(OSError):
+            owner.bind_service(13, None)
+    owner.close()
+    if failure != "closed":
+        queue.close.assert_called()
+
+
+@pytest.mark.parametrize("ending", ["exit", "cancel", "revoke"])
+def test_ingress_watch_closes_publication_without_reaping(ingress, monkeypatch, ending):
+    """Service exit is normal; cancellation and authority loss stop forwarding promptly."""
+    owner, listener, authority, _clock, thread, queue = ingress
+    cancellation = threading.Event()
+    owner.bind_service(12, cancellation)
+    if ending == "exit":
+        queue.control.return_value = [object()]
+    elif ending == "cancel":
+        cancellation.set()
+        monkeypatch.setattr(egress.time, "sleep", lambda _: owner.close())
+    else:
+        authority.try_egress_policy_revision.return_value = 8
+    thread.call_args_list[1].kwargs["target"]()
+    assert owner.cancellation_event.is_set() is (ending != "exit")
+    assert not owner.active()
+    listener.close.assert_called()
+    queue.close.assert_called()
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "bytes",
+        "expired",
+        "mismatch",
+        "not-ready",
+        "connector-fails",
+        "unbound",
+        "paused",
+        "closed",
+        "spawn-fails",
+        "read-fails",
+        "wait-fails",
+        "broken-pipe",
+        "cancelled-read-fails",
+        "client-disconnects",
+        "cleanup-fails",
+        "kill-race",
+    ],
+)
+def test_ingress_connector_relays_only_bound_foreground_bytes(ingress, monkeypatch, mode):
+    """A native connector authenticates the peer and retained cleanup failures refuse closure."""
+    owner, listener, _authority, clock, thread, _queue = ingress
+    if mode != "unbound":
+        owner.bind_service(12, None)
+    client, connector = Mock(), Mock()
+    connector.stdout.fileno.return_value = 23
+    connector.wait.return_value = {
+        "mismatch": 78,
+        "not-ready": 77,
+        "connector-fails": 79,
+        "broken-pipe": 79,
+    }.get(mode, 0)
+    if mode == "wait-fails":
+        connector.wait.side_effect = [subprocess.TimeoutExpired("connector", 2), 0]
+    if mode == "broken-pipe":
+        connector.stdin.write.side_effect = BrokenPipeError("connector exited")
+    if mode == "cleanup-fails":
+        connector.kill.side_effect = OSError("kill failed")
+    if mode == "kill-race":
+        connector.kill.side_effect = ProcessLookupError("already exited")
+    spawn = Mock(return_value=connector)
+    if mode == "spawn-fails":
+        spawn.side_effect = OSError("spawn failed")
+    monkeypatch.setattr(egress.subprocess, "Popen", spawn)
+    listener.accept.return_value = (client, None)
+    # Run the accept callback once to obtain the actual worker target without private access.
+    selected = Mock(side_effect=[([listener], [], []), OSError("listener stopped")])
+    monkeypatch.setattr(egress.select, "select", selected)
+    worker = thread.return_value
+
+    def serve_now():
+        """Execute the accepted worker synchronously under controlled I/O readiness."""
+        target = thread.call_args.kwargs["target"]
+        if mode == "expired":
+            clock[0] = 31.0
+        if mode == "paused":
+            owner.pause()
+        elif mode == "closed":
+            owner.close()
+        client.recv.side_effect = (
+            ConnectionResetError("client disconnected")
+            if mode == "client-disconnects"
+            else [b"request", b""]
+        )
+        rounds = [
+            ([client], [], []),
+            ([client], [], []),
+            ([connector.stdout], [], []),
+            ([connector.stdout], [], []),
+        ]
+        with monkeypatch.context() as io_patch:
+            io_patch.setattr(egress.select, "select", Mock(side_effect=rounds))
+            if mode == "cancelled-read-fails":
+
+                def cancel_and_fail(*_args):
+                    """Cancel the owner before its in-flight connector read fails."""
+                    owner.cancellation_event.set()
+                    raise OSError("read failed")
+
+                read = cancel_and_fail
+            else:
+                pipe_data = (
+                    [b""]
+                    if mode in {"mismatch", "not-ready", "connector-fails", "wait-fails"}
+                    else [b"reply", b""]
+                )
+                read = Mock(
+                    side_effect=OSError("read failed") if mode == "read-fails" else pipe_data
+                )
+            io_patch.setattr(egress.os, "read", read)
+            target(*thread.call_args.kwargs["args"])
+
+    # Thread.start is invoked while the broker lock is held, so defer the callback.
+    worker.start.side_effect = None
+    accept = thread.call_args_list[0].kwargs["target"]
+    with monkeypatch.context() as accept_patch:
+        # Stop after the first accepted worker without closing its live authority.
+        accept_patch.setattr(owner, "active", Mock(side_effect=[True, False]))
+        accept_patch.setattr(owner, "close", Mock(return_value=True))
+        accept()
+    serve_now()
+    if mode in {"unbound", "paused", "closed"}:
+        spawn.assert_not_called()
+    elif mode != "spawn-fails":
+        assert spawn.call_args.kwargs["close_fds"]
+        connector.stdin.close.assert_called()
+        connector.stdout.close.assert_called()
+        if mode == "bytes":
+            connector.stdin.write.assert_called_once_with(b"request")
+            client.sendall.assert_called_once_with(b"reply")
+        if mode == "mismatch":
+            assert owner.cancellation_event.is_set()
+            assert "descendant services are unsupported" in owner.failure_detail
+    if mode in {"spawn-fails", "read-fails", "wait-fails", "connector-fails", "broken-pipe"}:
+        assert owner.cancellation_event.is_set()
+        assert owner.interrupted
+        assert owner.failure_detail == "The native macOS ingress connector failed."
+    if mode in {"not-ready", "bytes", "client-disconnects"}:
+        assert not owner.cancellation_event.is_set()
+        assert owner.failure_detail == "Mediated network authority ended during this command."
+    if mode == "cancelled-read-fails":
+        assert owner.cancellation_event.is_set()
+        assert owner.failure_detail == "Mediated network authority ended during this command."
+    client.close.assert_called()
+    if mode == "cleanup-fails":
+        # Simulate process disappearance on the final owner shutdown; uncertainty remains.
+        connector.kill.side_effect = ProcessLookupError()
+    assert owner.close() is (mode not in {"cleanup-fails", "kill-race"})

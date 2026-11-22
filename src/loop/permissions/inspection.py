@@ -17,6 +17,16 @@ _SHELL_TOKEN = re.compile(
     r"(?P<operator>&>>|<<-|>>|>\||<>|>&|<&|&>|<<|&&|\|\||[;&|()<>\n])"
     r"|(?P<word>(?:[^\s;&|()<>'\"\\]+|'[^']*'|\"(?:\\.|[^\"\\])*\"|\\[\s\S])+)",
 )
+_SCRATCH_REDIRECTION = re.compile(
+    r'(?P<quote>"?)\$(?:TMPDIR|LOOP_OUTPUT_DIR|\{TMPDIR\}|\{LOOP_OUTPUT_DIR\})'
+    r"/[A-Za-z0-9._/-]+(?P=quote)"
+)
+_BOUND_PATH_ARGUMENT = re.compile(
+    r'(?P<quote>"?)\$(?:WORKSPACE_ROOT|TMPDIR|LOOP_OUTPUT_DIR|'
+    r"\{(?:WORKSPACE_ROOT|TMPDIR|LOOP_OUTPUT_DIR)\})(?:/[A-Za-z0-9._/-]+)?(?P=quote)"
+)
+_READ_ONLY_BUILTINS = frozenset({":", "[", "cd", "echo", "false", "printf", "pwd", "test", "true"})
+_SIMPLE_COMMAND_SEPARATORS = frozenset({";", "&&", "||", "|", "\n"})
 
 
 @dataclass(frozen=True)
@@ -267,8 +277,13 @@ def match_git_mutation(command: list[str]) -> CommandFinding | None:
     if Path(command[0]).name != "git":
         return None
     arguments = command[1:]
-    while arguments and arguments[0] == "-C" and len(arguments) > 1:
-        arguments = arguments[2:]
+    while arguments:
+        if arguments[0] in {"--no-optional-locks", "--no-pager"}:
+            arguments = arguments[1:]
+        elif arguments[0] == "-C" and len(arguments) > 1:
+            arguments = arguments[2:]
+        else:
+            break
     if not arguments:
         return None
     read_only = {
@@ -415,6 +430,7 @@ class CommandInspection:
         source: str,
         *,
         temporary_roots: tuple[Path, ...] = (),
+        scratch_only: bool = False,
     ) -> tuple[CommandFinding, ...]:
         """Collect all applicable findings in matcher registration order.
 
@@ -422,24 +438,90 @@ class CommandInspection:
             source (str): Opaque POSIX shell source to inspect heuristically.
             temporary_roots (tuple[Path, ...]): Bound, managed temporary roots whose literal
                 destinations need no destructive review. Defaults to no temporary exemptions.
+            scratch_only (bool): The native boundary allows only private scratch writes. Defaults
+                to False, which requires review of variable-based destinations.
 
         Returns:
             tuple[CommandFinding, ...]: Applicable findings; absence does not prove safety.
         """
-        return self.analyze(source, temporary_roots=temporary_roots).findings
+        return self.analyze(
+            source,
+            temporary_roots=temporary_roots,
+            scratch_only=scratch_only,
+        ).findings
 
-    def analyze(self, source: str, *, temporary_roots: tuple[Path, ...] = ()) -> CommandAnalysis:
+    def uses_only_scratch_writes(
+        self,
+        source: str,
+        *,
+        temporary_roots: tuple[Path, ...],
+        read_only_program: Callable[[tuple[str, ...]], bool],
+    ) -> bool:
+        """Recognize simple commands that can keep the workspace read-only.
+
+        Args:
+            source (str): Shell source, inspected without execution.
+            temporary_roots (tuple[Path, ...]): Bound private scratch roots.
+            read_only_program (Callable[[tuple[str, ...]], bool]): Check a literal external argv.
+
+        Returns:
+            bool: Whether every segment is a recognized read or scratch-only operation. A
+                negative result leaves the write requirements uncertain and never grants access.
+        """
+        try:
+            tokens = shell_tokens(source)
+        except ValueError:
+            return False
+        start = 0
+        for end in range(len(tokens) + 1):
+            if end < len(tokens) and not (
+                tokens[end].operator and tokens[end].value in _SIMPLE_COMMAND_SEPARATORS
+            ):
+                continue
+            words, writes = self.strip_redirections(
+                tokens[start:end],
+                temporary_roots,
+                scratch_only=True,
+            )
+            start = end + 1
+            if writes or any(
+                token.operator
+                or not (
+                    token.raw == "["
+                    or literal_shell_word(token.raw)
+                    or _BOUND_PATH_ARGUMENT.fullmatch(token.raw)
+                )
+                for token in words
+            ):
+                return False
+            if (
+                words
+                and words[0].value not in _READ_ONLY_BUILTINS
+                and not read_only_program(tuple(token.value for token in words))
+            ):
+                return False
+        return True
+
+    def analyze(
+        self,
+        source: str,
+        *,
+        temporary_roots: tuple[Path, ...] = (),
+        scratch_only: bool = False,
+    ) -> CommandAnalysis:
         """Inspect source once for effects and candidate executables.
 
         Args:
             source (str): Opaque POSIX shell source to inspect heuristically.
             temporary_roots (tuple[Path, ...]): Bound, managed temporary roots whose literal
                 destinations need no destructive review. Defaults to no temporary exemptions.
+            scratch_only (bool): The native boundary allows only private scratch writes. Defaults
+                to False, which requires review of variable-based destinations.
 
         Returns:
             CommandAnalysis: Bounded advisory classification; absence never proves safety.
         """
-        scan = self._scan(source, temporary_roots)
+        scan = self._scan(source, temporary_roots, scratch_only)
         return CommandAnalysis(
             tuple(finding for finding in scan.findings if finding is not None),
             scan.git_read,
@@ -459,6 +541,7 @@ class CommandInspection:
         self,
         source: str,
         temporary_roots: tuple[Path, ...],
+        scratch_only: bool,
         depth: int = 0,
     ) -> CommandScanResult:
         """Scan one shell level and merge bounded nested command classifications."""
@@ -498,7 +581,11 @@ class CommandInspection:
             segment = tokens[start:index]
             initial = start == 0
             start = index + 1
-            word_tokens, review = self.strip_redirections(segment, temporary_roots)
+            word_tokens, review = self.strip_redirections(
+                segment,
+                temporary_roots,
+                scratch_only=scratch_only,
+            )
             if review:
                 self._add_destructive_finding(findings, redirection=True)
             command, ambiguous = self._strip_shell_prefixes([token.value for token in word_tokens])
@@ -566,7 +653,12 @@ class CommandInspection:
                 if findings[position] is None and (finding := matcher(command)) is not None:
                     findings[position] = finding
             if name in self.SHELLS and depth < 2 and 0 <= shell_source < len(arguments):
-                nested = self._scan(arguments[shell_source], temporary_roots, depth + 1)
+                nested = self._scan(
+                    arguments[shell_source],
+                    temporary_roots,
+                    scratch_only,
+                    depth + 1,
+                )
                 git_read = git_read or nested.git_read
                 executables.extend(nested.executables)
                 path_arguments.extend(nested.path_arguments)
@@ -627,12 +719,16 @@ class CommandInspection:
         self,
         tokens: list[ShellToken],
         temporary_roots: tuple[Path, ...],
+        *,
+        scratch_only: bool = False,
     ) -> tuple[list[ShellToken], bool]:
         """Separate command words from redirects and identify unproven write destinations.
 
         Args:
             tokens (list[ShellToken]): Tokens for one shell command segment.
             temporary_roots (tuple[Path, ...]): Canonical temporary directories approved for writes.
+            scratch_only (bool): The native boundary allows only private scratch writes. Defaults
+                to False, which requires review of variable-based destinations.
 
         Returns:
             tuple[list[ShellToken], bool]: Remaining words and whether a write needs review.
@@ -664,18 +760,28 @@ class CommandInspection:
                     and (destination.value.isdecimal() or destination.value == "-")
                 )
                 review = review or not (
-                    descriptor or self._managed_destination(destination, temporary_roots)
+                    descriptor
+                    or self._managed_destination(destination, temporary_roots, scratch_only)
                 )
             if destination is not None:
                 position += 1
         return words, review
 
     @staticmethod
-    def _managed_destination(token: ShellToken | None, temporary_roots: tuple[Path, ...]) -> bool:
-        """Recognize only literal null-device or contained managed temporary destinations."""
-        if token is None or token.operator or any(char in token.raw for char in "$`*?[\n"):
+    def _managed_destination(
+        token: ShellToken | None,
+        temporary_roots: tuple[Path, ...],
+        scratch_only: bool,
+    ) -> bool:
+        """Recognize literal managed destinations and simple scratch-only redirections."""
+        if token is None or token.operator:
             return False
         path = Path(token.value)
+        if scratch_only and _SCRATCH_REDIRECTION.fullmatch(token.raw):
+            # Shell variables can change. Only native confinement makes the write scratch-only.
+            return ".." not in path.parts
+        if any(char in token.raw for char in "$`*?[\n"):
+            return False
         if token.value == "/dev/null":
             return True
         if not path.is_absolute() or ".." in path.parts:

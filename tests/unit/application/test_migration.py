@@ -7,7 +7,9 @@ from contextlib import closing
 import pytest
 
 from loop.application import ApplicationMigration, ApplicationPaths
-from loop.workspace import Workspace
+from loop.permissions import PermissionManager
+from loop.utils import dump_yaml, load_yaml
+from loop.workspace import Workspace, WorkspaceRepository
 
 
 def application_paths(tmp_path) -> ApplicationPaths:
@@ -103,6 +105,64 @@ def test_migration_preserves_policy_and_appends_to_existing_central_log(tmp_path
     lines = paths.operational_log.read_text(encoding="utf-8").splitlines()
     assert lines[0] == "central"
     assert json.loads(lines[1])["message"] == "legacy"
+
+
+@pytest.mark.parametrize("marker", ["matching", "orphan"])
+def test_checkout_policy_migration_cannot_enable_host_services(tmp_path, marker):
+    """Neither an enrolled generation nor a new checkout marker can import host-service consent."""
+    project = tmp_path / "project"
+    legacy = project / ".loop"
+    legacy.mkdir(parents=True)
+    source = legacy / "permissions.yaml"
+    paths = application_paths(tmp_path)
+    workspace = WorkspaceRepository(paths.workspace_catalog).initialize(Workspace.discover(project))
+    central = paths.for_workspace(workspace.id, project)
+    arguments = {
+        "workspace_root": project,
+        "configuration_path": central.permissions,
+        "user_configuration_path": paths.user_permissions,
+        "workspace_id": workspace.id,
+        "namespace_catalog_path": paths.workspace_catalog,
+        "user_namespace_identity": str(paths.data_root),
+    }
+    manager = PermissionManager(**arguments, bootstrap_pristine_policy=True)
+    ordinary = load_yaml(central.permissions.read_bytes())
+    manager.close()
+    central.permissions.unlink()
+    if marker == "orphan":
+        ordinary["namespace_generation"] = "1" * 32
+    original = dump_yaml(
+        {
+            **ordinary,
+            "backend_options": ["account_lookup"],
+            "command_backend_options": {"1" * 64: ["process_pools"]},
+        }
+    )
+    source.write_text(original)
+    ApplicationMigration(workspace, paths, central).run()
+
+    assert load_yaml(central.permissions.read_bytes()) == ordinary
+    assert source.read_text() == original
+    reopened = PermissionManager(**arguments)
+    expected = "Workspace opt-in is off" if marker == "matching" else "recovery required"
+    assert expected in reopened.sandbox_option_limit("account_lookup")
+    assert expected in reopened.sandbox_option_limit("process_pools")
+    reopened.close()
+
+
+@pytest.mark.parametrize("content", [b"{bad: [", bytes([255])])
+def test_checkout_policy_migration_preserves_invalid_policy_for_recovery(tmp_path, content):
+    """The permission manager receives the exact bytes it must diagnose for owner recovery."""
+    project = tmp_path / "project"
+    source = project / ".loop" / "permissions.yaml"
+    source.parent.mkdir(parents=True)
+    source.write_bytes(content)
+    workspace = initialized_workspace(project)
+    paths = application_paths(tmp_path)
+    central = paths.for_workspace(workspace.id, project)
+    ApplicationMigration(workspace, paths, central).run()
+
+    assert central.permissions.read_bytes() == content
 
 
 def test_migration_ignores_obsolete_application_database(tmp_path) -> None:

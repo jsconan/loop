@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING
 
 from ....permissions.protection import is_protected_external_read
 from .host import protected_path, runtime_read_files, runtime_read_roots
-from .paths import mount_arguments, python_runtime_mounts
+from .paths import mount_arguments
 from .seccomp import descriptor_filter
 
 if TYPE_CHECKING:
@@ -25,6 +25,7 @@ if TYPE_CHECKING:
 
 _SYSTEM_ALTERNATIVES = Path("/etc/alternatives")
 _MAX_SYSTEM_ALIAS_HOPS = 40
+_SHARED_MEMORY_CAPACITY = 8 * 1024 * 1024
 
 
 def _normalize_alias_target(link: Path, value: Path) -> Path:
@@ -105,7 +106,7 @@ def _runtime_path_alias_mounts(
     scratch: Path,
     extra_aliases: tuple[tuple[Path, Path], ...] = (),
 ) -> tuple[tuple[Path, ...], tuple[str, ...]]:
-    """Recreate aliases for authenticated runtime PATHs and approved Python installations."""
+    """Recreate aliases for authenticated runtime PATHs and selected system executables."""
     runtime_paths = tuple(dict.fromkeys(path for pair in runtime_roots for path in pair))
 
     def inside_runtime(path: Path) -> bool:
@@ -169,8 +170,6 @@ def _runtime_path_alias_mounts(
             aliases[target] = resolved
 
     for alias, target in extra_aliases:
-        if alias == target:
-            continue
         if any(
             alias == mounted or alias.is_relative_to(mounted) or mounted.is_relative_to(alias)
             for mounted in (
@@ -180,7 +179,7 @@ def _runtime_path_alias_mounts(
                 *(path for _, path in request.path_roots),
             )
         ):
-            raise ValueError("Native Python runtime alias overlaps another mount.")
+            raise ValueError("Native system executable alias overlaps another mount.")
         aliases[alias] = target
 
     if not covered and not aliases:
@@ -225,7 +224,7 @@ def namespace_arguments(
     scratch: Path,
     *,
     empty_mask: int,
-) -> Generator[tuple[tuple[str, ...], tuple[int, ...]], None, None]:
+) -> Generator[tuple[tuple[str, ...], tuple[int, ...], SandboxRequest], None, None]:
     """Keep fixed isolated setup arguments and inherited source/filter descriptors owned.
 
     Reuse the filesystem owner before generating the production filter. Resolve live protected
@@ -245,8 +244,8 @@ def namespace_arguments(
         empty_mask (int): Original authenticated read-only empty control inode descriptor.
 
     Yields:
-        tuple[tuple[str, ...], tuple[int, ...]]: Fixed Bubblewrap argument fragment and descriptors
-            to inherit into trusted setup, valid only while this context remains open.
+        tuple[tuple[str, ...], tuple[int, ...], SandboxRequest]: Fixed Bubblewrap arguments,
+            inherited descriptors valid for this context, and the request for the mounted view.
 
     Raises:
         ValueError: Filesystem/request authority or native filter generation is invalid.
@@ -283,26 +282,12 @@ def namespace_arguments(
             descriptor = runtime.enter_context(authority.open_verified(deadline=request.deadline))
             runtime_mounts.extend(("--ro-bind-fd", str(descriptor), str(spelling)))
             runtime_descriptors.append(descriptor)
-        executable_identities = getattr(request, "executable_identities", ())
-        if not isinstance(executable_identities, tuple):
-            executable_identities = ()
-        python_mounts = python_runtime_mounts(
-            request.workspace,
-            request.path_roots,
-            executable_identities,
-            system_roots=tuple(path for _, path in runtime_bindings),
-        )
-        if any(root not in request.read_roots for root, _ in python_mounts):
-            raise ValueError("Native Python runtime authority changed during preparation.")
         covered_paths, runtime_aliases = _runtime_path_alias_mounts(
             request,
             tuple(runtime_bindings),
             tuple(path for path, _ in file_bindings),
             scratch,
-            (
-                *tuple((alias, root) for root, alias in python_mounts),
-                *_runtime_executable_aliases(request, tuple(runtime_bindings)),
-            ),
+            _runtime_executable_aliases(request, tuple(runtime_bindings)),
         )
         runtime_mounts.extend(runtime_aliases)
         with mount_arguments(
@@ -312,8 +297,11 @@ def namespace_arguments(
             skip_path_roots=covered_paths,
             skip_executable_roots=tuple(canonical for _, canonical in runtime_bindings),
             runtime_roots=tuple(dict.fromkeys(path for pair in runtime_bindings for path in pair)),
-        ) as (mounts, sources):
-            data = descriptor_filter(deadline=request.deadline)
+        ) as (mounts, sources, mounted_request):
+            data = descriptor_filter(
+                deadline=request.deadline,
+                **({"ingress_worker": True} if request.ingress_port is not None else {}),
+            )
             if stream.write(data) != len(data):
                 raise OSError("Namespace descriptor filter write was incomplete.")
             stream.seek(0)
@@ -338,6 +326,12 @@ def namespace_arguments(
                 "/proc",
                 "--dev",
                 "/dev",
+                "--size",
+                str(_SHARED_MEMORY_CAPACITY),
+                "--perms",
+                "0700",
+                "--tmpfs",
+                "/dev/shm",
                 "--chdir",
                 str(request.cwd),
                 "--seccomp",
@@ -359,4 +353,4 @@ def namespace_arguments(
                 seen.add(descriptor)
             arguments = tuple(distinct)
             inherited = (*inherited, *duplicates)
-            yield arguments, inherited
+            yield arguments, inherited, mounted_request

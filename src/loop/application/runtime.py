@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import logging
 from collections.abc import Callable, Mapping
+from pathlib import Path
 from types import TracebackType
 from typing import Self, cast
 
@@ -38,6 +39,7 @@ from ..utils import run_in_worker_async
 from ..workspace import Workspace, WorkspaceCommands, WorkspaceRepository
 from .commands import ApplicationCommands
 from .paths import ApplicationPaths, WorkspacePaths
+from .verification import VerificationCommands
 
 
 class RuntimeRollbackError(RuntimeError):
@@ -121,6 +123,7 @@ class ApplicationRuntime:
             RuntimeRollbackError: If failed construction cannot be rolled back safely.
         """
         accepted_failures = ()
+        recovery_defaults = {}
         while True:
             try:
                 return cls.create(
@@ -133,11 +136,25 @@ class ApplicationRuntime:
                     interaction,
                     main_app=True,
                     accepted_preset_failures=accepted_failures,
+                    recovery_defaults=recovery_defaults,
                 )
             except (PermissionPresetError, PermissionNamespaceError) as error:
-                exclude = await PermissionManager.recover_startup_async(error, interaction)
+                exclude = await PermissionManager.recover_startup_async(
+                    error,
+                    interaction,
+                    allow_defaults=(
+                        isinstance(error, PermissionNamespaceError)
+                        and Path(error.path)
+                        in {workspace_paths.permissions, paths.user_permissions}
+                    ),
+                )
                 if exclude and isinstance(error, PermissionPresetError):
                     accepted_failures = error.failures
+                elif isinstance(error, PermissionNamespaceError) and exclude in {
+                    "continue",
+                    "reset",
+                }:
+                    recovery_defaults[Path(error.path)] = exclude
 
     @classmethod
     def create(
@@ -152,6 +169,7 @@ class ApplicationRuntime:
         *,
         main_app: bool = False,
         accepted_preset_failures: tuple[PermissionLoadFailure, ...] = (),
+        recovery_defaults: dict[Path, str] | None = None,
     ) -> ApplicationRuntime:
         """Build a runtime from initialized workspace and application-owned references.
 
@@ -165,6 +183,7 @@ class ApplicationRuntime:
             interaction (Interaction): User interaction service.
             main_app (bool): Enable direct main-app terminal management decisions; False
                 (default) prevents library command dispatch from elevating.
+            recovery_defaults (dict[Path, str] | None): Explicit startup recovery choices.
             accepted_preset_failures (tuple[PermissionLoadFailure, ...]): Preset failures
                 explicitly acknowledged for this startup attempt.
 
@@ -229,6 +248,7 @@ class ApplicationRuntime:
             session_store = SQLiteSessionStore(
                 workspace_paths.sessions,
                 workspace_id=workspace.id,
+                scratch_roots=workspace_paths.scratch_roots,
             )
             cls._track_close(session_store, cleanup_callbacks)
             permission_manager = PermissionManager(
@@ -240,23 +260,42 @@ class ApplicationRuntime:
                     paths.configuration_root,
                     paths.data_root,
                     paths.state_root,
+                    paths.session_scratch,
                 ),
                 workspace_id=workspace.id,
                 namespace_catalog_path=paths.workspace_catalog,
                 bootstrap_pristine_policy=True,
+                recovery_defaults=recovery_defaults,
                 user_namespace_identity=str(paths.data_root),
                 interaction=active_interaction,
                 accepted_preset_failures=accepted_preset_failures,
                 yolo=settings.app.yolo,
+                allow_direct_host_execution=settings.app.allow_direct_host_execution,
             )
             cls._track_close(permission_manager, cleanup_callbacks)
             permission_manager.require_policy_ready()
+            for path, action in (recovery_defaults or {}).items():
+                if action == "reset":
+                    scope = "user" if path == paths.user_permissions else "workspace"
+                    try:
+                        backup = permission_manager.save_recovery_defaults(scope)
+                    except OSError as error:
+                        raise PermissionNamespaceError(
+                            path,
+                            "Could not archive or save defaults. Retry, repair the file, "
+                            "or choose temporary defaults to leave it intact.",
+                        ) from error
+                    message = f"Saved default permission policy at {path}."
+                    if backup is not None:
+                        message += f" Original archived at {backup}."
+                    active_interaction.info(message)
             active_interaction = ApprovalInteraction(active_interaction, permission_manager)
             if settings.app.yolo and permission_manager.yolo:
                 active_interaction.warning(
                     "YOLO mode is active (source: "
                     f"{configuration.source_for('app.yolo')}). Eligible requests will run "
-                    "without confirmation, including explicit host commands."
+                    "without confirmation. Explicit host commands require the separate trusted "
+                    "app.allow_direct_host_execution setting and run unrestricted when enabled."
                 )
             elif settings.app.yolo:
                 active_interaction.warning(
@@ -270,6 +309,8 @@ class ApplicationRuntime:
                 permission_manager=permission_manager,
                 settings=ToolRuntimeSettings(
                     user_agent=settings.web.user_agent,
+                    sandbox_environment=settings.tools.sandbox_environment,
+                    sandbox_path_aliases=settings.tools.sandbox_path_aliases,
                     command_job_runtime_limit_seconds=(
                         settings.tools.command_job_runtime_limit_seconds
                     ),
@@ -356,6 +397,9 @@ class ApplicationRuntime:
                 )
             )
             loop.register_command_provider(WorkspaceCommands(workspace, workspace_repository))
+            loop.register_command_provider(
+                VerificationCommands(workspace_paths.data, tool_registry, loop.instructions_manager)
+            )
             previous_telemetry = get_telemetry()
             set_telemetry(telemetry)
             cleanup_callbacks.append(lambda: cls._restore_telemetry(telemetry, previous_telemetry))

@@ -28,7 +28,7 @@ def decoded(output: str):
 def approving_interaction() -> Mock:
     """Return an interaction that approves one requested mutation."""
     interaction = Mock(spec=Interaction)
-    interaction.prompt.return_value = ApprovalChoice.ONCE
+    interaction.prompt.return_value = ApprovalChoice.SESSION
     return interaction
 
 

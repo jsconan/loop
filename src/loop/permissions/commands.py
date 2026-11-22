@@ -9,6 +9,7 @@ from ..completion import CommandCompletion, CompletionValue
 from ..errors import Problem, log_problem
 from ..interaction import prompt_recovery
 from ..models import CommandCapability
+from ..sandbox_catalog import installed_paths, sandbox_options, system_paths
 from .manager import PermissionManager
 from .models import (
     Action,
@@ -22,15 +23,20 @@ from .models import (
     PermissionRule,
     PolicyScope,
     PresetReplacementPreview,
+    SandboxPathAccess,
 )
 
 _ACTION_DESCRIPTIONS = {
     Action.FILESYSTEM_LIST: "List entries under a filesystem path.",
     Action.FILESYSTEM_READ: "Read the contents of a filesystem object.",
+    Action.FILESYSTEM_EXECUTE: "Execute native code; readable interpreter source is separate.",
     Action.FILESYSTEM_CREATE: "Create a new filesystem object.",
     Action.FILESYSTEM_REPLACE: "Replace an existing filesystem object's contents.",
     Action.FILESYSTEM_DELETE: "Permanently delete a filesystem object.",
     Action.NETWORK_REQUEST: "Send an outbound HTTP request.",
+    Action.NETWORK_INGRESS: "Publish one sandbox service on a host-loopback port.",
+    Action.NETWORK_LOCAL: "Communicate with sandbox-attempt peers.",
+    Action.NETWORK_BROAD: "Use unrestricted networking, including host and LAN services.",
     Action.PROCESS_EXECUTE: "Execute a process.",
     Action.SESSION_MUTATE: "Change process-local agent session state.",
 }
@@ -38,6 +44,13 @@ _DECISION_DESCRIPTIONS = {
     Decision.ALLOW: "Permit matching operations without prompting.",
     Decision.ASK: "Require approval for every matching operation.",
     Decision.DENY: "Reject matching operations without prompting.",
+}
+_PATH_ACCESS_DESCRIPTIONS = {
+    SandboxPathAccess.READ: "Make a directory readable and executable.",
+    SandboxPathAccess.WRITE: "Allow reads and explicitly requested writes in this directory.",
+    SandboxPathAccess.WRITE_FILE: "Allow explicitly requested writes to this exact file path.",
+    SandboxPathAccess.READ_ONLY: "Allow reads and block writes intersecting this directory.",
+    SandboxPathAccess.DENY: "Block reads and writes to this exact path and its descendants.",
 }
 _SCOPE_DESCRIPTIONS = {
     PolicyScope.WORKSPACE: "Persist the change in the workspace policy.",
@@ -51,12 +64,10 @@ _COLLECTION_LIMITS = {
 _BOOLEAN_LIMITS = {
     "private-network": "deny_private_networks",
     "local-network": "deny_local_networks",
-    "host-process": "allow_host_processes",
 }
 _BOOLEAN_LIMIT_POLARITY = {
     "private-network": "deny",
     "local-network": "deny",
-    "host-process": "allow",
 }
 _LIMIT_FIELDS = {**_COLLECTION_LIMITS, **_BOOLEAN_LIMITS}
 _DISPATCH_MESSAGES = {
@@ -71,6 +82,7 @@ _DISPATCH_MESSAGES = {
     ),
 }
 _LOGGER = logging.getLogger(__name__)
+_PATH_SCOPES = (ApprovalChoice.SESSION, ApprovalChoice.WORKSPACE, ApprovalChoice.USER)
 
 
 def _enum_values(enum_type: type, descriptions: dict) -> tuple[CompletionValue, ...]:
@@ -166,8 +178,9 @@ class PermissionCommands:
                 log_problem(_LOGGER, problem, error)
                 context.interaction.report(problem)
                 context.interaction.warning(
-                    "Automatic repair and permissive defaults are unavailable while policy "
-                    "restrictions cannot be verified."
+                    "Repair the file and retry, or restart the application to choose temporary "
+                    "defaults or an archived reset. Protected administrator policy requires repair "
+                    "by its owner."
                 )
                 choice = prompt_recovery(
                     context.interaction,
@@ -188,7 +201,7 @@ class PermissionCommands:
     @staticmethod
     def _ensure_run_safe(context: CommandContext, arguments: tuple[str, ...]) -> None:
         """Reject permission operations that prompt or replace broad policy state mid-run."""
-        if not arguments or arguments[0] in {"show", "explain", "help", "default", "limit"}:
+        if not arguments or arguments[0] in {"show", "explain", "help", "default", "limit", "path"}:
             return
         if arguments[0] == "rule":
             if len(arguments) > 1 and arguments[1] in {"list", "remove"}:
@@ -205,6 +218,15 @@ class PermissionCommands:
                     "while the agent is working. Use an exact tool, action, and resource, or "
                     "change an action default or limit."
                 )
+        if (
+            arguments[0] == "sandbox"
+            and len(arguments) > 1
+            and (
+                arguments[1] == "workspace-write"
+                or arguments[1].replace("-", "_") in sandbox_options()
+            )
+        ):
+            return
         if arguments[0] in {"sandbox", "host"} and (
             len(arguments) == 1 or arguments[1] in {"list", "remove"}
         ):
@@ -276,6 +298,9 @@ class PermissionCommands:
         if arguments[:1] == ("rule",):
             self._change_rule(context, arguments[1:])
             return
+        if arguments[:1] == ("path",):
+            self._change_path(context, arguments[1:])
+            return
         if arguments[:1] == ("sandbox",):
             self._sandbox_rules(context, arguments[1:])
             return
@@ -290,9 +315,61 @@ class PermissionCommands:
             return
         raise ValueError("Invalid permission command arguments.")
 
-    def _sandbox_rules(self, context: CommandContext, arguments: tuple[str, ...]) -> None:
-        """List or remove sandbox-only command approvals."""
+    def _change_path(self, context: CommandContext, arguments: tuple[str, ...]) -> None:
+        """List or update exact native path policy rules."""
         manager = self._permission_manager
+        if not arguments or arguments == ("list",):
+            rows = [
+                *(f"system read {str(path)!r}" for path in system_paths()),
+                *(f"installed read {str(path)!r}" for path in installed_paths()),
+                *(
+                    f"{scope.value} {decision.value} {path!r}"
+                    for scope in _PATH_SCOPES
+                    for path, decision in sorted(manager.sandbox_path_rules(scope).items())
+                ),
+            ]
+            context.interaction.info("Sandbox path access levels\n" + ("\n".join(rows) or "none"))
+            return
+        if len(arguments) == 4 and arguments[0] == "set":
+            _, raw_scope, raw_access, path = arguments
+            decision = SandboxPathAccess(raw_access)
+        elif len(arguments) == 3 and arguments[0] == "remove":
+            _, raw_scope, path = arguments
+            decision = None
+        else:
+            raise ValueError("Use /permissions path list, path set, or path remove.")
+        scope = ApprovalChoice(raw_scope)
+        if manager.update_sandbox_paths(scope, {path: decision}):
+            context.interaction.info(f"Updated {scope.value} sandbox path {path!r}.")
+        else:
+            context.interaction.info(f"The {scope.value} sandbox path {path!r} is unchanged.")
+
+    def _sandbox_rules(self, context: CommandContext, arguments: tuple[str, ...]) -> None:
+        """Manage sandbox approvals, ordinary writes and backend workspace opt-ins."""
+        manager = self._permission_manager
+        if arguments and (name := arguments[0].replace("-", "_")) in sandbox_options():
+            if arguments[1:] in {("on",), ("off",)}:
+                manager.set_sandbox_option(name, arguments[1] == "on")
+            elif len(arguments) != 1:
+                raise ValueError(f"Use /permissions sandbox {arguments[0]} [on|off].")
+            limit = manager.sandbox_option_limit(name)
+            status = limit or "Enabled for explicitly requested, approved commands."
+            context.interaction.info(
+                f"{arguments[0]}: {status} {sandbox_options()[name]['notice']}"
+            )
+            return
+        if arguments[:1] == ("workspace-write",):
+            if arguments[1:] in {("on",), ("off",)}:
+                manager.set_workspace_command_writes(arguments[1] == "on")
+            elif len(arguments) != 1:
+                raise ValueError("Use /permissions sandbox workspace-write [on|off].")
+            scope = (
+                "workspace and private session scratch"
+                if manager.configuration.workspace_command_writes
+                else "private session scratch"
+            )
+            context.interaction.info(f"Ordinary command write request includes {scope}.")
+            return
         if not arguments or arguments == ("list",):
             lines = []
             for scope in ("session", "workspace", "user"):
@@ -323,7 +400,13 @@ class PermissionCommands:
             rules = manager.host_command_rules()
             context.interaction.info(
                 "Session host command approvals:\n"
-                + ("\n".join(f"{rule.id} {rule.source}" for rule in rules) or "none")
+                + (
+                    "\n".join(
+                        f"{rule.id} {rule.source} (approval v{rule.authorization_version})"
+                        for rule in rules
+                    )
+                    or "none"
+                )
             )
             return
         if len(arguments) == 2 and arguments[0] == "remove":
@@ -339,7 +422,9 @@ class PermissionCommands:
                 "Trusted host grants:\n"
                 + (
                     "\n".join(
-                        f"{rule.scope.value} {rule.id} {rule.cwd} {rule.source}" for rule in rules
+                        f"{rule.scope.value} {rule.id} {rule.cwd} {rule.source} "
+                        f"(approval v{rule.authorization_version}; v1 inactive)"
+                        for rule in rules
                     )
                     or "none"
                 )
@@ -753,12 +838,68 @@ class PermissionCommands:
             next=CommandCompletion(values=actions, children=explain_resources),
         )
         sandbox_scopes = (ApprovalChoice.SESSION, ApprovalChoice.WORKSPACE, ApprovalChoice.USER)
+        path_scope_values = tuple(
+            CompletionValue(scope.value, f"Apply to {scope.value} sandbox policy.")
+            for scope in _PATH_SCOPES
+        )
+        paths = CommandCompletion(
+            values=(
+                CompletionValue("list", "Show shipped runtime paths and scoped path rules."),
+                CompletionValue("set", "Set read, write, read-only, or deny access for a path."),
+                CompletionValue("remove", "Remove a scoped path rule."),
+            ),
+            children={
+                "set": CommandCompletion(
+                    values=path_scope_values,
+                    next=CommandCompletion(
+                        values=tuple(
+                            CompletionValue(access.value, _PATH_ACCESS_DESCRIPTIONS[access])
+                            for access in SandboxPathAccess
+                        )
+                    ),
+                ),
+                "remove": CommandCompletion(
+                    values=path_scope_values,
+                    children={
+                        scope.value: CommandCompletion(
+                            provider=lambda selected=scope: tuple(
+                                CompletionValue(path, decision.value)
+                                for path, decision in self._permission_manager.sandbox_path_rules(
+                                    selected
+                                ).items()
+                            )
+                        )
+                        for scope in _PATH_SCOPES
+                    },
+                ),
+            },
+        )
         sandbox = CommandCompletion(
             values=(
                 CompletionValue("list", "Show sandbox-only command approvals."),
                 CompletionValue("remove", "Revoke a sandbox-only command approval."),
+                CompletionValue("workspace-write", "Choose ordinary command write scope."),
+                *(
+                    CompletionValue(name.replace("_", "-"), detail["label"])
+                    for name, detail in sandbox_options().items()
+                ),
             ),
             children={
+                **{
+                    name.replace("_", "-"): CommandCompletion(
+                        values=(
+                            CompletionValue("on", "Allow explicitly approved requests."),
+                            CompletionValue("off", "Disable new requests."),
+                        )
+                    )
+                    for name in sandbox_options()
+                },
+                "workspace-write": CommandCompletion(
+                    values=(
+                        CompletionValue("on", "Include the workspace in ordinary write requests."),
+                        CompletionValue("off", "Default ordinary commands to scratch-only writes."),
+                    ),
+                ),
                 "remove": CommandCompletion(
                     values=tuple(
                         CompletionValue(scope.value, "Approval scope.") for scope in sandbox_scopes
@@ -774,7 +915,7 @@ class PermissionCommands:
                         )
                         for scope in sandbox_scopes
                     },
-                )
+                ),
             },
         )
         host = CommandCompletion(
@@ -909,7 +1050,12 @@ class PermissionCommands:
                 ),
                 CompletionValue(
                     "sandbox",
-                    "List or revoke sandbox-only command approvals.",
+                    "Manage sandbox-only approvals and ordinary command writes.",
+                    required_capabilities=frozenset({CommandCapability.CONTEXT_UPDATE}),
+                ),
+                CompletionValue(
+                    "path",
+                    "Manage sandbox filesystem path grants and denials.",
                     required_capabilities=frozenset({CommandCapability.CONTEXT_UPDATE}),
                 ),
                 CompletionValue(
@@ -951,6 +1097,7 @@ class PermissionCommands:
                 "default": default,
                 "rule": rule,
                 "sandbox": sandbox,
+                "path": paths,
                 "host": host,
                 "limit": limit,
                 "initialize": initialize,
@@ -997,7 +1144,6 @@ class PermissionCommands:
         boolean_values = (
             CompletionValue("private-network", "Access to private network targets."),
             CompletionValue("local-network", "Communication within one sandbox attempt."),
-            CompletionValue("host-process", "Processes run with this application's host access."),
         )
 
         def scoped_collection(operation: str) -> CommandCompletion:
@@ -1164,8 +1310,14 @@ class PermissionCommands:
     def _example_resource(action: Action) -> CompletionValue:
         if action.value.startswith("filesystem."):
             return CompletionValue("workspace", "Example workspace-relative path.")
+        if action is Action.NETWORK_INGRESS:
+            return CompletionValue("tcp://127.0.0.1:8080", "Exact host-loopback publication.")
         if action is Action.NETWORK_REQUEST:
             return CompletionValue("https://my-host.local", "Example HTTP request URL.")
+        if action in {Action.NETWORK_LOCAL, Action.NETWORK_BROAD}:
+            return CompletionValue(
+                "network:" + action.value.removeprefix("network."), "Native network scope."
+            )
         if action is Action.PROCESS_EXECUTE:
             return CompletionValue("git", "Example shell-free process command line.")
         return CompletionValue("state", "Example session-state identifier.")
@@ -1265,6 +1417,10 @@ class PermissionCommands:
             "<workspace|session> <decision> [tool|*] [action|*] [resource|*] [description] | "
             "rule [list [workspace|session]] | rule remove <workspace|session> <rule-id> | "
             "sandbox list | sandbox remove <session|workspace|user> <rule-id> | "
+            "sandbox workspace-write [on|off] | "
+            "sandbox <backend-option> [on|off] | "
+            "path list | path set <session|workspace|user> <read|write|read-only|deny> <path> | "
+            "path remove <session|workspace|user> <path> | "
             "host <list|trusted> | host remove <rule-id> | "
             "host trust [session|workspace|user] '<command>' | "
             "host untrust [session|workspace|user] <rule-id> | "
@@ -1289,8 +1445,11 @@ class PermissionCommands:
             "  /permissions initialize user <identity-from-show>\n"
             "  /permissions reset\n"
             "  /permissions reset user\n"
-            "  /permissions limit set session host-process allow\n"
             "  /permissions sandbox list\n"
+            "  /permissions sandbox workspace-write on\n"
+            "  /permissions path list\n"
+            "  /permissions path set workspace read '/opt/my-toolchain'\n"
+            "  /permissions path set user deny '/opt/my-toolchain/private'\n"
             "  /permissions host list\n"
             "  /permissions host trust workspace 'printf hello'\n"
             "  /permissions host trusted\n"
@@ -1302,12 +1461,14 @@ class PermissionCommands:
             "confirmation and diff previews the exact policy change. Initialization requires "
             "the exact identity shown by /permissions show and an absent policy and backup.\n\n"
             "Sandboxed command approvals are sandbox-only; list or remove them with "
-            "/permissions sandbox. A prelaunch host failure can receive an exact session "
-            "approval; list or revoke it with /permissions host. A human can install an exact "
-            "workspace-root grant in session, workspace or user scope with /permissions host "
-            "trust; it never changes the host-process eligibility gate. The explicit host "
-            "approval prompt also offers those grant scopes. Retries after possible effects "
-            "require a fresh one-time decision."
+            "/permissions sandbox. Manage read and execution scopes with /permissions path. "
+            "Path denials block access inside wider scopes as well. "
+            "Separate host requests need the trusted application gate "
+            "and exact consent; list or revoke grants with /permissions host. A human can "
+            "install an exact workspace-root grant in session, workspace or user scope with "
+            "/permissions host trust; it never changes app.allow_direct_host_execution. "
+            "The explicit host approval prompt also offers those grant scopes. A sandbox "
+            "failure never triggers automatic host execution or replay."
             " Protected administrator policy is installed outside user and workspace paths; "
             "show managed reports its identity and revision or an unavailable/recovery state. "
             "Reload binds a changed protected revision before new requests can use it."

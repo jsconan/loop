@@ -9,7 +9,7 @@ from pydantic import ValidationError
 from loop import constants
 from loop.configuration import ApplicationSettings, ConfigurationManager
 from loop.configuration import manager as configuration_module
-from loop.configuration.models import BackendSettings
+from loop.configuration.models import BackendSettings, ToolSettings
 from loop.models import CommandCapability
 
 
@@ -33,6 +33,39 @@ def test_backend_settings_reject_nonfinite_and_incoherent_repetition_values(valu
         BackendSettings.model_validate(values)
 
 
+def test_workspace_sandbox_environment_loads_literal_and_output_path_values(tmp_path):
+    """An explicit TOML path binding coexists with ordinary literal configuration."""
+    workspace_path = tmp_path / "workspace" / ".loop" / "config.toml"
+    workspace_path.parent.mkdir(parents=True)
+    workspace_path.write_text(
+        '[tools.sandbox_environment]\nPATH = "/usr/bin:/bin"\n'
+        'LABEL = "$LOOP_OUTPUT_DIR"\nREPORT_FILE = { output = "reports/my report.txt" }\n'
+    )
+    manager = ConfigurationManager(tmp_path / "config.toml", workspace_path)
+
+    settings = manager.load({})
+
+    assert settings.tools.model_dump()["sandbox_environment"] == {
+        "PATH": "/usr/bin:/bin",
+        "LABEL": "$LOOP_OUTPUT_DIR",
+        "REPORT_FILE": {"output": "reports/my report.txt"},
+    }
+    assert manager.source_for("tools.sandbox_environment") == "workspace"
+
+
+@pytest.mark.parametrize("output", ["", "/absolute", "reports/../outside", "nul\x00name"])
+def test_sandbox_environment_rejects_invalid_output_path(output):
+    """A generated environment path requires an owned relative suffix."""
+    with pytest.raises(ValidationError, match="Sandbox output paths must be relative"):
+        ToolSettings.model_validate({"sandbox_environment": {"REPORT_FILE": {"output": output}}})
+
+
+def test_sandbox_environment_requires_literal_search_path():
+    """An output binding cannot replace pre-launch executable lookup's literal PATH."""
+    with pytest.raises(ValidationError, match="Sandbox PATH must be a literal string"):
+        ToolSettings.model_validate({"sandbox_environment": {"PATH": {"output": "bin"}}})
+
+
 def test_manager_snapshots_its_configuration_path(tmp_path):
     """Configuration owns one immutable destination selected at construction."""
     path = tmp_path / "first.toml"
@@ -45,15 +78,14 @@ def test_manager_snapshots_its_configuration_path(tmp_path):
     assert path.is_file()
 
 
-def test_recovery_defaults_cannot_initialize_a_missing_file(tmp_path):
-    """A defaults bypass cannot create a persistent configuration through initialization."""
+def test_recovery_defaults_initialize_a_missing_file(tmp_path):
+    """Missing configuration can be initialized while using recovery defaults."""
     path = tmp_path / "missing.toml"
     manager = ConfigurationManager(path)
     manager.use_defaults()
 
-    with pytest.raises(ValueError, match="Repair and reload"):
-        manager.initialize()
-    assert not path.exists()
+    manager.initialize()
+    assert path.is_file()
 
 
 def test_recovery_reload_retries_the_failed_environment(tmp_path):
@@ -87,37 +119,47 @@ def test_recovery_entered_before_publication_preserves_the_saved_document(tmp_pa
     manager.load({})
     original = path.read_bytes()
 
-    with pytest.raises(ValueError, match="Repair and reload"):
+    with pytest.raises(ValueError, match="entered recovery"):
         manager.set("app.debug", True, scope="user", before_save=manager.use_defaults)
     assert path.read_bytes() == original
     assert manager.saved_yolo is None
     assert manager.effective.app.debug is False
 
 
-@pytest.mark.parametrize("operation", ["set", "unset", "reset_user", "reset_workspace", "save"])
-def test_recovery_defaults_protect_saved_configuration_until_reload(tmp_path, operation):
-    """A defaults bypass leaves the invalid document untouched and refuses durable writes."""
+@pytest.mark.parametrize("operation", ["set", "reset", "save"])
+def test_recovery_defaults_preserve_original_until_explicit_save(tmp_path, operation):
+    """Temporary defaults leave the original intact and archive it on explicit persistence."""
     user = tmp_path / "user.toml"
     user.write_text('[app]\ndebug = "invalid"\n', encoding="utf-8")
     manager = ConfigurationManager(user, tmp_path / "workspace.toml")
     original = user.read_bytes()
-
     assert manager.use_defaults().app.yolo is False
     assert manager.saved_yolo is None
+    manager.set_session("app.stream", False)
+    assert user.read_bytes() == original
     operations = {
         "set": lambda: manager.set("app.debug", True, scope="user"),
-        "unset": lambda: manager.unset("app.debug", scope="workspace"),
-        "reset_user": lambda: manager.reset_all(scope="user"),
-        "reset_workspace": lambda: manager.reset_all(scope="workspace"),
+        "reset": lambda: manager.reset_all(scope="user"),
         "save": manager.save,
     }
-    with pytest.raises(ValueError, match="Repair and reload"):
-        operations[operation]()
-    assert user.read_bytes() == original
-    assert manager.set_session("app.debug", True).app.debug is True
-    user.write_text("[app]\ndebug = false\n", encoding="utf-8")
-    assert manager.reload({}).app.debug is True
-    manager.set("app.stream", False, scope="user")
+    operations[operation]()
+    assert user.read_bytes() != original
+    assert [path.read_bytes() for path in tmp_path.glob(".user.toml.backup-*/user.toml")] == [
+        original
+    ]
+    assert ConfigurationManager(user).load({}).app.debug is (operation == "set")
+
+
+def test_recovery_save_refuses_concurrent_configuration_edit(tmp_path):
+    """A later external edit must be reloaded before replacement defaults can be saved."""
+    path = tmp_path / "config.toml"
+    path.write_text("invalid = [", encoding="utf-8")
+    manager = ConfigurationManager(path)
+    manager.use_defaults()
+    path.write_text("# newer settings", encoding="utf-8")
+    with pytest.raises(OSError, match="changed during recovery"):
+        manager.save()
+    assert path.read_text() == "# newer settings"
 
 
 @pytest.mark.parametrize("source", ["workspace", "environment"])
@@ -227,7 +269,9 @@ def test_legacy_workspace_section_cannot_activate_yolo(tmp_path):
     workspace_path.parent.mkdir()
     workspace_path.write_text("[loop]\nyolo = true\n", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="Workspace configuration cannot control app.yolo"):
+    with pytest.raises(
+        ValueError, match="Workspace configuration cannot control trusted execution settings."
+    ):
         manager.load({})
 
 
@@ -1507,3 +1551,84 @@ def test_environment_repetition_pair_cannot_be_hidden_by_session_value(tmp_path)
             {"LOOP_REPETITION_MIN_PATTERN_SIZE": "10", "LOOP_REPETITION_MAX_PATTERN_SIZE": "5"}
         )
     assert "environment variables" in error.value.title
+
+
+def test_host_gate_is_trusted_session_or_private_user_configuration(tmp_path):
+    """Workspace and environment settings cannot activate unrestricted execution."""
+    path = tmp_path / "user" / "config.toml"
+    workspace = tmp_path / "workspace" / ".loop" / "config.toml"
+    workspace.parent.mkdir(parents=True)
+    manager = ConfigurationManager(path, workspace_path=workspace)
+    manager.initialize()
+    manager.load({"APP_ALLOW_DIRECT_HOST_EXECUTION": "true"})
+    key = "app.allow_direct_host_execution"
+    assert not manager.effective.app.allow_direct_host_execution
+    assert manager.source_for(key) == "user"
+    with pytest.raises(ValueError, match="user or this session"):
+        manager.set(key, True, scope="workspace")
+    with pytest.raises(ValueError, match="Workspace configuration"):
+        manager.unset(key, scope="workspace")
+    workspace.write_text("[app]\nallow_direct_host_execution = true\n")
+    with pytest.raises(ValueError, match="Workspace configuration"):
+        manager.reload({})
+    workspace.write_text("")
+    manager.reload({})
+    with pytest.raises(ValueError, match="true or false"):
+        manager.set_session(key, "1")
+    manager.set_session(key, True)
+    assert manager.effective.app.allow_direct_host_execution
+    assert manager.source_for(key) == "session"
+    manager.set(key, True, scope="user")
+    manager.set_session(key, False)
+    assert not manager.effective.app.allow_direct_host_execution
+    assert ConfigurationManager(path).load({}).app.allow_direct_host_execution
+    path.chmod(0o644)
+    with pytest.raises(ValueError, match="owner-controlled"):
+        ConfigurationManager(path).load({})
+
+
+def test_invalid_edit_from_recovery_leaves_defaults_and_saved_bytes_unchanged(tmp_path):
+    """Validation errors roll back temporary edits without publishing an invalid document."""
+    path = tmp_path / "config.toml"
+    path.write_text("broken = [", encoding="utf-8")
+    manager = ConfigurationManager(path)
+    manager.use_defaults()
+    with pytest.raises(ValidationError):
+        manager.set("app.debug", "invalid", scope="user")
+    assert manager.effective.app.debug is False
+    assert path.read_text() == "broken = ["
+    manager.set("app.debug", True, scope="user")
+    assert manager.effective.app.debug is True
+    assert manager.saved_yolo is False
+    manager.set("app.stream", False, scope="user")
+    assert len(list(tmp_path.glob(".config.toml.backup-*"))) == 1
+
+
+def test_recovery_can_explicitly_save_a_missing_configuration(tmp_path):
+    """A temporary default policy can be saved even when no prior settings exist."""
+    path = tmp_path / "config.toml"
+    manager = ConfigurationManager(path)
+    manager.use_defaults()
+    manager.save()
+    assert path.is_file()
+    assert not list(tmp_path.glob(".config.toml.backup-*"))
+
+
+def test_unreadable_recovery_configuration_remains_unsaved(tmp_path, monkeypatch):
+    """Unreadable configuration can use defaults, but failed archival preserves its bytes."""
+    path = tmp_path / "config.toml"
+    path.write_text("# preserve", encoding="utf-8")
+    manager = ConfigurationManager(path)
+    original = Path.read_bytes
+
+    def refuse(candidate):
+        """Deny just the owned configuration snapshot read."""
+        if candidate == path:
+            raise PermissionError("fixture read refused")
+        return original(candidate)
+
+    monkeypatch.setattr(Path, "read_bytes", refuse)
+    manager.use_defaults()
+    with pytest.raises(OSError, match="could not be read for recovery"):
+        manager.save()
+    assert path.read_text() == "# preserve"

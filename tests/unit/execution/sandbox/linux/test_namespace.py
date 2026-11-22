@@ -16,7 +16,7 @@ def preparation(monkeypatch):
     monkeypatch.setattr(linux_namespace, "runtime_read_files", lambda **_kwargs: ())
     monkeypatch.setattr(linux_namespace.os, "O_PATH", 1, raising=False)
     request = Mock(network=False, deadline=20, cwd=Path("/work/sub"), path_roots=())
-    mounts = Mock(return_value=nullcontext((("--bind-fd", "4", "/work"), (4,))))
+    mounts = Mock(return_value=nullcontext((("--bind-fd", "4", "/work"), (4,), request)))
     monkeypatch.setattr(linux_namespace, "mount_arguments", mounts)
     monkeypatch.setattr(linux_namespace, "descriptor_filter", Mock(return_value=b"filter"))
     monkeypatch.setattr(linux_namespace.time, "monotonic", lambda: 10)
@@ -36,7 +36,8 @@ def test_namespace_fixed_boundary_and_original_grants(preparation, network):
     request, mounts, stream, context = preparation
     request.network = network
     with linux_namespace.namespace_arguments(request, Path("/scratch"), empty_mask=9) as result:
-        arguments, descriptors = result
+        arguments, descriptors, mounted_request = result
+        assert mounted_request is request
         assert arguments == (
             "--unshare-user",
             "--uid",
@@ -57,6 +58,12 @@ def test_namespace_fixed_boundary_and_original_grants(preparation, network):
             "/proc",
             "--dev",
             "/dev",
+            "--size",
+            "8388608",
+            "--perms",
+            "0700",
+            "--tmpfs",
+            "/dev/shm",
             "--chdir",
             "/work/sub",
             "--seccomp",
@@ -82,7 +89,7 @@ def test_namespace_owns_distinct_repeated_mount_sources(preparation, monkeypatch
     """Repeated bind sources receive distinct descriptors and are closed on every exit."""
     request, mounts, _, _ = preparation
     mounts.return_value = nullcontext(
-        (("--bind-fd", "4", "/a", "--ro-bind-fd", "4", "/b", "--bind-fd", "4", "/c"), (4,))
+        (("--bind-fd", "4", "/a", "--ro-bind-fd", "4", "/b", "--bind-fd", "4", "/c"), (4,), request)
     )
     duplicate = Mock(side_effect=[20, OSError("descriptor limit")] if failure else [20, 21])
     close = Mock()
@@ -99,6 +106,7 @@ def test_namespace_owns_distinct_repeated_mount_sources(preparation, monkeypatch
     with linux_namespace.namespace_arguments(request, Path("/scratch"), empty_mask=9) as (
         arguments,
         descriptors,
+        _,
     ):
         assert arguments[arguments.index("--bind-fd") :][:9] == (
             "--bind-fd",
@@ -206,6 +214,7 @@ def test_runtime_sources_are_pinned_readonly_and_closed(preparation, monkeypatch
         with linux_namespace.namespace_arguments(request, Path("/scratch"), empty_mask=9) as (
             arguments,
             descriptors,
+            _,
         ):
             assert arguments[
                 arguments.index("--ro-bind-fd") : arguments.index("--ro-bind-fd") + 6
@@ -250,6 +259,7 @@ def test_runtime_path_alias_is_recreated_when_request_mount_is_skipped(
     with linux_namespace.namespace_arguments(request, Path("/scratch"), empty_mask=9) as (
         arguments,
         _,
+        _,
     ):
         assert arguments.count("--symlink") == 1
         index = arguments.index("--symlink")
@@ -264,108 +274,23 @@ def test_runtime_path_alias_is_recreated_when_request_mount_is_skipped(
     )
 
 
-def test_namespace_recreates_the_workspace_python_runtime_alias(preparation, monkeypatch, tmp_path):
-    """A bound Python runtime remains resolvable through the venv's configured home alias."""
-    request, _mounts, _, _ = preparation
-    workspace = tmp_path / "workspace"
-    runtime = tmp_path / "home/runtime/cpython-3.14.1"
-    alias = tmp_path / "home/runtime/cpython-3.14"
-    request.workspace = workspace
-    request.read_roots = (runtime,)
-    request.automatic_tool_reads = ()
-    request.write_roots = (workspace,)
-    request.path_roots = ()
-    request.read_aliases = ()
-    request.executable_identities = ()
-    monkeypatch.setattr(
-        linux_namespace,
-        "python_runtime_mounts",
-        lambda *_args, **_kwargs: ((runtime, alias),),
-    )
-
-    with linux_namespace.namespace_arguments(request, Path("/scratch"), empty_mask=9) as result:
-        arguments, _ = result
-
-    assert arguments[arguments.index("--symlink") : arguments.index("--symlink") + 3] == (
-        "--symlink",
-        str(runtime),
-        str(alias),
-    )
-
-
-def test_namespace_rejects_a_python_runtime_alias_overlapping_the_workspace(
-    preparation, monkeypatch, tmp_path
-):
-    """A runtime alias cannot shadow the already approved writable workspace mount."""
+def test_selected_system_alias_cannot_overlap_an_owned_mount(preparation, monkeypatch, tmp_path):
+    """A required system executable alias cannot replace an approved directory."""
     request, _, _, _ = preparation
-    workspace = tmp_path / "workspace"
-    runtime = tmp_path / "runtime"
-    request.workspace = workspace
-    request.read_roots = (runtime,)
-    request.automatic_tool_reads = (runtime,)
-    request.write_roots = (workspace,)
-    request.path_roots = ()
-    request.read_aliases = ()
-    request.executable_identities = ()
-    monkeypatch.setattr(
-        linux_namespace,
-        "python_runtime_mounts",
-        lambda *_args, **_kwargs: ((runtime, workspace),),
-    )
-
-    with (
-        pytest.raises(ValueError, match="overlaps another mount"),
-        linux_namespace.namespace_arguments(request, Path("/scratch"), empty_mask=9),
-    ):
-        pytest.fail("An overlapping Python runtime alias was accepted")
-
-
-def test_namespace_keeps_a_canonical_python_runtime_path(preparation, monkeypatch, tmp_path):
-    """A venv with a canonical Python home needs no synthetic path alias."""
-    request, _, _, _ = preparation
-    workspace = tmp_path / "workspace"
-    runtime = tmp_path / "runtime"
-    request.workspace = workspace
-    request.read_roots = (runtime,)
-    request.automatic_tool_reads = (runtime,)
-    request.write_roots = (workspace,)
-    request.path_roots = ()
-    request.read_aliases = ()
-    monkeypatch.setattr(
-        linux_namespace,
-        "python_runtime_mounts",
-        lambda *_args, **_kwargs: ((runtime, runtime),),
-    )
-
-    with linux_namespace.namespace_arguments(request, Path("/scratch"), empty_mask=9) as result:
-        arguments, _ = result
-
-    assert "--symlink" not in arguments
-
-
-def test_namespace_rejects_a_python_runtime_missing_approved_read_authority(
-    preparation, monkeypatch, tmp_path
-):
-    """A derived venv alias cannot add a read root omitted from the approved request."""
-    request, _, _, _ = preparation
-    runtime = tmp_path / "runtime"
     request.workspace = tmp_path / "workspace"
     request.read_roots = ()
-    request.automatic_tool_reads = ()
     request.write_roots = ()
-    request.path_roots = ()
     request.read_aliases = ()
     monkeypatch.setattr(
         linux_namespace,
-        "python_runtime_mounts",
-        lambda *_args, **_kwargs: ((runtime, runtime),),
+        "_runtime_executable_aliases",
+        lambda *_: ((request.workspace / "tool", Path("/bin/real-tool")),),
     )
-
     with (
-        pytest.raises(ValueError, match="authority changed"),
+        pytest.raises(ValueError, match="system executable alias overlaps another mount"),
         linux_namespace.namespace_arguments(request, Path("/scratch"), empty_mask=9),
     ):
-        pytest.fail("An unapproved Python runtime was accepted")
+        pytest.fail("An overlapping executable alias was accepted")
 
 
 def test_runtime_path_root_without_alias_adds_no_symlink(preparation, monkeypatch, tmp_path):
@@ -382,6 +307,7 @@ def test_runtime_path_root_without_alias_adds_no_symlink(preparation, monkeypatc
 
     with linux_namespace.namespace_arguments(request, Path("/scratch"), empty_mask=9) as (
         arguments,
+        _,
         _,
     ):
         assert "--symlink" not in arguments
@@ -931,7 +857,8 @@ def test_namespace_pins_system_data_at_exact_readonly_destinations(preparation, 
         lambda **_kwargs: ((Path("/etc/resolv.conf"), authority),),
     )
     with linux_namespace.namespace_arguments(request, Path("/scratch"), empty_mask=9) as result:
-        arguments, descriptors = result
+        arguments, descriptors, mounted_request = result
+        assert mounted_request is request
         assert arguments[arguments.index("--ro-bind-fd") :][:3] == (
             "--ro-bind-fd",
             "81",

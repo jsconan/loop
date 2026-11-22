@@ -42,6 +42,7 @@ from loop.execution.sandbox import SandboxOutcome, SandboxRequest
 from loop.execution.sandbox.constants import TMPDIR_ENVIRONMENT_VARIABLE
 from loop.execution.sandbox.macos import backend as macos_backend
 from loop.instructions import InstructionsManager, RuntimeEnvironment
+from loop.permissions import SandboxPathAccess
 from loop.permissions.managed import ManagedPolicyStore
 from loop.permissions.models import SessionTarget
 from loop.tooling import ToolRuntimeSettings
@@ -60,6 +61,7 @@ from loop.utils.yaml import load_yaml
 from tests.scheduling import receive_fifo_byte
 
 pytestmark = [pytest.mark.integration, pytest.mark.e2e, pytest.mark.macos]
+_QUALIFICATION_BASH = os.environ.get("LOOP_NATIVE_MACOS_BASH")
 _QUALIFICATION_UV = shutil.which("uv")
 _SYSTEM_MAKE = shutil.which("make", path=os.defpath)
 _SYSTEM_CAT = shutil.which("cat", path=os.defpath)
@@ -71,14 +73,15 @@ _SYSTEM_GETCONF = shutil.which("getconf", path=os.defpath)
 
 
 def test_native_tool_schema_omits_unavailable_execution_capabilities():
-    """An unqualified raw backend does not advertise optional native controls."""
+    """A raw backend exposes demand-qualified transports but withholds unqualified terminals."""
     service = CommandExecutionService(macos_backend.MacOSSeatbeltBackend(), Mock())
     registry = ToolRegistry([run_command, control_command_terminal], execution_service=service)
     try:
         definitions = {item.name: item for item in registry.definitions()}
         properties = definitions["run_command"].parameters["properties"]
         assert "interactive" not in properties
-        assert "egress_origins" not in properties
+        assert {"egress_origins", "local_ipc", "ingress_port"} <= properties.keys()
+        assert "$LOOP_INGRESS_SOCKET" in properties["ingress_port"]["description"]
         assert "control_command_terminal" not in definitions
     finally:
         registry.close()
@@ -102,6 +105,7 @@ def test_live_system_probe_preserves_command_diagnostics_and_isolation(native_wo
                 policy_version=backend.policy_version,
                 deadline=time.monotonic() + 30,
                 workspace_id="live-system-probe",
+                local_network=False,
             )
         )
 
@@ -143,6 +147,7 @@ def test_direct_unbound_home_scratch_keeps_private_names_denied(native_workspace
                 policy_version=backend.policy_version,
                 deadline=time.monotonic() + 30,
                 workspace_id="unbound-home-scratch",
+                local_network=False,
             )
         )
     finally:
@@ -152,6 +157,13 @@ def test_direct_unbound_home_scratch_keeps_private_names_denied(native_workspace
     assert result.exit_code != 0
     assert (scratch / "ordinary").read_text() == "ordinary"
     assert not (scratch / ".ssh").exists()
+
+
+def automatic_process_policy(workspace):
+    """Opt into automatic processes while testing native filesystem and runtime capabilities."""
+    manager = PermissionManager(workspace)
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW, scope=PolicyScope.SESSION)
+    return manager
 
 
 @pytest.mark.parametrize("protected_target", [False, True])
@@ -166,7 +178,7 @@ def test_live_silent_denial_is_reported_without_attributing_the_exit(
     interaction.prompt.return_value = "approve"
     registry = ToolRegistry(
         [run_command],
-        permission_manager=PermissionManager(native_workspace),
+        permission_manager=automatic_process_policy(native_workspace),
         execution_service=CommandExecutionService(backend, host),
     )
     try:
@@ -175,7 +187,7 @@ def test_live_silent_denial_is_reported_without_attributing_the_exit(
             protected.mkdir()
             (protected / "fixture-private-target").write_text("synthetic-canary")
             (native_workspace / "opaque-link").symlink_to(protected / "fixture-private-target")
-            command = "test -e opaque-link >/dev/null 2>&1; exit 7"
+            command = "if cat opaque-link >/dev/null 2>&1; then exit 8; fi; exit 7"
         else:
             command = "cat external-link >/dev/null 2>&1; exit 7"
         result = json.loads(
@@ -226,7 +238,10 @@ def test_successful_command_keeps_buffered_denials_optional(
     monkeypatch.setattr(macos_backend, "_read_denial_from_log", snapshot)
     monkeypatch.setattr(macos_backend, "_denial_from_log", snapshot)
 
-    result = public_command.call("printf x >> count; cat external-link >/dev/null 2>&1; true")
+    result = public_command.call(
+        "printf x >> count; cat external-link >/dev/null 2>&1; true",
+        write_roots=[str(native_workspace)],
+    )
 
     assert result["ok"]
     output = result["result"]
@@ -266,7 +281,10 @@ def test_public_command_reports_unverified_diagnostic_candidates(
     )
     monkeypatch.setattr(macos_backend, "_read_denial_from_log", lambda *_args: None)
 
-    result = public_command.call("printf x >> count; printf 'invalid option\\n' >&2; exit 7")
+    result = public_command.call(
+        "printf x >> count; printf 'invalid option\\n' >&2; exit 7",
+        write_roots=[str(native_workspace)],
+    )
 
     assert result["problem"]["code"] == "process.nonzero_exit"
     metadata = result["problem"]["metadata"]
@@ -290,7 +308,9 @@ def test_public_command_reports_unverified_diagnostic_candidates(
         assert candidates[0]["operation"] == "file-read-data"
         assert candidates[0]["target"] == "<external>"
         assert candidates[0]["attribution"] == "unknown"
-        assert candidates[0]["classification"] == "unclassified"
+        assert candidates[0]["classification"] == (
+            "also_observed_in_successful_startup_probe" if diagnostics == "live" else "unclassified"
+        )
     else:
         assert not candidates
     assert "/arbitrary/system/cache" not in json.dumps(metadata)
@@ -309,7 +329,7 @@ def test_public_denial_never_launches_unapproved_host_retry(backend, native_work
     )
     registry = ToolRegistry(
         [run_command],
-        permission_manager=PermissionManager(native_workspace),
+        permission_manager=automatic_process_policy(native_workspace),
         execution_service=CommandExecutionService(backend, host),
     )
     try:
@@ -345,7 +365,6 @@ def test_yolo_scoped_external_read_uses_native_sandbox_without_saved_grant(
         {
             "command": "cat external-link",
             "cwd": str(native_workspace),
-            "read_only": True,
             "read_roots": [str(outside)],
         }
     )
@@ -369,7 +388,7 @@ def test_yolo_scoped_external_read_uses_native_sandbox_without_saved_grant(
 def test_workspace_paths_are_usable_process_paths(public_command, native_workspace):
     """Shell expansion reaches workspace bytes and preserves the process path in output."""
     result = public_command.call(
-        'cat "$WORKSPACE_ROOT/ordinary"; printf "%s" "$WORKSPACE_ROOT"', read_only=True
+        'cat "$WORKSPACE_ROOT/ordinary"; printf "%s" "$WORKSPACE_ROOT"',
     )
     assert result["ok"] is True
     assert result["result"]["stdout"]["content"] == f"ordinary-data{native_workspace}"
@@ -426,14 +445,10 @@ def test_public_command_and_file_tool_preserve_path_like_content(
     )
     try:
         read = dispatch("read_text_file", {"path": logical})
-        success = dispatch("run_command", {"command": command, "read_only": True})
-        failure = dispatch(
-            "run_command", {"command": f"{command}; {command} >&2; exit 7", "read_only": True}
-        )
-        literal = dispatch(
-            "run_command", {"command": f"printf %s {shlex.quote(path_only)}", "read_only": True}
-        )
-        quoted = dispatch("run_command", {"command": quoted_source, "read_only": True})
+        success = dispatch("run_command", {"command": command})
+        failure = dispatch("run_command", {"command": f"{command}; {command} >&2; exit 7"})
+        literal = dispatch("run_command", {"command": f"printf %s {shlex.quote(path_only)}"})
+        quoted = dispatch("run_command", {"command": quoted_source})
     finally:
         registry.close()
     assert read["ok"] and read["result"]["path"] == logical
@@ -517,7 +532,9 @@ def test_unrelated_environment_metadata_does_not_block_workspace_tool(
             ">/dev/null 2>&1; then exit 10; fi"
         )
 
-    result = public_command.call(source, read_only=True)
+    result = public_command.call(
+        source,
+    )
 
     assert result["ok"], result
     assert result["result"]["stdout"]["content"] == "fixture-ok"
@@ -558,7 +575,7 @@ def test_timeout_warns_about_effects_without_replay(backend, native_workspace, m
     interaction.prompt.return_value = "approve"
     registry = ToolRegistry(
         [run_command],
-        permission_manager=PermissionManager(native_workspace),
+        permission_manager=automatic_process_policy(native_workspace),
         execution_service=CommandExecutionService(backend, host),
         settings=ToolRuntimeSettings(
             command_default_initial_wait_seconds=2, command_job_runtime_limit_seconds=2
@@ -571,6 +588,7 @@ def test_timeout_warns_about_effects_without_replay(backend, native_workspace, m
                 json.dumps(
                     {
                         "command": "printf x >> count; printf ready; printf r > ready; read _ < gate",
+                        "write_roots": [str(native_workspace)],
                         "cwd": str(native_workspace),
                     }
                 ),
@@ -615,7 +633,7 @@ def test_automatic_discovery_keeps_an_existing_scoped_grant(backend, native_work
     host = Mock()
     registry = ToolRegistry(
         [run_command, resolve_executable],
-        permission_manager=PermissionManager(native_workspace),
+        permission_manager=automatic_process_policy(native_workspace),
         execution_service=CommandExecutionService(backend, host),
     )
     try:
@@ -632,7 +650,6 @@ def test_automatic_discovery_keeps_an_existing_scoped_grant(backend, native_work
                     {
                         "command": tool.name,
                         "cwd": str(native_workspace),
-                        "read_only": True,
                         "executable_grant": references[0],
                     }
                 ),
@@ -672,7 +689,7 @@ def test_project_selected_tools_keep_separate_scoped_grants(backend, native_work
     host = Mock()
     registry = ToolRegistry(
         [run_command, resolve_executable],
-        permission_manager=PermissionManager(native_workspace),
+        permission_manager=automatic_process_policy(native_workspace),
         execution_service=CommandExecutionService(backend, host),
     )
     try:
@@ -682,7 +699,7 @@ def test_project_selected_tools_keep_separate_scoped_grants(backend, native_work
         assert [item["name"] for item in found] == list(names)
         references = [item["grant_reference"] for item in found]
         assert references[0] != references[1]
-        arguments = {"command": "; ".join(names), "cwd": str(native_workspace), "read_only": True}
+        arguments = {"command": "; ".join(names), "cwd": str(native_workspace)}
         without = json.loads(
             registry.call("run_command", json.dumps(arguments), interaction=interaction)
         )
@@ -702,7 +719,7 @@ def test_project_selected_tools_keep_separate_scoped_grants(backend, native_work
             encoding="utf-8",
         )
         wrapper.chmod(0o755)
-        indirect = {"command": "./wrapper.sh", "cwd": str(native_workspace), "read_only": True}
+        indirect = {"command": "./wrapper.sh", "cwd": str(native_workspace)}
         unavailable = json.loads(
             registry.call("run_command", json.dumps(indirect), interaction=interaction)
         )
@@ -761,7 +778,7 @@ def test_selected_executable_follows_directory_alias_into_approved_root(
     host = Mock()
     registry = ToolRegistry(
         [run_command, resolve_executable],
-        permission_manager=PermissionManager(native_workspace),
+        permission_manager=automatic_process_policy(native_workspace),
         execution_service=CommandExecutionService(backend, host),
     )
     command = {
@@ -771,7 +788,7 @@ def test_selected_executable_follows_directory_alias_into_approved_root(
         "parent": "./lookup/../lookup/fixture-task",
         "grant": "fixture-task",
     }[selection]
-    arguments = {"command": command, "cwd": str(native_workspace), "read_only": True}
+    arguments = {"command": command, "cwd": str(native_workspace)}
     try:
         denied = json.loads(
             registry.call("run_command", json.dumps(arguments), interaction=interaction)
@@ -849,10 +866,10 @@ def test_approved_path_scope_supports_indirect_executables(
     host = Mock()
     registry = ToolRegistry(
         [run_command],
-        permission_manager=PermissionManager(native_workspace),
+        permission_manager=automatic_process_policy(native_workspace),
         execution_service=CommandExecutionService(backend, host),
     )
-    arguments = {"command": "./launcher", "cwd": str(native_workspace), "read_only": True}
+    arguments = {"command": "./launcher", "cwd": str(native_workspace)}
     try:
         denied = json.loads(
             registry.call("run_command", json.dumps(arguments), interaction=interaction)
@@ -890,14 +907,20 @@ def test_public_writable_command_cannot_change_policy_coordination_files(
         target.write_text("preserve-policy-canary", encoding="utf-8")
     for target in targets:
         for command in ("printf changed > ", "rm "):
-            result = public_command.call(command + shlex.quote(str(target)))
+            result = public_command.call(
+                command + shlex.quote(str(target)), write_roots=[str(native_workspace)]
+            )
             assert not result["ok"], result
             assert target.read_text(encoding="utf-8") == "preserve-policy-canary"
     marker = directory / "permissions.yaml.reset-pending"
-    denied_marker = public_command.call("printf changed > " + shlex.quote(str(marker)))
+    denied_marker = public_command.call(
+        "printf changed > " + shlex.quote(str(marker)), write_roots=[str(native_workspace)]
+    )
     assert not denied_marker["ok"], denied_marker
     assert not marker.exists()
-    allowed = public_command.call("printf writable > ordinary-output")
+    allowed = public_command.call(
+        "printf writable > ordinary-output", write_roots=[str(native_workspace)]
+    )
     assert allowed["ok"], allowed
     assert (native_workspace / "ordinary-output").read_text(encoding="utf-8") == "writable"
     public_command.host.run_host_command.assert_not_called()
@@ -906,7 +929,7 @@ def test_public_writable_command_cannot_change_policy_coordination_files(
 def test_external_environment_keeps_selection_with_narrow_read_scope(
     backend, native_workspace, monkeypatch
 ):
-    """An approved external executable directory retains its environment without sibling reads."""
+    """An explicitly approved external environment retains its metadata and excludes siblings."""
     runtime = Path(sys.base_prefix).resolve(strict=True)
     binary = Path(getattr(sys, "_base_executable", sys.executable)).resolve(strict=True)
     environment = native_workspace.parent / "external-environment"
@@ -917,7 +940,7 @@ def test_external_environment_keeps_selection_with_narrow_read_scope(
     (environment / "pyvenv.cfg").write_text(
         f"home = {binary.parent}\ninclude-system-site-packages = false\n", encoding="utf-8"
     )
-    sibling = environment / "sibling-canary"
+    sibling = environment.with_name("environment-sibling-canary")
     sibling.write_text("outside-data", encoding="utf-8")
     monkeypatch.setenv("PATH", os.pathsep.join((str(tools), os.defpath)))
     interaction = Mock()
@@ -925,7 +948,7 @@ def test_external_environment_keeps_selection_with_narrow_read_scope(
     host = Mock()
     registry = ToolRegistry(
         [run_command],
-        permission_manager=PermissionManager(native_workspace),
+        permission_manager=automatic_process_policy(native_workspace),
         execution_service=CommandExecutionService(backend, host),
     )
     code = (
@@ -941,8 +964,7 @@ def test_external_environment_keeps_selection_with_narrow_read_scope(
     arguments = {
         "command": f"{shlex.quote(str(selected))} -c {shlex.quote(code)}",
         "cwd": str(native_workspace),
-        "read_only": True,
-        "read_roots": [str(tools), str(runtime)],
+        "read_roots": [str(environment), str(runtime)],
     }
     try:
         result = json.loads(
@@ -1120,7 +1142,7 @@ def test_workspace_executable_link_requests_installation_scope(
     host = Mock()
     registry = ToolRegistry(
         [run_command],
-        permission_manager=PermissionManager(native_workspace),
+        permission_manager=automatic_process_policy(native_workspace),
         execution_service=CommandExecutionService(backend, host),
     )
     arguments = {
@@ -1164,7 +1186,6 @@ def test_workspace_executable_link_requests_installation_scope(
         if invocation == "forwarded-path-chain"
         else "./fixture-launcher ./fixture-tool",
         "cwd": str(native_workspace),
-        "read_only": True,
     }
     if invocation == "covered-retarget":
         arguments["read_roots"] = [str(installed)]
@@ -1286,14 +1307,20 @@ def test_env_shebang_requests_selected_interpreter_without_host_retry(
     host = Mock()
     registry = ToolRegistry(
         [run_command],
-        permission_manager=PermissionManager(native_workspace),
+        permission_manager=automatic_process_policy(native_workspace),
         execution_service=CommandExecutionService(backend, host),
     )
     try:
         result = json.loads(
             registry.call(
                 "run_command",
-                json.dumps({"command": "./fixture-task", "cwd": str(native_workspace)}),
+                json.dumps(
+                    {
+                        "command": "./fixture-task",
+                        "write_roots": [str(native_workspace)],
+                        "cwd": str(native_workspace),
+                    }
+                ),
                 interaction=interaction,
             )
         )
@@ -1337,7 +1364,9 @@ def test_env_shebang_respects_workspace_path_precedence(
     task.write_text("#!/usr/bin/env fixture-engine\n", encoding="utf-8")
     task.chmod(0o755)
 
-    result = public_command.call("./fixture-task", read_only=True)
+    result = public_command.call(
+        "./fixture-task",
+    )
 
     assert result["ok"], result
     assert result["result"]["stdout"]["content"] == "selected-first"
@@ -1369,7 +1398,9 @@ def test_env_noexec_shell_does_not_request_a_forwarded_runtime(
     (tools / "fixture-shell").symlink_to("/bin/sh")
     monkeypatch.setenv("PATH", os.pathsep.join((str(tools), os.defpath)))
 
-    result = public_command.call("./fixture-launcher ./fixture-task", read_only=True)
+    result = public_command.call(
+        "./fixture-launcher ./fixture-task",
+    )
 
     assert result["ok"], result
     assert result["result"]["exit_code"] == 0
@@ -1404,7 +1435,9 @@ def test_env_wrapper_does_not_treat_an_unrelated_interpreter_as_a_shell(
     launcher.chmod(0o755)
     monkeypatch.setenv("PATH", os.pathsep.join((str(tools), os.defpath)))
 
-    result = public_command.call("./fixture-launcher ./fixture-task", read_only=True)
+    result = public_command.call(
+        "./fixture-launcher ./fixture-task",
+    )
 
     assert result["ok"], result
     assert result["result"]["stdout"]["content"] == "unrelated-interpreter"
@@ -1528,10 +1561,10 @@ def test_workspace_script_uses_approved_off_path_interpreter(
     host = Mock()
     registry = ToolRegistry(
         [run_command],
-        permission_manager=PermissionManager(native_workspace),
+        permission_manager=automatic_process_policy(native_workspace),
         execution_service=CommandExecutionService(backend, host),
     )
-    arguments = {"command": command, "cwd": str(native_workspace), "read_only": True}
+    arguments = {"command": command, "cwd": str(native_workspace)}
     try:
         denied = json.loads(
             registry.call("run_command", json.dumps(arguments), interaction=interaction)
@@ -1636,7 +1669,7 @@ def test_direct_script_requests_identified_interpreter_directory(
     host = Mock()
     registry = ToolRegistry(
         [run_command],
-        permission_manager=PermissionManager(native_workspace),
+        permission_manager=automatic_process_policy(native_workspace),
         execution_service=CommandExecutionService(backend, host),
     )
     invocation = (
@@ -1657,7 +1690,6 @@ def test_direct_script_requests_identified_interpreter_directory(
         if spelling in {"literal-dollar", "dynamic-dollar"}
         else f"{invocation} && :",
         "cwd": str(native_workspace),
-        "read_only": True,
     }
     if requested != "none":
         arguments["read_roots"] = [str(native_workspace if requested == "workspace" else extra)]
@@ -1700,17 +1732,13 @@ def test_direct_script_requests_identified_interpreter_directory(
         (True, ".venv", "project-timeout"),
         (True, ".venv", "project-timeout-impersonator"),
         (True, "chosen env's", "project"),
-        ("retarget", ".venv", "project"),
-        (False, ".venv", "direct"),
         (True, ".venv", "direct"),
-        (False, ".venv", "script"),
         (True, ".venv", "script"),
         (True, ".venv", "script-virtual"),
-        (False, ".venv", "standard-direct"),
         (True, ".venv", "standard-direct"),
     ],
 )
-def test_workspace_runtime_is_prepared_in_original_call(
+def test_workspace_runtime_uses_declared_scope_across_launchers(
     backend,
     native_workspace,
     monkeypatch,
@@ -1719,7 +1747,7 @@ def test_workspace_runtime_is_prepared_in_original_call(
     environment_name,
     selection,
 ):
-    """A selected workspace runtime works off PATH after scoped approval."""
+    """A declared runtime works across launchers without inferring project metadata."""
     if _QUALIFICATION_UV is None:
         pytest.skip("The qualification runner is required")
     timeout = shutil.which("timeout")
@@ -1800,11 +1828,6 @@ def test_workspace_runtime_is_prepared_in_original_call(
             else (str(Path(_QUALIFICATION_UV).parent), os.defpath)
         ),
     )
-    if not prepared:
-        monkeypatch.setattr("loop.execution.facade.discover_workspace_runtimes", lambda *_args: ())
-        monkeypatch.setattr(
-            "loop.execution.facade.discover_workspace_interpreters", lambda *_args: ()
-        )
     prefix = (
         ""
         if environment_name == ".venv"
@@ -1860,36 +1883,36 @@ def test_workspace_runtime_is_prepared_in_original_call(
         }
         else command + shlex.quote(program),
         "cwd": str(native_workspace),
-        "read_only": selection
-        not in {
+        "write_roots": [str(native_workspace)]
+        if selection
+        in {
             "project-no-bytecode",
             "project-cd",
             "project-timeout",
             "project-timeout-impersonator",
-        },
+        }
+        else [],
     }
-    interaction = Mock()
-    if prepared == "retarget":
-
-        def approve_changed_selection(*_args, **_kwargs):
-            """Change the selected interpreter while its scope is being approved."""
-            (commands / "python").unlink()
-            (commands / "python").symlink_to("/bin/sh")
-            return "approve"
-
-        interaction.prompt.side_effect = approve_changed_selection
+    runtime_reads = tuple(dict.fromkeys((*arguments.get("read_roots", ()), str(runtime))))
+    if prepared:
+        arguments["read_roots"] = list(runtime_reads)
     else:
-        if prepared:
-            interaction.prompt.side_effect = ["deny", "approve"]
-        else:
-            interaction.prompt.return_value = "approve"
+        arguments["read_roots"] = [str(Path(_QUALIFICATION_UV).resolve().parent)]
+    interaction = Mock()
+    if prepared:
+        interaction.prompt.side_effect = ["deny", "approve"]
+    else:
+        interaction.prompt.return_value = "approve"
     host = Mock()
-    permissions = PermissionManager(native_workspace)
+    permissions = automatic_process_policy(native_workspace)
     marker = permissions.temporary_directory / "entered"
     registry = ToolRegistry(
         [run_command],
         permission_manager=permissions,
         execution_service=CommandExecutionService(backend, host),
+        settings=ToolRuntimeSettings(
+            sandbox_path_aliases=(str(home.parent),) if prepared else (),
+        ),
     )
     try:
         first = json.loads(
@@ -1897,13 +1920,7 @@ def test_workspace_runtime_is_prepared_in_original_call(
         )
         if not prepared:
             assert first["problem"]["code"] == "process.nonzero_exit", first
-            assert interaction.prompt.call_count == int(selection != "project")
-            assert not marker.exists()
-            host.run_host_command.assert_not_called()
-            return
-        if prepared == "retarget":
-            assert first["problem"]["code"] == "sandbox.stale", first
-            interaction.prompt.assert_called_once()
+            assert interaction.prompt.call_count == 1
             assert not marker.exists()
             host.run_host_command.assert_not_called()
             return
@@ -1993,10 +2010,10 @@ def test_workspace_script_uses_approved_off_path_virtual_environment(
     host = Mock()
     registry = ToolRegistry(
         [run_command],
-        permission_manager=PermissionManager(native_workspace),
+        permission_manager=automatic_process_policy(native_workspace),
         execution_service=CommandExecutionService(backend, host),
     )
-    arguments = {"command": command, "cwd": str(native_workspace), "read_only": True}
+    arguments = {"command": command, "cwd": str(native_workspace)}
     try:
         denied = json.loads(
             registry.call("run_command", json.dumps(arguments), interaction=interaction)
@@ -2063,13 +2080,12 @@ def test_indirect_alias_order_reuses_remembered_native_approval(
     host = Mock()
     registry = ToolRegistry(
         [run_command],
-        permission_manager=PermissionManager(native_workspace),
+        permission_manager=automatic_process_policy(native_workspace),
         execution_service=CommandExecutionService(backend, host),
     )
     arguments = {
         "command": "./launcher",
         "cwd": str(native_workspace),
-        "read_only": True,
         "read_roots": [str(installed)],
     }
     original_scandir = os.scandir
@@ -2131,10 +2147,10 @@ def test_indirect_path_alias_does_not_skip_an_unapproved_earlier_executable(
     host = Mock()
     registry = ToolRegistry(
         [run_command],
-        permission_manager=PermissionManager(native_workspace),
+        permission_manager=automatic_process_policy(native_workspace),
         execution_service=CommandExecutionService(backend, host),
     )
-    arguments = {"command": "./launcher", "cwd": str(native_workspace), "read_only": True}
+    arguments = {"command": "./launcher", "cwd": str(native_workspace)}
     try:
         denied = json.loads(
             registry.call(
@@ -2197,14 +2213,157 @@ def test_public_nested_seatbelt_refusal_never_retries_on_host(public_command):
 def test_read_only_command_writes_only_owned_scratch(public_command, native_workspace):
     """A read-only command may use private scratch but cannot write workspace coverage data."""
     scratch = public_command.call(
-        'printf scratch > "$TMPDIR/report"; cat "$TMPDIR/report"', read_only=True
+        'printf scratch > "$TMPDIR/report"; cat "$TMPDIR/report"',
     )
     assert scratch["ok"] is True
     assert scratch["result"]["stdout"]["content"] == "scratch"
-    denied = public_command.call("printf unsafe > .coverage", read_only=True)
+    denied = public_command.call(
+        "printf unsafe > .coverage",
+    )
     assert denied["ok"] is False
     assert not (native_workspace / ".coverage").exists()
     assert not (native_workspace / "report").exists()
+    public_command.host.run_host_command.assert_not_called()
+
+
+@pytest.mark.parametrize("size", [32, 16_384])
+@pytest.mark.parametrize(
+    "reader",
+    ["wc -c", """/bin/bash -c 'test "$HOME" = "$TMPDIR" && /usr/bin/wc -c'"""],
+    ids=["system-tool", "legacy-bash"],
+)
+def test_public_command_here_documents_work_with_private_scratch(public_command, size, reader):
+    """POSIX here-documents can feed system tools and stock Bash from private scratch."""
+    source = (
+        "set -e\ncat > \"$TMPDIR/input\" <<'LOOP_EOF'\n"
+        + "x" * size
+        + f'\nLOOP_EOF\n{reader} < "$TMPDIR/input"'
+    )
+    result = public_command.call(source)
+    assert result["ok"], result
+    assert result["result"]["boundary"] == "sandbox"
+    assert int(result["result"]["stdout"]["content"]) == size + 1
+    public_command.host.run_host_command.assert_not_called()
+
+
+@pytest.fixture
+def stock_bash():
+    """Require a deliberately selected stock Bash for native shell compatibility checks."""
+    if _QUALIFICATION_BASH is None:
+        pytest.skip("Set LOOP_NATIVE_MACOS_BASH to a compatible stock Bash executable")
+    executable = Path(_QUALIFICATION_BASH)
+    assert executable.is_absolute() and executable.name == "bash"
+    resolved = executable.resolve(strict=True)
+    assert resolved != Path("/bin/bash")
+    assert resolved.is_file() and os.access(resolved, os.X_OK)
+    return resolved
+
+
+@pytest.mark.parametrize("size", [32, 16_384])
+def test_workspace_path_selects_stock_bash_with_native_here_documents(
+    public_command, native_workspace, stock_bash, size
+):
+    """Lookup and children agree on stock Bash while an absolute shebang selects Apple Bash."""
+    commands = stock_bash.parent
+    public_command.manager.update_sandbox_paths(
+        ApprovalChoice.WORKSPACE, {str(commands): SandboxPathAccess.READ}
+    )
+    public_command.registry.settings.sandbox_environment = {
+        "PATH": os.pathsep.join((str(commands), "/usr/bin", "/bin")),
+    }
+    version_probe = native_workspace / "interpreter"
+    version_probe.write_text('#!/bin/bash\nprintf "%s\\n" "${BASH_VERSINFO[0]}"\n')
+    version_probe.chmod(0o755)
+    script = native_workspace / "here-document"
+    script.write_text(
+        "#!/bin/bash\nset -e\n"
+        'test "$HOME" = "$TMPDIR"\n'
+        'if [ "${BASH_VERSINFO[0]}" -ge 5 ]; then\n'
+        '  test "$(command -v bash)" = "$BASH"\n'
+        "  bash ./interpreter\n"
+        "fi\n"
+        "/usr/bin/wc -c <<'LOOP_EOF'\n" + "x" * size + "\nLOOP_EOF\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+
+    lookup = json.loads(
+        public_command.registry.call(
+            "resolve_executable",
+            '{"name": "bash"}',
+            interaction=public_command.interaction,
+        )
+    )
+    assert lookup["ok"], lookup
+    assert lookup["result"]["status"] == "installed_on_host"
+    assert lookup["result"]["resolved_path"] == str(stock_bash)
+    assert lookup["result"]["sandbox_access"] == "default_read"
+    result = public_command.call("bash ./here-document")
+    assert result["ok"], result
+    major, length = result["result"]["stdout"]["content"].split()
+    assert int(major) >= 5
+    assert int(length) == size + 1
+
+    legacy = public_command.call("./interpreter")
+    assert legacy["ok"] and legacy["result"]["stdout"]["content"].strip() == "3", legacy
+    if size > 32:
+        legacy_document = public_command.call("./here-document")
+        assert legacy_document["problem"]["code"] == "process.nonzero_exit", legacy_document
+        assert (
+            "cannot create temp file" in legacy_document["problem"]["metadata"]["stderr"]["content"]
+        )
+    public_command.host.run_host_command.assert_not_called()
+
+
+def test_stock_bash_upgrade_revalidates_stable_workspace_path(
+    public_command, native_workspace, stock_bash
+):
+    """A stable runtime path follows an approved upgrade and rejects a stale approval."""
+    installation = native_workspace.parent / "installation"
+    versions = tuple(installation / str(version) for version in (1, 2))
+    for number, version in enumerate(versions, start=1):
+        version.mkdir(parents=True)
+        shutil.copyfile(stock_bash, version / "bash")
+        (version / "bash").chmod(0o755)
+        (version / "release").write_text(str(number), encoding="utf-8")
+    stable = native_workspace.parent / "stable"
+    stable.symlink_to(versions[0], target_is_directory=True)
+    public_command.registry.settings.sandbox_environment = {"PATH": str(stable)}
+    public_command.registry.settings.sandbox_path_aliases = (str(stable),)
+    public_command.manager.update_sandbox_paths(
+        ApprovalChoice.WORKSPACE, {str(installation): SandboxPathAccess.READ}
+    )
+    public_command.manager.set_default(
+        Action.PROCESS_EXECUTE, Decision.ASK, scope=PolicyScope.SESSION
+    )
+    source = """bash -c '/bin/cat "${BASH%/*}/release"'"""
+
+    initial = public_command.call(source)
+    assert initial["ok"] and initial["result"]["stdout"]["content"] == "1", initial
+
+    def upgrade_during_approval(*_args, **_kwargs):
+        """Retarget the stable install spelling before granting the old command request."""
+        stable.unlink()
+        stable.symlink_to(versions[1], target_is_directory=True)
+        return "approve"
+
+    assert not public_command.manager.sandboxed_command_rules(ApprovalChoice.SESSION)
+    public_command.interaction.prompt.side_effect = upgrade_during_approval
+    stale = public_command.call(source)
+    assert stale["problem"]["code"] == "sandbox.stale", stale
+
+    public_command.interaction.prompt.side_effect = None
+    public_command.interaction.prompt.return_value = "approve"
+    updated = public_command.call(source)
+    assert updated["ok"] and updated["result"]["stdout"]["content"] == "2", updated
+    assert public_command.interaction.prompt.call_count == 3
+
+    public_command.manager.update_sandbox_paths(ApprovalChoice.WORKSPACE, {str(installation): None})
+    public_command.registry.settings.sandbox_path_aliases = ()
+    hidden = public_command.call("""/bin/dash -c '\"$PATH/bash\" --version'""")
+    assert not hidden["ok"], hidden
+    assert hidden["problem"]["code"] == "process.nonzero_exit", hidden
+    assert "GNU bash" not in hidden["problem"]["metadata"]["stdout"]["content"]
     public_command.host.run_host_command.assert_not_called()
 
 
@@ -2221,7 +2380,9 @@ def test_command_output_reports_decoding_loss(
     public_command, command, content, size, loss, exit_code
 ):
     """Successful and failed native output preserve newlines and report decoding loss."""
-    result = public_command.call(f"{command}; exit {exit_code}", read_only=True)
+    result = public_command.call(
+        f"{command}; exit {exit_code}",
+    )
 
     output = result["result"] if exit_code == 0 else result["problem"]["metadata"]
     if exit_code:
@@ -2241,16 +2402,18 @@ def test_literal_tmp_does_not_grant_host_temporary_files(public_command, native_
     marker = host_directory / "marker"
     marker.write_text("host-temporary-canary", encoding="utf-8")
     host_spelling = Path("/tmp") / host_directory.name
-    read = public_command.call("cat " + shlex.quote(str(host_spelling / "marker")), read_only=True)
+    read = public_command.call(
+        "cat " + shlex.quote(str(host_spelling / "marker")),
+    )
     assert read["ok"] is False
     assert "host-temporary-canary" not in json.dumps(read)
     write = public_command.call(
-        "printf forbidden > " + shlex.quote(str(host_spelling / "output")), read_only=True
+        "printf forbidden > " + shlex.quote(str(host_spelling / "output")),
     )
     assert write["ok"] is False
     assert not (host_directory / "output").exists()
     private = public_command.call(
-        'printf private > "$TMPDIR/output"; cat "$TMPDIR/output"', read_only=True
+        'printf private > "$TMPDIR/output"; cat "$TMPDIR/output"',
     )
     assert private["ok"] is True
     assert private["result"]["stdout"]["content"] == "private"
@@ -2272,12 +2435,12 @@ def test_shared_developer_cache_names_do_not_grant_host_temporary_files(
     output.unlink()
     marker.write_text("private-cache-canary", encoding="utf-8")
     read = public_command.call(
-        f"{shlex.quote(_SYSTEM_CAT)} {shlex.quote(str(marker))}", read_only=True
+        f"{shlex.quote(_SYSTEM_CAT)} {shlex.quote(str(marker))}",
     )
     assert not read["ok"]
     assert "private-cache-canary" not in json.dumps(read)
     write = public_command.call(
-        f"{shlex.quote(_SYSTEM_PRINTF)} forbidden > {shlex.quote(str(output))}", read_only=True
+        f"{shlex.quote(_SYSTEM_PRINTF)} forbidden > {shlex.quote(str(output))}",
     )
     assert not write["ok"]
     assert not output.exists()
@@ -2310,7 +2473,9 @@ def test_make_prepares_a_literal_indirect_tool_in_one_call(
     workspace_bin.mkdir(parents=True)
     monkeypatch.setenv("PATH", os.pathsep.join((str(workspace_bin), str(root), os.defpath)))
 
-    result = public_command.call(source, read_only=True)
+    result = public_command.call(
+        source,
+    )
 
     assert result["ok"], result
     assert result["result"]["stdout"]["content"] == "indirect-ready"
@@ -2328,7 +2493,7 @@ def test_make_prepares_a_literal_indirect_tool_in_one_call(
 
 
 def test_make_prepares_workspace_venv_runtime_in_one_call(public_command, native_workspace):
-    """A literal recipe authorizes its selected workspace interpreter before launch."""
+    """A literal recipe uses the same declared runtime scope as an opaque launcher."""
     if _SYSTEM_MAKE is None:
         pytest.skip("System make is required")
     created = subprocess.run(
@@ -2342,8 +2507,19 @@ def test_make_prepares_workspace_venv_runtime_in_one_call(public_command, native
     (native_workspace / "Makefile").write_text(
         '.PHONY: test\ntest:\n\t@./.venv/bin/python -c "print(1)"\n'
     )
-    result = public_command.call(f"{_SYSTEM_MAKE} test", read_only=True)
-    assert result["ok"], result
+    interpreter = Path(sys.executable).resolve(strict=True)
+    roots, aliases = public_command.backend.installed_tool_roots(interpreter)
+    base = Path(sys.base_prefix).resolve(strict=True)
+    if not any(base.is_relative_to(root) for root in roots):
+        roots = (base, *(root for root in roots if not root.is_relative_to(base)))
+    public_command.registry.settings.sandbox_path_aliases = tuple(
+        str(alias) for alias, _, _, _ in aliases
+    )
+    result = public_command.call(
+        f"{_SYSTEM_MAKE} test",
+        read_roots=[str(root) for root in roots],
+    )
+    assert result["ok"], json.dumps(result, indent=2)
     assert result["result"]["stdout"]["content"] == "1\n"
     assert public_command.interaction.prompt.call_count <= 1
     public_command.host.run_host_command.assert_not_called()
@@ -2361,7 +2537,9 @@ def test_make_runs_unrelated_system_tools_in_one_call(public_command, native_wor
         ".PHONY: test\ntest:\n\t@perl -e 'print \"perl\"'\n\t@awk 'BEGIN { print 23 }'\n",
         encoding="utf-8",
     )
-    result = public_command.call(f"{_SYSTEM_MAKE} test", read_only=True)
+    result = public_command.call(
+        f"{_SYSTEM_MAKE} test",
+    )
     assert result["ok"], json.dumps(result, indent=2)
     assert result["result"]["stdout"]["content"] == "perl23\n"
     public_command.host.run_host_command.assert_not_called()
@@ -2381,10 +2559,14 @@ def test_make_recipe_can_use_session_scratch(public_command, native_workspace):
         encoding="utf-8",
     )
     source = f'{make} -f "{scratch}/{makefile.name}"'
-    default = public_command.call(source, read_only=True)
+    default = public_command.call(
+        source,
+    )
     assert default["ok"] is True, default
     assert (public_command.scratch / "recipe.txt").read_text(encoding="utf-8") == "recipe"
-    result = public_command.call(f"{source} {make_args}", read_only=True)
+    result = public_command.call(
+        f"{source} {make_args}",
+    )
     assert result["ok"] is True, result
     assert (public_command.scratch / "recipe.txt").read_text(encoding="utf-8") == "recipe"
     other = SessionManager(
@@ -2399,7 +2581,9 @@ def test_make_recipe_can_use_session_scratch(public_command, native_workspace):
         makefile.write_text(
             f"all:\n\t@{shlex.quote(_SYSTEM_CAT)} {shlex.quote(str(canary))}\n", encoding="utf-8"
         )
-        denied = public_command.call(source, read_only=True)
+        denied = public_command.call(
+            source,
+        )
         assert denied["ok"] is False
         assert "other-session-canary" not in json.dumps(denied)
         assert canary.read_text(encoding="utf-8") == "other-session-canary"
@@ -2414,7 +2598,9 @@ def test_developer_tool_shim_makefile_from_stdin_uses_session_scratch(public_com
         f"{shlex.quote(_SYSTEM_PRINTF)} 'all:\\n\\t@{shlex.quote(_SYSTEM_PRINTF)} private\\n' "
         f"| {shlex.quote(_SYSTEM_MAKE)} -f -"
     )
-    result = public_command.call(source, read_only=True)
+    result = public_command.call(
+        source,
+    )
     assert result["ok"] is True, result
     assert result["result"]["stdout"]["content"] == "private"
     public_command.host.run_host_command.assert_not_called()
@@ -2431,7 +2617,9 @@ def test_system_compiler_uses_private_temporary_storage(public_command):
         f'{shlex.quote(_SYSTEM_CC)} -c "{VirtualPath.TEMPORARY}/{source.name}" '
         f'-o "{VirtualPath.TEMPORARY}/{output.name}"'
     )
-    result = public_command.call(command, read_only=True)
+    result = public_command.call(
+        command,
+    )
     assert result["ok"], result
     assert output.is_file() and output.stat().st_size > 0
     public_command.host.run_host_command.assert_not_called()
@@ -2450,7 +2638,9 @@ def test_developer_tool_discovery_preserves_scratch_for_stdin(public_command, na
         f'{printer} %s {makefile} | "$tool" -f -; '
         f'{shlex.quote(_SYSTEM_CAT)} "$TMPDIR/output"'
     )
-    result = public_command.call(source, read_only=True)
+    result = public_command.call(
+        source,
+    )
     assert result["ok"] is True, result
     assert result["result"]["stdout"]["content"] == "private"
     other = SessionManager(
@@ -2466,7 +2656,9 @@ def test_developer_tool_discovery_preserves_scratch_for_stdin(public_command, na
         command = (
             f'set -e; tool=$({finder} --find {make_name}); {printer} %s {makefile} | "$tool" -f -'
         )
-        denied = public_command.call(command, read_only=True)
+        denied = public_command.call(
+            command,
+        )
         assert denied["ok"] is False
         assert "other-session-canary" not in json.dumps(denied)
         assert canary.read_text(encoding="utf-8") == "other-session-canary"
@@ -2498,8 +2690,11 @@ else:
 """
     result = public_command.call(
         "python -B -c " + shlex.quote(source),
-        read_only=True,
-        read_roots=[str(Path(sys.prefix).resolve()), str(Path(path_module.__file__).parents[2])],
+        read_roots=[
+            str(Path(sys.prefix).resolve()),
+            str(Path(sys.base_prefix).resolve()),
+            str(Path(path_module.__file__).parents[2]),
+        ],
     )
 
     assert result["ok"], result
@@ -2519,7 +2714,6 @@ def test_system_files_remain_readable_without_host_access(public_command, monkey
     result = public_command.call(
         f"cat {shlex.quote(str(system_version))} >/dev/null && "
         'if cat "$WORKSPACE_ROOT/external-link" >/dev/null 2>&1; then exit 9; fi',
-        read_only=True,
     )
     assert result["ok"], json.dumps(result, indent=2)
     public_command.host.run_host_command.assert_not_called()
@@ -2541,7 +2735,6 @@ def test_system_read_roots_keep_private_names_blocked_with_parent_on_path(
     result = public_command.call(
         f"cat {shlex.quote(str(system / 'ordinary'))} && "
         f"if cat {shlex.quote(str(system / '.ssh/secret'))} 2>/dev/null; then exit 9; fi",
-        read_only=True,
     )
     assert result["ok"], json.dumps(result, indent=2)
     assert result["result"]["stdout"]["content"] == "ordinary-system"
@@ -2552,7 +2745,7 @@ def test_system_read_roots_keep_private_names_blocked_with_parent_on_path(
 def test_public_project_environment_loads_managed_runtime_dependencies(
     public_command, native_workspace, monkeypatch, scratch_script
 ):
-    """A selected project interpreter can load its managed package dependencies in one call."""
+    """A declared toolchain can load supporting packages through different wrappers."""
     uv = _QUALIFICATION_UV
     environment = Path(sys.prefix)
     config = environment / "pyvenv.cfg"
@@ -2562,7 +2755,7 @@ def test_public_project_environment_loads_managed_runtime_dependencies(
     installation = public_command.backend.installed_tool_roots(interpreter)
     if installation is None:
         pytest.skip("The active interpreter has invalid package metadata")
-    roots, _ = installation
+    roots, aliases = installation
     if len(roots) < 2 or not all(public_command.backend.managed_tool_root(root) for root in roots):
         pytest.skip("The active interpreter needs verified managed package dependencies")
     (native_workspace / "external-link").unlink()
@@ -2574,7 +2767,8 @@ def test_public_project_environment_loads_managed_runtime_dependencies(
     shutil.copyfile(config, commands.parent / "pyvenv.cfg")
     (native_workspace / "pyproject.toml").write_text(
         '[project]\nname = "native-runtime"\nversion = "0.0.0"\n'
-        "[tool.uv]\npackage = false\n"
+        'requires-python = ">=3.11,<4.0"\n'
+        '[tool.uv]\npackage = false\noverride-dependencies = ["pytest>=8"]\n'
         '[tool.pytest.ini_options]\naddopts = ["-p", "no:cacheprovider"]\n'
         'pythonpath = ["."]\n',
         encoding="utf-8",
@@ -2612,7 +2806,12 @@ def test_public_project_environment_loads_managed_runtime_dependencies(
         command = 'bash "$TMPDIR/run_tests.sh"'
     else:
         command = 'cd "$WORKSPACE_ROOT"; ' + command
-    result = public_command.call(command)
+    public_command.registry.settings.sandbox_path_aliases = tuple(
+        str(alias) for alias, _, _, _ in aliases
+    )
+    result = public_command.call(
+        command, read_roots=[str(root) for root in roots], write_roots=[str(native_workspace)]
+    )
     assert result["ok"], json.dumps(result, indent=2)
     assert "1 passed" in result["result"]["stdout"]["content"]
     if scratch_script:
@@ -2650,15 +2849,15 @@ def test_public_runtime_dependencies_support_custom_package_prefix(
         f"exec /bin/cat {shlex.quote(str(opt / 'support/data'))}\n"
     )
     executable.chmod(0o755)
-    commands = native_workspace / ".venv/bin"
+    commands = native_workspace / "bin"
     commands.mkdir(parents=True)
-    (commands / "python").symlink_to(opt / "runtime/bin/engine")
-    (commands.parent / "pyvenv.cfg").write_text(
-        f"home = {opt / 'runtime/bin'}\nimplementation = CPython\nversion_info = 9.8.7\n"
+    (commands / "fixture-runner").symlink_to(opt / "runtime/bin/engine")
+    public_command.registry.settings.sandbox_path_aliases = tuple(
+        str(opt / name) for name in ("runtime", "support")
     )
 
     assert not public_command.backend.managed_tool_root(runtime)
-    result = public_command.call("./.venv/bin/python -c pass")
+    result = public_command.call("./bin/fixture-runner", read_roots=[str(runtime), str(dependency)])
     assert result["ok"], json.dumps(result, indent=2)
     assert result["result"]["stdout"]["content"] == "custom-dependency"
     assert public_command.interaction.prompt.call_count == 1
@@ -2715,9 +2914,9 @@ def test_piped_make_prepares_its_selected_tool(
     ],
 )
 def test_public_session_runs_pytest_from_private_unusual_scratch(
-    backend, native_workspace, monkeypatch, native_execution_clock, full_project
+    backend, native_workspace, monkeypatch, native_execution_clock, native_directory, full_project
 ):
-    """Public dispatch runs small or full project tests in durable session scratch."""
+    """Run copied project tests from compact scratch and a fixture from legacy scratch."""
     uv = _QUALIFICATION_UV
     if uv is None:
         pytest.skip("uv is required to qualify the project test workflow")
@@ -2749,6 +2948,7 @@ def test_public_session_runs_pytest_from_private_unusual_scratch(
     else:
         (native_workspace / "pyproject.toml").write_text(
             '[project]\nname = "native-test-fixture"\nversion = "0.0.0"\n'
+            'requires-python = ">=3.11"\n'
             "[tool.uv]\npackage = false\n",
             encoding="utf-8",
         )
@@ -2766,12 +2966,22 @@ def test_public_session_runs_pytest_from_private_unusual_scratch(
         (tests / "test_sample.py").write_text(
             "from sample import value\n\ndef test_value():\n    assert value() == 42\n"
         )
+    workspace_coverage = native_workspace / ".coverage"
+    workspace_coverage.write_text("keep original coverage")
     database = native_workspace.parent / "Library" / "Application Support" / "sessions.db"
+    compact_root = native_directory("/private/tmp") if full_project else None
     sessions = SessionManager(
-        session_store=SQLiteSessionStore(database, workspace_id="pytest-native"),
+        session_store=SQLiteSessionStore(
+            database,
+            workspace_id="pytest-native",
+            scratch_roots=(compact_root,) if compact_root is not None else (),
+        ),
         workspace_id="pytest-native",
     )
-    permissions = PermissionManager(native_workspace)
+    permissions = PermissionManager(
+        native_workspace,
+        protected_host_roots=(database.parent, compact_root) if compact_root is not None else (),
+    )
     host = Mock()
     host.run_host_command.side_effect = AssertionError("unapproved host launch")
     interaction = Mock()
@@ -2803,7 +3013,12 @@ def test_public_session_runs_pytest_from_private_unusual_scratch(
         os.pathsep.join((str(Path(uv).parent), str(Path(sys.executable).parent), os.defpath)),
     )
     try:
-        assert "Library/Application Support" in str(loop.permission_manager.temporary_directory)
+        scratch = loop.permission_manager.temporary_directory
+        if compact_root is None:
+            assert "Library/Application Support" in str(scratch)
+        else:
+            assert scratch.is_relative_to(compact_root)
+            assert not any(character.isspace() for character in str(scratch))
         lookup = json.loads(
             loop.tool_registry.call(
                 "resolve_executable",
@@ -2816,7 +3031,7 @@ def test_public_session_runs_pytest_from_private_unusual_scratch(
         environment = (
             f'PYTHONPATH="{VirtualPath.WORKSPACE}{"/src" if full_project else ""}" '
             f"UV_PROJECT_ENVIRONMENT={shlex.quote(str(Path(sys.prefix).resolve()))} "
-            + ("UV_NO_SYNC=1 " if full_project else "")
+            'UV_NO_SYNC=1 COVERAGE_FILE="$LOOP_OUTPUT_DIR/.coverage" '
         )
         references = [item["grant_reference"] for item in lookup["result"]["executables"]]
         ungranted = json.loads(
@@ -2826,6 +3041,7 @@ def test_public_session_runs_pytest_from_private_unusual_scratch(
                     {
                         "command": environment + f"{make} test-architecture",
                         "cwd": "$WORKSPACE_ROOT",
+                        "write_roots": ["$WORKSPACE_ROOT"],
                         "read_roots": [str(Path(sys.prefix).resolve())],
                     }
                 ),
@@ -2833,10 +3049,17 @@ def test_public_session_runs_pytest_from_private_unusual_scratch(
                 instructions_manager=loop.instructions_manager,
             )
         )
-        assert not ungranted["ok"]
+        assert not ungranted["ok"], json.dumps(ungranted)
         assert ungranted["problem"]["code"] == "process.nonzero_exit"
         denial = ungranted["problem"]["metadata"]["stderr"]["content"]
-        assert (uv_name if full_project else "Operation not permitted") in denial
+        if full_project:
+            assert uv_name in denial
+        else:
+            missing_tool = {
+                f"make: {uv_name}: No such file or directory",
+                f"make: {uv_name}: Operation not permitted",
+            }
+            assert missing_tool.intersection(denial.splitlines()), denial
         direct_test = (
             "tests/unit/agent/test_runner.py -k prepares_env_interpreter"
             if full_project
@@ -2870,7 +3093,10 @@ def test_public_session_runs_pytest_from_private_unusual_scratch(
                         {
                             "command": environment + command,
                             "cwd": "$WORKSPACE_ROOT",
-                            "read_roots": [str(Path(sys.prefix).resolve())],
+                            "read_roots": [
+                                str(Path(sys.prefix).resolve()),
+                                str(Path(sys.base_prefix).resolve()),
+                            ],
                             "executable_grant": references,
                         }
                     ),
@@ -2941,6 +3167,10 @@ def test_public_session_runs_pytest_from_private_unusual_scratch(
                     cursor = page.get("next_cursor")
             assert result["ok"], json.dumps(result, indent=2) + "\nFull stdout:\n" + content
             assert expected in content
+        assert workspace_coverage.read_text() == "keep original coverage"
+        scratch = loop.permission_manager.temporary_directory
+        assert len(list(scratch.glob("output-*/.coverage"))) == 1
+        interaction.prompt.assert_called()
         host.run_host_command.assert_not_called()
     finally:
         loop.command_manager.close()
@@ -2959,8 +3189,12 @@ def test_public_writable_command_cannot_change_private_workspace_entries(
     existing.write_text("preserve-private-canary", encoding="utf-8")
     created = directory / "new-entry"
 
-    overwritten = public_command.call(f"printf changed > {shlex.quote(str(existing))}")
-    created_result = public_command.call(f"printf changed > {shlex.quote(str(created))}")
+    overwritten = public_command.call(
+        f"printf changed > {shlex.quote(str(existing))}", write_roots=[str(native_workspace)]
+    )
+    created_result = public_command.call(
+        f"printf changed > {shlex.quote(str(created))}", write_roots=[str(native_workspace)]
+    )
 
     assert overwritten["ok"] is False
     assert created_result["ok"] is False
@@ -3004,7 +3238,7 @@ def test_public_granted_roots_keep_private_components_denied(
                 f": {shell_path(virtual)}; cat {shell_path(spelling)}; "
                 f"printf changed > {shell_path(spelling)}; "
                 f"printf changed > {shell_path(spelling.rsplit('/', 1)[0] + '/new-entry')}",
-                read_only=read_only,
+                write_roots=[] if read_only else [str(native_workspace)],
                 read_roots=reads,
             )
             assert result["ok"] is False, result
@@ -3012,7 +3246,9 @@ def test_public_granted_roots_keep_private_components_denied(
             assert existing.read_text() == "private-root-canary"
             assert not created.exists()
     ordinary = public_command.call(
-        f"cat {shell_path(virtual + '/neighbor')}", read_only=read_only, read_roots=reads
+        f"cat {shell_path(virtual + '/neighbor')}",
+        write_roots=[] if read_only else [str(native_workspace)],
+        read_roots=reads,
     )
     assert ordinary["result"]["stdout"]["content"] == "ordinary-readable"
     public_command.host.run_host_command.assert_not_called()
@@ -3024,12 +3260,14 @@ def test_public_skill_root_shell_uses_physical_path_without_rewriting(public_com
     (root / "neighbor").write_text("ordinary-skill-data", encoding="utf-8")
     public_command.instructions.activate_skill("fixture")
 
-    physical = public_command.call(f"cat {shlex.quote(str(root / 'neighbor'))}", read_only=True)
+    physical = public_command.call(
+        f"cat {shlex.quote(str(root / 'neighbor'))}",
+    )
     assert physical["ok"], physical
     assert physical["result"]["stdout"]["content"] == "ordinary-skill-data"
 
     virtual = public_command.call(
-        "printf '%s\\n' '/skills/fixture/neighbor'; cat /skills/fixture/neighbor", read_only=True
+        "printf '%s\\n' '/skills/fixture/neighbor'; cat /skills/fixture/neighbor",
     )
     assert virtual["problem"]["code"] == "process.nonzero_exit", virtual
     assert virtual["problem"]["metadata"]["stdout"]["content"] == "/skills/fixture/neighbor\n"
@@ -3046,7 +3284,9 @@ def test_public_skill_alias_rejects_private_hardlink(public_command, native_work
     (root / "public-alias").hardlink_to(source)
     public_command.instructions.activate_skill("fixture")
 
-    result = public_command.call("cat " + shlex.quote(str(root / "public-alias")), read_only=True)
+    result = public_command.call(
+        "cat " + shlex.quote(str(root / "public-alias")),
+    )
 
     assert result["problem"]["code"] == "sandbox.invalid", result
     assert "private-skill-canary" not in json.dumps(result)
@@ -3061,7 +3301,6 @@ def test_public_session_scratch_denies_private_names(public_command):
             f'mkdir -p "$TMPDIR/nested"; mkdir "$TMPDIR/nested/{component}"; '
             f'printf fixture > "$TMPDIR/nested/{component}/key"; '
             f'cat "$TMPDIR/nested/{component}/key"',
-            read_only=True,
         )
         assert result["problem"]["code"] == "process.nonzero_exit", result
         assert result["problem"]["metadata"]["stdout"]["content"] == ""
@@ -3074,7 +3313,9 @@ def test_public_writable_command_keeps_ordinary_workspace_writes_available(
     public_command, native_workspace
 ):
     """Private-component write denials leave ordinary writable workspace files available."""
-    result = public_command.call("printf ordinary-updated > ordinary")
+    result = public_command.call(
+        "printf ordinary-updated > ordinary", write_roots=[str(native_workspace)]
+    )
 
     assert result["ok"] is True
     assert (native_workspace / "ordinary").read_text(encoding="utf-8") == "ordinary-updated"
@@ -3082,7 +3323,7 @@ def test_public_writable_command_keeps_ordinary_workspace_writes_available(
 
 
 def test_public_external_write_grant_stays_in_approved_directory(public_command, native_workspace):
-    """Seatbelt permits one approved external write and denies sibling and control writes."""
+    """Seatbelt allows ordinary external output and denies protected creation and other writes."""
     external = native_workspace.parent / "external-write"
     sibling = native_workspace.parent / "external-sibling"
     external.mkdir()
@@ -3098,6 +3339,13 @@ def test_public_external_write_grant_stays_in_approved_directory(public_command,
     )
     assert approved["ok"], approved
     assert (external / "allowed").read_text(encoding="utf-8") == "approved"
+
+    secret = external / ".env"
+    protected_name = public_command.call(
+        "printf denied > " + shlex.quote(str(secret)), read_roots=[str(external)], **grants
+    )
+    assert protected_name["problem"]["code"] == "process.nonzero_exit", protected_name
+    assert not secret.exists()
 
     outside = public_command.call(
         "printf denied > " + shlex.quote(str(sibling / "blocked")), **grants
@@ -3134,7 +3382,7 @@ def test_public_attempt_local_unix_ipc_needs_no_approval_or_host_fallback(public
         "my $data = qq(); defined recv($p, $data, 5, 0) or die $!; print $data;"
     )
 
-    result = public_command.call(source, read_only=True)
+    result = public_command.call(source, local_ipc=True)
 
     assert result["ok"], result
     assert result["result"]["stdout"]["content"] == "local"
@@ -3153,7 +3401,9 @@ def test_public_local_network_deny_removes_macos_socket_authority(public_command
         "print bind($s, pack_sockaddr_un($path)) ? qq(allowed) : 0+$!;"
     )
 
-    result = public_command.call(source, read_only=True)
+    result = public_command.call(
+        source,
+    )
 
     assert result["ok"], result
     assert result["result"]["stdout"]["content"] == str(errno.EPERM)
@@ -3197,6 +3447,7 @@ def test_managed_local_network_deny_removes_macos_socket_authority(
             directory, trust_anchor=native_workspace.parent, owner_uid=os.getuid()
         ),
     )
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW, scope=PolicyScope.SESSION)
     instructions = InstructionsManager(
         runtime_environment=RuntimeEnvironment(native_workspace, manager.temporary_directory)
     )
@@ -3214,7 +3465,7 @@ def test_managed_local_network_deny_removes_macos_socket_authority(
         result = json.loads(
             registry.call(
                 "run_command",
-                json.dumps({"command": source, "cwd": "$WORKSPACE_ROOT", "read_only": True}),
+                json.dumps({"command": source, "cwd": "$WORKSPACE_ROOT"}),
                 interaction=public_command.interaction,
                 instructions_manager=instructions,
             )
@@ -3307,7 +3558,9 @@ def test_root_managed_policy_controls_macos_yolo_host_and_native_network(
         "my $path = qq($ENV{TMPDIR}/denied.sock); "
         "print bind($s, pack_sockaddr_un($path)) ? qq(allowed) : 0+$!;"
     )
-    denied_local = public_command.call(source, read_only=True)
+    denied_local = public_command.call(
+        source,
+    )
     assert denied_local["ok"], denied_local
     assert denied_local["result"]["stdout"]["content"] == str(errno.EPERM)
     public_command.interaction.prompt.assert_not_called()
@@ -3319,7 +3572,9 @@ def test_public_mediated_origin_uses_scoped_approval_without_host_fallback(
 ):
     """An approved macOS mediator keeps ordinary command effects inside the sandbox."""
     result = live_egress_clock.call(
-        "printf unsafe > mediated-marker", egress_origins=["https://example.invalid"]
+        "printf unsafe > mediated-marker",
+        egress_origins=["https://example.invalid"],
+        write_roots=[str(native_workspace)],
     )
 
     assert result["ok"], result
@@ -3355,9 +3610,16 @@ def test_native_general_network_grant_reaches_host_loopback(backend, native_work
 
 
 def test_public_user_enabled_general_network_is_an_explicit_alternative(public_command):
-    """A trusted limit change permits separately approved general networking on macOS."""
+    """Approved networking resolves localhost and preserves offline account visibility."""
     if not Path("/usr/bin/nc").is_file():
         pytest.skip("The system netcat client is unavailable")
+    account_check = "/usr/bin/perl -e " + shlex.quote(
+        "delete $ENV{HOME}; print defined(getpwuid($<)) ? qq(available) : qq(unavailable)"
+    )
+    offline = public_command.call(account_check)
+    assert offline["ok"], offline
+    visible = offline["result"]["stdout"]["content"]
+    assert visible in {"available", "unavailable"}
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         listener.listen()
@@ -3367,10 +3629,12 @@ def test_public_user_enabled_general_network_is_an_explicit_alternative(public_c
             "deny_private_networks", False, scope=PolicyScope.SESSION
         )
         result = public_command.call(
-            f"printf granted | /usr/bin/nc -w 1 127.0.0.1 {port}", network=True
+            f"{account_check} && printf granted | /usr/bin/nc -4 -w 1 localhost {port}",
+            network=True,
         )
         assert result["ok"], result
         assert result["result"]["boundary"] == "sandbox"
+        assert result["result"]["stdout"]["content"] == visible
         with listener.accept()[0] as connection:
             assert connection.recv(32) == b"granted"
         public_command.host.run_host_command.assert_not_called()
@@ -3386,7 +3650,9 @@ def test_public_user_enabled_general_network_is_an_explicit_alternative(public_c
 )
 def test_public_safe_redirections_run_without_approval(public_command, source):
     """Null-device and managed temporary output preserve native enforcement without prompts."""
-    result = public_command.call(source, read_only=True)
+    result = public_command.call(
+        source,
+    )
     assert result["ok"] is True
     public_command.interaction.prompt.assert_not_called()
     public_command.host.run_host_command.assert_not_called()
@@ -3399,7 +3665,9 @@ def test_public_safe_redirect_does_not_bypass_workspace_overwrite_review(
     interaction = Mock()
     interaction.prompt.return_value = "deny"
     result = public_command.call(
-        "printf unsafe >ordinary >/dev/null", chosen_interaction=interaction
+        "printf unsafe >ordinary >/dev/null",
+        chosen_interaction=interaction,
+        write_roots=[str(native_workspace)],
     )
     assert result["problem"]["code"] == "tool.denied"
     assert (native_workspace / "ordinary").read_text() == "ordinary-data"
@@ -3430,7 +3698,7 @@ def test_effectful_native_denial_is_not_replayed(public_command, native_workspac
         f"then exit 9; fi; printf 'Operation not permitted' >&2; exit {exit_code}"
     )
 
-    result = public_command.call(source)
+    result = public_command.call(source, write_roots=[str(native_workspace)])
 
     assert result["problem"]["code"] == "process.nonzero_exit", result
     metadata = result["problem"]["metadata"]
@@ -3452,7 +3720,9 @@ def test_explicitly_declined_destructive_command_preserves_input(public_command,
     """Destructive review is enforced before native or unrestricted execution."""
     interaction = Mock()
     interaction.prompt.return_value = "deny"
-    result = public_command.call("rm -f ordinary", chosen_interaction=interaction)
+    result = public_command.call(
+        "rm -f ordinary", chosen_interaction=interaction, write_roots=[str(native_workspace)]
+    )
     assert result["problem"]["code"] == "tool.denied"
     assert (native_workspace / "ordinary").read_text() == "ordinary-data"
     public_command.host.run_host_command.assert_not_called()
@@ -3460,7 +3730,9 @@ def test_explicitly_declined_destructive_command_preserves_input(public_command,
 
 def test_large_output_remains_bounded(public_command):
     """Public native output capture drains large output while retaining its configured limit."""
-    result = public_command.call("/usr/bin/yes x | /usr/bin/head -c 100000", read_only=True)
+    result = public_command.call(
+        "/usr/bin/yes x | /usr/bin/head -c 100000",
+    )
     assert result["ok"] is True
     output = result["result"]["stdout"]
     assert len(output["content"]) <= MAX_OUTPUT_CHARS
@@ -3487,7 +3759,9 @@ def test_native_protected_controls_resist_opaque_overwrite(
     target = native_workspace / relative
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text("preserve-control")
-    result = public_command.call(f"eval 'printf changed > {relative}'")
+    result = public_command.call(
+        f"eval 'printf changed > {relative}'", write_roots=[str(native_workspace)]
+    )
     assert result["ok"] is False
     assert target.read_text() == "preserve-control"
     public_command.host.run_host_command.assert_not_called()
@@ -3523,12 +3797,16 @@ def test_native_protected_controls_resist_opaque_overwrite(
         "env -i /usr/bin/git clean -fd",
     ],
 )
-def test_destructive_forms_require_fresh_review(public_command, native_workspace, source):
-    """Direct, wrapped and nested destructive forms cannot launch after review is declined."""
+def test_declared_write_scope_requires_review_independent_of_spelling(
+    public_command, native_workspace, source
+):
+    """Direct, wrapped and nested writers cannot launch when their declared scope is declined."""
     (native_workspace / "sample.txt").write_text("replacement")
     interaction = Mock()
     interaction.prompt.return_value = "deny"
-    result = public_command.call(source, chosen_interaction=interaction)
+    result = public_command.call(
+        source, chosen_interaction=interaction, write_roots=[str(native_workspace)]
+    )
     assert result["problem"]["code"] == "tool.denied"
     assert (native_workspace / "ordinary").read_text() == "ordinary-data"
     interaction.prompt.assert_called_once()
@@ -3556,7 +3834,9 @@ def test_renamed_tool_keeps_native_boundary(public_command):
 )
 def test_public_special_workspace_names_preserve_policy(public_command, native_workspace):
     """Virtual paths with unusual host spellings retain protected and outside denies."""
-    allowed = public_command.call('cat "$WORKSPACE_ROOT/ordinary"', read_only=True)
+    allowed = public_command.call(
+        'cat "$WORKSPACE_ROOT/ordinary"',
+    )
     assert allowed["ok"] and allowed["result"]["stdout"]["content"] == "ordinary-data"
     targets = ["AGENTS.md", 'POLICY"name.md', "POLICY\nname.md"]
     for name in targets:
@@ -3603,13 +3883,18 @@ def test_public_exact_path_executable_does_not_expose_siblings(
     sibling.write_text("outside-sibling-canary")
     monkeypatch.setenv("PATH", str(tools) + ":/usr/bin:/bin")
     for registration in ("run_command", "renamed_command"):
-        allowed = public_command.call("reviewtool", name=registration, read_only=True)
+        allowed = public_command.call(
+            "reviewtool",
+            name=registration,
+        )
         assert allowed["ok"] and allowed["result"]["boundary"] == "sandbox"
         assert allowed["result"]["stdout"]["content"] == (
             "" if kind == "binary" else "exact-file-ok"
         )
     public_command.interaction.prompt.assert_not_called()
-    denied = public_command.call("cat " + shlex.quote(str(sibling)), read_only=True)
+    denied = public_command.call(
+        "cat " + shlex.quote(str(sibling)),
+    )
     assert not denied["ok"]
     assert "outside-sibling-canary" not in json.dumps(denied)
     public_command.host.run_host_command.assert_not_called()
@@ -3626,7 +3911,7 @@ def test_session_files_survive_commands_turns_and_runtime_recreation(
     host.run_host_command.side_effect = AssertionError("unapproved host launch")
     interaction = Mock()
     interaction.prompt.side_effect = lambda message, **kwargs: (
-        ApprovalChoice.ONCE
+        next(key for key, index in kwargs["index"].items() if index == "Y")
         if message == "Proceed?"
         else "deny"
         if "without the OS sandbox" in message
@@ -3640,7 +3925,7 @@ def test_session_files_survive_commands_turns_and_runtime_recreation(
             session_store=SQLiteSessionStore(database, workspace_id="workspace"),
             workspace_id="workspace",
         )
-        permissions = PermissionManager(native_workspace)
+        permissions = automatic_process_policy(native_workspace)
         registry = ToolRegistry(
             [run_command, read_text_file, write_text_file],
             permission_manager=permissions,
@@ -3680,16 +3965,18 @@ def test_session_files_survive_commands_turns_and_runtime_recreation(
             "run_command",
             command='printf draft > "$TMPDIR/report.txt"',
             cwd="$WORKSPACE_ROOT",
-            read_only=True,
         )
-        canonical = dispatch(loop, "run_command", command='cd "$TMPDIR"; pwd -P', read_only=True)
+        canonical = dispatch(
+            loop,
+            "run_command",
+            command='cd "$TMPDIR"; pwd -P',
+        )
         assert canonical["stdout"]["content"].strip() == str(directory.resolve())
         dispatch(
             loop,
             "run_command",
             command='sqlite3 "$TMPDIR/state.db" "CREATE TABLE state(value); '
             "INSERT INTO state VALUES ('literal /tmp/row');\"",
-            read_only=True,
         )
         read = dispatch(loop, "read_text_file", path="$TMPDIR/report.txt")
         assert read["content"] == "draft"
@@ -3700,7 +3987,6 @@ def test_session_files_survive_commands_turns_and_runtime_recreation(
             "run_command",
             command='cat "$TMPDIR/report.txt"; cat "$TMPDIR/revised.txt"',
             cwd="$WORKSPACE_ROOT",
-            read_only=True,
         )
         assert result["stdout"]["content"] == "draftrevised"
         loop.command_manager.call("sessions", "new")
@@ -3710,13 +3996,12 @@ def test_session_files_survive_commands_turns_and_runtime_recreation(
             "run_command",
             command='test ! -e "$TMPDIR/report.txt"',
             cwd="$WORKSPACE_ROOT",
-            read_only=True,
         )
         for forbidden in (database.parent, database, directory):
             denied = json.loads(
                 loop.tool_registry.call(
                     "run_command",
-                    json.dumps({"command": "ls " + shlex.quote(str(forbidden)), "read_only": True}),
+                    json.dumps({"command": "ls " + shlex.quote(str(forbidden))}),
                     interaction=interaction,
                     instructions_manager=loop.instructions_manager,
                 )
@@ -3733,7 +4018,6 @@ def test_session_files_survive_commands_turns_and_runtime_recreation(
                     {
                         "command": 'cat "$TMPDIR/escape"',
                         "cwd": "$WORKSPACE_ROOT",
-                        "read_only": True,
                     }
                 ),
                 interaction=interaction,
@@ -3747,7 +4031,7 @@ def test_session_files_survive_commands_turns_and_runtime_recreation(
         denied = json.loads(
             loop.tool_registry.call(
                 "run_command",
-                json.dumps({"command": ":", "cwd": "$WORKSPACE_ROOT", "read_only": True}),
+                json.dumps({"command": ":", "cwd": "$WORKSPACE_ROOT"}),
                 interaction=interaction,
                 instructions_manager=loop.instructions_manager,
             )
@@ -3764,14 +4048,12 @@ def test_session_files_survive_commands_turns_and_runtime_recreation(
             "run_command",
             command='cat "$TMPDIR/report.txt"; cat "$TMPDIR/revised.txt"',
             cwd="$WORKSPACE_ROOT",
-            read_only=True,
         )
         assert result["stdout"]["content"] == "draftrevised"
         state = dispatch(
             loop,
             "run_command",
             command='sqlite3 "$TMPDIR/state.db" "SELECT value FROM state;"',
-            read_only=True,
         )
         assert state["stdout"]["content"].strip() == "literal /tmp/row"
         assert directory.is_dir()
@@ -3792,12 +4074,12 @@ def test_session_paths_round_trip_through_scripts_subprocesses_and_file_tools(
     sessions = SessionManager(
         session_store=SQLiteSessionStore(database, workspace_id="paths"), workspace_id="paths"
     )
-    permissions = PermissionManager(native_workspace)
+    permissions = automatic_process_policy(native_workspace)
     host = Mock()
     host.run_host_command.side_effect = AssertionError("unapproved host launch")
     interaction = Mock()
     interaction.prompt.side_effect = lambda message, **kwargs: (
-        ApprovalChoice.ONCE
+        next(key for key, index in kwargs["index"].items() if index == "Y")
         if message == "Proceed?"
         else "deny"
         if "without the OS sandbox" in message
@@ -3879,7 +4161,10 @@ def test_session_paths_round_trip_through_scripts_subprocesses_and_file_tools(
             " f.write(b'subprocess'); print(f.name)\n"
         )
         assert call("write_text_file", path="$TMPDIR/probe.py", content=program)["ok"]
-        filename = command('python -B -S "$TMPDIR/probe.py"').strip()
+        filename = command(
+            'python -B -S "$TMPDIR/probe.py"',
+            read_roots=[str(Path(sys.prefix).resolve()), str(Path(sys.base_prefix).resolve())],
+        ).strip()
         assert Path(filename).parent == scratch
         physical_read = call("read_text_file", path=filename)
         assert physical_read["result"]["path"] == rendered.display(filename)
@@ -3905,22 +4190,35 @@ def test_session_paths_round_trip_through_scripts_subprocesses_and_file_tools(
         read_variants = call("read_text_file", path="$TMPDIR/variants.json")["result"]
         assert read_variants["path"] == "$TMPDIR/variants.json"
         assert read_variants["content"] == variants
-        assert command('cat "$TMPDIR/variants.json"', read_only=True) == variants
+        assert (
+            command(
+                'cat "$TMPDIR/variants.json"',
+            )
+            == variants
+        )
         lines = "one\rtwo\r\nthree\n"
         assert call("write_text_file", path="$TMPDIR/lines.txt", content=lines)["ok"]
         assert call("read_text_file", path="$TMPDIR/lines.txt")["result"]["content"] == lines
-        assert command('cat "$TMPDIR/lines.txt"', read_only=True) == lines
+        assert (
+            command(
+                'cat "$TMPDIR/lines.txt"',
+            )
+            == lines
+        )
         failed_lines = call(
-            "run_command", command='cat "$TMPDIR/lines.txt"; exit 7', read_only=True
+            "run_command",
+            command='cat "$TMPDIR/lines.txt"; exit 7',
         )
         assert failed_lines["problem"]["metadata"]["stdout"]["content"] == lines
-        failure = call("run_command", command='cat "$TMPDIR/variants.json"; exit 7', read_only=True)
+        failure = call(
+            "run_command",
+            command='cat "$TMPDIR/variants.json"; exit 7',
+        )
         assert failure["problem"]["code"] == "process.nonzero_exit"
         assert failure["problem"]["metadata"]["stdout"]["content"] == variants
         command(
             'printf data > "$TMPDIR/.loop/library"; mv "$TMPDIR/.loop/library" "$TMPDIR/renamed"; '
             'rm "$TMPDIR/renamed"',
-            read_only=True,
         )
         for target in (native_workspace / ".gitignore", native_workspace / ".ssh" / "new"):
             denied = call("run_command", command="printf bad > " + shlex.quote(str(target)))
@@ -3936,7 +4234,10 @@ def test_session_paths_round_trip_through_scripts_subprocesses_and_file_tools(
             "cat " + shlex.quote(str(scratch / "command.txt")),
             'cat "$TMPDIR/../../"*/files/command.txt',
         ):
-            denied = call("run_command", command=source, read_only=True)
+            denied = call(
+                "run_command",
+                command=source,
+            )
             assert not denied["ok"], denied
             assert "command" not in denied["problem"]["metadata"]["stdout"]["content"]
         assert (scratch / "command.txt").read_text() == "command"

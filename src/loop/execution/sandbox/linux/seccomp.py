@@ -106,14 +106,15 @@ def _require_result(result: int) -> None:
         raise OSError(-result, "Native seccomp operation failed.")
 
 
-def descriptor_filter(*, deadline: float | None = None) -> bytes:
+def descriptor_filter(*, ingress_worker: bool = False, deadline: float | None = None) -> bytes:
     """Build a native 64-bit filter using installed libseccomp ABI resolution and export.
 
     Support native ARM64 and x86-64, including their platform-name aliases. Only the native
     architecture is included: foreign/32-bit ABIs and x32-number aliases are killed.
-    recvmsg/recvmmsg return EPERM; io_uring setup/enter/register return ENOSYS. Socket creation
-    permits IPv4, IPv6 and NETLINK_ROUTE only. Socket pairs permit only already-connected Unix
-    stream and sequenced-packet pairs. Other socket families and netlink protocols return EPERM.
+    Payload recvmsg/recvmmsg return EPERM; io_uring setup/enter/register return ENOSYS.
+    Socket creation permits IPv4, IPv6 and NETLINK_ROUTE only. Socket pairs permit only
+    already-connected Unix stream and sequenced-packet pairs. Other socket families and
+    netlink protocols return EPERM.
     Other native calls retain the surrounding namespace, AppArmor and capability restrictions.
     The caller must authenticate and install these bytes through Bubblewrap before any
     command code, then qualify enforcement. This builder neither installs a filter nor
@@ -121,16 +122,21 @@ def descriptor_filter(*, deadline: float | None = None) -> bytes:
     dynamic loader are outside its trust boundary.
 
     Args:
+        ingress_worker (bool): Temporarily retain recvmsg for the sealed trusted ingress worker.
+            Its parent must stack the full default filter after forking, before payload exec.
         deadline (float | None): Optional absolute monotonic preparation budget.
 
     Returns:
         bytes: Native classic BPF instructions accepted by Bubblewrap's --seccomp.
 
     Raises:
+        TypeError: The ingress-worker mode is not boolean.
         ValueError: Host ABI, discovered authority, syscall mapping or exported bytes are unsafe.
         OSError: Protected host discovery, a required libseccomp API, allocation or export fails.
         TimeoutError: The preparation budget expires.
     """
+    if not isinstance(ingress_worker, bool):
+        raise TypeError("Invalid trusted ingress-worker mode.")
     architecture_name = _NATIVE_NAMES.get(platform.machine().lower())
     if platform.system() != "Linux" or architecture_name is None:
         raise ValueError("Unsupported native descriptor-filter ABI.")
@@ -144,6 +150,8 @@ def descriptor_filter(*, deadline: float | None = None) -> bytes:
     try:
         _require_result(library.seccomp_attr_set(context, _BAD_ARCH, _KILL_PROCESS))
         for name, error in _DENIED_SYSCALLS:
+            if ingress_worker and name == b"recvmsg":
+                continue
             number = library.seccomp_syscall_resolve_name_arch(architecture, name)
             if number < 0:
                 raise ValueError("Required native seccomp syscall is unavailable.")
@@ -309,7 +317,7 @@ def local_network_filter(*, mediated_egress: bool, deadline: float | None = None
         library.seccomp_release(context)
 
 
-def install_local_network_filter(program: bytes) -> None:
+def install_payload_filter(program: bytes) -> None:
     """Install a trusted precompiled filter after mediator startup and before shell entry.
 
     Args:
@@ -325,7 +333,7 @@ def install_local_network_filter(program: bytes) -> None:
         or len(program) > _MAX_FILTER_BYTES
         or len(program) % _BPF_INSTRUCTION_BYTES
     ):
-        raise ValueError("Invalid inherited local-network filter.")
+        raise ValueError("Invalid inherited payload filter.")
 
     class FilterProgram(ctypes.Structure):
         """Represent the kernel's sock_fprog ABI for an immutable BPF buffer."""
@@ -355,4 +363,4 @@ def install_local_network_filter(program: bytes) -> None:
         0,
     )
     if result != 0:
-        raise OSError(ctypes.get_errno(), "Native local-network filter installation failed.")
+        raise OSError(ctypes.get_errno(), "Native payload filter installation failed.")

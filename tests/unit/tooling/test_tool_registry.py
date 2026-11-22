@@ -46,6 +46,7 @@ from loop import (
     ToolResultPresentationSpec,
     delete_path,
     read_text_file,
+    request_host_command,
     resolve_executable,
     run_command,
     write_text_file,
@@ -58,7 +59,7 @@ from loop.execution.sandbox.macos.backend import MacOSSeatbeltBackend
 from loop.instructions import InstructionsManager
 from loop.interaction import ConsoleInteraction, Interaction
 from loop.models import ToolDefinition
-from loop.permissions import CommandAnalysis, PermissionRule, PolicyScope
+from loop.permissions import CommandAnalysis, PermissionRule
 from loop.permissions.protection import protected_workspace_paths
 from loop.tooling import (
     FileObservations,
@@ -131,6 +132,15 @@ def test_yolo_admits_exact_registered_host_tool_without_fresh_input(tmp_path, as
         if asynchronous
         else registry.call("host_extension", "{}")
     )
+    assert json.loads(output)["ok"] is False
+    assert not registry.definitions()
+    manager.set_direct_host_execution(True)
+    assert registry.definitions()
+    output = (
+        asyncio.run(registry.call_async("host_extension", "{}"))
+        if asynchronous
+        else registry.call("host_extension", "{}")
+    )
     assert result_value(output) == "admitted"
     interaction.prompt.assert_not_called()
     manager.set_yolo(False)
@@ -139,7 +149,12 @@ def test_yolo_admits_exact_registered_host_tool_without_fresh_input(tmp_path, as
         if asynchronous
         else registry.call("host_extension", "{}")
     )
-    assert json.loads(denied)["problem"]["code"] == "tool.denied"
+    assert json.loads(denied)["problem"]["code"] == "host_command.denied"
+    manager.set_yolo(True)
+    manager.add_rule(
+        PermissionRule(tool="host_extension", action=Action.PROCESS_EXECUTE, decision=Decision.DENY)
+    )
+    assert not registry.definitions()
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
@@ -218,11 +233,19 @@ def _permission_manager_mock():
     permissions.check_boundaries.return_value = None
     permissions.check_boundaries_async.return_value = None
     permissions.sandbox_scope_limit.return_value = None
+    permissions.sandbox_access_for_review.return_value = None
+    permissions.prepare_sandbox_workspace_writes.side_effect = lambda request, *_, **__: request
+    permissions.requestable_sandbox_options.return_value = ()
+    permissions.sandbox_default_write_scope.return_value = ((), None)
+    permissions.sandbox_path_read_roots.return_value = ((), 0)
     permissions.sandbox_write_root_limit.return_value = None
     permissions.sandbox_network_limit.return_value = None
     permissions.temporary_directory_allows_private_names = False
     permissions.standalone_execution.side_effect = lambda: nullcontext(
         permissions.temporary_directory
+    )
+    permissions.sandbox_attempt.side_effect = lambda request, _revision, _cancel: nullcontext(
+        request
     )
     return permissions
 
@@ -3972,9 +3995,10 @@ def test_tool_transforms_customize_generic_definitions_and_worker_contexts():
     """Tool-owned transforms customize definitions and worker context without name checks."""
 
     def customize_definition(
-        definition: ToolDefinition, settings: ToolRuntimeSettings
+        definition: ToolDefinition, settings: ToolRuntimeSettings, services: tuple[str, ...]
     ) -> ToolDefinition:
         """Include a current runtime value in a model-facing definition."""
+        assert services == ()
         definition.description = f"{definition.description} {settings.user_agent}"
         return definition
 
@@ -4350,7 +4374,7 @@ def test_headless_interaction_requirement_is_structured():
 def test_call_with_timing_excludes_permission_confirmation(monkeypatch):
     """Tool timing begins after authorization and uses the policy manager's recorder."""
     interaction = Mock(spec=Interaction, supports_fresh_host_approval=True)
-    interaction.prompt.return_value = ApprovalChoice.ONCE
+    interaction.prompt.return_value = ApprovalChoice.SESSION
     recorder = Mock()
     permissions = PermissionManager(interaction=interaction, recorder=recorder)
     registry = ToolRegistry(interaction=interaction, permission_manager=permissions)
@@ -4427,9 +4451,9 @@ def test_call_command_resolves_virtual_paths_before_execution(tmp_path):
         runtime_environment=RuntimeEnvironment(tmp_path, tmp_path / "temporary")
     )
 
-    execution = ToolRegistry([read_text_file]).command(
-        "read_text_file", ("$WORKSPACE_ROOT/notes.txt",), instructions_manager=instructions
-    )
+    execution = ToolRegistry(
+        [read_text_file], permission_manager=PermissionManager(tmp_path)
+    ).command("read_text_file", ("$WORKSPACE_ROOT/notes.txt",), instructions_manager=instructions)
 
     assert result_value(execution.output)["content"] == "virtual content"
     assert result_value(execution.output)["path"] == "$WORKSPACE_ROOT/notes.txt"
@@ -4660,7 +4684,7 @@ def test_all_dispatch_paths_preserve_structured_operation_planning_problems():
 def test_call_with_timing_async_excludes_permission_confirmation(monkeypatch):
     """Async tool timing spans awaited execution but excludes permission confirmation."""
     interaction = Mock(spec=ConsoleInteraction)
-    interaction.prompt_async.return_value = ApprovalChoice.ONCE
+    interaction.prompt_async.return_value = ApprovalChoice.SESSION
     recorder = Mock()
     permissions = PermissionManager(interaction=interaction, recorder=recorder)
     registry = ToolRegistry(interaction=interaction, permission_manager=permissions)
@@ -4788,7 +4812,7 @@ def test_async_dispatch_keeps_event_loop_responsive_during_approval():
     async def approve(_message, **_kwargs):
         approval_started.set()
         await continue_approval.wait()
-        return ApprovalChoice.ONCE
+        return ApprovalChoice.SESSION
 
     interaction = ConsoleInteraction(console=Console(file=io.StringIO()), markdown=False)
     interaction.prompt_async = AsyncMock(side_effect=approve)
@@ -4952,6 +4976,7 @@ def test_virtual_file_paths_resolve_before_authorization_and_return_virtual_meta
     path.write_text("useful content", encoding="utf-8")
     permissions = _permission_manager_mock()
     permissions.check_boundaries.return_value = None
+    permissions.open_read_file.side_effect = PermissionManager(tmp_path).open_read_file
     permissions.authorize.return_value = SimpleNamespace(decision=Decision.ALLOW)
     permissions.authorize_async.return_value = SimpleNamespace(decision=Decision.ALLOW)
     registry = ToolRegistry([read_text_file], permission_manager=permissions)
@@ -5049,9 +5074,11 @@ def test_command_workspace_prefix_selects_the_workspace_root(tmp_path, monkeypat
         tmp_path,
         interaction=interaction,
         configuration=PermissionConfiguration(
-            limits=PolicyLimits(allow_host_processes=True),
+            limits=PolicyLimits(),
         ),
+        allow_direct_host_execution=True,
     )
+    permissions.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
     registry = ToolRegistry(
         [run_command],
         interaction=_approving_interaction(),
@@ -5089,15 +5116,20 @@ def test_command_virtual_workspace_read_roots_do_not_expand_authority(tmp_path, 
         runtime_environment=RuntimeEnvironment(tmp_path, tmp_path / "scratch")
     )
     interaction = Mock(spec=Interaction, supports_fresh_host_approval=True)
+    permissions = PermissionManager(tmp_path, interaction=interaction)
+    permissions.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
     registry = ToolRegistry(
         [run_command],
         interaction=interaction,
-        permission_manager=PermissionManager(tmp_path, interaction=interaction),
+        permission_manager=permissions,
         execution_service=CommandExecutionService(
             MacOSSeatbeltBackend(), LocalHostCommandExecutor()
         ),
     )
     backend = Mock()
+    monkeypatch.setattr(
+        type(backend), "trusted_system_path", lambda *_args, **_kwargs: True, raising=False
+    )
     backend.run.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
     monkeypatch.setattr(registry._execution_service, "_backend", backend)
 
@@ -5108,7 +5140,6 @@ def test_command_virtual_workspace_read_roots_do_not_expand_authority(tmp_path, 
             {
                 "command": "cd $WORKSPACE_ROOT && git diff --cached --stat",
                 "cwd": "$WORKSPACE_ROOT",
-                "read_only": True,
                 "read_roots": ["$WORKSPACE_ROOT", "$WORKSPACE_ROOT/src"],
             }
         ),
@@ -5128,7 +5159,8 @@ def test_denied_command_virtualizes_offer_and_preserves_cached_output(tmp_path, 
     instructions = InstructionsManager(runtime_environment=RuntimeEnvironment(tmp_path, None))
     interaction = _approving_interaction()
     permissions = PermissionManager(tmp_path)
-    permissions.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    permissions.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
+    permissions.set_direct_host_execution(True)
     registry = ToolRegistry(
         [run_command],
         interaction=interaction,
@@ -5138,6 +5170,9 @@ def test_denied_command_virtualizes_offer_and_preserves_cached_output(tmp_path, 
         ),
     )
     backend = Mock()
+    monkeypatch.setattr(
+        type(backend), "trusted_system_path", lambda *_args, **_kwargs: True, raising=False
+    )
     backend.run.return_value = CommandProcessResult(
         SandboxOutcome.DENIED,
         stdout=(str(tmp_path) + "/output\n")
@@ -5149,7 +5184,7 @@ def test_denied_command_virtualizes_offer_and_preserves_cached_output(tmp_path, 
 
     output = registry.call(
         "run_command",
-        json.dumps({"command": source, "cwd": "$WORKSPACE_ROOT", "read_only": True}),
+        json.dumps({"command": source, "cwd": "$WORKSPACE_ROOT"}),
         interaction=interaction,
         instructions_manager=instructions,
     )
@@ -5157,7 +5192,7 @@ def test_denied_command_virtualizes_offer_and_preserves_cached_output(tmp_path, 
     problem = json.loads(output)["problem"]
     assert problem["code"] == "sandbox.denied", problem
     assert "$WORKSPACE_ROOT/.ssh/fake" in problem["metadata"]["host_offer"]
-    assert any("$WORKSPACE_ROOT" in call.args[0] for call in interaction.info.call_args_list)
+    interaction.info.assert_not_called()
     handle = problem["metadata"]["stdout"]["handle"]
     path, _ = cached_path(handle)
     assert path.read_text() == backend.run.return_value.stdout
@@ -5219,7 +5254,7 @@ def test_command_output_and_failure_details_preserve_workspace_paths(tmp_path, m
     _use_managed_command_scratch(registry, instructions)
     output = registry.call(
         "run_command",
-        json.dumps({"command": "pwd", "read_only": True}),
+        json.dumps({"command": "pwd"}),
         instructions_manager=instructions,
     )
 
@@ -5251,7 +5286,7 @@ def test_command_sandbox_failure_preserves_workspace_paths(tmp_path, monkeypatch
     _use_managed_command_scratch(registry, instructions)
     output = registry.call(
         "run_command",
-        json.dumps({"command": "pwd", "read_only": True}),
+        json.dumps({"command": "pwd"}),
         instructions_manager=instructions,
     )
 
@@ -5259,7 +5294,7 @@ def test_command_sandbox_failure_preserves_workspace_paths(tmp_path, monkeypatch
     assert json.loads(output)["problem"]["detail"] == (
         "failed to inspect $WORKSPACE_ROOT/source.py"
     )
-    assert "PATH=" not in json.loads(output)["problem"]["metadata"]["host_offer"]
+    assert "host_offer" not in json.loads(output)["problem"]["metadata"]
 
 
 def test_command_preserves_source_and_binds_concrete_roots(tmp_path, monkeypatch):
@@ -5270,10 +5305,12 @@ def test_command_preserves_source_and_binds_concrete_roots(tmp_path, monkeypatch
     instructions = InstructionsManager(runtime_environment=RuntimeEnvironment(tmp_path, scratch))
     interaction = Mock(spec=Interaction, supports_fresh_host_approval=True)
     interaction.prompt.return_value = "approve"
+    permissions = PermissionManager(tmp_path)
+    permissions.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
     registry = ToolRegistry(
         [run_command],
         interaction=_approving_interaction(),
-        permission_manager=PermissionManager(tmp_path),
+        permission_manager=permissions,
         execution_service=CommandExecutionService(
             MacOSSeatbeltBackend(), LocalHostCommandExecutor()
         ),
@@ -5295,6 +5332,9 @@ def test_command_preserves_source_and_binds_concrete_roots(tmp_path, monkeypatch
         )
 
     backend = Mock()
+    monkeypatch.setattr(
+        type(backend), "trusted_system_path", lambda *_args, **_kwargs: True, raising=False
+    )
     backend.run.side_effect = execute
     monkeypatch.setattr(registry._execution_service, "_backend", backend)
 
@@ -5332,7 +5372,7 @@ def test_command_ignores_virtual_root_substrings(tmp_path, monkeypatch):
     _use_managed_command_scratch(registry, instructions)
     output = registry.call(
         "run_command",
-        json.dumps({"command": "echo /tmp-old", "read_only": True}),
+        json.dumps({"command": "echo /tmp-old"}),
         instructions_manager=instructions,
     )
 
@@ -5350,9 +5390,10 @@ def test_command_host_retry_preserves_source(tmp_path, monkeypatch):
     interaction = Mock(spec=Interaction, supports_fresh_host_approval=True)
     interaction.prompt.return_value = "approve"
     permissions = PermissionManager(tmp_path)
-    permissions.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    permissions.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
+    permissions.set_direct_host_execution(True)
     registry = ToolRegistry(
-        [run_command],
+        [run_command, request_host_command],
         interaction=_approving_interaction(),
         permission_manager=permissions,
         execution_service=CommandExecutionService(
@@ -5360,6 +5401,9 @@ def test_command_host_retry_preserves_source(tmp_path, monkeypatch):
         ),
     )
     backend = Mock()
+    monkeypatch.setattr(
+        type(backend), "trusted_system_path", lambda *_args, **_kwargs: True, raising=False
+    )
     backend.run.return_value = CommandProcessResult(
         SandboxOutcome.UNAVAILABLE, detail="profile unavailable"
     )
@@ -5382,12 +5426,21 @@ def test_command_host_retry_preserves_source(tmp_path, monkeypatch):
         instructions_manager=instructions,
     )
 
+    assert json.loads(output)["problem"]["code"] == "sandbox.unavailable"
+    host.run_host_command.assert_not_called()
+    interaction.prompt.assert_not_called()
+    output = registry.call(
+        "request_host_command",
+        json.dumps({"command": "cat $WORKSPACE_ROOT", "reason": "Profile unavailable"}),
+        interaction=interaction,
+        instructions_manager=instructions,
+    )
     assert result_value(output)["boundary"] == "host"
     assert result_value(output)["stdout"]["content"] == "cat $WORKSPACE_ROOT"
     warning = interaction.info.call_args_list[-1].args[0]
     assert 'Command: "cat $WORKSPACE_ROOT"' in warning
-    assert "Reason: The sandbox was unavailable." in warning
-    assert str(tmp_path) not in warning
+    assert 'Agent-supplied reason: "Profile unavailable"' in warning
+    assert str(tmp_path) in warning
     assert "Execution source:" not in warning
     assert "Virtual path mappings:" not in warning
     assert "Environment:" not in warning
@@ -6816,3 +6869,30 @@ def test_cancelled_callback_worker_settles_owned_work(started):
             await asyncio.to_thread(registry.close)
 
     asyncio.run(scenario())
+
+
+def test_file_commands_preserve_default_and_explicit_hard_denials(tmp_path):
+    """User command dispatch retains both default and injected file policy boundaries."""
+    source = tmp_path / ".env"
+    source.write_text("secret", encoding="utf-8")
+    for manager in (None, PermissionManager(tmp_path)):
+        registry = ToolRegistry([read_text_file], permission_manager=manager)
+        result = json.loads(registry.command("read_text_file", (str(source),)).output)
+        assert result["problem"]["code"] == "tool.denied"
+        assert "secret" not in json.dumps(result)
+
+
+def test_command_context_retains_native_execution_authorization(tmp_path):
+    """Execution-aware direct commands retain their separate admission service."""
+
+    @declare_tool(
+        actions={Action.PROCESS_EXECUTE},
+        operation_planner=lambda arguments: OperationPlan(arguments=arguments),
+        execution_authorization=True,
+    )
+    def admission(context: ToolContext) -> bool:
+        """Observe whether execution admission is still available to the command owner."""
+        return context.additional_authorizer is not None
+
+    registry = ToolRegistry([admission], permission_manager=PermissionManager(tmp_path))
+    assert result_value(registry.command("admission", ()).output) is True

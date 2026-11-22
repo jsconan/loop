@@ -23,6 +23,7 @@ from loop import (
     Operation,
     PermissionManager,
     ToolRegistry,
+    constants,
 )
 from loop.execution import CommandExecutionService
 from loop.execution.coordinator import (
@@ -53,6 +54,7 @@ def controlled_execution_clock(monkeypatch):
 def test_async_public_sandbox_command_reaches_native_backend(tmp_path):
     """The owner relay approves a routine tool command and starts the sandbox backend."""
     manager = PermissionManager(tmp_path)
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
     backend = Mock()
     backend.run.return_value = CommandProcessResult(
         SandboxOutcome.COMPLETED, exit_code=0, stdout="ok"
@@ -80,7 +82,7 @@ def test_possibly_effective_sandbox_failure_needs_explicit_host_request(tmp_path
     """A possibly effective failure cannot launch host work without a new explicit request."""
     marker = tmp_path / "host-marker"
     manager = PermissionManager(tmp_path)
-    manager.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    manager.set_direct_host_execution(True)
     manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW, scope=PolicyScope.SESSION)
     interaction = Mock(spec=Interaction)
     interaction.supports_fresh_host_approval = True
@@ -134,7 +136,7 @@ def test_explicit_host_tool_prompts_before_real_host_command(tmp_path, answer):
     """The public host tool starts one real child only after an explicit fresh decision."""
     marker = tmp_path / "marker"
     manager = PermissionManager(tmp_path)
-    manager.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    manager.set_direct_host_execution(True)
     manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW, scope=PolicyScope.SESSION)
     interaction = Mock(spec=Interaction)
     interaction.supports_fresh_host_approval = True
@@ -177,29 +179,35 @@ def test_yolo_public_host_tool_runs_exact_request_without_gate_or_prompt(tmp_pat
         {"command": "printf run >> marker", "cwd": str(tmp_path), "reason": "Native YOLO check"}
     )
 
+    disabled = json.loads(registry.call("request_host_command", payload, interaction=interaction))
+    assert disabled["problem"]["code"] == "tool.denied"
+    assert not marker.exists()
+    manager.set_direct_host_execution(True)
     first = json.loads(registry.call("request_host_command", payload, interaction=interaction))
 
     assert first["result"]["boundary"] == "host"
     assert marker.read_text(encoding="utf-8") == "run"
     interaction.prompt.assert_not_called()
     assert "Command:" in interaction.warning.call_args.args[0]
-    assert manager.configuration.limits.allow_host_processes is False
+    assert manager.direct_host_execution_enabled
+    assert not manager.trusted_host_command_rules()
 
     manager.set_yolo(False)
     second = json.loads(registry.call("request_host_command", payload, interaction=interaction))
-    assert second["problem"]["code"] == "tool.denied"
+    assert second["problem"]["code"] == "host_command.denied"
     assert marker.read_text(encoding="utf-8") == "run"
 
 
 @pytest.mark.skipif(
-    os.environ.get("LOOP_NATIVE_HOST_TEST") != "disposable-linux-host",
-    reason="Real unrestricted host-shell qualification requires a disposable Linux host.",
+    os.environ.get("LOOP_NATIVE_HOST_TEST")
+    not in {"disposable-linux-host", "disposable-macos-host"},
+    reason="Real unrestricted host-shell qualification requires an owned disposable fixture.",
 )
 def test_trusted_host_shell_crosses_file_tool_deny_but_obeys_host_deny(tmp_path):
     """A trusted unrestricted shell reads synthetic data while a host deny blocks admission."""
     (tmp_path / "private").write_text("synthetic-host-private", encoding="utf-8")
     permissions = PermissionManager(tmp_path)
-    permissions.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    permissions.set_direct_host_execution(True)
     permissions.add_rule(
         PermissionRule(
             decision=Decision.DENY,
@@ -241,8 +249,9 @@ def test_trusted_host_shell_crosses_file_tool_deny_but_obeys_host_deny(tmp_path)
 
 
 @pytest.mark.skipif(
-    os.environ.get("LOOP_NATIVE_HOST_TEST") != "disposable-linux-host",
-    reason="Real unrestricted host-shell qualification requires a disposable Linux host.",
+    os.environ.get("LOOP_NATIVE_HOST_TEST")
+    not in {"disposable-linux-host", "disposable-macos-host"},
+    reason="Real unrestricted host-shell qualification requires an owned disposable fixture.",
 )
 def test_host_prompt_persists_grant_for_a_later_headless_session(tmp_path):
     """A real host prompt can persist a user grant that works after process restart."""
@@ -258,7 +267,7 @@ def test_host_prompt_persists_grant_for_a_later_headless_session(tmp_path):
     permissions = PermissionManager(tmp_path, **arguments)
     permissions.initialize_policy_namespace("workspace", workspace.id, authorized=True)
     permissions.initialize_policy_namespace("user", str(catalog.parent), authorized=True)
-    permissions.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    permissions.set_direct_host_execution(True)
     interaction = Mock(spec=Interaction, supports_fresh_host_approval=True)
     interaction.prompt.return_value = "trust_user"
     registry = ToolRegistry(
@@ -277,7 +286,7 @@ def test_host_prompt_persists_grant_for_a_later_headless_session(tmp_path):
     permissions.close()
 
     reloaded = PermissionManager(tmp_path, **arguments)
-    reloaded.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    reloaded.set_direct_host_execution(True)
     resumed = ToolRegistry(
         BUILTIN_TOOLS,
         permission_manager=reloaded,
@@ -310,7 +319,7 @@ def test_explicit_host_timeout_reports_effects_without_replay(tmp_path, monkeypa
     monkeypatch.setattr("loop.execution.coordinator.time", SimpleNamespace(monotonic=lambda: 100.0))
     monkeypatch.setattr("loop.utils.process.time", SimpleNamespace(monotonic=expired_after_entry))
     manager = PermissionManager(tmp_path)
-    manager.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    manager.set_direct_host_execution(True)
     manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW, scope=PolicyScope.SESSION)
     interaction = Mock(spec=Interaction)
     interaction.supports_fresh_host_approval = True
@@ -364,7 +373,7 @@ def test_explicit_host_output_reports_decoding_loss(
 ):
     """Successful and failed host output preserve newlines and report decoding loss."""
     manager = PermissionManager(tmp_path)
-    manager.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    manager.set_direct_host_execution(True)
     manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW, scope=PolicyScope.SESSION)
     interaction = Mock(spec=Interaction)
     interaction.supports_fresh_host_approval = True
@@ -415,7 +424,7 @@ def test_explicit_host_output_preserves_path_like_content(tmp_path, exit_code):
     )
     (tmp_path / "path-content.json").write_text(content, encoding="utf-8", newline="")
     manager = PermissionManager(tmp_path)
-    manager.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    manager.set_direct_host_execution(True)
     manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW, scope=PolicyScope.SESSION)
     interaction = Mock(spec=Interaction)
     interaction.supports_fresh_host_approval = True
@@ -462,7 +471,7 @@ def test_explicit_host_tool_uses_async_owner_relay(tmp_path):
     """An asynchronous tool call relays a fresh decision before starting its real host child."""
     marker = tmp_path / "async-marker"
     manager = PermissionManager(tmp_path)
-    manager.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    manager.set_direct_host_execution(True)
     manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW, scope=PolicyScope.SESSION)
     interaction = Mock(spec=Interaction)
     interaction.supports_fresh_host_approval = True
@@ -487,7 +496,7 @@ def test_explicit_host_tool_uses_async_owner_relay(tmp_path):
 def test_explicit_host_tool_async_cancellation_precedes_approval(tmp_path):
     """A cancellation while an owner-relayed decision is pending prevents host launch."""
     manager = PermissionManager(tmp_path)
-    manager.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    manager.set_direct_host_execution(True)
     manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW, scope=PolicyScope.SESSION)
     interaction = Mock(spec=Interaction)
     interaction.supports_fresh_host_approval = True
@@ -611,6 +620,7 @@ def test_local_host_executor_timeout_closes_retained_pipe_without_thread_error(
         """Represent a descendant-held reader at the operating-system boundary."""
         thread = boundary.thread_factory(**kwargs)
         thread.is_alive.return_value = True
+        thread.join.side_effect = boundary.clock.sleep
         return thread
 
     monkeypatch.setattr("loop.execution.coordinator.threading.Thread", retained_thread)
@@ -621,7 +631,8 @@ def test_local_host_executor_timeout_closes_retained_pipe_without_thread_error(
     assert result.outcome is SandboxOutcome.TIMED_OUT
     boundary.kill.assert_called_once_with(123, 9)
     assert [call.args for call in boundary.close.call_args_list] == [(101,), (102,)]
-    assert all(thread.join.call_count == 2 for thread in boundary.threads)
+    assert result.stdout_discarded is None and result.stderr_discarded is None
+    assert boundary.clock.current == pytest.approx(101 + 2 * constants.COMMAND_CLEANUP_WAIT_SECONDS)
 
 
 def test_session_host_approval_does_not_survive_a_replaced_read_root(tmp_path):
@@ -630,7 +641,7 @@ def test_session_host_approval_does_not_survive_a_replaced_read_root(tmp_path):
     outside.mkdir()
     interaction = Mock(spec=Interaction)
     interaction.supports_fresh_host_approval = True
-    host_answers = iter(("session", "deny"))
+    host_answers = iter(("approve", "deny"))
     interaction.prompt.side_effect = lambda prompt, **_kwargs: (
         next(host_answers) if prompt.startswith("Run this exact command") else "approve"
     )
@@ -639,7 +650,7 @@ def test_session_host_approval_does_not_survive_a_replaced_read_root(tmp_path):
     host = Mock()
     host.run_host_command.return_value = "host-result"
     manager = PermissionManager(tmp_path)
-    manager.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    manager.set_direct_host_execution(True)
     service = CommandExecutionCoordinator(backend, host, manager, interaction)
     first = request(tmp_path, read_roots=(outside,))
     offer = service.run_sandboxed(first, "run_command").offer
@@ -671,7 +682,7 @@ def test_host_retry_uses_owner_relay_without_blocking(tmp_path, monkeypatch):
     interaction._choices_session.input.fileno.return_value = 0
     monkeypatch.setattr("loop.interaction.console.os.isatty", lambda fd: fd == 0)
     manager = PermissionManager(tmp_path, interaction=interaction)
-    manager.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    manager.set_direct_host_execution(True)
     backend = Mock()
     backend.run.return_value = CommandProcessResult(SandboxOutcome.UNAVAILABLE)
     host = Mock()
@@ -690,7 +701,9 @@ def test_host_retry_uses_owner_relay_without_blocking(tmp_path, monkeypatch):
 
         def execute():
             """Offer and approve one host retry from the tool worker."""
-            attempt = service.run_sandboxed(approved, "run_command")
+            attempt = service.run_sandboxed(
+                approved, "run_command", sandbox_admission=manager.sandbox_attempt
+            )
             assert attempt.offer is not None
             return service.retry_host_command(attempt.offer, approved)
 

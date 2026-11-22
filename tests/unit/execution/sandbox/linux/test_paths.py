@@ -16,7 +16,6 @@ from loop.execution.sandbox.linux.paths import (
     bind_paths,
     mount_arguments,
     prepare_paths,
-    python_runtime_mounts,
 )
 
 from ..helpers import logical_private_name
@@ -34,6 +33,8 @@ def bound(monkeypatch, tmp_path):
         "loop.execution.sandbox.contracts.tempfile.gettempdir", lambda: str(tmp_path)
     )
     monkeypatch.setattr("loop.execution.sandbox.linux.paths.time.monotonic", lambda: 0)
+    # Isolate mount preparation from the separately tested complete-link accountant.
+    monkeypatch.setattr(linux_paths, "inspect_hardlink_aliases", Mock(return_value={}))
     monkeypatch.setattr(linux_paths, "NATIVE_SCRATCH_PATH", _TEST_NATIVE_SCRATCH)
     monkeypatch.setattr(
         linux_paths,
@@ -61,49 +62,6 @@ def bound(monkeypatch, tmp_path):
     return create, workspace, scratch
 
 
-def _python_environment(tmp_path, monkeypatch):
-    """Create a workspace venv that references a versioned user-local CPython install."""
-    monkeypatch.setattr(
-        linux_paths,
-        "is_protected_external_read",
-        lambda path: logical_private_name(path, tmp_path.parent),
-    )
-    home = tmp_path / "home"
-    home.mkdir()
-    workspace = tmp_path / "workspace"
-    venv_bin = workspace / ".venv/bin"
-    venv_bin.mkdir(parents=True)
-    runtime_parent = home / "runtime-store"
-    runtime_parent.mkdir()
-    runtime_alias = runtime_parent / "cpython-3.14"
-    runtime_root = runtime_parent / "cpython-3.14.1"
-    runtime_root.mkdir()
-    (runtime_root / "bin").mkdir()
-    (runtime_root / "lib/python3.14").mkdir(parents=True)
-    interpreter = runtime_root / "bin/python3.14"
-    interpreter.write_text("interpreter", encoding="utf-8")
-    interpreter.chmod(0o755)
-    runtime_alias.symlink_to(runtime_root, target_is_directory=True)
-    (venv_bin / "python").symlink_to(runtime_alias / "bin/python3.14")
-    (venv_bin.parent / "pyvenv.cfg").write_text(
-        f"home = {runtime_alias / 'bin'}\nimplementation = CPython\nversion_info = 3.14\n",
-        encoding="utf-8",
-    )
-    return home, workspace, venv_bin, runtime_root, runtime_alias
-
-
-def _python_identity(venv_bin):
-    """Create a selected interpreter identity for the workspace environment."""
-    spelling = venv_bin / "python"
-    try:
-        resolved = spelling.resolve(strict=True)
-        details = resolved.stat()
-        device, inode = details.st_dev, details.st_ino
-    except (OSError, RuntimeError):
-        resolved, device, inode = spelling, 0, 0
-    return (("python", spelling, resolved, device, inode),)
-
-
 def _external_executable_request(create, scratch, tools):
     """Create a request whose PATH contains one external executable identity."""
     tools.mkdir()
@@ -116,697 +74,6 @@ def _external_executable_request(create, scratch, tools):
         executable_identities=(("tool", executable, executable, details.st_dev, details.st_ino),),
     )
     return request, executable
-
-
-def test_python_runtime_mounts_bind_only_a_selected_workspace_interpreter(tmp_path, monkeypatch):
-    """Discover a safe runtime only for the selected workspace interpreter identity."""
-    home, workspace, venv_bin, runtime_root, runtime_alias = _python_environment(
-        tmp_path, monkeypatch
-    )
-    monkeypatch.setattr(
-        "loop.execution.sandbox.linux.paths.pwd.getpwuid",
-        lambda _uid: SimpleNamespace(pw_dir=str(home)),
-    )
-    identity = _python_identity(venv_bin)
-    config = venv_bin.parent / "pyvenv.cfg"
-    config.write_text(config.read_text() + "unrecognized line\nother = value\n", encoding="utf-8")
-
-    assert python_runtime_mounts(workspace, ((venv_bin, venv_bin),), identity) == (
-        (runtime_root, runtime_alias),
-    )
-    assert python_runtime_mounts(workspace, ((venv_bin, venv_bin),), ()) == ()
-    assert (
-        python_runtime_mounts(workspace, ((venv_bin, venv_bin),), identity, system_roots=(home,))
-        == ()
-    )
-
-
-@pytest.mark.parametrize("matching", [True, False])
-def test_python_runtime_mounts_validate_standard_environment_metadata(
-    tmp_path, monkeypatch, matching
-):
-    """Standard environment metadata requires the selected base executable identity."""
-    home, workspace, venv_bin, runtime_root, runtime_alias = _python_environment(
-        tmp_path, monkeypatch
-    )
-    monkeypatch.setattr(linux_paths.pwd, "getpwuid", lambda _uid: SimpleNamespace(pw_dir=str(home)))
-    interpreter = runtime_root / "bin/python3.14"
-    reference = interpreter if matching else runtime_root / "bin/other"
-    if not matching:
-        reference.write_text("other", encoding="utf-8")
-    (venv_bin.parent / "pyvenv.cfg").write_text(
-        f"home = {runtime_alias / 'bin'}\nversion = 3.14.1\nexecutable = {reference}\n",
-        encoding="utf-8",
-    )
-
-    result = python_runtime_mounts(workspace, ((venv_bin, venv_bin),), _python_identity(venv_bin))
-
-    assert result == (((runtime_root, runtime_alias),) if matching else ())
-
-
-@pytest.mark.parametrize(
-    "case", ["relative", "protected", "nul", "duplicate-version", "duplicate-executable"]
-)
-def test_standard_environment_metadata_rejects_unsafe_references(tmp_path, monkeypatch, case):
-    """Unsafe or ambiguous standard-environment evidence creates no runtime scope."""
-    home, workspace, venv_bin, runtime_root, runtime_alias = _python_environment(
-        tmp_path, monkeypatch
-    )
-    monkeypatch.setattr(linux_paths.pwd, "getpwuid", lambda _uid: SimpleNamespace(pw_dir=str(home)))
-    interpreter = runtime_root / "bin/python3.14"
-    reference = str(interpreter)
-    if case == "relative":
-        reference = "relative"
-    elif case == "protected":
-        private = home / ".ssh"
-        private.mkdir()
-        link = private / "fixture"
-        link.symlink_to(interpreter)
-        reference = str(link)
-    elif case == "nul":
-        reference = "bad\x00path"
-    config = f"home = {runtime_alias / 'bin'}\nversion = 3.14.1\nexecutable = {reference}\n"
-    if case == "duplicate-version":
-        config += "version = 3.14.1\n"
-    elif case == "duplicate-executable":
-        config += f"executable = {reference}\n"
-    (venv_bin.parent / "pyvenv.cfg").write_text(config, encoding="utf-8")
-
-    assert not python_runtime_mounts(workspace, ((venv_bin, venv_bin),), _python_identity(venv_bin))
-
-
-def test_managed_environment_ignores_duplicate_unused_standard_fields(tmp_path, monkeypatch):
-    """Unused standard fields do not invalidate already-supported managed metadata."""
-    home, workspace, venv_bin, runtime_root, runtime_alias = _python_environment(
-        tmp_path, monkeypatch
-    )
-    monkeypatch.setattr(linux_paths.pwd, "getpwuid", lambda _uid: SimpleNamespace(pw_dir=str(home)))
-    config = venv_bin.parent / "pyvenv.cfg"
-    config.write_text(config.read_text(encoding="utf-8") + "version = one\nversion = two\n")
-
-    assert python_runtime_mounts(
-        workspace, ((venv_bin, venv_bin),), _python_identity(venv_bin)
-    ) == ((runtime_root, runtime_alias),)
-
-
-@pytest.mark.parametrize("name", ["python", "python3", "project-interpreter"])
-def test_python_runtime_mounts_accept_selected_interpreter_aliases(tmp_path, monkeypatch, name):
-    """Interpreter identity, rather than the tool name, determines the candidate runtime."""
-    home, workspace, venv_bin, runtime_root, runtime_alias = _python_environment(
-        tmp_path, monkeypatch
-    )
-    monkeypatch.setattr(linux_paths.pwd, "getpwuid", lambda _uid: SimpleNamespace(pw_dir=str(home)))
-    spelling = venv_bin / name
-    if name != "python":
-        spelling.symlink_to(venv_bin / "python")
-    target = spelling.resolve(strict=True)
-    details = target.stat()
-    identity = ((name, spelling, target, details.st_dev, details.st_ino),)
-
-    assert python_runtime_mounts(workspace, ((venv_bin, venv_bin),), identity) == (
-        (runtime_root, runtime_alias),
-    )
-
-
-def test_python_runtime_mounts_accept_selected_interpreter_without_conventional_alias(
-    tmp_path, monkeypatch
-):
-    """A selected interpreter is bound even when its environment has no standard alias."""
-    home, workspace, venv_bin, runtime_root, runtime_alias = _python_environment(
-        tmp_path, monkeypatch
-    )
-    monkeypatch.setattr(linux_paths.pwd, "getpwuid", lambda _uid: SimpleNamespace(pw_dir=str(home)))
-    original = venv_bin / "python"
-    interpreter = original.resolve(strict=True)
-    original.unlink()
-    selected = venv_bin / "project-interpreter"
-    selected.symlink_to(interpreter)
-    details = interpreter.stat()
-    identity = ((selected.name, selected, interpreter, details.st_dev, details.st_ino),)
-
-    assert python_runtime_mounts(workspace, ((venv_bin, venv_bin),), identity) == (
-        (runtime_root, runtime_alias),
-    )
-
-
-@pytest.mark.parametrize("versioned_present", [True, False])
-def test_python_runtime_mounts_refuse_other_binary_without_conventional_alias(
-    tmp_path, monkeypatch, versioned_present
-):
-    """Missing or different CPython anchors cannot turn another executable into a grant."""
-    home, workspace, venv_bin, runtime_root, _ = _python_environment(tmp_path, monkeypatch)
-    monkeypatch.setattr(linux_paths.pwd, "getpwuid", lambda _uid: SimpleNamespace(pw_dir=str(home)))
-    (venv_bin / "python").unlink()
-    versioned = runtime_root / "bin/python3.14"
-    if not versioned_present:
-        versioned.unlink()
-    other = runtime_root / "bin/other"
-    other.write_text("not an interpreter", encoding="utf-8")
-    other.chmod(0o755)
-    selected = venv_bin / "project-tool"
-    selected.symlink_to(other)
-    details = other.stat()
-    identity = ((selected.name, selected, other, details.st_dev, details.st_ino),)
-
-    assert python_runtime_mounts(workspace, ((venv_bin, venv_bin),), identity) == ()
-
-
-@pytest.mark.parametrize(
-    "metadata",
-    [
-        "missing",
-        "symlink",
-        "hardlink",
-        "mode",
-        "invalid",
-        "duplicate",
-        "invalid-home",
-        "protected-home",
-        "mismatch",
-    ],
-)
-def test_unidentified_workspace_executable_does_not_depend_on_runtime_metadata(
-    tmp_path, monkeypatch, metadata
-):
-    """Unrelated tools cannot gain authority or fail because of optional environment metadata."""
-    _home, workspace, bin_dir, _runtime_root, _runtime_alias = _python_environment(
-        tmp_path, monkeypatch
-    )
-    (bin_dir / "python").unlink()
-    executable = bin_dir / "fixture-processor"
-    executable.write_text("unrelated executable", encoding="utf-8")
-    executable.chmod(0o755)
-    details = executable.stat()
-    identity = ((executable.name, executable, executable, details.st_dev, details.st_ino),)
-    config = bin_dir.parent / "pyvenv.cfg"
-    if metadata == "missing":
-        config.unlink()
-    elif metadata == "symlink":
-        config.unlink()
-        config.symlink_to(workspace / "unrelated")
-    elif metadata == "hardlink":
-        os.link(config, workspace / "unrelated")
-    elif metadata == "mode":
-        config.chmod(0o666)
-    elif metadata == "invalid":
-        config.write_bytes(b"\xff")
-    elif metadata == "duplicate":
-        config.write_text(config.read_text(encoding="utf-8") + "home = /other/bin\n")
-    elif metadata in {"invalid-home", "protected-home"}:
-        value = "relative/bin" if metadata == "invalid-home" else str(workspace / ".ssh/bin")
-        config.write_text(f"home = {value}\nimplementation = CPython\nversion_info = 3.14\n")
-    lookup = Mock(side_effect=KeyError("unavailable account"))
-    monkeypatch.setattr(linux_paths.pwd, "getpwuid", lookup)
-
-    assert python_runtime_mounts(workspace, ((bin_dir, bin_dir),), identity) == ()
-    lookup.assert_not_called()
-
-
-def test_identified_interpreter_without_standard_alias_still_rejects_unsafe_runtime(
-    tmp_path, monkeypatch
-):
-    """Matching versioned interpreter identity never bypasses runtime-root validation."""
-    home, workspace, bin_dir, runtime_root, _ = _python_environment(tmp_path, monkeypatch)
-    monkeypatch.setattr(linux_paths.pwd, "getpwuid", lambda _uid: SimpleNamespace(pw_dir=str(home)))
-    interpreter = (bin_dir / "python").resolve(strict=True)
-    (bin_dir / "python").unlink()
-    selected = bin_dir / "fixture-interpreter"
-    selected.symlink_to(interpreter)
-    details = interpreter.stat()
-    identity = ((selected.name, selected, interpreter, details.st_dev, details.st_ino),)
-    runtime_root.chmod(0o777)
-
-    with pytest.raises(ValueError, match="runtime directory is unsafe"):
-        python_runtime_mounts(workspace, ((bin_dir, bin_dir),), identity)
-
-
-def test_unidentified_runtime_metadata_timeout_is_not_suppressed(tmp_path, monkeypatch):
-    """Timeouts stop preparation even before an optional interpreter can be identified."""
-    _home, workspace, bin_dir, _runtime_root, _ = _python_environment(tmp_path, monkeypatch)
-    (bin_dir / "python").unlink()
-    executable = bin_dir / "fixture-processor"
-    executable.write_text("unrelated executable", encoding="utf-8")
-    details = executable.stat()
-    identity = ((executable.name, executable, executable, details.st_dev, details.st_ino),)
-    monkeypatch.setattr(linux_paths.os, "open", Mock(side_effect=TimeoutError("metadata timeout")))
-
-    with pytest.raises(TimeoutError, match="metadata timeout"):
-        python_runtime_mounts(workspace, ((bin_dir, bin_dir),), identity)
-
-
-def test_python_runtime_mounts_check_all_selected_interpreters_without_conventional_alias(
-    tmp_path, monkeypatch
-):
-    """An unrelated earlier executable cannot hide the selected interpreter."""
-    home, workspace, venv_bin, runtime_root, runtime_alias = _python_environment(
-        tmp_path, monkeypatch
-    )
-    monkeypatch.setattr(linux_paths.pwd, "getpwuid", lambda _uid: SimpleNamespace(pw_dir=str(home)))
-    interpreter = (venv_bin / "python").resolve(strict=True)
-    (venv_bin / "python").unlink()
-    other = runtime_root / "bin/other"
-    other.write_text("not an interpreter", encoding="utf-8")
-    other.chmod(0o755)
-    selected = venv_bin / "selected-interpreter"
-    unrelated = venv_bin / "selected-other"
-    selected.symlink_to(interpreter)
-    unrelated.symlink_to(other)
-    identities = []
-    for spelling in (unrelated, selected):
-        resolved = spelling.resolve(strict=True)
-        details = resolved.stat()
-        identities.append((spelling.name, spelling, resolved, details.st_dev, details.st_ino))
-
-    assert python_runtime_mounts(workspace, ((venv_bin, venv_bin),), tuple(identities)) == (
-        (runtime_root, runtime_alias),
-    )
-
-
-def test_python_runtime_mounts_refuse_unreadable_conventional_anchor(tmp_path, monkeypatch):
-    """An inaccessible conventional interpreter is not treated as an absent anchor."""
-    home, workspace, venv_bin, _, _ = _python_environment(tmp_path, monkeypatch)
-    monkeypatch.setattr(linux_paths.pwd, "getpwuid", lambda _uid: SimpleNamespace(pw_dir=str(home)))
-    identity = _python_identity(venv_bin)
-    original = Path.resolve
-
-    def resolve(path, *args, **kwargs):
-        """Model an anchor that cannot be inspected without changing other path resolution."""
-        if path == venv_bin / "python":
-            raise PermissionError("anchor inaccessible")
-        return original(path, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "resolve", resolve)
-    assert python_runtime_mounts(workspace, ((venv_bin, venv_bin),), identity) == ()
-
-
-def test_python_runtime_mounts_preserve_each_selected_environment(tmp_path, monkeypatch):
-    """Independent interpreter identities bind only their own user-local runtimes."""
-    home, workspace, first_bin, first_root, first_alias = _python_environment(tmp_path, monkeypatch)
-    monkeypatch.setattr(linux_paths.pwd, "getpwuid", lambda _uid: SimpleNamespace(pw_dir=str(home)))
-    second_bin = workspace / "second/bin"
-    second_bin.mkdir(parents=True)
-    second_root = home / "runtime-store/cpython-3.13"
-    (second_root / "bin").mkdir(parents=True)
-    (second_root / "lib/python3.13").mkdir(parents=True)
-    interpreter = second_root / "bin/python3.13"
-    interpreter.write_text("interpreter", encoding="utf-8")
-    interpreter.chmod(0o755)
-    (second_bin / "python").symlink_to(interpreter)
-    (second_bin / "python-second").symlink_to(interpreter)
-    (second_bin.parent / "pyvenv.cfg").write_text(
-        f"home = {second_root / 'bin'}\nimplementation = CPython\nversion_info = 3.13\n",
-        encoding="utf-8",
-    )
-    roots = ((first_bin, first_bin), (second_bin, second_bin))
-    details = interpreter.stat()
-    identities = (
-        *_python_identity(first_bin),
-        (
-            "python-second",
-            second_bin / "python-second",
-            interpreter,
-            details.st_dev,
-            details.st_ino,
-        ),
-    )
-
-    assert python_runtime_mounts(workspace, roots, identities) == (
-        (first_root, first_alias),
-        (second_root, second_root),
-    )
-    assert python_runtime_mounts(workspace, roots, identities, system_roots=(first_root,)) == (
-        (second_root, second_root),
-    )
-    assert python_runtime_mounts(workspace, roots, _python_identity(first_bin)) == (
-        (first_root, first_alias),
-    )
-
-
-@pytest.mark.parametrize("change", ["unrelated", "outside", "stale", "spoofed", "missing"])
-def test_python_runtime_mounts_do_not_infer_from_unrelated_or_stale_tools(
-    tmp_path, monkeypatch, change
-):
-    """An unselected, changed or unrelated executable cannot imply runtime read authority."""
-    home, workspace, venv_bin, _, _ = _python_environment(tmp_path, monkeypatch)
-    monkeypatch.setattr(linux_paths.pwd, "getpwuid", lambda _uid: SimpleNamespace(pw_dir=str(home)))
-    name, spelling, target, device, inode = _python_identity(venv_bin)[0]
-    if change == "unrelated":
-        other = venv_bin / "other"
-        other.write_text("other", encoding="utf-8")
-        details = other.stat()
-        spelling, target, device, inode = other, other, details.st_dev, details.st_ino
-    elif change == "outside":
-        spelling = tmp_path / "python"
-    elif change == "stale":
-        inode += 1
-    elif change == "spoofed":
-        spelling = venv_bin / "other"
-        spelling.write_text("not the selected interpreter", encoding="utf-8")
-    else:
-        spelling.unlink()
-
-    assert (
-        python_runtime_mounts(
-            workspace, ((venv_bin, venv_bin),), ((name, spelling, target, device, inode),)
-        )
-        == ()
-    )
-
-
-def test_python_runtime_mounts_reject_interpreter_disappearing_during_binding(
-    tmp_path, monkeypatch
-):
-    """An interpreter that disappears between lookup and verification grants no runtime."""
-    home, workspace, venv_bin, _, _ = _python_environment(tmp_path, monkeypatch)
-    monkeypatch.setattr(linux_paths.pwd, "getpwuid", lambda _uid: SimpleNamespace(pw_dir=str(home)))
-    identity = _python_identity(venv_bin)
-    original = Path.resolve
-    calls = 0
-
-    def resolve(path, *args, **kwargs):
-        """Refuse the selected spelling after its initial successful lookup."""
-        nonlocal calls
-        if path == venv_bin / "python":
-            calls += 1
-            if calls == 2:
-                raise OSError("interpreter disappeared")
-        return original(path, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "resolve", resolve)
-    assert python_runtime_mounts(workspace, ((venv_bin, venv_bin),), identity) == ()
-
-
-def test_python_runtime_mounts_accept_a_canonical_python_home(tmp_path, monkeypatch):
-    """A venv already pointing at the runtime's canonical path needs no alias."""
-    home, workspace, venv_bin, runtime_root, _runtime_alias = _python_environment(
-        tmp_path, monkeypatch
-    )
-    monkeypatch.setattr(
-        "loop.execution.sandbox.linux.paths.pwd.getpwuid",
-        lambda _uid: SimpleNamespace(pw_dir=str(home)),
-    )
-    (venv_bin / "python").unlink()
-    (venv_bin / "python").symlink_to(runtime_root / "bin/python3.14")
-    (venv_bin.parent / "pyvenv.cfg").write_text(
-        f"home = {runtime_root / 'bin'}\nimplementation = CPython\nversion_info = 3.14\n",
-        encoding="utf-8",
-    )
-    assert python_runtime_mounts(
-        workspace, ((venv_bin, venv_bin),), _python_identity(venv_bin)
-    ) == ((runtime_root, runtime_root),)
-
-
-@pytest.mark.parametrize(
-    "metadata",
-    [
-        "home = /runtime/bin\nimplementation = PyPy\nversion_info = 3.14\n",
-        "home = /runtime/bin\nimplementation = CPython\nversion_info = unknown\n",
-        "implementation = CPython\nversion_info = 3.14\n",
-    ],
-)
-def test_python_runtime_mounts_skip_non_cpython_or_incomplete_venv_metadata(
-    tmp_path, monkeypatch, metadata
-):
-    """Do not infer runtime authority from unsupported or incomplete venv metadata."""
-    home, workspace, venv_bin, _, _ = _python_environment(tmp_path, monkeypatch)
-    monkeypatch.setattr(
-        "loop.execution.sandbox.linux.paths.pwd.getpwuid",
-        lambda _uid: SimpleNamespace(pw_dir=str(home)),
-    )
-    (venv_bin.parent / "pyvenv.cfg").write_text(metadata, encoding="utf-8")
-    assert (
-        python_runtime_mounts(workspace, ((venv_bin, venv_bin),), _python_identity(venv_bin)) == ()
-    )
-
-
-def test_python_runtime_mounts_skip_missing_and_unrelated_path_environments(tmp_path, monkeypatch):
-    """Search only workspace PATH venvs and ignore absent or unrelated configurations."""
-    home, workspace, venv_bin, _, _ = _python_environment(tmp_path, monkeypatch)
-    monkeypatch.setattr(
-        "loop.execution.sandbox.linux.paths.pwd.getpwuid",
-        lambda _uid: SimpleNamespace(pw_dir=str(home)),
-    )
-    tools = tmp_path / "tools"
-    tools.mkdir()
-    identity = _python_identity(venv_bin)
-    config = venv_bin.parent / "pyvenv.cfg"
-    config.unlink()
-
-    assert python_runtime_mounts(workspace, ((venv_bin, venv_bin),), identity) == ()
-    assert python_runtime_mounts(workspace, ((tools, tools),), identity) == ()
-    assert python_runtime_mounts(workspace, ((tmp_path / "bin", tmp_path / "bin"),), identity) == ()
-
-
-@pytest.mark.parametrize(
-    ("failure", "raises"),
-    [
-        ("relative-home", True),
-        ("non-bin-home", True),
-        ("missing-home", False),
-        ("missing-interpreter", False),
-        ("missing-stdlib", False),
-        ("external-interpreter", False),
-        ("external-stdlib", False),
-        ("home-root", True),
-        ("workspace-root", True),
-        ("outside-user-home", True),
-        ("unsafe-directory", True),
-        ("foreign-group-directory", True),
-        ("unsafe-interpreter", True),
-        ("non-executable-interpreter", False),
-        ("directory-interpreter", False),
-        ("protected-alias", True),
-    ],
-)
-def test_python_runtime_mounts_validate_the_selected_interpreter_and_tree(
-    tmp_path, monkeypatch, failure, raises
-):
-    """Only a safe CPython tree referenced by the workspace venv becomes read authority."""
-    home, workspace, venv_bin, runtime_root, runtime_alias = _python_environment(
-        tmp_path, monkeypatch
-    )
-    configured_home = runtime_alias / "bin"
-    interpreter = runtime_root / "bin/python3.14"
-    config = venv_bin.parent / "pyvenv.cfg"
-    if failure in {"relative-home", "non-bin-home", "missing-home"}:
-        home_value = (
-            "relative/bin"
-            if failure == "relative-home"
-            else str(runtime_root / "lib")
-            if failure == "non-bin-home"
-            else str(home / "missing/bin")
-        )
-        config.write_text(
-            f"home = {home_value}\nimplementation = CPython\nversion_info = 3.14\n",
-            encoding="utf-8",
-        )
-    elif failure == "missing-interpreter":
-        (venv_bin / "python").unlink()
-    elif failure == "missing-stdlib":
-        (runtime_root / "lib/python3.14").rmdir()
-    elif failure == "external-interpreter":
-        external = home / "other/python3.14"
-        external.parent.mkdir()
-        external.write_text("interpreter", encoding="utf-8")
-        external.chmod(0o755)
-        (venv_bin / "python").unlink()
-        (venv_bin / "python").symlink_to(external)
-    elif failure == "external-stdlib":
-        stdlib = runtime_root / "lib/python3.14"
-        stdlib.rmdir()
-        external = home / "external-stdlib"
-        external.mkdir()
-        stdlib.symlink_to(external, target_is_directory=True)
-    elif failure == "home-root":
-        (home / "bin").mkdir()
-        (home / "lib/python3.14").mkdir(parents=True)
-        (home / "bin/python3.14").write_text("interpreter", encoding="utf-8")
-        (home / "bin/python3.14").chmod(0o755)
-        configured_home = home / "bin"
-        (venv_bin / "python").unlink()
-        (venv_bin / "python").symlink_to(configured_home / "python3.14")
-        config.write_text(
-            f"home = {configured_home}\nimplementation = CPython\nversion_info = 3.14\n",
-            encoding="utf-8",
-        )
-    elif failure == "workspace-root":
-        runtime_root.rename(workspace / "cpython-runtime")
-        runtime_root = workspace / "cpython-runtime"
-        runtime_alias.unlink()
-        runtime_alias.symlink_to(runtime_root, target_is_directory=True)
-        home = workspace
-    elif failure == "outside-user-home":
-        runtime_root.rename(tmp_path / "external-python")
-        runtime_root = tmp_path / "external-python"
-        runtime_alias.unlink()
-        runtime_alias.symlink_to(runtime_root, target_is_directory=True)
-    elif failure in {"unsafe-directory", "foreign-group-directory"}:
-        runtime_root.chmod(0o777 if failure == "unsafe-directory" else 0o775)
-        if failure == "foreign-group-directory":
-            monkeypatch.setattr("loop.execution.sandbox.linux.paths.os.getgid", lambda: -1)
-    elif failure == "unsafe-interpreter":
-        interpreter.chmod(0o777)
-    elif failure == "non-executable-interpreter":
-        interpreter.chmod(0o644)
-    elif failure == "directory-interpreter":
-        interpreter.unlink()
-        interpreter.mkdir()
-        (venv_bin / "python").unlink()
-        (venv_bin / "python").symlink_to(runtime_alias / "bin/python3.14")
-    elif failure == "protected-alias":
-        alias = home / ".config/python"
-        alias.parent.mkdir()
-        alias.symlink_to(runtime_root, target_is_directory=True)
-        (venv_bin / "python").unlink()
-        (venv_bin / "python").symlink_to(alias / "bin/python3.14")
-        config.write_text(
-            f"home = {alias / 'bin'}\nimplementation = CPython\nversion_info = 3.14\n",
-            encoding="utf-8",
-        )
-    monkeypatch.setattr(
-        "loop.execution.sandbox.linux.paths.pwd.getpwuid",
-        lambda _uid: SimpleNamespace(pw_dir=str(home)),
-    )
-    identity = _python_identity(venv_bin)
-
-    if raises:
-        with pytest.raises(ValueError):
-            python_runtime_mounts(workspace, ((venv_bin, venv_bin),), identity)
-    else:
-        assert python_runtime_mounts(workspace, ((venv_bin, venv_bin),), identity) == ()
-
-
-@pytest.mark.parametrize("failure", ["lookup", "file", "world-write", "group-write"])
-def test_python_runtime_mounts_reject_an_untrusted_account_home(tmp_path, monkeypatch, failure):
-    """Refuse runtime discovery when the account home cannot be safely bound."""
-    home, workspace, venv_bin, _, _ = _python_environment(tmp_path, monkeypatch)
-    (venv_bin.parent / "pyvenv.cfg").chmod(0o600)
-    if failure == "lookup":
-        monkeypatch.setattr(
-            "loop.execution.sandbox.linux.paths.pwd.getpwuid",
-            Mock(side_effect=KeyError("missing account")),
-        )
-    elif failure == "file":
-        fake_home = tmp_path / "not-home"
-        fake_home.write_text("not a directory", encoding="utf-8")
-        monkeypatch.setattr(
-            "loop.execution.sandbox.linux.paths.pwd.getpwuid",
-            lambda _uid: SimpleNamespace(pw_dir=str(fake_home)),
-        )
-    else:
-        home.chmod(0o777 if failure == "world-write" else 0o775)
-        monkeypatch.setattr(
-            "loop.execution.sandbox.linux.paths.pwd.getpwuid",
-            lambda _uid: SimpleNamespace(pw_dir=str(home)),
-        )
-        if failure == "group-write":
-            monkeypatch.setattr("loop.execution.sandbox.linux.paths.os.getgid", lambda: -1)
-    with pytest.raises(ValueError, match="home is unavailable|home is unsafe"):
-        python_runtime_mounts(
-            workspace,
-            ((venv_bin, venv_bin),),
-            _python_identity(venv_bin),
-        )
-
-
-@pytest.mark.parametrize("failure", ["link", "descriptor", "changed", "utf8", "oversized"])
-def test_python_runtime_mounts_reject_changed_or_invalid_venv_metadata(
-    tmp_path, monkeypatch, failure
-):
-    """Bind bounded venv metadata without accepting a replacement or malformed encoding."""
-    home, workspace, venv_bin, _, _ = _python_environment(tmp_path, monkeypatch)
-    monkeypatch.setattr(linux_paths.pwd, "getpwuid", lambda _uid: SimpleNamespace(pw_dir=str(home)))
-    config = venv_bin.parent / "pyvenv.cfg"
-    selected = config.stat()
-    if failure == "link":
-        copy = tmp_path / "pyvenv-copy"
-        os.link(config, copy)
-    elif failure == "descriptor":
-        original_fstat = linux_paths.os.fstat
-
-        def fstat(descriptor):
-            """Change the opened config identity before parsing it."""
-            details = original_fstat(descriptor)
-            if (details.st_dev, details.st_ino) == (selected.st_dev, selected.st_ino):
-                return SimpleNamespace(st_dev=details.st_dev, st_ino=details.st_ino + 1)
-            return details
-
-        monkeypatch.setattr(linux_paths.os, "fstat", fstat)
-    elif failure == "changed":
-        original_fstat = linux_paths.os.fstat
-        calls = 0
-
-        def fstat(descriptor):
-            """Change the metadata timestamp between its read and final check."""
-            nonlocal calls
-            details = original_fstat(descriptor)
-            if (details.st_dev, details.st_ino) != (selected.st_dev, selected.st_ino):
-                return details
-            calls += 1
-            return SimpleNamespace(
-                st_dev=details.st_dev,
-                st_ino=details.st_ino,
-                st_size=details.st_size,
-                st_mtime_ns=details.st_mtime_ns + (calls > 1),
-            )
-
-        monkeypatch.setattr(linux_paths.os, "fstat", fstat)
-    elif failure == "utf8":
-        config.write_bytes(b"\xff")
-    else:
-        config.write_bytes(b"x" * (64 * 1024 + 1))
-    expected = "unsafe|changed|invalid" if failure in {"link", "oversized"} else "changed|invalid"
-    if failure == "utf8":
-        expected = "invalid"
-
-    with pytest.raises(ValueError, match=expected):
-        python_runtime_mounts(
-            workspace,
-            ((venv_bin, venv_bin),),
-            _python_identity(venv_bin),
-        )
-
-
-@pytest.mark.parametrize("unsafe", ["protected", "config-mode", "duplicate"])
-def test_python_runtime_mounts_reject_unsafe_automatic_read_authority(
-    tmp_path, monkeypatch, unsafe
-):
-    """Reject private or ambiguous venv metadata before granting a runtime directory read."""
-    home, workspace, venv_bin, _runtime_root, runtime_alias = _python_environment(
-        tmp_path, monkeypatch
-    )
-    monkeypatch.setattr(
-        "loop.execution.sandbox.linux.paths.pwd.getpwuid",
-        lambda _uid: SimpleNamespace(pw_dir=str(home)),
-    )
-    config = venv_bin.parent / "pyvenv.cfg"
-    if unsafe == "protected":
-        private_parent = home / ".config"
-        private_parent.mkdir()
-        protected_root = private_parent / "cpython-3.14.1"
-        protected_root.mkdir()
-        (protected_root / "bin").mkdir()
-        (protected_root / "lib/python3.14").mkdir(parents=True)
-        (protected_root / "bin/python3.14").write_text("interpreter", encoding="utf-8")
-        (protected_root / "bin/python3.14").chmod(0o755)
-        runtime_alias.unlink()
-        runtime_alias.symlink_to(protected_root, target_is_directory=True)
-        (venv_bin / "python").unlink()
-        (venv_bin / "python").symlink_to(runtime_alias / "bin/python3.14")
-        config.write_text(
-            f"home = {runtime_alias / 'bin'}\nimplementation = CPython\nversion_info = 3.14\n",
-            encoding="utf-8",
-        )
-    elif unsafe == "config-mode":
-        config.chmod(0o666)
-    else:
-        config.write_text(config.read_text() + "home = /duplicate\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="unsafe|ambiguous|outside the safe"):
-        python_runtime_mounts(
-            workspace,
-            ((venv_bin, venv_bin),),
-            _python_identity(venv_bin),
-        )
 
 
 def test_prepare_paths_preserves_sorted_protection_private_masks_and_ancestor_writes(bound):
@@ -841,6 +108,19 @@ def test_prepare_paths_preserves_sorted_protection_private_masks_and_ancestor_wr
     assert not (workspace / "must-not-run").exists()
 
 
+def test_prepare_paths_uses_only_the_mask_for_a_denied_control_file(bound):
+    """A hard-denied control file has no native mount carrying its original data."""
+    create, workspace, scratch = bound
+    instructions = workspace / "AGENTS.md"
+    instructions.write_text("denied-instructions")
+    assert prepare_paths(create(hard_denied_paths=(instructions,)), scratch) == (
+        (),
+        (instructions,),
+        (),
+        (),
+    )
+
+
 @pytest.mark.parametrize("read_only", [False, True])
 def test_prepare_paths_records_read_only_hardlinks_for_granted_roots(bound, tmp_path, read_only):
     """Writable hardlinks get mounts; links within an already read-only root need none."""
@@ -855,6 +135,142 @@ def test_prepare_paths_records_read_only_hardlinks_for_granted_roots(bound, tmp_
     expected_mounts = () if read_only else (root / "alias",)
     assert prepare_paths(request, scratch) == ((), (), (), expected_mounts)
     assert outside.read_text() == "original"
+
+
+@pytest.mark.parametrize(
+    "case,refusal",
+    [
+        ("approved", None),
+        ("public-cache", None),
+        ("owner-only-traversal", None),
+        ("missing-revision", "Unapproved Linux hardlink source"),
+        ("wrong-cache", "Unapproved Linux hardlink source"),
+        ("shared-write-cache", "owner-controlled account cache"),
+        ("denied-cache", "owner-controlled account cache"),
+        ("writable-home", "unsafe account ancestry"),
+        ("writable-peer", "names outside the verified scope"),
+        ("denied-file", "names outside the verified scope"),
+        ("protected-file", "names outside the verified scope"),
+        ("third-name", "names outside the verified scope"),
+        ("cache-file-mount", "names outside the verified scope"),
+        ("workspace-file-mount", "shared dependency has a mounted alias"),
+        ("mounted-cache", "source has a mounted alias"),
+        ("mounted-home-alias", "source has a mounted alias"),
+        ("bad-mountinfo", "Ambiguous Linux hardlink source mount authority"),
+        ("changed-mountinfo", "source mounts changed"),
+    ],
+)
+def test_cache_witness_checks_native_policy_without_becoming_a_mount(
+    bound, tmp_path, monkeypatch, case, refusal
+):
+    """A complete approved group supplies one immutable workspace entry; uncertain peers refuse."""
+    from loop.permissions.protection import inspect_hardlink_aliases
+
+    create, workspace, scratch = bound
+    cache = tmp_path / ".cache"
+    cache.mkdir(mode=0o700)
+    source = cache / ("AGENTS.md" if case == "protected-file" else "package")
+    source.write_text("dependency")
+    source.chmod(0o644)
+    alias = workspace / "dependency"
+    alias.hardlink_to(source)
+    if case == "third-name":
+        (tmp_path / "other").hardlink_to(source)
+    if case in {"public-cache", "writable-peer"}:
+        cache.chmod(0o755)
+    if case == "shared-write-cache":
+        cache.chmod(0o770)
+    if case == "writable-home":
+        tmp_path.chmod(0o770)
+    if case in {"writable-peer", "owner-only-traversal"}:
+        source.chmod(0o664)
+    denial = {"denied-cache": (cache,), "denied-file": (source,)}.get(case, ())
+    request = create(
+        hard_denied_paths=denial, permission_revision=None if case == "missing-revision" else 2
+    ).with_backend_options((), (cache,))
+    mount = {
+        "cache-file-mount": source,
+        "workspace-file-mount": alias,
+        "mounted-cache": cache,
+        "mounted-home-alias": tmp_path,
+    }.get(case, Path("/"))
+    mount_root = "/subtree" if case == "mounted-home-alias" else "/"
+    fields = ["1", "0", "1:0", mount_root, str(mount), "rw", "-", "ext4", "device", "rw"]
+    first = [[]] if case == "bad-mountinfo" else [fields]
+    changed = [[*fields[:4], str(workspace / "late-mount"), *fields[5:]]]
+    mountinfo = Mock(side_effect=[first, changed if case == "changed-mountinfo" else first])
+    monkeypatch.setattr(linux_paths, "read_mountinfo", mountinfo)
+    monkeypatch.setattr(linux_paths, "inspect_hardlink_aliases", inspect_hardlink_aliases)
+    resolved = tmp_path / "another-cache" if case == "wrong-cache" else cache
+    monkeypatch.setattr(linux_paths, "hardlink_source_paths", lambda *_: (resolved,))
+    if refusal is None:
+        assert prepare_paths(request, scratch) == ((), (), (), (alias,))
+    else:
+        with pytest.raises(ValueError, match=refusal):
+            prepare_paths(request, scratch)
+    assert source.stat().st_nlink == (3 if case == "third-name" else 2)
+
+
+@pytest.mark.parametrize("concealed", [False, True])
+def test_cache_is_unused_when_all_visible_links_are_accounted_for(
+    bound, tmp_path, monkeypatch, concealed
+):
+    """Ordinary and masked files work without inspecting an unrelated unsafe cache."""
+    from loop.permissions.protection import inspect_hardlink_aliases
+
+    create, workspace, scratch = bound
+    cache = tmp_path / ".cache"
+    cache.mkdir()
+    cache.chmod(0o777)
+    directory = workspace / "retired"
+    directory.mkdir()
+    (directory / "first").write_text("data")
+    peer = (tmp_path if concealed else directory) / "second"
+    peer.hardlink_to(directory / "first")
+    request = create(
+        hard_denied_paths=(directory,) if concealed else (),
+        permission_revision=1,
+    ).with_backend_options((), (cache,))
+    mountinfo = Mock(side_effect=AssertionError("Unexpected cache inspection."))
+    monkeypatch.setattr(linux_paths, "read_mountinfo", mountinfo)
+    monkeypatch.setattr(linux_paths, "hardlink_source_paths", lambda *_: (cache,))
+    monkeypatch.setattr(linux_paths, "inspect_hardlink_aliases", inspect_hardlink_aliases)
+
+    _, private, _, immutable = prepare_paths(request, scratch)
+    assert (directory in private) is concealed
+    assert (directory / "first" in immutable) is not concealed
+    mountinfo.assert_not_called()
+
+
+@pytest.mark.parametrize("authority", ["read", "write", "workspace", "descendant"])
+def test_runtime_duplicate_does_not_reclassify_system_hardlinks_as_data(
+    bound, tmp_path, monkeypatch, authority
+):
+    """Only exact authenticated read-only runtime duplicates avoid the data alias census."""
+    from loop.permissions.protection import inspect_hardlink_aliases
+
+    create, _, scratch = bound
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    selected = runtime / "child" if authority == "descendant" else runtime
+    selected.mkdir(exist_ok=True)
+    outside = tmp_path / "outside"
+    outside.write_text("system-tool")
+    (selected / "tool").hardlink_to(outside)
+    monkeypatch.setattr(linux_paths, "inspect_hardlink_aliases", inspect_hardlink_aliases)
+    changes = {"read_roots": (selected,)}
+    if authority == "write":
+        changes["write_roots"] = (selected,)
+    elif authority == "workspace":
+        changes.update(workspace=selected, cwd=selected, write_roots=())
+    request = create(**changes)
+    with pytest.raises(ValueError, match="Incomplete hardlink aliases"):
+        prepare_paths(request, scratch)
+    if authority == "read":
+        assert prepare_paths(request, scratch, runtime_roots=(runtime,)) == ((), (), (), ())
+    else:
+        with pytest.raises(ValueError, match="Incomplete hardlink aliases"):
+            prepare_paths(request, scratch, runtime_roots=(runtime,))
 
 
 @pytest.mark.parametrize("source", ["instruction", "private"])
@@ -1341,7 +757,7 @@ def test_mount_arguments_preserves_grant_roles_protection_and_private_masks(bind
     private.mkdir()
     (private / "AGENTS.md").write_text("private instructions")
     request = create(write_roots=() if read_only else (workspace,))
-    with mount_arguments(request, scratch) as (arguments, inherited):
+    with mount_arguments(request, scratch) as (arguments, inherited, _):
         operation = "--ro-bind-fd" if read_only else "--bind-fd"
         workspace_index = arguments.index(str(workspace))
         assert arguments[workspace_index - 2] == operation
@@ -1373,7 +789,7 @@ def test_mount_arguments_binds_only_a_private_session_temporary_subdirectory(bin
     monkeypatch.setattr(linux_paths, "NATIVE_CONVENTIONAL_TMP_PATH", destination, raising=False)
     request = create(scratch_root=scratch, scratch_data=True)
 
-    with mount_arguments(request, scratch) as (arguments, inherited):
+    with mount_arguments(request, scratch) as (arguments, inherited, _):
         index = len(arguments) - 1 - arguments[::-1].index(str(destination))
         assert arguments[index - 2] == "--bind-fd"
         descriptor = int(arguments[index - 1])
@@ -1523,21 +939,12 @@ def test_conventional_temporary_mount_is_omitted_when_authority_overlaps(
         assert not (scratch / linux_paths.SESSION_CONVENTIONAL_TMP_NAME).exists()
 
 
-@pytest.mark.parametrize("overlap", ["runtime", "interpreter-alias"])
-def test_conventional_temporary_respects_discovered_runtime_paths(binding, monkeypatch, overlap):
-    """A discovered runtime or interpreter alias keeps its existing namespace view."""
+def test_conventional_temporary_respects_protected_runtime_paths(binding, monkeypatch):
+    """A bound runtime keeps its existing namespace view."""
     create, _, scratch, _ = binding
     destination = Path("/unit-conventional-temp")
     monkeypatch.setattr(linux_paths, "NATIVE_CONVENTIONAL_TMP_PATH", destination)
-    runtime = destination / "selected-runtime"
-    roots = (runtime,) if overlap == "runtime" else ()
-    monkeypatch.setattr(
-        linux_paths,
-        "python_runtime_mounts",
-        lambda *_args, **_kwargs: (
-            ((Path("/selected-runtime"), runtime),) if overlap == "interpreter-alias" else ()
-        ),
-    )
+    roots = (destination / "selected-runtime",)
     request = create(scratch_root=scratch, scratch_data=True)
     assert not linux_paths.conventional_tmp_available(request, scratch, runtime_roots=roots)
     with mount_arguments(request, scratch, runtime_roots=roots):
@@ -1596,7 +1003,7 @@ def test_mount_arguments_binds_hardlinks_read_only_after_writable_roots(binding,
     alias = workspace / "alias"
     os.link(outside, alias)
     request = create()
-    with mount_arguments(request, scratch) as (arguments, inherited):
+    with mount_arguments(request, scratch) as (arguments, inherited, _):
         workspace_index = arguments.index(str(workspace))
         alias_index = arguments.index(str(alias))
         assert arguments[workspace_index - 2] == "--bind-fd"
@@ -1624,7 +1031,7 @@ def test_large_hardlink_sets_use_containing_directory_mounts(binding, tmp_path, 
     outside.write_text("nested-module")
     os.link(outside, nested / "module.py")
     request = create()
-    with mount_arguments(request, scratch) as (arguments, inherited):
+    with mount_arguments(request, scratch) as (arguments, inherited, _):
         workspace_index = arguments.index(str(workspace))
         package_index = arguments.index(str(package))
         assert arguments[workspace_index - 2] == "--bind-fd"
@@ -1732,7 +1139,7 @@ def test_mount_arguments_preserves_nested_write_grants_inside_readonly_workspace
     instruction = nested / "AGENTS.md"
     instruction.write_text("instructions")
     request = create(read_roots=(nested,), write_roots=(nested,))
-    with mount_arguments(request, scratch) as (arguments, _):
+    with mount_arguments(request, scratch) as (arguments, _, _):
         workspace_index = arguments.index(str(workspace))
         nested_index = arguments.index(str(nested))
         instruction_index = arguments.index(str(instruction))
@@ -1740,6 +1147,42 @@ def test_mount_arguments_preserves_nested_write_grants_inside_readonly_workspace
         assert arguments[workspace_index - 2] == "--ro-bind-fd"
         assert arguments[nested_index - 2] == "--bind-fd"
         assert arguments[instruction_index - 2] == "--ro-bind-fd"
+
+
+def test_mount_arguments_keeps_exact_file_parent_mutable_for_filename_policy(binding):
+    """Pin the containing directory while leaving the future approved file unmounted."""
+    create, workspace, scratch, _ = binding
+    parent = workspace / "output"
+    parent.mkdir()
+    coverage = parent / ".coverage"
+    control = parent / "AGENTS.md"
+    control.write_text("protected")
+    request = create(write_roots=(), write_files=(coverage,))
+
+    with mount_arguments(request, scratch) as (arguments, descriptors, _):
+        workspace_index = arguments.index(str(workspace))
+        parent_index = arguments.index(str(parent))
+        control_index = arguments.index(str(control))
+        assert workspace_index < parent_index < control_index
+        assert arguments[workspace_index - 2] == "--ro-bind-fd"
+        assert arguments[parent_index - 2] == "--bind-fd"
+        assert int(arguments[parent_index - 1]) in descriptors
+        assert arguments[control_index - 2] == "--ro-bind-fd"
+        assert str(coverage) not in arguments
+        assert not coverage.exists()
+
+
+def test_prepare_paths_refuses_exact_file_scope_inside_writable_scratch(bound):
+    """A scratch-wide filename rule must not expose siblings on an exact-file parent."""
+    create, _, scratch = bound
+    workspace = scratch / "nested-workspace"
+    workspace.mkdir()
+    request = create(
+        workspace=workspace, cwd=workspace, write_roots=(), write_files=(workspace / ".coverage",)
+    )
+
+    with pytest.raises(ValueError, match="cannot overlap the writable scratch view"):
+        prepare_paths(request, scratch)
 
 
 @pytest.mark.parametrize("unsafe", ["missing", "contents", "writable", "hardlink", "directory"])
@@ -1786,7 +1229,7 @@ def test_mount_arguments_owns_only_its_private_mask_duplicate(binding, tmp_path,
                 if caller_failure
                 else nullcontext()
             ),
-            mount_arguments(create(), scratch, empty_mask=descriptor) as (arguments, inherited),
+            mount_arguments(create(), scratch, empty_mask=descriptor) as (arguments, inherited, _),
         ):
             duplicates = set()
             for name in (".ssh", ".aws"):
@@ -1846,7 +1289,7 @@ def test_mount_arguments_keeps_selected_workspace_read_only_in_scratch_mirror(bi
     selected.mkdir()
     (selected / "ordinary").write_text("selected")
     request = create(cwd=selected, workspace=selected, write_roots=())
-    with mount_arguments(request, scratch) as (arguments, inherited):
+    with mount_arguments(request, scratch) as (arguments, inherited, _):
         for path in (selected, _TEST_NATIVE_SCRATCH / "selected"):
             index = arguments.index(str(path))
             assert arguments[index - 2] == "--ro-bind-fd"
@@ -1867,7 +1310,7 @@ def test_mount_arguments_mirrors_scratch_hardlinks_and_private_masks(binding, tm
     mask.write_bytes(b"")
     with (
         mask.open("rb") as empty,
-        mount_arguments(create(), scratch, empty_mask=empty.fileno()) as (arguments, inherited),
+        mount_arguments(create(), scratch, empty_mask=empty.fileno()) as (arguments, inherited, _),
     ):
         for name in ("linked", ".aws"):
             path = _TEST_NATIVE_SCRATCH / name
@@ -1902,7 +1345,7 @@ def test_mount_arguments_pins_external_executables_once_by_file_identity(binding
         request,
         scratch,
         skip_executable_roots=(tools,) if skip else (),
-    ) as (arguments, inherited):
+    ) as (arguments, inherited, _):
         if skip:
             assert str(executable) not in arguments
         else:
@@ -2073,7 +1516,7 @@ def test_mount_arguments_preserves_external_path_symlink_metadata(bound, monkeyp
     alias.symlink_to(runtime, target_is_directory=True)
     monkeypatch.setattr(os, "O_PATH", os.O_RDONLY, raising=False)
     request = create(environment={"PATH": str(alias), "TMPDIR": str(scratch)})
-    with mount_arguments(request, scratch) as (arguments, _):
+    with mount_arguments(request, scratch) as (arguments, _, _):
         index = arguments.index("--symlink")
         assert arguments[index : index + 3] == ("--symlink", str(runtime), str(alias))
         assert arguments[-5:-3] == ("--dir", str(_TEST_NATIVE_SCRATCH))
@@ -2092,7 +1535,7 @@ def test_mount_arguments_skips_path_roots_supplied_by_runtime_mount(bound, monke
     monkeypatch.setattr(os, "O_PATH", os.O_RDONLY, raising=False)
     request = create(environment={"PATH": str(alias), "TMPDIR": str(scratch)})
 
-    with mount_arguments(request, scratch, skip_path_roots=(alias,)) as (arguments, _):
+    with mount_arguments(request, scratch, skip_path_roots=(alias,)) as (arguments, _, _):
         assert str(canonical.parent) not in arguments
         assert str(alias) not in arguments
 
@@ -2142,3 +1585,106 @@ def test_fresh_session_data_scan_allows_private_names_without_exposing_workspace
     (scratch / "shared").hardlink_to(scratch / "library")
     with pytest.raises(ValueError, match="shared inode"):
         prepare_paths(create(scratch_root=scratch, scratch_data=True), scratch)
+
+
+def test_prepare_paths_refuses_environment_value_root(bound, tmp_path):
+    """A grant rooted inside environment data cannot hide its protected ancestor component."""
+    create, _workspace, scratch = bound
+    values = tmp_path / ".env.production"
+    values.mkdir()
+    with pytest.raises(ValueError, match="environment values"):
+        prepare_paths(create(read_roots=(values,)), scratch)
+
+
+def test_prepare_paths_uses_complete_alias_accounting_before_mounts(bound, monkeypatch):
+    """Mount preparation invokes the shared inventory and refuses its uncertain view."""
+    create, workspace, scratch = bound
+    census = Mock(side_effect=ValueError("Incomplete hardlink aliases"))
+    monkeypatch.setattr(linux_paths, "inspect_hardlink_aliases", census)
+    with pytest.raises(ValueError, match="Incomplete hardlink aliases"):
+        prepare_paths(create(), scratch)
+    census.assert_called_once_with((workspace, scratch), 1000, unaccounted=set(), scratch=scratch)
+
+
+@pytest.mark.parametrize(
+    "required",
+    [
+        "unused",
+        "cwd",
+        "scratch",
+        "read",
+        "write",
+        "executable",
+        "extra-alias",
+        "visible",
+        "visible-complete",
+    ],
+)
+def test_prepare_paths_hides_links_only_inside_denied_directories(
+    bound, tmp_path, monkeypatch, required
+):
+    """Unaccounted links stay refused unless a native directory mask already conceals them."""
+    from loop.permissions.protection import inspect_hardlink_aliases
+
+    create, workspace, scratch = bound
+    environment = workspace / "tools" / "retired"
+    packages = environment / "packages"
+    packages.mkdir(parents=True)
+    (environment / "bin").mkdir()
+    cached = tmp_path / "cache"
+    cached.write_text("package data")
+    (packages / "data").hardlink_to(cached)
+    (packages / ".env").write_text("private")
+    if required == "unused":
+        (environment / "legacy-tool").symlink_to(cached)
+    monkeypatch.setattr(linux_paths, "inspect_hardlink_aliases", inspect_hardlink_aliases)
+    changes = {
+        "write_roots": (workspace,),
+        "hard_denied_paths": () if required == "visible" else (environment,),
+    }
+    if required == "cwd":
+        changes["cwd"] = packages
+    elif required == "scratch":
+        scratch = environment / "temp"
+        scratch.mkdir(mode=0o700)
+        changes["environment"] = {"PATH": str(workspace), "TMPDIR": str(scratch)}
+        changes["scratch_root"] = scratch
+    elif required == "read":
+        changes["read_roots"] = (packages,)
+    elif required == "write":
+        changes["write_roots"] = (environment,)
+    elif required == "executable":
+        runtime = tmp_path / "runtime"
+        runtime.mkdir()
+        interpreter = runtime / "tool"
+        interpreter.write_text("interpreter")
+        interpreter.chmod(0o755)
+        spelling = environment / "bin/tool"
+        spelling.symlink_to(interpreter)
+        changes["read_roots"] = (runtime,)
+        changes["environment"] = {"PATH": str(spelling.parent), "TMPDIR": str(scratch)}
+        detail = interpreter.stat()
+        changes["workspace_executable_identities"] = (
+            (spelling.name, spelling, interpreter, detail.st_dev, detail.st_ino),
+        )
+    elif required in {"extra-alias", "visible-complete"}:
+        (workspace / "unmasked-link").hardlink_to(cached)
+        if required == "visible-complete":
+            cached.unlink()
+    request = create(**changes)
+    if required == "unused":
+        assert prepare_paths(request, scratch) == (
+            (),
+            (environment,),
+            tuple(sorted((environment, environment.parent))),
+            (),
+        )
+    elif required in {"extra-alias", "visible"}:
+        with pytest.raises(ValueError, match="Incomplete hardlink aliases"):
+            prepare_paths(request, scratch)
+    elif required == "visible-complete":
+        with pytest.raises(ValueError, match="aliases protected or private data"):
+            prepare_paths(request, scratch)
+    else:
+        with pytest.raises(ValueError, match="A required Linux sandbox path"):
+            prepare_paths(request, scratch)

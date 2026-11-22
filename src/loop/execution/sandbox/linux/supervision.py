@@ -28,7 +28,7 @@ from .admission import GenerationAdmission, admission_group
 from .constants import CGROUP_PROCS_FILENAME, NATIVE_CANCEL_FRAME
 
 if TYPE_CHECKING:
-    from .egress import EgressBroker
+    from .egress import NetworkBroker
 
 _CLEANUP_SECONDS = 1.0
 _CLIENT_DISCONNECT_POLL_MILLISECONDS = 50
@@ -130,7 +130,7 @@ def supervise_payload(
     deadline: float,
     *,
     connection: int | None = None,
-    mediator: EgressBroker | None = None,
+    mediator: NetworkBroker | None = None,
     output_observer: Callable[[str, str], None] | None = None,
     send_lock: threading.Lock | None = None,
     terminal_master: int | None = None,
@@ -151,7 +151,7 @@ def supervise_payload(
         connection (int | None): Admitted socket descriptor that may carry the fixed
             cancellation byte; a full client disconnect also cancels. ``None`` leaves
             cancellation to the common supervisor. Request half-close is not cancellation.
-        mediator (EgressBroker | None): Attempt-owned HTTP broker whose authenticated
+        mediator (NetworkBroker | None): Attempt-owned HTTP broker whose authenticated
             heartbeats and revision acknowledgements share the admitted control socket.
         output_observer (Callable[[str, str], None] | None): Bounded process output receiver.
         send_lock (threading.Lock | None): Shared output/control socket writer lock.

@@ -5,6 +5,8 @@ from pathlib import Path
 
 from .... import constants as app_constants
 
+INGRESS_PORT_ENVIRONMENT_VARIABLE = "LOOP_INGRESS_PORT"
+
 # Reviewed import members follow the Python package, not the installed application name.
 PACKAGE_NAMESPACE = __package__.partition(".")[0]
 PACKAGE_ARTIFACT_PREFIX = f"{PACKAGE_NAMESPACE}/"
@@ -30,7 +32,7 @@ NATIVE_CONVENTIONAL_TMP_PATH = Path("/tmp")
 SESSION_CONVENTIONAL_TMP_NAME = f"{app_constants.APP_NAME}-conventional-tmp"
 NATIVE_POLICY_VERSION = "linux-native-v1"
 # Change when retained receiver semantics require a checked installation refresh.
-NATIVE_RECEIVER_REVISION = "sandbox-local-network-v1"
+NATIVE_RECEIVER_REVISION = "network-runtime-deadline-v1"
 # This runtime revision uses a shell-safe private scratch namespace path.
 NATIVE_PAYLOAD_MARKER_PREFIX = "LOOP_PAYLOAD_"
 NATIVE_REQUEST_MAGIC = b"LOOP\x01"

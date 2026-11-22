@@ -2,8 +2,8 @@
 
 import logging
 import os
-import shutil
 import stat
+from functools import partial
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -17,14 +17,14 @@ from ..tooling import ToolContext, normalize_optional_null, tool
 from ..utils import (
     TextSearchCase,
     VirtualPath,
-    canonical_path,
     filter_paths_by_globs,
     format_content_diff,
     format_content_preview,
-    is_binary_file,
     is_path_ignored,
     iter_visible_paths,
-    read_bounded_text,
+    open_selected_file,
+    open_selected_parent,
+    read_bounded_text_stream,
     search_text_paths,
     sha256_digest,
     write_text_atomically,
@@ -46,11 +46,12 @@ def _file_plan(action: Action):
 
     def _plan(arguments: dict[str, object]) -> OperationPlan:
         path = Path(str(arguments["path"]))
-        resource = canonical_path(path)
+        resource = str(_lexical_mutation_path(path))
         normalized = dict(arguments)
         normalized["path"] = resource
         return OperationPlan(
             arguments=normalized,
+            continuation=lambda: _bound_read_plan(normalized, action),
             operations=(
                 Operation(
                     tool_id="",
@@ -61,6 +62,130 @@ def _file_plan(action: Action):
         )
 
     return _plan
+
+
+def _bound_read_plan(arguments: dict[str, object], action: Action) -> OperationPlan:
+    """Bind an authorized file identity before final permission evaluation and execution."""
+    path = Path(str(arguments["path"]))
+    try:
+        details = path.stat()
+    except FileNotFoundError:
+        target = FileTarget(path=str(path))
+    else:
+        target = FileTarget(
+            path=str(path),
+            expected_kind="directory" if stat.S_ISDIR(details.st_mode) else None,
+            expected_device=details.st_dev,
+            expected_inode=details.st_ino,
+            expected_ctime_ns=details.st_ctime_ns,
+            expected_link_count=details.st_nlink,
+        )
+    return OperationPlan(
+        arguments=arguments,
+        operations=(Operation(tool_id="", action=action, target=target),),
+    )
+
+
+def _approved_read_root(context: ToolContext, action: Action) -> FileTarget | None:
+    """Return the exact read or listing root admitted by this invocation's planner."""
+    return next(
+        (
+            operation.target
+            for operation in context.operations
+            if operation.action is action and isinstance(operation.target, FileTarget)
+        ),
+        None,
+    )
+
+
+def _readable(
+    context: ToolContext,
+    path: Path,
+    action: Action = Action.FILESYSTEM_READ,
+    *,
+    supporting: bool = False,
+) -> bool:
+    """Apply current policy before a tool discovers or inspects one path."""
+    if context.permission_manager is None:
+        raise RuntimeError("File permission authority is unavailable.")
+    allowed = context.permission_manager.can_inspect_file(
+        path,
+        tool_id=context.tool_name,
+        action=action,
+        approved_root=None if supporting else _approved_read_root(context, action),
+    )
+    if allowed and not supporting:
+        context.file_read_paths.add(str(path))
+    return allowed
+
+
+def _open_read(context: ToolContext, path: Path, *, supporting: bool = False) -> int:
+    """Recheck current policy and open the authorized identity for one tool read."""
+    if context.permission_manager is None:
+        raise RuntimeError("File permission authority is unavailable.")
+    identity = next(
+        (
+            (
+                operation.target.expected_device,
+                operation.target.expected_inode,
+                operation.target.expected_ctime_ns,
+                operation.target.expected_link_count,
+            )
+            for operation in context.operations
+            if isinstance(operation.target, FileTarget)
+            and (
+                operation.target.path == str(path) or Path(operation.target.path).resolve() == path
+            )
+            and operation.target.expected_device is not None
+            and operation.target.expected_inode is not None
+            and operation.target.expected_ctime_ns is not None
+            and operation.target.expected_link_count is not None
+        ),
+        None,
+    )
+    selected, descriptor = context.permission_manager.open_read_file(
+        path,
+        identity,
+        tool_id=context.tool_name,
+        approved_root=(
+            None if supporting else _approved_read_root(context, Action.FILESYSTEM_READ)
+        ),
+    )
+    context.file_read_paths.update((str(path), str(selected)))
+    return descriptor
+
+
+def _read_ignore(context: ToolContext, path: Path) -> str | None:
+    """Load ignore policy only through an independent, descriptor-bound read."""
+    if not _readable(context, path, supporting=True) or not path.is_file():
+        return None
+    with os.fdopen(_open_read(context, path, supporting=True), "r", encoding="utf-8") as stream:
+        return stream.read()
+
+
+def _searchable(context: ToolContext, path: Path) -> bool:
+    """Filter binary data through the same authorized descriptor boundary as text reads."""
+    with os.fdopen(_open_read(context, path), "rb") as stream:
+        return b"\0" not in stream.read(constants.DEFAULT_STREAM_CHUNK_SIZE)
+
+
+def _mutation_denial(context: ToolContext) -> Problem | None:
+    """Recheck the current hard boundary before consuming an approved mutation capability."""
+    if context.permission_manager is None:
+        raise RuntimeError("File permission authority is unavailable.")
+    context.permission_manager.require_policy_ready()
+    denial = context.permission_manager.check_boundaries(
+        context.operations + context.prerequisite_operations
+    )
+    if denial is None:
+        return None
+    return Problem(
+        code="tool.denied",
+        title="Tool denied",
+        detail=denial.reason,
+        severity="warning",
+        operation=context.tool_name,
+    )
 
 
 def _edit_problem(code: str, detail: str) -> ProblemException:
@@ -142,7 +267,13 @@ def _path_kind(path: Path) -> FileKind | None:
     return None
 
 
-def _capture_entry(path: Path, relative_path: str, *, digest: bool) -> FileManifestEntry:
+def _capture_entry(
+    path: Path,
+    relative_path: str,
+    *,
+    digest: bool,
+    identity: tuple[int, int, int, int] | None = None,
+) -> FileManifestEntry:
     """Capture one object state without following symbolic links."""
     status = path.lstat()
     kind = _path_kind(path)
@@ -150,7 +281,8 @@ def _capture_entry(path: Path, relative_path: str, *, digest: bool) -> FileManif
         raise ValueError(f"Path '{path}' has an unsupported object type.")
     content_digest = None
     if digest and kind == "file":
-        content_digest = sha256_digest(path.read_bytes())
+        _, content = _read_regular_entry(path, relative_path, identity)
+        content_digest = sha256_digest(content)
     return FileManifestEntry(
         relative_path=relative_path,
         kind=kind,
@@ -158,17 +290,30 @@ def _capture_entry(path: Path, relative_path: str, *, digest: bool) -> FileManif
         inode=status.st_ino,
         size=status.st_size,
         mtime_ns=status.st_mtime_ns,
+        ctime_ns=status.st_ctime_ns,
+        link_count=status.st_nlink,
         mode=status.st_mode,
         digest=content_digest,
     )
 
 
-def _read_regular_entry(path: Path, relative_path: str) -> tuple[FileManifestEntry, bytes]:
+def _read_regular_entry(
+    path: Path, relative_path: str, identity: tuple[int, int, int, int] | None
+) -> tuple[FileManifestEntry, bytes]:
     """Read one regular file and bind its digest to stable surrounding metadata."""
     before = _capture_entry(path, relative_path, digest=False)
     if before.kind != "file":
         raise ValueError(f"Path '{path}' is not a regular file.")
-    content = path.read_bytes()
+    descriptor = open_selected_file(Path(path.anchor), path, (before.device, before.inode))
+    with os.fdopen(descriptor, "rb") as stream:
+        opened = os.fstat(stream.fileno())
+        current = (opened.st_dev, opened.st_ino, opened.st_ctime_ns, opened.st_nlink)
+        if (
+            current != (before.device, before.inode, before.ctime_ns, before.link_count)
+            or current != identity
+        ):
+            raise PermissionError("Selected file or aliases changed before reading.")
+        content = stream.read()
     after = _capture_entry(path, relative_path, digest=False)
     if after != before:
         raise ValueError("The target changed during planning; operation was cancelled.")
@@ -193,6 +338,8 @@ def _target_from_entry(
         expected_inode=entry.inode,
         expected_size=entry.size,
         expected_mtime_ns=entry.mtime_ns,
+        expected_ctime_ns=entry.ctime_ns,
+        expected_link_count=entry.link_count,
         expected_mode=entry.mode,
         expected_parent_device=parent.st_dev,
         expected_parent_inode=parent.st_ino,
@@ -207,8 +354,20 @@ def _mutation_operation(action: Action, target: FileTarget, reason: str | None =
 
 
 def _read_operation(action: Action, path: str) -> Operation:
-    """Build one prerequisite filesystem inspection operation."""
-    return Operation(tool_id="", action=action, target=FileTarget(path=path))
+    """Bind metadata before authorizing the prerequisite content inspection."""
+    try:
+        details = Path(path).stat()
+    except FileNotFoundError:
+        target = FileTarget(path=path)
+    else:
+        target = FileTarget(
+            path=path,
+            expected_device=details.st_dev,
+            expected_inode=details.st_ino,
+            expected_ctime_ns=details.st_ctime_ns,
+            expected_link_count=details.st_nlink,
+        )
+    return Operation(tool_id="", action=action, target=target)
 
 
 def _write_plan(arguments: dict[str, object]) -> OperationPlan:
@@ -220,15 +379,16 @@ def _write_plan(arguments: dict[str, object]) -> OperationPlan:
         _mutation_operation(action, FileTarget(path=resource))
         for action in (Action.FILESYSTEM_CREATE, Action.FILESYSTEM_REPLACE)
     )
+    read = _read_operation(Action.FILESYSTEM_READ, resource)
     return OperationPlan(
         arguments=normalized,
-        operations=(_read_operation(Action.FILESYSTEM_READ, resource),),
+        operations=(read,),
         boundary_operations=boundaries,
-        continuation=lambda: _finish_write_plan(normalized),
+        continuation=lambda: _finish_write_plan(normalized, read.target),
     )
 
 
-def _finish_write_plan(arguments: dict[str, object]) -> OperationPlan:
+def _finish_write_plan(arguments: dict[str, object], selected: FileTarget) -> OperationPlan:
     """Inspect an authorized write target and produce its mutation capability."""
     path = _mutation_path(Path(str(arguments["path"])))
     resource = str(path)
@@ -271,7 +431,16 @@ def _finish_write_plan(arguments: dict[str, object]) -> OperationPlan:
             "Could not write file",
             f"Path '{path}' is not a regular file.",
         )
-    entry, existing_bytes = _read_regular_entry(path, ".")
+    entry, existing_bytes = _read_regular_entry(
+        path,
+        ".",
+        (
+            selected.expected_device,
+            selected.expected_inode,
+            selected.expected_ctime_ns,
+            selected.expected_link_count,
+        ),
+    )
     try:
         existing = existing_bytes.decode("utf-8")
     except UnicodeDecodeError:
@@ -296,15 +465,16 @@ def _edit_plan(arguments: dict[str, object]) -> OperationPlan:
     resource = str(path)
     normalized = {**arguments, "path": resource}
     boundary = _mutation_operation(Action.FILESYSTEM_REPLACE, FileTarget(path=resource))
+    read = _read_operation(Action.FILESYSTEM_READ, resource)
     return OperationPlan(
         arguments=normalized,
-        operations=(_read_operation(Action.FILESYSTEM_READ, resource),),
+        operations=(read,),
         boundary_operations=(boundary,),
-        continuation=lambda: _finish_edit_plan(normalized),
+        continuation=lambda: _finish_edit_plan(normalized, read.target),
     )
 
 
-def _finish_edit_plan(arguments: dict[str, object]) -> OperationPlan:
+def _finish_edit_plan(arguments: dict[str, object], selected: FileTarget) -> OperationPlan:
     """Capture the authorized edit source before validating model-supplied anchors."""
     path = _mutation_path(Path(str(arguments["path"])))
     resource = str(path)
@@ -314,7 +484,16 @@ def _finish_edit_plan(arguments: dict[str, object]) -> OperationPlan:
             raise _edit_problem(
                 "filesystem.path_not_file", f"Path '{path}' is not an existing regular file."
             )
-        entry, original_bytes = _read_regular_entry(path, ".")
+        entry, original_bytes = _read_regular_entry(
+            path,
+            ".",
+            (
+                selected.expected_device,
+                selected.expected_inode,
+                selected.expected_ctime_ns,
+                selected.expected_link_count,
+            ),
+        )
     except OSError as exc:
         raise _edit_problem("filesystem.edit_failed", str(exc)) from exc
 
@@ -413,7 +592,13 @@ def _inspect_delete_plan(arguments: dict[str, object]) -> OperationPlan:
             arguments=normalized, operations=(final,), boundary_operations=(boundary,)
         )
     if not recursive:
-        return _finish_file_delete_plan(normalized, reason)
+        read = _read_operation(Action.FILESYSTEM_READ, resource)
+        return OperationPlan(
+            arguments=normalized,
+            operations=(read,),
+            boundary_operations=(boundary,),
+            continuation=lambda: _finish_file_delete_plan(normalized, reason, read.target),
+        )
     return OperationPlan(
         arguments=normalized,
         operations=(_read_operation(Action.FILESYSTEM_LIST, resource),),
@@ -422,10 +607,22 @@ def _inspect_delete_plan(arguments: dict[str, object]) -> OperationPlan:
     )
 
 
-def _finish_file_delete_plan(arguments: dict[str, object], reason: str) -> OperationPlan:
+def _finish_file_delete_plan(
+    arguments: dict[str, object], reason: str, selected: FileTarget
+) -> OperationPlan:
     """Capture an authorized regular-file deletion capability."""
     path = Path(str(arguments["path"]))
-    entry = _capture_entry(path, ".", digest=True)
+    entry = _capture_entry(
+        path,
+        ".",
+        digest=True,
+        identity=(
+            selected.expected_device,
+            selected.expected_inode,
+            selected.expected_ctime_ns,
+            selected.expected_link_count,
+        ),
+    )
     if entry.kind != "file":
         raise _planning_problem(
             "delete_path",
@@ -489,17 +686,25 @@ def _finish_directory_delete_plan(
     path = Path(str(arguments["path"]))
     completed = []
     for expected in metadata:
+        selected = path if expected.relative_path == "." else path / expected.relative_path
         current = _capture_entry(
-            path if expected.relative_path == "." else path / expected.relative_path,
+            selected,
             expected.relative_path,
-            digest=expected.kind == "file",
+            digest=False,
         )
-        if current.model_copy(update={"digest": None}) != expected:
+        if current != expected:
             raise _planning_problem(
                 "delete_path",
                 "filesystem.target_changed",
                 "Could not delete path",
                 "The target changed during planning; deletion was cancelled.",
+            )
+        if expected.kind == "file":
+            current = _capture_entry(
+                selected,
+                expected.relative_path,
+                digest=True,
+                identity=(expected.device, expected.inode, expected.ctime_ns, expected.link_count),
             )
         completed.append(current)
     manifest = tuple(completed)
@@ -515,7 +720,17 @@ def _matches_target(path: Path, target: FileTarget) -> bool:
     if not _matches_parent(path, target):
         return False
     try:
-        current = _capture_entry(path, ".", digest=target.expected_digest is not None)
+        current = _capture_entry(
+            path,
+            ".",
+            digest=target.expected_digest is not None,
+            identity=(
+                target.expected_device,
+                target.expected_inode,
+                target.expected_ctime_ns,
+                target.expected_link_count,
+            ),
+        )
     except (OSError, ValueError):
         return False
     return (
@@ -524,6 +739,8 @@ def _matches_target(path: Path, target: FileTarget) -> bool:
         and current.inode == target.expected_inode
         and current.size == target.expected_size
         and current.mtime_ns == target.expected_mtime_ns
+        and current.ctime_ns == target.expected_ctime_ns
+        and current.link_count == target.expected_link_count
         and current.mode == target.expected_mode
         and current.digest == target.expected_digest
     )
@@ -546,8 +763,7 @@ def _matches_manifest(path: Path, target: FileTarget) -> bool:
     """Return whether a recursive target still matches its approved manifest.
 
     This is an immediate optimistic precondition, not an atomic tree compare-and-delete. The
-    executor additionally relies on the standard library's descriptor-based ``rmtree`` protection
-    where available and refuses recursion on platforms without it.
+    executor additionally binds parent descriptors and deletes only approved manifest entries.
     """
     if not _matches_parent(path, target):
         return False
@@ -560,12 +776,73 @@ def _matches_manifest(path: Path, target: FileTarget) -> bool:
                 path if entry.relative_path == "." else path / entry.relative_path,
                 entry.relative_path,
                 digest=entry.kind == "file",
+                identity=(entry.device, entry.inode, entry.ctime_ns, entry.link_count),
             )
             for entry in current_metadata
         )
     except (OSError, ValueError):
         return False
     return completed == target.manifest
+
+
+def _delete_selected(path: Path, target: FileTarget) -> None:
+    """Delete only manifest-selected names through identity-bound parent descriptors."""
+    entries = (
+        target.manifest
+        if target.recursive
+        else (
+            FileManifestEntry(
+                relative_path=".",
+                kind=target.expected_kind,
+                device=target.expected_device,
+                inode=target.expected_inode,
+                size=target.expected_size,
+                mtime_ns=target.expected_mtime_ns,
+                ctime_ns=target.expected_ctime_ns,
+                link_count=target.expected_link_count,
+                mode=target.expected_mode,
+                digest=target.expected_digest,
+            ),
+        )
+    )
+    parents = {entry.relative_path: (entry.device, entry.inode) for entry in entries}
+    removed_alias_states = {}
+    for entry in reversed(entries):
+        selected = path if entry.relative_path == "." else path / entry.relative_path
+        parent_identity = (
+            (target.expected_parent_device, target.expected_parent_inode)
+            if entry.relative_path == "."
+            else parents[Path(entry.relative_path).parent.as_posix()]
+        )
+        with open_selected_parent(selected, parent_identity) as directory:
+            current = os.stat(selected.name, dir_fd=directory, follow_symlinks=False)
+            if (current.st_dev, current.st_ino, current.st_mode) != (
+                entry.device,
+                entry.inode,
+                entry.mode,
+            ):
+                raise RuntimeError("The target changed after approval; deletion was cancelled.")
+            if entry.kind == "directory":
+                os.rmdir(selected.name, dir_fd=directory)
+            elif entry.kind == "file":
+                identity = (entry.device, entry.inode)
+                expected_state = removed_alias_states.get(
+                    identity, (entry.ctime_ns, entry.link_count)
+                )
+                descriptor = open_selected_file(Path(selected.anchor), selected, identity)
+                try:
+                    opened = os.fstat(descriptor)
+                    if (opened.st_ctime_ns, opened.st_nlink) != expected_state:
+                        raise PermissionError("Selected file or aliases changed before deletion.")
+                    os.unlink(selected.name, dir_fd=directory)
+                    # Unlinking one approved name changes the shared inode's change time.
+                    # Bind that known effect before removing its next approved alias.
+                    remaining = os.fstat(descriptor)
+                    removed_alias_states[identity] = (remaining.st_ctime_ns, remaining.st_nlink)
+                finally:
+                    os.close(descriptor)
+            else:
+                os.unlink(selected.name, dir_fd=directory)
 
 
 @tool(
@@ -591,15 +868,24 @@ def list_folder(
 ) -> list[FolderEntry] | Problem:
     """List selected, non-ignored entries in a folder on the local disk."""
     try:
-        folder = Path(path).resolve()
-        if is_path_ignored(folder):
+        requested = Path(path)
+        if not _readable(context, requested, Action.FILESYSTEM_LIST):
+            raise PermissionError("File policy no longer permits listing this folder.")
+        folder = requested.resolve()
+        read_ignore = partial(_read_ignore, context)
+        if is_path_ignored(folder, read_ignore=read_ignore):
             return Problem(
                 code="filesystem.path_ignored",
                 title="Folder cannot be listed",
                 detail=f"Path '{path}' is ignored.",
                 operation="list_folder",
             )
-        entries = iter_visible_paths(folder, recursive)
+        entries = iter_visible_paths(
+            folder,
+            recursive,
+            read_ignore=read_ignore,
+            allowed=lambda entry: _readable(context, entry, Action.FILESYSTEM_LIST),
+        )
         result = sorted(
             (
                 FolderEntry(
@@ -612,6 +898,8 @@ def list_folder(
             ),
             key=lambda entry: entry["path"],
         )
+        if not _readable(context, requested, Action.FILESYSTEM_LIST):
+            raise PermissionError("File policy no longer permits listing this folder.")
         context.observe_directory(folder)
         return result
     except Exception as exc:  # noqa: BLE001  # pylint: disable=broad-except
@@ -654,7 +942,8 @@ def read_text_file(
         int | None,
         Field(
             description="Byte offset from next_start_byte when a line is split. "
-            "For line-based reads, use JSON null (unquoted).",
+            "For line-based reads, use JSON null (unquoted). With a later starting line, "
+            "a zero byte offset selects the line.",
             ge=0,
         ),
         BeforeValidator(normalize_optional_null),
@@ -681,18 +970,21 @@ def read_text_file(
     """Read a bounded UTF-8 text range with its complete source version."""
     try:
         file_path = Path(path)
-        result = FileContentResult(
-            path=path,
-            **read_bounded_text(
-                file_path,
-                start_byte=start_byte,
-                start_line=None if start_byte is not None and start_line == 1 else start_line,
-                max_lines=max_lines,
-                max_bytes=max_bytes,
-                preserve_line_boundaries=True,
-                include_version=True,
-            ),
-        )
+        with os.fdopen(_open_read(context, file_path), "rb") as stream:
+            result = FileContentResult(
+                path=path,
+                **read_bounded_text_stream(
+                    stream,
+                    start_byte=start_byte,
+                    start_line=None if start_byte is not None and start_line == 1 else start_line,
+                    max_lines=max_lines,
+                    max_bytes=max_bytes,
+                    preserve_line_boundaries=True,
+                    include_version=True,
+                ),
+            )
+        if not _readable(context, file_path):
+            raise PermissionError("File policy changed while reading.")
         context.record_file_read(file_path, result["version"])
         context.observe_file(path)
         return result
@@ -779,8 +1071,12 @@ def search_text(
 ) -> TextSearchResult | Problem:
     """Search bounded text matches in a file or folder on the local disk."""
     try:
-        target = Path(path).resolve()
-        if is_path_ignored(target):
+        requested = Path(path)
+        if not _readable(context, requested):
+            raise PermissionError("File policy no longer permits searching this path.")
+        target = requested.resolve()
+        read_ignore = partial(_read_ignore, context)
+        if is_path_ignored(target, read_ignore=read_ignore):
             return Problem(
                 code="filesystem.path_ignored",
                 title="Path cannot be searched",
@@ -789,13 +1085,18 @@ def search_text(
             )
         if target.is_file():
             root = target.parent
-            candidates = [] if is_binary_file(target) else [target]
+            candidates = [target]
         elif target.is_dir():
             root = target
             candidates = [
                 entry
-                for entry in iter_visible_paths(target, True)
-                if entry.is_file() and not entry.is_symlink() and not is_binary_file(entry)
+                for entry in iter_visible_paths(
+                    target,
+                    True,
+                    read_ignore=read_ignore,
+                    allowed=lambda candidate: _readable(context, candidate),
+                )
+                if entry.is_file() and not entry.is_symlink()
             ]
         else:
             return Problem(
@@ -804,7 +1105,11 @@ def search_text(
                 detail=f"Path '{path}' is not an existing file or folder.",
                 operation="search_text",
             )
-        candidates = list(filter_paths_by_globs(candidates, root, include))
+        candidates = [
+            entry
+            for entry in filter_paths_by_globs(candidates, root, include)
+            if _searchable(context, entry)
+        ]
         matches, truncated = search_text_paths(
             candidates,
             query,
@@ -814,12 +1119,15 @@ def search_text(
             context_lines=context_lines,
             max_results=max_results,
             max_bytes=max_bytes,
+            opener=lambda path: _open_read(context, path),
             native_runner=(
                 context.execution_service.run_trusted_search
                 if context.execution_service is not None
                 else None
             ),
         )
+        if not _readable(context, requested):
+            raise PermissionError("File policy no longer permits searching this path.")
         if target.is_dir():
             context.observe_directory(target)
         else:
@@ -871,12 +1179,16 @@ def write_text_file(
         planned = operation.target if operation is not None else None
         if not isinstance(planned, FileTarget) or planned.expected_exists is None:
             raise RuntimeError("Authorized file-state precondition is missing.")
+        if denial := _mutation_denial(context):
+            return denial
         write_text_atomically(
             Path(planned.path),
             content,
             expected_digest=planned.expected_digest if planned.expected_exists else None,
             expected_device=planned.expected_device,
             expected_inode=planned.expected_inode,
+            expected_ctime_ns=planned.expected_ctime_ns,
+            expected_link_count=planned.expected_link_count,
             expected_mode=planned.expected_mode,
             expected_parent_device=planned.expected_parent_device,
             expected_parent_inode=planned.expected_parent_inode,
@@ -929,10 +1241,21 @@ def edit_text_file(
             raise RuntimeError("Authorized file-state precondition is missing.")
         if planned.expected_digest is None:
             raise RuntimeError("Approved edit content is missing.")
+        if denial := _mutation_denial(context):
+            return denial
         target = Path(planned.path)
         if not _matches_target(target, planned):
             raise RuntimeError("The target changed after approval; replacement was cancelled.")
-        current_bytes = target.read_bytes()
+        _, current_bytes = _read_regular_entry(
+            target,
+            ".",
+            (
+                planned.expected_device,
+                planned.expected_inode,
+                planned.expected_ctime_ns,
+                planned.expected_link_count,
+            ),
+        )
         updated, replacement_count = _edited_content(
             current_bytes.decode("utf-8"), old_content, new_content, replace_all
         )
@@ -942,6 +1265,8 @@ def edit_text_file(
             expected_digest=planned.expected_digest,
             expected_device=planned.expected_device,
             expected_inode=planned.expected_inode,
+            expected_ctime_ns=planned.expected_ctime_ns,
+            expected_link_count=planned.expected_link_count,
             expected_mode=planned.expected_mode,
             expected_parent_device=planned.expected_parent_device,
             expected_parent_inode=planned.expected_parent_inode,
@@ -990,19 +1315,17 @@ def delete_path(
             or planned.expected_kind is None
         ):
             raise RuntimeError("Authorized deletion capability is missing.")
+        if denial := _mutation_denial(context):
+            return denial
         target = Path(planned.path)
         if planned.recursive:
-            if (
-                not shutil.rmtree.avoids_symlink_attacks
-                or planned.expected_kind != "directory"
-                or not _matches_manifest(target, planned)
-            ):
+            if planned.expected_kind != "directory" or not _matches_manifest(target, planned):
                 raise RuntimeError("The target changed after approval; deletion was cancelled.")
-            shutil.rmtree(target)
+            _delete_selected(target, planned)
         elif planned.expected_kind in {"file", "symlink"}:
             if not _matches_target(target, planned):
                 raise RuntimeError("The target changed after approval; deletion was cancelled.")
-            target.unlink()
+            _delete_selected(target, planned)
             context.record_file_removal(target)
         else:
             raise RuntimeError("Authorized deletion capability has an unsupported target kind.")

@@ -382,6 +382,8 @@ def test_install_reviewed_refuses_a_different_retained_reservation(administrator
 def test_install_reviewed_cleans_recorded_partial_state(administrator, monkeypatch):
     """Install checks the reviewed original record and removes it before staging."""
     administrator.mkdir(parents=True)
+    administrator.parent.chmod(0o755)
+    administrator.chmod(0o755)
     record = administrator / "management.json"
     entry = administrator / "loop_uninstall.py"
     record.write_bytes(b"record")
@@ -517,6 +519,8 @@ def test_install_reviewed_refuses_changed_fixed_authority(administrator, monkeyp
         )
     elif case in {"inventory", "lock", "writable"}:
         administrator.mkdir(parents=True)
+        administrator.parent.chmod(0o755)
+        administrator.chmod(0o755)
         if case == "inventory":
             (administrator / "unknown").write_bytes(b"x")
         else:

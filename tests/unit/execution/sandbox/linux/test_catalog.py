@@ -1,6 +1,7 @@
 """Verify packaged isolated runtime assembly, closed policy and exact helper byte authority."""
 
 import importlib.util
+import tomllib
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -46,6 +47,9 @@ def test_catalog_uses_distribution_resources_and_authenticated_helper(helper):
     assert b"def exchange_request" in catalog["loop/execution/sandbox/linux/transport.py"]
     assert b"def from_wire" in catalog["loop/execution/sandbox/contracts.py"]
     assert b"protected_workspace_paths" in catalog["loop/permissions/protection.py"]
+    assert "loop/sandbox_catalog.py" in catalog
+    paths = tomllib.loads(catalog["loop/execution/sandbox/linux/policy.toml"].decode("utf-8"))
+    assert "/usr" in paths["system"]
     assert b"execute_installed_request(\n" in catalog["loop_receiver.py"]
     assert b'entry.parent / "management.json", payload, connection' in catalog["loop_receiver.py"]
     assert b"def compile_payload" in catalog["loop/execution/sandbox/linux/compiler.py"]

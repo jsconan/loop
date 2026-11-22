@@ -33,7 +33,10 @@ import pytest
 from packaging.requirements import Requirement
 
 from loop import (
+    Action,
     ApprovalChoice,
+    Decision,
+    PermissionConfiguration,
     PermissionManager,
     PolicyScope,
     RuntimeEnvironment,
@@ -54,7 +57,6 @@ from loop.execution.sandbox import (
     SandboxRequest,
     select_sandbox_backend,
 )
-from loop.execution.sandbox.constants import CPYTHON_EXECUTABLE_NAME
 from loop.execution.sandbox.contracts import CommandProcessResult
 from loop.execution.sandbox.linux.backend import LinuxNativeBackend
 from loop.execution.sandbox.linux.catalog import runtime_catalog
@@ -76,6 +78,7 @@ from loop.execution.sandbox.linux.policy import payload_profile
 from loop.execution.sandbox.linux.records import read_generation
 from loop.execution.sandbox.linux.runtime import execution_authority
 from loop.instructions import InstructionsManager, Skill, SkillManager
+from loop.permissions import PolicyLimits, SandboxPathAccess
 from loop.permissions.audit import SQLitePermissionAudit
 from loop.permissions.protection import PRIVATE_READ_COMPONENTS
 from loop.tooling import ToolRegistration, ToolRuntimeSettings
@@ -91,7 +94,7 @@ from loop.tools.system import (
 )
 from loop.utils import VirtualPath
 from loop.utils.content import encode_content_cursor
-from loop.utils.yaml import load_yaml
+from loop.utils.yaml import dump_yaml, load_yaml
 
 _ALIAS_DIRECTORY = os.environ.get("LOOP_NATIVE_SOCKET_ALIAS_DIRECTORY")
 _ALTERNATIVE_CANARY = os.environ.get("LOOP_NATIVE_ALTERNATIVE_CANARY")
@@ -101,6 +104,7 @@ _INNER_ADVERSARIAL_OPT_IN = (
     os.environ.get("LOOP_NATIVE_INNER_ADVERSARIAL_TEST") == "disposable-linux-host"
 )
 _RUNTIME_FIXTURE = os.environ.get("LOOP_NATIVE_RUNTIME_FIXTURE")
+CPYTHON_EXECUTABLE_NAME = "python"
 _RUNTIME_FIXTURE_MARKER = b"Loop private-runtime qualification fixture v1\n"
 _QUALIFICATION_UV = shutil.which("uv")
 _SYSTEM_MAKE = shutil.which("make", path=os.defpath)
@@ -162,7 +166,9 @@ class Interaction:
             self.retarget = None
             link.unlink()
             link.symlink_to(target)
-        return ApprovalChoice.ONCE if message == "Proceed?" else "approve"
+        if message == "Proceed?":
+            return next(key for key, index in kwargs["index"].items() if index == "Y")
+        return "approve"
 
     def info(self, message):
         """Accept the permission service's informational text."""
@@ -205,7 +211,6 @@ def test_yolo_scoped_external_read_uses_installed_sandbox_without_saved_grant(
         {
             "command": f"cat {shlex.quote(str(canary))}",
             "cwd": str(workspace),
-            "read_only": True,
             "read_roots": [str(outside)],
         }
     )
@@ -414,10 +419,11 @@ def invoke_tools(
     scratch_path=None,
     session_owner=None,
     retarget=None,
-    disable_runtime_discovery=False,
     skill_root=None,
     allow_general_network=False,
     deny_local_network=False,
+    sandbox_environment=None,
+    sandbox_path_aliases=(),
 ):
     """Run public tool calls in one isolated process with the installed native receiver."""
     interaction, workspace, _ = public
@@ -450,10 +456,11 @@ def invoke_tools(
                 "session_id": session_id,
                 "session_workspace_id": session_workspace_id,
                 "retarget": [str(path) for path in retarget] if retarget is not None else None,
-                "disable_runtime_discovery": disable_runtime_discovery,
                 "skill_root": str(skill_root) if skill_root is not None else None,
                 "allow_general_network": allow_general_network,
                 "deny_local_network": deny_local_network,
+                "sandbox_environment": sandbox_environment or {},
+                "sandbox_path_aliases": sandbox_path_aliases,
             }
         ),
         capture_output=True,
@@ -524,7 +531,6 @@ def invoke_registered(
     *,
     model_paths=False,
     deny_sandbox=False,
-    disable_runtime_discovery=False,
 ):
     """Call registered native tools together so opaque grants stay bound to one service."""
     interaction, workspace, generation, audit_path = public_registry
@@ -535,7 +541,6 @@ def invoke_registered(
         workspace_id="native-public-review",
         model_paths=model_paths,
         deny_sandbox=deny_sandbox,
-        disable_runtime_discovery=disable_runtime_discovery,
     )
 
 
@@ -560,11 +565,6 @@ def native_request(
 def public_client():
     """Run registered public calls with authenticated native authority and no host fallback."""
     value = json.loads(sys.stdin.read())
-    if value.get("disable_runtime_discovery"):
-        from loop.execution import facade
-
-        facade.discover_workspace_runtimes = lambda *_args: ()
-        facade.discover_workspace_interpreters = lambda *_args: ()
     backend = LinuxNativeBackend()
     failure = backend.capability_failure()
     assert failure is None, failure
@@ -583,6 +583,8 @@ def public_client():
         configuration_path=value["configuration_path"],
         **permission_manager_arguments,
     )
+    # These cases isolate resource approvals; application-storage checks exercise default ask.
+    permissions.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW, scope=PolicyScope.SESSION)
     command_sessions = (
         SessionManager(
             interaction=interaction,
@@ -646,6 +648,8 @@ def public_client():
         permission_manager=permissions,
         execution_service=CommandExecutionService(backend, RefusingHost()),
         settings=ToolRuntimeSettings(
+            sandbox_environment=value["sandbox_environment"],
+            sandbox_path_aliases=tuple(value["sandbox_path_aliases"]),
             command_default_initial_wait_seconds=value.get("initial_wait")
             if value.get("initial_wait") is not None
             else value.get("seconds", 2),
@@ -916,7 +920,6 @@ def test_public_virtual_commands_reuse_policy_and_keep_protected_paths(public, n
         "arguments": {
             "command": 'cat "$WORKSPACE_ROOT/ordinary"; printf "%s" "$WORKSPACE_ROOT"',
             "cwd": "$WORKSPACE_ROOT",
-            "read_only": True,
         },
     }
     (first,) = invoke_tools(public, [call], model_paths=True)
@@ -938,7 +941,6 @@ def test_public_virtual_commands_reuse_policy_and_keep_protected_paths(public, n
                 "arguments": {
                     "command": 'cat "$WORKSPACE_ROOT/.ssh/key"; cat ../loop-native-test-outside/secret',
                     "cwd": "$WORKSPACE_ROOT",
-                    "read_only": True,
                 },
             },
             {
@@ -1051,7 +1053,10 @@ def test_public_timeout_preserves_both_streams_and_descendant_cleanup(public):
         "pid=os.fork();os.setsid() if pid==0 else None;time.sleep(30)"
     )
     started = time.monotonic()
-    result = invoke(public, source, read_only=True)
+    result = invoke(
+        public,
+        source,
+    )
     elapsed = time.monotonic() - started
     assert result["problem"]["code"] == "sandbox.timed_out"
     metadata = result["problem"]["metadata"]
@@ -1170,6 +1175,7 @@ def test_public_command_hard_deadline_after_continuation(public):
             "arguments": {
                 "command": "printf x >> deadline-count; printf ready; sleep 20",
                 "cwd": str(workspace),
+                "write_roots": [str(workspace)],
                 "wait_seconds": 0,
             },
         }
@@ -1203,7 +1209,10 @@ def test_public_process_created_inner_pty_is_private(public):
         "import os; master, slave = os.openpty(); "
         "print(os.isatty(slave), os.ttyname(slave)); os.close(master); os.close(slave)"
     )
-    result = invoke(public, command, read_only=True)
+    result = invoke(
+        public,
+        command,
+    )
     assert result["ok"], result
     assert result["result"]["stdout"]["content"].startswith("True /dev/pts/")
     require_drained(public[2])
@@ -1260,7 +1269,16 @@ def test_public_inner_seccomp_restricts_children_without_losing_outer_boundary(
         )
         result = invoke_tools(
             public,
-            [{"tool": "run_command", "arguments": {"command": command, "cwd": str(workspace)}}],
+            [
+                {
+                    "tool": "run_command",
+                    "arguments": {
+                        "command": command,
+                        "cwd": str(workspace),
+                        "write_roots": [str(workspace)],
+                    },
+                }
+            ],
             seconds=30,
         )[0]
     assert result["ok"] and result["result"]["exit_code"] == 0, json.dumps(result, indent=2)
@@ -1322,7 +1340,10 @@ def test_public_attempt_private_loopback(public):
         "peer,_=server.accept(); client.sendall(b'local-ok'); "
         "print(peer.recv(8).decode()); peer.close(); client.close(); server.close()"
     )
-    result = invoke(public, "/usr/bin/python3 -I -c " + shlex.quote(source), read_only=True)
+    result = invoke(
+        public,
+        "/usr/bin/python3 -I -c " + shlex.quote(source),
+    )
     assert result["ok"] and result["result"]["stdout"]["content"] == "local-ok\n", result
     require_drained(public[2])
 
@@ -1370,7 +1391,10 @@ except OSError as error:
     checks["unix-path-and-abstract"] = error.errno == errno.EPERM
 print(json.dumps(checks, sort_keys=True))
 """
-        result = invoke(public, "/usr/bin/python3 -I -c " + shlex.quote(source), read_only=True)
+        result = invoke(
+            public,
+            "/usr/bin/python3 -I -c " + shlex.quote(source),
+        )
     assert result["ok"], result
     checks = json.loads(result["result"]["stdout"]["content"])
     assert all(checks.values()), checks
@@ -1394,7 +1418,6 @@ def test_user_local_network_deny_blocks_addressable_sockets(public):
     result = invoke(
         public,
         "/usr/bin/python3 -I -c " + shlex.quote(source),
-        read_only=True,
         deny_local_network=True,
     )
     assert result["ok"], result
@@ -1745,6 +1768,7 @@ def test_public_terminal_cannot_inject_into_another_live_session(public):
             "arguments": {
                 "command": "/usr/bin/python3 -u -I -c " + shlex.quote(first_script),
                 "cwd": str(workspace),
+                "write_roots": [str(workspace)],
                 "interactive": True,
             },
         },
@@ -1921,6 +1945,7 @@ def test_public_command_default_wait_continues_same_process(public):
             "arguments": {
                 "command": "printf x >> continuation-count; sleep 1; printf finished",
                 "cwd": str(workspace),
+                "write_roots": [str(workspace)],
             },
         },
         {
@@ -1977,7 +2002,7 @@ def test_public_terminal_continues_same_process_past_old_deadline(public):
             }
         )
     started = time.monotonic()
-    results = invoke_tools(public, calls, seconds=70)
+    results = invoke_tools(public, calls, seconds=70, initial_wait=0.1)
     assert time.monotonic() - started >= 60
     assert all(item["ok"] for item in results), results
     output = "".join(event["content"] for item in results[2:] for event in item["result"]["events"])
@@ -1994,12 +2019,21 @@ def test_public_terminal_continues_same_process_past_old_deadline(public):
 def test_public_command_continues_past_previous_default_deadline(public, noisy):
     """One installed command completes after five minutes without replay."""
     _interaction, workspace, generation = public
-    command = "printf x >> count; " + ("printf begin; " if noisy else "") + "sleep 301; printf end"
+    command = (
+        "set -e; printf x >> count; "
+        + ("printf begin; " if noisy else "")
+        + "sleep 301; printf end"
+    )
 
     calls = [
         {
             "tool": "run_command",
-            "arguments": {"command": command, "cwd": str(workspace), "wait_seconds": 1},
+            "arguments": {
+                "command": command,
+                "cwd": str(workspace),
+                "wait_seconds": 1,
+                "write_roots": [str(workspace)],
+            },
         }
     ]
     for index in range(1, 15):
@@ -2036,7 +2070,7 @@ def test_silent_kernel_denial_is_reported_without_replay(public, exit_code):
         f"printf x >> count; /usr/bin/python3 -c {shlex.quote(script)} "
         f">/dev/null 2>&1; sleep 1; exit {exit_code}"
     )
-    result = invoke(public, source)
+    result = invoke(public, source, write_roots=[str(workspace)])
     logs = subprocess.run(
         [journal, "--no-pager", "--quiet", "--boot", "--dmesg", "--lines=2000", "--output=json"],
         capture_output=True,
@@ -2133,7 +2167,7 @@ def test_effectful_native_denial_is_not_replayed(
         f"then exit 9; fi; printf 'Operation not permitted' >&2; exit {exit_code}"
     )
 
-    result = invoke(public, source)
+    result = invoke(public, source, write_roots=[str(workspace)])
 
     assert result["problem"]["code"] == "process.nonzero_exit", result
     metadata = result["problem"]["metadata"]
@@ -2164,7 +2198,7 @@ def test_effectful_native_denial_is_not_replayed(
 def test_public_external_python_library_runs_from_a_hardlinked_read_root(
     public, public_workspace_root, request, native_directory
 ):
-    """Keep cache-linked library files readable through their approved read-only root."""
+    """Require the complete cache-link view before exposing a linked library through a grant."""
     _workspace_root, _permissions_root, external_root = public_workspace_root
     fixture = native_directory(
         external_root,
@@ -2182,7 +2216,10 @@ def test_public_external_python_library_runs_from_a_hardlinked_read_root(
         + ");import owned_module;print(owned_module.value)"
     )
     command = "/usr/bin/python3 -I -B -c " + shlex.quote(code)
-    accepted = invoke(public, command, read_only=True, read_roots=[str(library)])
+    denied = invoke(public, command, read_roots=[str(library)])
+    assert denied["problem"]["code"] == "sandbox.invalid", denied
+    assert denied["problem"]["metadata"]["sandbox_diagnostics"]["possible_effects"] is False
+    accepted = invoke(public, command, read_roots=[str(fixture)])
     assert accepted["result"]["exit_code"] == 0, accepted
     assert accepted["result"]["stdout"]["content"] == "copied-library\n"
     assert module.stat().st_nlink == 2
@@ -2190,17 +2227,110 @@ def test_public_external_python_library_runs_from_a_hardlinked_read_root(
     require_drained(public[2])
 
 
+@pytest.mark.parametrize("public_workspace_root", ["home"], indirect=True)
+def test_native_approved_cache_link_preserves_workspace_read_and_cache_isolation(
+    installation, public, native_directory
+):
+    """The installed receiver admits a real shared file while keeping its cache inaccessible."""
+    from loop.sandbox_catalog import hardlink_source_paths
+
+    backend, generation = installation
+    assert "shared_dependencies" in backend.backend_options
+    sources = hardlink_source_paths(("shared_dependencies",), "linux")
+    workspace = public[1]
+    scratch = native_directory(Path("/tmp"))
+    fixture = native_directory(sources[0])
+    shared = fixture / "dependency.dat"
+    shared.write_text("cached dependency")
+    (fixture / "sibling").write_text("outside")
+    (workspace / "dependency.dat").hardlink_to(shared)
+    source = (
+        f"test ! -e {shlex.quote(str(fixture / 'sibling'))} || exit 3; "
+        f"test ! -e {shlex.quote(str(shared))} || exit 4; "
+        "if (printf edit > dependency.dat) 2>/dev/null; then exit 5; fi; "
+        "cat dependency.dat && printf done > ordinary-output"
+    )
+    request = native_request(backend, workspace, scratch, source)
+    refused = backend.run(request)
+    assert refused.outcome is SandboxOutcome.INVALID and not refused.possible_effects, refused
+    assert "names outside the verified scope" in refused.detail
+    assert not (workspace / "ordinary-output").exists()
+    approved = replace(
+        request.with_backend_options(("shared_dependencies",), sources), permission_revision=1
+    )
+    result = backend.run(approved)
+    assert result.outcome is SandboxOutcome.COMPLETED and result.exit_code == 0, result.detail
+    assert result.stdout == "cached dependency"
+    assert (workspace / "ordinary-output").read_text() == "done"
+    assert shared.read_text() == "cached dependency" and shared.stat().st_nlink == 2
+    require_drained(generation)
+
+
+def test_public_denied_directory_conceals_links_without_blocking_workspace_commands(
+    public, tmp_path, monkeypatch
+):
+    """A denied directory is concealed even with unaccounted links and a PATH entry."""
+    workspace = public[1]
+    candidate = workspace / "tools" / "retired"
+    packages = candidate / "lib" / "packages"
+    packages.mkdir(parents=True)
+    (candidate / "bin").mkdir()
+    monkeypatch.setenv("PATH", os.pathsep.join((str(candidate / "bin"), os.defpath)))
+    outside = tmp_path / "outside-data"
+    outside.write_text("outside-package-canary")
+    module = packages / "module"
+    module.hardlink_to(outside)
+    (candidate / "old-tool").symlink_to(outside)
+    with monkeypatch.context() as storage:
+        storage.setattr(tempfile, "tempdir", str(tmp_path))
+        permissions = PermissionManager(workspace, configuration_path=public[0].configuration_path)
+    try:
+        assert permissions.update_sandbox_paths(
+            ApprovalChoice.WORKSPACE, {str(candidate): SandboxPathAccess.DENY}
+        )
+    finally:
+        permissions.close()
+    (workspace / "ordinary").write_text("workspace-ok")
+    source = (
+        "set -e; cat ordinary; "
+        'case ":$PATH:" in *:"$WORKSPACE_ROOT/tools/retired/bin":*) exit 7;; esac; '
+        'test ! -e "$WORKSPACE_ROOT/tools/retired/lib/packages/module"; '
+        'test ! -L "$WORKSPACE_ROOT/tools/retired/old-tool"; '
+        'if (printf bad > "$WORKSPACE_ROOT/tools/retired/new") 2>/dev/null; then exit 8; fi; '
+        'if mv "$WORKSPACE_ROOT/tools" "$WORKSPACE_ROOT/displaced" 2>/dev/null; then exit 9; fi; '
+        "printf still-writable > ordinary-output"
+    )
+    result = invoke(public, source, write_roots=[str(workspace)])
+    assert result["ok"], json.dumps(result, indent=2)
+    assert result["result"]["stdout"]["content"] == "workspace-ok"
+    assert (workspace / "ordinary-output").read_text() == "still-writable"
+    assert not (candidate / "new").exists()
+    assert module.stat().st_ino == outside.stat().st_ino
+    assert outside.read_text() == "outside-package-canary"
+    exposed = workspace / "visible-alias"
+    exposed.hardlink_to(outside)
+    try:
+        denied = invoke(public, "printf leaked; cat visible-alias")
+        assert denied["problem"]["code"] == "sandbox.invalid", denied
+        assert denied["problem"]["metadata"]["sandbox_diagnostics"]["possible_effects"] is False
+    finally:
+        exposed.unlink()
+    require_drained(public[2])
+
+
 def test_public_writable_workspace_hardlink_cannot_modify_outside_inode(public, tmp_path):
-    """Writable workspaces can read hardlinked files, but their aliases cannot mutate outside."""
+    """An unaccounted outside inode refuses the whole grant before any shell effects."""
     outside_directory = tmp_path.parent / "outside-hardlink"
     outside_directory.mkdir()
     outside = outside_directory / "outside-canary"
     outside.write_text("preserve-outside")
     alias = public[1] / "outside-alias"
     alias.hardlink_to(outside)
-    result = invoke(public, "printf changed > " + shlex.quote(str(alias)))
-    assert result["problem"]["code"] == "process.nonzero_exit", result
-    assert result["problem"]["metadata"]["stderr"]["content"]
+    result = invoke(
+        public, "printf changed > " + shlex.quote(str(alias)), write_roots=[str(public[1])]
+    )
+    assert result["problem"]["code"] == "sandbox.invalid", result
+    assert result["problem"]["metadata"]["sandbox_diagnostics"]["possible_effects"] is False
     assert outside.read_text() == "preserve-outside"
     assert alias.read_text() == "preserve-outside"
     alias.unlink()
@@ -2220,9 +2350,11 @@ def test_public_ls_runs_with_large_hardlinked_virtualenv(public, native_director
         directory.mkdir(exist_ok=True)
         (directory / source.name).hardlink_to(source)
 
-    listed = invoke(public, "ls .")
+    listed = invoke(public, "ls .", read_roots=[str(cache)], write_roots=[str(public[1])])
     assert listed["result"]["exit_code"] == 0, listed
-    written = invoke(public, "printf allowed > ordinary")
+    written = invoke(
+        public, "printf allowed > ordinary", read_roots=[str(cache)], write_roots=[str(public[1])]
+    )
     assert written["result"]["exit_code"] == 0, written
     assert (public[1] / "ordinary").read_text() == "allowed"
     linked = library / ("0/" if layout == "scattered" else "") / "module-0.py"
@@ -2232,7 +2364,12 @@ def test_public_ls_runs_with_large_hardlinked_virtualenv(public, native_director
         + "); assert p.read_text()=='value = 1\\n'; assert runpy.run_path(str(p))['value']==1;\n"
     )
     code += "for action in (lambda:p.write_text('bad'),lambda:p.chmod(0o600),lambda:p.unlink(),lambda:p.rename(p.with_name('moved'))):\n try: action()\n except OSError as error: assert error.errno in (errno.EPERM,errno.EACCES,errno.EROFS,errno.EBUSY)\n else: raise RuntimeError('linked inode was mutable')\n"
-    verified = invoke(public, "/usr/bin/python3 -I -c " + shlex.quote(code))
+    verified = invoke(
+        public,
+        "/usr/bin/python3 -I -c " + shlex.quote(code),
+        read_roots=[str(cache)],
+        write_roots=[str(public[1])],
+    )
     assert verified["ok"], verified
     assert (cache / "module-0.py").read_text() == "value = 1\n"
     if layout == "scattered":
@@ -2246,6 +2383,7 @@ def test_public_ls_runs_with_large_hardlinked_virtualenv(public, native_director
                     "arguments": {
                         "command": "sleep 1; printf late > deadline-marker",
                         "cwd": str(public[1]),
+                        "read_roots": [str(cache)],
                     },
                 }
             ],
@@ -2295,12 +2433,126 @@ def test_public_read_only_command_can_create_files_in_private_scratch(public):
     )
     command = "/usr/bin/python3 -I -c " + shlex.quote(source)
 
-    result = invoke(public, command, read_only=True)
+    result = invoke(
+        public,
+        command,
+    )
 
     assert result["result"]["exit_code"] == 0, result
     assert result["result"]["stdout"]["content"] == "SCRATCH_WRITE=ok\n"
     assert not public[0].prompts
     require_drained(public[2])
+
+
+def test_public_system_mime_metadata_is_available_read_only(public):
+    """The installed payload can read the exact public MIME table without writing it."""
+    mime_types = Path("/etc/mime.types")
+    if not mime_types.is_file():
+        pytest.skip("The distribution does not provide /etc/mime.types")
+    source = """
+import errno
+import hashlib
+import os
+from pathlib import Path
+
+table = Path('/etc/mime.types')
+print(hashlib.file_digest(table.open('rb'), 'sha256').hexdigest())
+try:
+    descriptor = os.open(table, os.O_WRONLY)
+except OSError as error:
+    assert error.errno in {errno.EACCES, errno.EPERM, errno.EROFS}, error
+else:
+    os.close(descriptor)
+    raise AssertionError('Public MIME table accepted writable access')
+"""
+    with mime_types.open("rb") as table:
+        expected = hashlib.file_digest(table, "sha256").hexdigest()
+    result = invoke(public, "/usr/bin/python3 -I -c " + shlex.quote(source))
+    assert result["ok"], result
+    assert result["result"]["stdout"]["content"].strip() == expected
+    require_drained(public[2])
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_installed_exact_file_scope_preserves_sibling_and_private_denials(
+    installation, native_directory, existing
+):
+    """Exact named writes can create, unlink and replace files without enabling sibling writes."""
+    backend, generation = installation
+    if SandboxCapability.WRITE_FILES not in backend.capabilities:
+        pytest.skip("Refresh the installed receiver to qualify exact file write scopes")
+    workspace = native_directory("/tmp")
+    output = workspace / "output"
+    output.mkdir()
+    scratch = native_directory("/tmp")
+    target = output / ".coverage"
+    staging = output / "staging"
+    neighbor = output / "neighbor"
+    protected = output / ".env"
+    neighbor.write_text("neighbor", encoding="utf-8")
+    protected.write_text("protected", encoding="utf-8")
+    if existing:
+        target.write_text("old", encoding="utf-8")
+    script = """import errno
+import os
+from pathlib import Path
+
+root = Path('output')
+target, staging, neighbor, protected = (
+    root / name for name in ('.coverage', 'staging', 'neighbor', '.env')
+)
+
+def denied(operation):
+    try:
+        operation()
+    except OSError as error:
+        assert error.errno in (errno.EACCES, errno.EPERM, errno.EROFS), error
+        return
+    raise AssertionError('unauthorized operation succeeded')
+
+target.write_text('created or truncated')
+target.unlink()
+target.write_text('recreated')
+staging.write_text('published')
+os.replace(staging, target)
+denied(lambda: neighbor.write_text('wrong'))
+denied(lambda: (root / 'unapproved').write_text('wrong'))
+denied(neighbor.unlink)
+denied(lambda: os.replace(neighbor, target))
+denied(lambda: os.replace(target, neighbor))
+denied(protected.read_text)
+denied(lambda: protected.write_text('wrong'))
+target.unlink()
+denied(lambda: os.link(neighbor, target))
+denied(target.mkdir)
+os.symlink(neighbor.name, target)
+denied(lambda: target.write_text('wrong'))
+target.unlink()
+target.write_text('final')
+"""
+    request = SandboxRequest.create(
+        source="/usr/bin/python3 -IB -c " + shlex.quote(script),
+        cwd=workspace,
+        workspace=workspace,
+        read_roots=(),
+        write_roots=(),
+        write_files=(target, staging),
+        network=False,
+        environment={"PATH": os.defpath, "TMPDIR": str(scratch)},
+        policy_version=backend.policy_version,
+        deadline=time.monotonic() + 20,
+        workspace_id="native-exact-file-write",
+        scratch_root=scratch,
+    )
+
+    result = backend.run(request)
+
+    assert result.outcome is SandboxOutcome.COMPLETED and result.exit_code == 0, result.stderr
+    assert target.read_text(encoding="utf-8") == "final"
+    assert neighbor.read_text(encoding="utf-8") == "neighbor"
+    assert protected.read_text(encoding="utf-8") == "protected"
+    assert not (output / "unapproved").exists()
+    require_drained(generation)
 
 
 @pytest.mark.parametrize("public_workspace_root", ["home"], indirect=True)
@@ -2368,7 +2620,6 @@ def test_public_conventional_temporary_directory_is_session_private(
                         f"printf 'fresh\\n' > {shlex.quote(str(temporary / private_name))}"
                     ),
                     "cwd": VirtualPath.WORKSPACE,
-                    "read_only": True,
                 },
             }
         ],
@@ -2392,7 +2643,6 @@ def test_public_conventional_temporary_directory_is_session_private(
                         f"printf other-session > {shlex.quote(str(report))}"
                     ),
                     "cwd": VirtualPath.WORKSPACE,
-                    "read_only": True,
                 },
             }
         ],
@@ -2431,7 +2681,6 @@ def test_public_conventional_temporary_directory_is_session_private(
                         'printf "%s" "$value"'
                     ),
                     "cwd": VirtualPath.WORKSPACE,
-                    "read_only": True,
                 },
             },
             {"tool": "read_text_file", "arguments": {"path": child}},
@@ -2457,7 +2706,6 @@ def test_public_conventional_temporary_directory_is_session_private(
                     "arguments": {
                         "command": f"printf unsafe > {shlex.quote(str(temporary / injected_link.name))}",
                         "cwd": VirtualPath.WORKSPACE,
-                        "read_only": True,
                     },
                 }
             ],
@@ -2497,6 +2745,7 @@ def test_public_conventional_temporary_preserves_overlapping_workspace(public, n
                         "then exit 9; fi; printf overlap-ok"
                     ),
                     "cwd": VirtualPath.WORKSPACE,
+                    "write_roots": [str(workspace)],
                 },
             }
         ],
@@ -2535,7 +2784,16 @@ def test_nested_workspace_uses_real_scratch_mirror_without_broadening_access(pub
 
     (result,) = invoke_tools(
         public,
-        [{"tool": "run_command", "arguments": {"command": command, "cwd": VirtualPath.WORKSPACE}}],
+        [
+            {
+                "tool": "run_command",
+                "arguments": {
+                    "command": command,
+                    "cwd": VirtualPath.WORKSPACE,
+                    "write_roots": [VirtualPath.WORKSPACE],
+                },
+            }
+        ],
         permission_workspace=project,
         scratch_path=scratch,
         model_paths=True,
@@ -2604,7 +2862,6 @@ def test_bound_session_scratch_works_without_global_temporary_directories(public
                 "arguments": {
                     "command": '/bin/sh "$TMPDIR/probe.sh"',
                     "cwd": "$WORKSPACE_ROOT",
-                    "read_only": True,
                 },
             },
             {"tool": "read_text_file", "arguments": {"path": "$TMPDIR/report.txt"}},
@@ -2632,9 +2889,14 @@ def test_public_writable_command_cannot_change_policy_coordination_files(public)
     ]
     for target in targets:
         target.write_text("preserve-policy-canary", encoding="utf-8")
-    commands = [("printf changed > " + shlex.quote(str(target)), {}) for target in targets]
-    commands += [("rm " + shlex.quote(str(target)), {}) for target in targets]
-    commands.append(("printf writable > ordinary", {}))
+    commands = [
+        ("printf changed > " + shlex.quote(str(target)), {"write_roots": [str(public[1])]})
+        for target in targets
+    ]
+    commands += [
+        ("rm " + shlex.quote(str(target)), {"write_roots": [str(public[1])]}) for target in targets
+    ]
+    commands.append(("printf writable > ordinary", {"write_roots": [str(public[1])]}))
 
     results = invoke_many(public, commands)
 
@@ -2660,9 +2922,10 @@ def test_public_writable_command_cannot_change_private_workspace_entries(public)
         created = directory / "new-entry"
         targets.append((component, existing, created))
         calls.extend(
-            ("printf changed > " + shlex.quote(str(target)), {}) for target in (existing, created)
+            ("printf changed > " + shlex.quote(str(target)), {"write_roots": [str(public[1])]})
+            for target in (existing, created)
         )
-    calls.append(("printf writable > ordinary", {}))
+    calls.append(("printf writable > ordinary", {"write_roots": [str(public[1])]}))
 
     results = invoke_many(public, calls)
     for result in results[:-1]:
@@ -2681,11 +2944,9 @@ def test_public_runtime_roots_deny_private_data_and_executables(public, private_
     """System runtime reads do not expose private components or execute their contents."""
     root = private_runtime_fixture
     relatives = (".ssh/key", "nested/.AWS/key", ".config/key", ".loop/key", "Library/key")
-    calls = [
-        ("cat " + shlex.quote(str(root / relative)), {"read_only": True}) for relative in relatives
-    ]
-    calls.append((shlex.quote(str(root / ".ssh/probe")), {"read_only": True}))
-    calls.append(("cat " + shlex.quote(str(root / "neighbor")), {"read_only": True}))
+    calls = [("cat " + shlex.quote(str(root / relative)), {}) for relative in relatives]
+    calls.append((shlex.quote(str(root / ".ssh/probe")), {}))
+    calls.append(("cat " + shlex.quote(str(root / "neighbor")), {}))
 
     results = invoke_many(public, calls)
 
@@ -2707,11 +2968,11 @@ def test_public_session_scratch_denies_new_private_names(public):
                 f'printf fixture > "$TMPDIR/nested/{component}/key"; '
                 f'cat "$TMPDIR/nested/{component}/key"'
             ),
-            {"read_only": True},
+            {},
         )
         for component in (".ssh", ".AWS", ".config", ".loop", "Library")
     ]
-    calls.append(('printf ordinary > "$TMPDIR/result"; cat "$TMPDIR/result"', {"read_only": True}))
+    calls.append(('printf ordinary > "$TMPDIR/result"; cat "$TMPDIR/result"', {}))
     results = invoke_many(public, calls)
     for result in results[:-1]:
         assert result["problem"]["code"] == "process.nonzero_exit", result
@@ -2727,7 +2988,10 @@ def test_public_private_reads_are_case_insensitive_at_every_depth(public, relati
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text("private-read-canary", encoding="utf-8")
 
-    result = invoke(public, "cat " + shlex.quote(relative), read_only=True)
+    result = invoke(
+        public,
+        "cat " + shlex.quote(relative),
+    )
 
     assert result["problem"]["code"] == "process.nonzero_exit", result
     assert "private-read-canary" not in json.dumps(result)
@@ -2764,9 +3028,12 @@ def test_public_git_write_grants_only_top_level_metadata(public, mode):
     }
     results = invoke_many(
         public,
-        [(allowed, {"git_write": True})]
+        [(allowed, {"git_write": True, "write_roots": [str(workspace)]})]
         + [
-            ("printf changed > " + shlex.quote(relative), {"git_write": True})
+            (
+                "printf changed > " + shlex.quote(relative),
+                {"git_write": True, "write_roots": [str(workspace)]},
+            )
             for relative in controls
         ],
         permission_workspace=workspace,
@@ -2795,7 +3062,7 @@ def test_public_git_write_grants_only_top_level_metadata(public, mode):
         (True, ".venv", False, False, "project-scratch"),
         (True, "chosen-environment", False, False, "project"),
         (True, "chosen env's", False, False, "project"),
-        (True, ".venv", True, False, "project"),
+        (True, ".venv", True, False, "direct"),
         (True, ".venv", False, True, "project"),
         (False, ".venv", False, False, "direct"),
         (True, ".venv", False, False, "direct"),
@@ -2807,7 +3074,7 @@ def test_public_git_write_grants_only_top_level_metadata(public, mode):
         (True, ".venv", False, False, "standard-direct"),
     ],
 )
-def test_public_workspace_runtime_is_prepared_in_original_call(
+def test_public_workspace_runtime_is_available_through_approved_scope(
     public_registry,
     public_workspace_root,
     request,
@@ -2819,7 +3086,7 @@ def test_public_workspace_runtime_is_prepared_in_original_call(
     synchronize,
     selection,
 ):
-    """A selected workspace runtime works off PATH after scoped approval."""
+    """A selected runtime works under explicit authority through direct and opaque commands."""
     if (_QUALIFICATION_UV is None and selection != "script-virtual") or _SYSTEM_SH is None:
         pytest.skip("The qualification runner and system shell are required")
     configuration = Path(sys.prefix) / "pyvenv.cfg"
@@ -2883,7 +3150,10 @@ def test_public_workspace_runtime_is_prepared_in_original_call(
             pytest.skip("The qualification environment has no supported version metadata")
         version = ".".join(parts[:2])
         (workspace / ".python-version").write_text(version + "\n", encoding="utf-8")
-        project += f'requires-python = ">={version}"\n[tool.uv]\nexclude-newer = "7 days"\n'
+        project += (
+            f'requires-python = ">={version},<4.0"\n'
+            '[tool.uv]\nexclude-newer = "7 days"\noverride-dependencies = []\n'
+        )
     (workspace / "pyproject.toml").write_text(project, encoding="utf-8")
     program = (
         "import os,pathlib,sys\n"
@@ -2960,47 +3230,54 @@ def test_public_workspace_runtime_is_prepared_in_original_call(
         }
         else command + shlex.quote(program),
         "cwd": VirtualPath.WORKSPACE,
-        "read_only": not synchronize
-        and selection not in {"project-no-bytecode", "project-cd", "project-scratch"},
+        "write_roots": [str(workspace)]
+        if synchronize or selection in {"project-no-bytecode", "project-cd", "project-scratch"}
+        else [],
     }
     assert interaction.configuration_path is not None
     marker = Path(interaction.session_manager.temporary_directory) / "entered"
-    if not prepared:
+    if not prepared and selection != "script":
         (prior,) = invoke_registered(
             public_registry,
             [{"tool": "run_command", "arguments": arguments}],
             model_paths=True,
-            disable_runtime_discovery=True,
         )
         assert prior["problem"]["code"] == "process.nonzero_exit", json.dumps(prior, indent=2)
-        assert len(interaction.prompts) == int(selection != "project")
         assert (commands / "python").resolve(strict=True) == interpreter
         assert canary.read_text(encoding="utf-8") == "outside-canary"
         assert secret.read_text(encoding="utf-8") == "private-canary"
         require_drained(generation)
         return
+    if prepared:
+        arguments["read_roots"] = [str(runtime)]
+    aliases = (str(home.parent),) if home.parent.is_symlink() else ()
     if retarget:
         (stale,) = invoke_tools(
             (interaction, workspace, generation),
             [{"tool": "run_command", "arguments": arguments}],
             model_paths=True,
             retarget=(commands / "python", Path(_SYSTEM_SH)),
+            sandbox_path_aliases=aliases,
         )
         assert stale["problem"]["code"] == "sandbox.stale", stale
         assert len(interaction.prompts) == 1
         assert not marker.exists()
         require_drained(generation)
         return
-    (denied,) = invoke_registered(
-        public_registry,
+    (denied,) = invoke_tools(
+        (interaction, workspace, generation),
         [{"tool": "run_command", "arguments": arguments}],
         model_paths=True,
         deny_sandbox=True,
+        sandbox_path_aliases=aliases,
     )
     assert denied["problem"]["code"] == "tool.denied", denied
     assert not marker.exists()
-    (allowed,) = invoke_registered(
-        public_registry, [{"tool": "run_command", "arguments": arguments}], model_paths=True
+    (allowed,) = invoke_tools(
+        (interaction, workspace, generation),
+        [{"tool": "run_command", "arguments": arguments}],
+        model_paths=True,
+        sandbox_path_aliases=aliases,
     )
     assert allowed["ok"], json.dumps(allowed, indent=2)
     assert allowed["result"]["stdout"]["content"].splitlines() == [
@@ -3057,14 +3334,16 @@ def test_piped_make_prepares_its_selected_tool(public, monkeypatch):
         model_paths=True,
         seconds=20,
     )
-    assert result["ok"], result
+    assert result["ok"], json.dumps({"result": result, "scope": interaction.infos})
     assert "uv " in result["result"]["stdout"]["content"]
     assert not denied["ok"] and "private-canary" not in json.dumps(denied)
     assert interaction.prompts
     require_drained(generation)
 
 
-def test_public_uv_runs_a_workspace_virtualenv_with_its_user_local_runtime(public, monkeypatch):
+def test_public_uv_runs_a_workspace_virtualenv_with_its_user_local_runtime(
+    public, monkeypatch, native_directory, tmp_path
+):
     """Run approved tools, nested session storage and pytest through the installed sandbox."""
     uv = _QUALIFICATION_UV
     if uv is None or _SYSTEM_SH is None:
@@ -3206,7 +3485,6 @@ def test_public_uv_runs_a_workspace_virtualenv_with_its_user_local_runtime(publi
                 "arguments": {
                     "command": f"test ! -e {shlex.quote(str(interpreter))} && printf hidden",
                     "cwd": "$WORKSPACE_ROOT",
-                    "read_only": True,
                 },
             }
         ],
@@ -3215,7 +3493,7 @@ def test_public_uv_runs_a_workspace_virtualenv_with_its_user_local_runtime(publi
     assert without_runtime["ok"] and without_runtime["result"]["stdout"]["content"] == "hidden"
     assert not interaction.prompts
 
-    (automatic,) = invoke_tools(
+    (approved_runtime,) = invoke_tools(
         public,
         [
             {
@@ -3226,20 +3504,88 @@ def test_public_uv_runs_a_workspace_virtualenv_with_its_user_local_runtime(publi
                         "--no-cache run --no-sync pytest -p no:cacheprovider -q test_sample.py 2>&1"
                     ),
                     "cwd": "$WORKSPACE_ROOT",
-                    "read_only": True,
+                    "read_roots": [str(runtime_root)],
                 },
             }
         ],
         model_paths=True,
         seconds=30,
     )
-    assert automatic["ok"], (
-        json.dumps(automatic, indent=2),
+    assert approved_runtime["ok"], (
+        json.dumps(approved_runtime, indent=2),
         interaction.infos,
         interaction.prompts,
     )
-    assert "2 passed" in automatic["result"]["stdout"]["content"]
+    assert "2 passed" in approved_runtime["result"]["stdout"]["content"]
     assert any(str(runtime_root) in message for message in interaction.infos)
+
+    prepared = workspace / "prepared-environment"
+    (prepared / "bin").mkdir(parents=True)
+    (prepared / "bin" / CPYTHON_EXECUTABLE_NAME).symlink_to(interpreter)
+    shutil.copyfile(venv_bin.parent / "pyvenv.cfg", prepared / "pyvenv.cfg")
+    shutil.copytree(venv_bin.parent / "lib", prepared / "lib")
+    prepared_pytest = prepared / "bin/pytest"
+    prepared_pytest.write_text(
+        pytest_entry.read_text(encoding="utf-8").replace(str(venv_bin), str(prepared / "bin")),
+        encoding="utf-8",
+    )
+    prepared_pytest.chmod(0o755)
+    outside = native_directory(workspace.parent, name="loop-native-test-outside-runtime")
+    outside_file = outside / "unapproved-library"
+    outside_file.write_text("outside-runtime-canary", encoding="utf-8")
+    unsafe_file = venv_bin.parent / "lib" / outside_file.name
+    os.link(outside_file, unsafe_file)
+    with monkeypatch.context() as storage:
+        storage.setattr(tempfile, "tempdir", str(tmp_path))
+        permissions = PermissionManager(
+            workspace, configuration_path=interaction.configuration_path
+        )
+    try:
+        permissions.update_sandbox_paths(
+            ApprovalChoice.WORKSPACE, {str(venv_bin.parent): SandboxPathAccess.DENY}
+        )
+        (prepared_run, concealed) = invoke_tools(
+            public,
+            [
+                {
+                    "tool": "run_command",
+                    "arguments": {
+                        "command": (
+                            f'cd "$WORKSPACE_ROOT"; {runner} '
+                            "run --no-cache pytest -p no:cacheprovider -q test_sample.py 2>&1"
+                        ),
+                        "cwd": "$WORKSPACE_ROOT",
+                        "read_roots": [str(runtime_root)],
+                    },
+                },
+                {
+                    "tool": "run_command",
+                    "arguments": {
+                        "command": (
+                            f"test ! -e {shlex.quote(str(unsafe_file))} && printf concealed"
+                        ),
+                        "cwd": "$WORKSPACE_ROOT",
+                    },
+                },
+            ],
+            model_paths=True,
+            seconds=30,
+            sandbox_environment={
+                "PATH": os.pathsep.join((str(prepared / "bin"), str(venv_bin), base_path)),
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "UV_PROJECT_ENVIRONMENT": str(prepared),
+                "UV_NO_SYNC": "1",
+            },
+        )
+        assert prepared_run["ok"], prepared_run
+        assert "2 passed" in prepared_run["result"]["stdout"]["content"]
+        assert concealed["ok"] and concealed["result"]["stdout"]["content"] == "concealed"
+        assert unsafe_file.samefile(outside_file)
+    finally:
+        permissions.update_sandbox_paths(ApprovalChoice.WORKSPACE, {str(venv_bin.parent): None})
+        permissions.close()
+        unsafe_file.unlink()
+        shutil.rmtree(prepared)
 
     def run_with_interpreter(
         command, *, deny_sandbox=False, fresh_scratch=False, seconds=20, initial_wait=None
@@ -3258,7 +3604,7 @@ def test_public_uv_runs_a_workspace_virtualenv_with_its_user_local_runtime(publi
                     "arguments": {
                         "command": command,
                         "cwd": "$WORKSPACE_ROOT",
-                        "read_only": True,
+                        "read_roots": [str(runtime_root)],
                     },
                     "argument_sources": {
                         "executable_grant": {"result_index": 0, "result_key": "grant_reference"}
@@ -3324,7 +3670,7 @@ def test_public_uv_runs_a_workspace_virtualenv_with_its_user_local_runtime(publi
                         "command": f"{shlex.quote(custom_interpreter.name)} -I -B -c "
                         + shlex.quote("print('custom-interpreter-ok')"),
                         "cwd": VirtualPath.WORKSPACE,
-                        "read_only": True,
+                        "read_roots": [str(runtime_root)],
                     },
                     "argument_sources": {
                         "executable_grant": {"result_index": 0, "result_key": "grant_reference"}
@@ -3443,9 +3789,9 @@ def test_public_uv_runs_a_workspace_virtualenv_with_its_user_local_runtime(publi
         "tests/unit/execution/sandbox/linux/test_paths.py::"
         "test_mount_arguments_preserves_grant_roles_protection_and_private_masks "
         "tests/unit/execution/sandbox/linux/test_paths.py::"
-        "test_python_runtime_mounts_bind_only_a_selected_workspace_interpreter "
+        "test_prepare_paths_hides_links_only_inside_denied_directories\\[unused\\] "
         "tests/unit/execution/sandbox/linux/test_paths.py::"
-        "test_python_runtime_mounts_reject_unsafe_automatic_read_authority\\[protected\\] "
+        "test_prepare_paths_hides_links_only_inside_denied_directories\\[visible-complete\\] "
         "tests/unit/execution/sandbox/linux/test_policy.py::"
         "test_payload_policy_allows_only_the_bound_external_executable_file "
         "tests/unit/execution/sandbox/linux/test_setup.py::"
@@ -3576,7 +3922,7 @@ def test_payload_cannot_submit_broader_request_over_pathname_ipc(
             value = invoke(
                 public,
                 "/usr/bin/python3 -I -c " + shlex.quote(code),
-                read_only=read_only,
+                write_roots=[] if read_only else [str(workspace)],
                 network=network,
                 allow_general_network=network,
             )
@@ -3617,7 +3963,10 @@ def test_unix_socket_creation_is_unavailable_while_connected_pairs_and_pipes_wor
 
 def test_public_large_command_negotiates_compact_wire_schema(public):
     """A real oversized duplicate source uses the compact request without replay."""
-    result = invoke(public, "printf compact" + " " * 40000, read_only=True)
+    result = invoke(
+        public,
+        "printf compact" + " " * 40000,
+    )
     assert result["ok"], json.dumps(result, indent=2)
     assert result["result"]["exit_code"] == 0
     assert result["result"]["stdout"]["content"] == "compact"
@@ -3805,7 +4154,10 @@ def test_near_deadline_success_and_large_bounded_delivery(public):
     code = (
         "import sys,time;time.sleep(1);sys.stdout.write('x'*1000000);sys.stderr.write('y'*1000000)"
     )
-    result = invoke(public, "/usr/bin/python3 -I -c " + shlex.quote(code), read_only=True)
+    result = invoke(
+        public,
+        "/usr/bin/python3 -I -c " + shlex.quote(code),
+    )
     assert result["result"]["exit_code"] == 0
     for name in ("stdout", "stderr"):
         stream = result["result"][name]
@@ -3819,7 +4171,10 @@ def test_near_deadline_success_and_large_bounded_delivery(public):
 def test_public_output_preserves_carriage_returns(public, exit_code):
     """Installed command output preserves CR, CRLF and LF on success and failure."""
     source = "printf 'a\\rb\\r\\nc\\n'; printf 'a\\rb\\r\\nc\\n' >&2"
-    result = invoke(public, f"{source}; exit {exit_code}", read_only=True)
+    result = invoke(
+        public,
+        f"{source}; exit {exit_code}",
+    )
     output = result["result"] if exit_code == 0 else result["problem"]["metadata"]
     if exit_code:
         assert result["problem"]["code"] == "process.nonzero_exit"
@@ -3862,14 +4217,13 @@ def test_public_command_and_file_tool_preserve_path_like_content(public):
             {"tool": "read_text_file", "arguments": {"path": logical}},
             {
                 "tool": "run_command",
-                "arguments": {"command": command, "cwd": VirtualPath.WORKSPACE, "read_only": True},
+                "arguments": {"command": command, "cwd": VirtualPath.WORKSPACE},
             },
             {
                 "tool": "run_command",
                 "arguments": {
                     "command": f"{command}; {command} >&2; exit 7",
                     "cwd": VirtualPath.WORKSPACE,
-                    "read_only": True,
                 },
             },
             {
@@ -3877,7 +4231,6 @@ def test_public_command_and_file_tool_preserve_path_like_content(public):
                 "arguments": {
                     "command": f"printf %s {shlex.quote(content)}",
                     "cwd": VirtualPath.WORKSPACE,
-                    "read_only": True,
                 },
             },
             {
@@ -3885,7 +4238,6 @@ def test_public_command_and_file_tool_preserve_path_like_content(public):
                 "arguments": {
                     "command": quoted_source,
                     "cwd": VirtualPath.WORKSPACE,
-                    "read_only": True,
                 },
             },
         ],
@@ -3927,6 +4279,62 @@ def test_public_system_hostname_and_default_trust_match_host(public):
     )
     assert result["ok"], result
     assert json.loads(result["result"]["stdout"]["content"]) == direct
+    require_drained(public[2])
+
+
+def test_public_offline_trust_store_lists_only_bound_ca_bundle(public):
+    """Offline TLS clients can enumerate the synthetic store and read its sole public bundle."""
+    store = Path("/etc/ssl/certs")
+    bundle = store / "ca-certificates.crt"
+    assert bundle.is_file() and any(path != bundle for path in store.iterdir())
+    code = """import hashlib,json,os,socket,ssl,sys
+from pathlib import Path
+store=Path('/etc/ssl/certs')
+bundle=store/'ca-certificates.crt'
+with socket.socket() as client:
+    status=client.connect_ex(('127.0.0.1',int(sys.argv[1])))
+print(json.dumps({'entries':sorted(os.listdir(store)),
+    'digest':hashlib.sha256(bundle.read_bytes()).hexdigest(),
+    'trust':len(ssl.create_default_context(cafile=str(bundle)).get_ca_certs()),
+    'private':os.path.lexists('/etc/ssl/private'),'connection':status}))
+"""
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        result = invoke(
+            public,
+            "/usr/bin/python3 -I -c " + shlex.quote(code) + f" {listener.getsockname()[1]}",
+        )
+        assert result["ok"], result
+        assert not select.select([listener], [], [], 0)[0]
+    observed = json.loads(result["result"]["stdout"]["content"])
+    assert observed["entries"] == [bundle.name]
+    assert observed["digest"] == hashlib.sha256(bundle.read_bytes()).hexdigest()
+    assert observed["trust"] > 0 and not observed["private"] and observed["connection"] != 0
+    require_drained(public[2])
+
+
+@pytest.mark.parametrize("resource", ["directory", "bundle"])
+def test_public_hard_deny_applies_to_synthetic_ca_store(public, resource):
+    """An explicit hard denial overrides enumeration and the fixed public file rule."""
+    store = Path("/etc/ssl/certs")
+    selected = store if resource == "directory" else store / "ca-certificates.crt"
+    policy = PermissionConfiguration(limits=PolicyLimits(hard_denied_paths=(str(selected),)))
+    public[0].configuration_path.write_text(dump_yaml(policy.model_dump(mode="json")))
+    probe = """import os,sys
+try:
+    if sys.argv[1]=='directory':
+        os.listdir(sys.argv[2])
+    else:
+        open(sys.argv[2],'rb').close()
+except PermissionError:
+    print('denied')
+"""
+    result = invoke(
+        public, "/usr/bin/python3 -I -c " + shlex.join([probe, resource, str(selected)])
+    )
+    assert result["ok"], result
+    assert result["result"]["stdout"]["content"] == "denied\n"
     require_drained(public[2])
 
 
@@ -3993,9 +4401,7 @@ def test_public_dns_client_uses_owned_network_endpoint(public, transport):
                     "A",
                 )
             )
-            result = invoke(
-                public, command, network=True, read_only=True, allow_general_network=True
-            )
+            result = invoke(public, command, network=True, allow_general_network=True)
             future.result(timeout=5)
         if transport == "tcp":
             assert result["ok"] and result["result"]["stdout"]["content"] == "127.0.0.42\n", result
@@ -4273,7 +4679,7 @@ def test_public_automatic_discovery_preserves_a_scoped_reference(
     }
     command = {
         "tool": "run_command",
-        "arguments": {"command": tool.name, "cwd": VirtualPath.WORKSPACE, "read_only": True},
+        "arguments": {"command": tool.name, "cwd": VirtualPath.WORKSPACE},
         "argument_sources": {
             "executable_grant": {"result_index": 0, "result_key": "grant_reference"}
         },
@@ -4304,7 +4710,10 @@ def test_public_make_runs_unrelated_system_tools_in_one_call(public, absolute_aw
         f".PHONY: test\ntest:\n\t@perl -e 'print \"perl\"'\n\t@{awk} 'BEGIN {{ print 23 }}'\n",
         encoding="utf-8",
     )
-    result = invoke(public, f"{_SYSTEM_MAKE} test", read_only=True)
+    result = invoke(
+        public,
+        f"{_SYSTEM_MAKE} test",
+    )
     assert result["ok"], json.dumps(result, indent=2)
     assert result["result"]["stdout"]["content"] == "perl23\n"
     assert not interaction.prompts
@@ -4321,7 +4730,10 @@ def test_absolute_system_link_within_runtime_does_not_require_path_entry(public,
         ".PHONY: test\ntest:\n\t@/usr/bin/python3 -c 'assert True'\n", encoding="utf-8"
     )
     monkeypatch.setenv("PATH", "/loop-no-such-path")
-    result = invoke(public, f"{_SYSTEM_MAKE} test", read_only=True)
+    result = invoke(
+        public,
+        f"{_SYSTEM_MAKE} test",
+    )
     assert result["ok"], json.dumps(result, indent=2)
     assert result["result"]["exit_code"] == 0
     assert not interaction.prompts
@@ -4355,7 +4767,10 @@ def test_selected_system_alternative_does_not_expose_other_entries(public):
         ".PHONY: test\ntest:\n\t@awk 'BEGIN { print 23 }'\n\t@./alternative-probe\n",
         encoding="utf-8",
     )
-    result = invoke(public, f"{_SYSTEM_MAKE} test", read_only=True)
+    result = invoke(
+        public,
+        f"{_SYSTEM_MAKE} test",
+    )
     assert result["ok"], json.dumps(result, indent=2)
     assert result["result"]["stdout"]["content"] == "23\n"
     assert canary.is_symlink()
@@ -4368,9 +4783,7 @@ def test_selected_system_alternative_preserves_approved_directory(public):
     (workspace / "Makefile").write_text(
         ".PHONY: test\ntest:\n\t@awk 'BEGIN { print 23 }'\n", encoding="utf-8"
     )
-    result = invoke(
-        public, f"{_SYSTEM_MAKE} test", read_only=True, read_roots=["/etc/alternatives"]
-    )
+    result = invoke(public, f"{_SYSTEM_MAKE} test", read_roots=["/etc/alternatives"])
     assert result["ok"], json.dumps(result, indent=2)
     assert result["result"]["stdout"]["content"] == "23\n"
     assert len(interaction.prompts) == 1
@@ -4392,7 +4805,10 @@ def test_system_executable_with_intermediate_directory_alias(public, monkeypatch
         ".PHONY: test\ntest:\n\t@loop-parent-tool\n", encoding="utf-8"
     )
     monkeypatch.setenv("PATH", os.pathsep.join((str(root), "/usr/bin", "/bin")))
-    result = invoke(public, f"{_SYSTEM_MAKE} test", read_only=True)
+    result = invoke(
+        public,
+        f"{_SYSTEM_MAKE} test",
+    )
     assert result["ok"], json.dumps(result, indent=2)
     assert result["result"]["stdout"]["content"] == "parent-chain"
     assert not interaction.prompts
@@ -4431,7 +4847,10 @@ def test_mismatched_receiver_alias_capability_refuses_before_effects(
     def without_system_aliases(installed, deadline):
         """Represent an authenticated receiver without system-alias support."""
         capabilities = retained_capabilities(installed, deadline)
-        capabilities["NATIVE_REQUEST_FEATURES"] = ("workspace-executable-identities-v1",)
+        capabilities["NATIVE_REQUEST_FEATURES"] = (
+            "workspace-executable-identities-v1",
+            "native-hard-policy-v1",
+        )
         return capabilities
 
     monkeypatch.setattr(linux_runtime, "_wire_capabilities", without_system_aliases)
@@ -4505,7 +4924,6 @@ def test_public_make_prepares_a_literal_indirect_tool_in_one_call(
                 "arguments": {
                     "command": source,
                     "cwd": VirtualPath.WORKSPACE,
-                    "read_only": True,
                 },
             }
         ],
@@ -4532,8 +4950,8 @@ def test_public_make_prepares_a_literal_indirect_tool_in_one_call(
     require_drained(generation)
 
 
-def test_public_make_prepares_workspace_venv_runtime_in_one_call(public, monkeypatch):
-    """A literal recipe selects and authorizes its workspace interpreter before launch."""
+def test_public_make_uses_explicit_runtime_scope(public, monkeypatch):
+    """A build recipe can use an explicitly approved workspace runtime."""
     if _SYSTEM_MAKE is None:
         pytest.skip("System make is required")
     interaction, workspace, generation = public
@@ -4550,10 +4968,21 @@ def test_public_make_prepares_workspace_venv_runtime_in_one_call(public, monkeyp
         '.PHONY: test\ntest:\n\t@./.venv/bin/python -c "print(1)"\n'
     )
     monkeypatch.setenv("PATH", os.defpath)
+    interpreter = (environment / "bin/python").resolve(strict=True)
+    runtime = Path(sys.base_prefix).resolve(strict=True)
+    home_alias = Path(sys._base_executable).parent.parent
+    aliases = (str(home_alias),) if home_alias.is_symlink() else ()
+    assert interpreter.is_relative_to(runtime)
     (result,) = invoke_tools(
         public,
-        [{"tool": "run_command", "arguments": {"command": "make test", "read_only": True}}],
+        [
+            {
+                "tool": "run_command",
+                "arguments": {"command": "make test", "read_roots": [str(runtime)]},
+            }
+        ],
         model_paths=True,
+        sandbox_path_aliases=aliases,
     )
     assert result["ok"], result
     assert result["result"]["stdout"]["content"] == "1\n"
@@ -4591,7 +5020,6 @@ def test_public_make_requires_a_scoped_indirect_tool_grant(
         "arguments": {
             "command": shlex.quote(_SYSTEM_MAKE),
             "cwd": VirtualPath.WORKSPACE,
-            "read_only": True,
         },
     }
     (denied,) = invoke_registered(public_registry, [command], model_paths=True)
@@ -4679,7 +5107,7 @@ def test_public_selected_executable_follows_directory_alias_into_approved_root(
         "parent": "./lookup/../lookup/fixture-task",
         "grant": "fixture-task",
     }[selection]
-    arguments = {"command": command, "cwd": VirtualPath.WORKSPACE, "read_only": True}
+    arguments = {"command": command, "cwd": VirtualPath.WORKSPACE}
     if decision == "deny":
         (denied,) = invoke_registered(
             public_registry,
@@ -4770,7 +5198,7 @@ def test_public_indirect_path_lookup_uses_an_approved_root_without_tool_lookup(
     launcher.write_text(f"#!{_SYSTEM_SH}\n{shlex.quote(name)}\n", encoding="utf-8")
     launcher.chmod(0o755)
     monkeypatch.setenv("PATH", os.pathsep.join((str(lookup), os.defpath)))
-    arguments = {"command": "./launcher", "cwd": VirtualPath.WORKSPACE, "read_only": True}
+    arguments = {"command": "./launcher", "cwd": VirtualPath.WORKSPACE}
     (denied,) = invoke_registered(
         public_registry, [{"tool": "run_command", "arguments": arguments}], model_paths=True
     )
@@ -4828,7 +5256,7 @@ def test_workspace_selected_executable_retarget_is_stale(
     launcher.chmod(0o755)
     monkeypatch.setenv("PATH", os.pathsep.join((str(earlier), str(workspace), os.defpath)))
 
-    positive = invoke(public, "printf positive > ordinary")
+    positive = invoke(public, "printf positive > ordinary", write_roots=[str(workspace)])
     assert positive["ok"], positive
     assert (workspace / "ordinary").read_text(encoding="utf-8") == "positive"
     interaction.prompts.clear()
@@ -5006,7 +5434,6 @@ def test_workspace_executable_link_requests_installation_scope(
     arguments = {
         "command": f"{invocation_source} -c {shlex.quote(source)}",
         "cwd": VirtualPath.WORKSPACE,
-        "read_only": True,
     }
     (denied,) = invoke_registered(
         public_registry,
@@ -5179,7 +5606,7 @@ def test_workspace_script_uses_approved_off_path_interpreter(
             f"if {shlex.quote(_SYSTEM_CAT)} {shlex.quote(str(secret))} >/dev/null 2>&1; "
             "then exit 10; fi"
         )
-    arguments = {"command": command, "cwd": VirtualPath.WORKSPACE, "read_only": True}
+    arguments = {"command": command, "cwd": VirtualPath.WORKSPACE}
     if invocation == "direct-identified-workspace":
         arguments["read_roots"] = [VirtualPath.WORKSPACE]
     (denied,) = invoke_registered(
@@ -5282,7 +5709,7 @@ def test_workspace_script_uses_approved_off_path_virtual_environment(
         f"if {shlex.quote(_SYSTEM_CAT)} {shlex.quote(str(secret))} >/dev/null 2>&1; "
         "then exit 10; fi"
     )
-    arguments = {"command": command, "cwd": VirtualPath.WORKSPACE, "read_only": True}
+    arguments = {"command": command, "cwd": VirtualPath.WORKSPACE}
     (denied,) = invoke_registered(
         public_registry,
         [{"tool": "run_command", "arguments": arguments}],
@@ -5351,10 +5778,10 @@ def test_indirect_alias_order_reuses_remembered_native_approval(
     monkeypatch.setenv("PATH", os.pathsep.join((str(lookup), os.defpath)))
     prompts = []
 
-    def remember(message, **_kwargs):
+    def remember(message, **kwargs):
         """Remember this fixture's sandbox scope in the current session."""
         prompts.append(message)
-        return "session"
+        return next(key for key, index in kwargs["index"].items() if index == "S")
 
     interaction.prompt = remember
     backend, installed_generation = installation
@@ -5369,7 +5796,6 @@ def test_indirect_alias_order_reuses_remembered_native_approval(
     arguments = {
         "command": "./launcher",
         "cwd": str(workspace),
-        "read_only": True,
         "read_roots": [str(installed)],
     }
     original_scandir = os.scandir
@@ -5431,7 +5857,7 @@ def test_indirect_path_alias_does_not_skip_an_unapproved_earlier_executable(
     launcher.write_text(f"#!{_SYSTEM_SH}\nfixture-task\n", encoding="utf-8")
     launcher.chmod(0o755)
     monkeypatch.setenv("PATH", os.pathsep.join((str(earlier), str(lookup), os.defpath)))
-    arguments = {"command": "./launcher", "cwd": VirtualPath.WORKSPACE, "read_only": True}
+    arguments = {"command": "./launcher", "cwd": VirtualPath.WORKSPACE}
     (denied,) = invoke_registered(
         public_registry,
         [{"tool": "run_command", "arguments": arguments | {"read_roots": [str(installed)]}}],
@@ -5504,7 +5930,6 @@ def test_public_unrelated_metadata_does_not_block_workspace_executable(
                 "arguments": {
                     "command": command,
                     "cwd": "$WORKSPACE_ROOT",
-                    "read_only": True,
                 },
             }
         ],
@@ -5576,7 +6001,6 @@ def test_public_executable_lookup_and_exact_file_authority(
                 "arguments": {
                     "command": executable.name,
                     "cwd": "$WORKSPACE_ROOT",
-                    "read_only": True,
                 },
                 "argument_sources": {
                     "executable_grant": {"result_index": 0, "result_key": "grant_reference"}
@@ -5587,7 +6011,6 @@ def test_public_executable_lookup_and_exact_file_authority(
                 "arguments": {
                     "command": executable.name,
                     "cwd": "$WORKSPACE_ROOT",
-                    "read_only": True,
                 },
             },
         ],
@@ -5631,7 +6054,6 @@ def test_public_audit_correlates_native_attempt_without_command_content(
                 "arguments": {
                     "command": f"printf {token} >/dev/null",
                     "cwd": str(workspace),
-                    "read_only": True,
                 },
             }
         ],
@@ -5745,13 +6167,16 @@ def test_public_network_grant_keeps_udp_offline_until_approved(public):
             + str(listener.getsockname()[1])
             + ");socket.socket(type=socket.SOCK_DGRAM).sendto(b'granted',target)"
         )
-        denied = invoke(public, source, read_only=True)
+        denied = invoke(
+            public,
+            source,
+        )
         assert denied.get("ok") is True, denied
         assert denied["result"]["exit_code"] == 0, denied
         with pytest.raises(TimeoutError):
             listener.recvfrom(32)
 
-        approved = invoke(public, source, read_only=True, network=True, allow_general_network=True)
+        approved = invoke(public, source, network=True, allow_general_network=True)
         assert approved["result"]["exit_code"] == 0, approved
         listener.settimeout(2)
         assert listener.recvfrom(32)[0] == b"granted"
@@ -5856,7 +6281,6 @@ def test_public_git_read_follows_linked_worktree_metadata_grant(
         "/usr/bin/git status --porcelain",
         cwd=str(linked),
         read_roots=[str(metadata)],
-        read_only=True,
     )
     assert result["result"]["exit_code"] == 0, result
     assert result["result"]["stdout"]["content"] == ""
@@ -6818,7 +7242,10 @@ def test_public_profile_lifecycle_handles_many_workspaces(installation, public, 
     capacity, _ = generation_limits(installed.config.reservation, generation)
     for index in range(3 * capacity + 1):
         current = native_directory(workspace.parent, name=f"loop-native-test-public-{index}")
-        result = invoke((interaction, current, generation), "printf public-ready", read_only=True)
+        result = invoke(
+            (interaction, current, generation),
+            "printf public-ready",
+        )
         assert result["ok"], result
         assert result["result"]["stdout"]["content"] == "public-ready"
         assert len(profile_inventory(generation)) <= 2

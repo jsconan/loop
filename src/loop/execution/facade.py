@@ -17,14 +17,16 @@ from collections.abc import Callable, Generator, Iterator
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Literal, NamedTuple
 from uuid import uuid4
 
 from .. import constants
 from ..command_authorities import command_authorities
 from ..errors import Problem, log_problem
-from ..permissions import Action, ProcessBoundary, ProcessTarget
-from ..permissions.protection import is_protected_external_read
+from ..models import SandboxOutputPath
+from ..permissions import Action, ProcessBoundary, ProcessTarget, match_git_mutation
+from ..permissions.protection import is_protected_external_read, write_file_state
+from ..sandbox_catalog import hardlink_source_paths
 from ..session.models import SessionExecutionConflictError
 from ..telemetry import telemetry_trace_event
 from ..utils import (
@@ -50,14 +52,14 @@ from .jobs import (
     CommandJobs,
 )
 from .runtime_discovery import (
-    RuntimeCandidate,
+    WorkspaceExecutableLink,
     discover_makefile_commands,
     discover_scratch_shell_source,
-    discover_workspace_interpreters,
-    discover_workspace_runtimes,
+    linked_project_installations,
     selected_workspace_executable,
     timeout_child_source,
     workspace_command_source,
+    workspace_shell_programs,
 )
 from .sandbox import (
     CommandProcessResult,
@@ -74,6 +76,7 @@ from .sandbox.constants import (
     HOME_ENVIRONMENT_VARIABLE,
     LANG_ENVIRONMENT_VARIABLE,
     MINIMAL_SYSTEM_PATH,
+    OUTPUT_DIRECTORY_ENVIRONMENT_VARIABLE,
     PATH_ENVIRONMENT_VARIABLE,
     SYSTEM_LOCALE,
     TEMP_ENVIRONMENT_VARIABLE,
@@ -90,24 +93,6 @@ _LOGGER = logging.getLogger(__name__)
 def _command_paths(context: ToolContext) -> VirtualPath:
     """Use captured command roots when available, otherwise read the current roots."""
     return context.command_paths or context.instructions_manager.virtual_paths
-
-
-class WorkspaceExecutableLink(NamedTuple):
-    """Bind a workspace executable spelling to its selected file identity.
-
-    Args:
-        name (str): Command spelling selected through PATH or a literal path.
-        spelling (Path): Workspace path used to select the executable.
-        resolved (Path): Canonical selected file.
-        device (int): Device number of the selected file.
-        inode (int): Inode number of the selected file.
-    """
-
-    name: str
-    spelling: Path
-    resolved: Path
-    device: int
-    inode: int
 
 
 class WorkspaceScriptInterpreters(NamedTuple):
@@ -132,6 +117,12 @@ _MAX_EXECUTABLE_SYMLINKS = 40
 _MAX_INDIRECT_PATH_ENTRIES = 1024
 _MAX_INTERPRETER_LINE_BYTES = 4096
 _MAX_RETURNED_DENIAL_CANDIDATES = 4
+_WRITE_DENIAL_OPERATIONS = frozenset(
+    {"file-write-create", "file-write-data", "file-write-unlink", "unlink"}
+)
+_PERMISSION_FAILURE = re.compile(
+    r"\b(?:permission denied|operation not permitted|read-only file system)\b", re.IGNORECASE
+)
 _HOST_AUTHORITY_NOTICE = (
     "The sandbox restrictions did not apply. The command ran with the host user's "
     "authority, subject to independent OS and outer-environment restrictions. "
@@ -174,7 +165,7 @@ class ExecutableGrant:
         roots (tuple[DirectoryIdentity, ...]): Bound installation read roots.
         identity (tuple[int, int]): Executable device and inode.
         opt_aliases (tuple[tuple[Path, int, int, Path], ...]): Bound package aliases.
-        managed_package (bool): Whether all roots qualify for automatic package reads.
+        managed_package (bool): Whether all roots have verified installed-package metadata.
     """
 
     name: str
@@ -228,6 +219,57 @@ def _interrupted_effect_notice(boundary: str) -> str:
         "Inspect captured output and state before another attempt; another attempt may repeat "
         "effects."
     )
+
+
+def _write_retry_candidates(
+    request: SandboxRequest,
+    context: ToolContext,
+    denials: list[dict],
+) -> list[str] | None:
+    """Return eligible fixed files, or None when a denial suggests generated siblings."""
+    prefix = f"{VirtualPath.WORKSPACE}/"
+    candidates = []
+    generated_names: dict[tuple[Path, str], str] = {}
+    for denial in denials:
+        target = denial.get("target", "")
+        if (
+            denial["classification"] != "unclassified"
+            or denial.get("operation") not in _WRITE_DENIAL_OPERATIONS
+            or not target.startswith(prefix)
+        ):
+            continue
+        path = request.workspace / target.removeprefix(prefix)
+        if (
+            path == request.workspace
+            or not path.is_relative_to(request.workspace)
+            or path in request.write_files
+            or any(path.is_relative_to(root) for root in request.write_roots)
+            or request.protected_paths.protects_write_file(path.relative_to(request.workspace))
+            or request.denies_path(path)
+        ):
+            continue
+        if denial["operation"] == "file-write-create" and any(
+            path.parent == granted.parent
+            and path.name.startswith((f"{granted.name}.", f"{granted.name}-"))
+            for granted in request.write_files
+        ):
+            return None
+        try:
+            if context.permission_manager.sandbox_write_root_limit(request.workspace, (path,)):
+                continue
+            state = write_file_state(path)
+        except (OSError, RuntimeError, ValueError):
+            continue
+        if state is None and denial["operation"] == "file-write-create":
+            # An absent entry may be a directory or a generated name that will change.
+            stem = re.match(r"\.?[^.-]+(?=[.-])", path.name)
+            if stem is not None:
+                first_name = generated_names.setdefault((path.parent, stem.group()), path.name)
+                if first_name != path.name:
+                    return None
+            continue
+        candidates.append(target)
+    return list(dict.fromkeys(candidates))
 
 
 def _automatic_executable_identities(
@@ -336,6 +378,7 @@ def _workspace_script_interpreters(
     cwd: Path,
     workspace: Path,
     *,
+    may_read: Callable[[Path], bool],
     first_arguments: tuple[str, ...] = (),
     allow_path_lookup: bool = True,
 ) -> WorkspaceScriptInterpreters:
@@ -368,7 +411,7 @@ def _workspace_script_interpreters(
                         WorkspaceExecutableLink(name, *match, details.st_dev, details.st_ino)
                     )
             _, script = match
-            if not script.is_relative_to(workspace) or is_protected_external_read(script):
+            if not script.is_relative_to(workspace) or not may_read(script):
                 continue
             before = script.lstat()
             if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
@@ -376,7 +419,7 @@ def _workspace_script_interpreters(
             descriptor = open_selected_file(workspace, script, (before.st_dev, before.st_ino))
             try:
                 bound = os.fstat(descriptor)
-                if not stat.S_ISREG(bound.st_mode) or bound.st_nlink != 1:
+                if not stat.S_ISREG(bound.st_mode) or bound.st_nlink != 1 or not may_read(script):
                     continue
                 content = os.read(descriptor, _MAX_INTERPRETER_LINE_BYTES)
                 forwarded = None
@@ -633,71 +676,14 @@ def _backend_method(backend: SandboxBackend, name: str) -> Callable | None:
     return getattr(backend, name) if callable(getattr(type(backend), name, None)) else None
 
 
-def _installed_runtime_packages(
-    backend: SandboxBackend,
-    candidates: tuple[RuntimeCandidate, ...],
-    workspace: Path,
-    covered_roots: tuple[Path, ...],
-) -> tuple[tuple[Path, ...], tuple[Path, ...]]:
-    """Suggest verified installed runtime dependencies for already selected interpreters."""
-    runtime_resolver = _backend_method(backend, "installed_runtime_roots")
-    resolver = runtime_resolver or _backend_method(backend, "installed_tool_roots")
-    package_root = _backend_method(backend, "installed_package_root")
-    if not callable(package_root):
-        package_root = _backend_method(backend, "managed_tool_root")
-    if not callable(resolver) or not callable(package_root):
-        return (), ()
-    if not candidates:
-        return (), ()
-    try:
-        home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve(strict=True)
-    except (KeyError, OSError, RuntimeError, ValueError):
-        return (), ()
-    roots = []
-    aliases = []
-    for candidate in candidates:
-        if is_protected_external_read(candidate.identity[2]):
-            continue
-        installation = (
-            resolver(
-                candidate.identity[2], spelling=candidate.alias_executable, workspace=workspace
-            )
-            if callable(runtime_resolver)
-            else resolver(candidate.identity[2])
-        )
-        if installation is None:
-            continue
-        package_roots, package_aliases = installation
-        if (
-            not package_roots
-            or not candidate.identity[2].is_relative_to(package_roots[0])
-            or len(roots) + len(package_roots) > constants.MAX_COMMAND_PATH_COUNT
-            or any(
-                is_protected_external_read(root)
-                or workspace.is_relative_to(root)
-                or home.is_relative_to(root)
-                or package_root(root) is not True
-                for root in package_roots
-            )
-        ):
-            continue
-        for alias, device, inode, target in package_aliases:
-            details = alias.lstat()
-            if (
-                (details.st_dev, details.st_ino) != (device, inode)
-                or alias.resolve(strict=True) != target
-                or target not in package_roots
-                or is_protected_external_read(alias)
-            ):
-                break
-        else:
-            roots.extend(
-                root
-                for root in package_roots
-                if not any(root.is_relative_to(covered) for covered in covered_roots)
-            )
-            aliases.extend(alias for alias, _, _, _ in package_aliases)
-    return tuple(dict.fromkeys(roots)), tuple(dict.fromkeys(aliases))
+def _sandbox_search_path(context: ToolContext) -> str:
+    """Use the same effective search path for lookup and command binding."""
+    path = context.settings.sandbox_environment.get(
+        PATH_ENVIRONMENT_VARIABLE, os.environ.get(PATH_ENVIRONMENT_VARIABLE, MINIMAL_SYSTEM_PATH)
+    )
+    if isinstance(path, str):
+        return path
+    raise ValueError("Sandbox PATH must be a literal string.")
 
 
 class CommandExecutionService:
@@ -799,6 +785,38 @@ class CommandExecutionService:
         capabilities = self._backend.capabilities
         return capabilities if isinstance(capabilities, frozenset) else frozenset()
 
+    @property
+    def backend_options(self) -> tuple[str, ...]:
+        """Identify optional authorities the selected backend can enforce.
+
+        Returns:
+            tuple[str, ...]: Backend-owned keys available for sandbox command requests.
+        """
+        options = getattr(self._backend, "backend_options", ())
+        return options if isinstance(options, tuple) else ()
+
+    @property
+    def requestable_backend_capabilities(self) -> frozenset[SandboxCapability]:
+        """Expose supported requests, including optional features qualified only after approval.
+
+        Returns:
+            frozenset[SandboxCapability]: Requestable features; this does not authorize launch.
+        """
+        optional = getattr(self._backend, "requestable_capabilities", frozenset())
+        return self.backend_capabilities | (
+            optional if isinstance(optional, frozenset) else frozenset()
+        )
+
+    @property
+    def backend_capability_guidance(self) -> dict[str, str]:
+        """Return native-owned instructions for the supported capability transport.
+
+        Returns:
+            dict[str, str]: Capability names mapped to immediately usable command instructions.
+        """
+        guidance = getattr(self._backend, "capability_guidance", {})
+        return dict(guidance) if isinstance(guidance, dict) else {}
+
     @classmethod
     def for_host(cls) -> CommandExecutionService:
         """Compose trusted built-in execution boundaries for the current host.
@@ -828,7 +846,7 @@ class CommandExecutionService:
         with self._backend_lease() as available:
             if not available:
                 raise RuntimeError("Native execution service is closed.")
-            path_value = os.environ.get(PATH_ENVIRONMENT_VARIABLE, MINIMAL_SYSTEM_PATH)
+            path_value = _sandbox_search_path(context)
             workspace = (
                 Path(_command_paths(context).resolve(VirtualPath.WORKSPACE)).resolve()
                 if context.instructions_manager is not None
@@ -881,6 +899,7 @@ class CommandExecutionService:
                 path_value,
                 lookup_cwd,
                 workspace,
+                policy_reads=self._sandbox_path_reads(context, workspace or lookup_cwd)[0],
             )
             if grant is None:
                 return result
@@ -911,6 +930,7 @@ class CommandExecutionService:
         *,
         match: tuple[Path, Path] | None = None,
         optional_metadata: bool = False,
+        policy_reads: tuple[Path, ...] = (),
     ) -> tuple[dict, ExecutableGrant | None]:
         """Discover one executable without publishing or evicting a lookup reference."""
         if match is None:
@@ -922,8 +942,9 @@ class CommandExecutionService:
         system_roots = getattr(self._backend, "system_read_roots", ())
         if not isinstance(system_roots, tuple):
             system_roots = ()
-        readable = any(
-            resolved.is_relative_to(root) and spelling.is_relative_to(root) for root in system_roots
+        readable = all(
+            any(path.is_relative_to(root) for root in (*system_roots, *policy_reads))
+            for path in (spelling, resolved)
         ) or (workspace is not None and resolved.is_relative_to(workspace))
         result = {
             "name": name,
@@ -933,6 +954,10 @@ class CommandExecutionService:
             "sandbox_access": "default_read" if readable else "external_read_grant_required",
         }
         if readable:
+            result["grant_note"] = (
+                "This executable is already readable. Run the command with executable_grant "
+                "omitted or null."
+            )
             return result, None
         if is_protected_external_read(resolved):
             result["sandbox_access"] = "protected_external_path"
@@ -1033,11 +1058,13 @@ class CommandExecutionService:
         names: tuple[str, ...],
         workspace: Path,
         cwd: Path | None = None,
+        *,
+        policy_reads: tuple[Path, ...] = (),
     ) -> tuple[ExecutableGrant, ...]:
         """Bind verified managed tools named by a shell command."""
         working_directory = cwd or workspace
         grants: list[ExecutableGrant] = []
-        path_value = os.environ.get(PATH_ENVIRONMENT_VARIABLE, MINIMAL_SYSTEM_PATH)
+        path_value = _sandbox_search_path(context)
         bound_workspace = workspace if context.instructions_manager is not None else None
         for name in list(dict.fromkeys(names))[: constants.MAX_COMMAND_PATH_COUNT]:
             if "/" in name or name in {".", ".."}:
@@ -1056,10 +1083,32 @@ class CommandExecutionService:
                 bound_workspace,
                 match=match,
                 optional_metadata=True,
+                policy_reads=policy_reads,
             )
             if grant is not None and grant.managed_package:
                 grants.append(grant)
         return tuple(grants)
+
+    def _sandbox_path_reads(
+        self,
+        context: ToolContext,
+        workspace: Path,
+        excluded: tuple[Path, ...] = (),
+        *,
+        requested_writes: tuple[Path, ...] = (),
+    ) -> tuple[tuple[Path, ...], int]:
+        """Get read-only command scope from policy for this native platform."""
+        if context.permission_manager is None:
+            return (), 0
+        installed = _backend_method(self._backend, "installed_read_roots")
+        native = getattr(self._backend, "system_read_roots", ())
+        return context.permission_manager.sandbox_path_read_roots(
+            workspace,
+            installed() if installed is not None else (),
+            (*excluded, *(native if isinstance(native, tuple) else ())),
+            context.tool_name,
+            requested_writes=requested_writes,
+        )
 
     def close(self) -> None:
         """Stop new admission and close the backend when its last native user settles."""
@@ -1398,6 +1447,7 @@ class CommandExecutionService:
         display_path: Callable[[str], str],
         *,
         job: CommandJob,
+        prepared_access: bool = False,
         skill_snapshot: tuple[tuple[str, Path, str], ...] = (),
         prelaunch_failure: CommandProcessResult | None = None,
         reason: str | None = None,
@@ -1410,6 +1460,7 @@ class CommandExecutionService:
             context.permission_manager,
             context.interaction,
             **({"host_audit": context.audit_host_detached} if context.audit_host_detached else {}),
+            host_recovery_revision=context.host_recovery_detached,
         )
         reason_argument = {"reason": reason} if reason is not None else {}
         invalidated = False
@@ -1420,8 +1471,13 @@ class CommandExecutionService:
             else None
         )
 
-        def sandbox_admitted() -> bool | None:
-            """Commit job admission only while its used skills remain active."""
+        def sandbox_admitted() -> bool | str | None:
+            """Commit job admission only while the selected command authority is current."""
+            if (
+                context.sandbox_admission_check is not None
+                and (refusal := context.sandbox_admission_check()) is not None
+            ):
+                return refusal
             if admit_skills is not None:
                 return admit_skills(skill_snapshot, job.admitted)
             job.admitted()
@@ -1437,11 +1493,14 @@ class CommandExecutionService:
                 cancellation_event=context.cancellation_event,
                 admission_cancellation_event=admission_cancellation_event,
                 on_admitted=sandbox_admitted,
+                prepared_access=prepared_access,
+                sandbox_admission=context.sandbox_attempt_detached,
                 output_observer=job.publish,
                 **({"terminal_input": job.next_terminal_frame} if job.terminal else {}),
                 **(
                     {"egress_authority": context.egress_authority}
-                    if context.egress_authority is not None and request.egress_origins
+                    if context.egress_authority is not None
+                    and (request.egress_origins or request.ingress_port is not None)
                     else {}
                 ),
                 **reason_argument,
@@ -1452,47 +1511,7 @@ class CommandExecutionService:
                 attempt.result.outcome is SandboxOutcome.COMPLETED
                 or attempt.result.possible_effects
             )
-            retry = None
-            if attempt.result is not None and attempt.offer is not None:
-                reserved_interaction = job.begin_interaction()
-                if reserved_interaction:
-
-                    def complete_host_admission() -> None:
-                        """Release the approval interaction before host supervision."""
-                        nonlocal reserved_interaction
-                        if (
-                            admission_cancellation_event is not None
-                            and admission_cancellation_event.is_set()
-                        ):
-                            job.cancel()
-                        job.admitted()
-                        job.end_interaction()
-                        reserved_interaction = False
-
-                    def host_authorized() -> bool:
-                        """Commit skill authority after approval without releasing the owner."""
-                        return admit_skills(skill_snapshot, lambda: None)
-
-                    try:
-                        host_output_sizes = job.output_sizes()
-                        retry = coordinator.retry_host_command(
-                            attempt.offer,
-                            request,
-                            execution_timeout=context.settings.command_job_runtime_limit_seconds,
-                            cancellation_event=context.cancellation_event,
-                            on_admitted=complete_host_admission,
-                            output_observer=job.publish,
-                            **({"on_authorized": host_authorized} if admit_skills else {}),
-                        )
-                        if retry is not None:
-                            job.capture_result_output(retry, host_output_sizes)
-                    finally:
-                        if reserved_interaction:
-                            job.end_interaction()
-            if possible_effects or (
-                retry is not None
-                and (retry.outcome is SandboxOutcome.COMPLETED or retry.possible_effects)
-            ):
+            if possible_effects:
                 invalidated = True
                 invalidate()
         except BaseException as exc:
@@ -1511,16 +1530,6 @@ class CommandExecutionService:
             )
         result = attempt.result
         boundary = "sandbox"
-        if (
-            retry is None
-            and attempt.offer is not None
-            and context.cancellation_event is not None
-            and context.cancellation_event.is_set()
-        ):
-            result = replace(result, outcome=SandboxOutcome.CANCELLED)
-        if retry is not None:
-            result = retry
-            boundary = "host"
         if request.terminal:
             result = replace(
                 result,
@@ -1591,6 +1600,18 @@ class CommandExecutionService:
         output = {
             "boundary": boundary,
             "exit_code": result.exit_code,
+            "write_scope": {
+                "roots": [redact(str(root)) for root in request.write_roots],
+                "files": [redact(str(path)) for path in request.write_files],
+                "guidance": (
+                    "Only private session scratch and the declared file scopes are writable. "
+                    f'Use "${OUTPUT_DIRECTORY_ENVIRONMENT_VARIABLE}" for generated files and '
+                    "caches. If output must be saved outside scratch, "
+                    "request an existing output directory in write_roots or use write_files "
+                    "for a known fixed filename. Hard-denied paths remain unavailable. Inspect "
+                    "possible effects before retrying."
+                ),
+            },
             "lifecycle": {
                 "cancel_requested": bool(
                     context.cancellation_event and context.cancellation_event.is_set()
@@ -1626,8 +1647,51 @@ class CommandExecutionService:
         }
         if request.terminal:
             output["terminal_output"] = "escaped-controls"
-        if boundary == "host":
-            output["authority_notice"] = _HOST_AUTHORITY_NOTICE
+        if (
+            result.outcome is SandboxOutcome.COMPLETED
+            and result.exit_code != 0
+            and (
+                any(item.get("operation") in _WRITE_DENIAL_OPERATIONS for item in denial_candidates)
+                or _PERMISSION_FAILURE.search(result.stderr)
+                or _PERMISSION_FAILURE.search(result.stdout)
+            )
+        ):
+            candidates = (
+                _write_retry_candidates(request, context, denial_candidates)
+                if SandboxCapability.WRITE_FILES in self.backend_capabilities
+                else []
+            )
+            guidance = (
+                "Check whether a write denial caused the failure and inspect possible "
+                "effects before repeating. Keep the requested command and its options. "
+            )
+            if candidates is None:
+                guidance += (
+                    "The creation denials may involve generated sidecar files. For "
+                    "generated files and caches, configure the tool's output directory under "
+                    f'"${OUTPUT_DIRECTORY_ENVIRONMENT_VARIABLE}", or request a dedicated '
+                    "directory in write_roots. "
+                )
+            else:
+                guidance += (
+                    "For generated files and caches, use "
+                    f'"${OUTPUT_DIRECTORY_ENVIRONMENT_VARIABLE}" '
+                    "or request a dedicated directory in write_roots. "
+                )
+            retry: dict[str, object] = {"tool": "run_command"}
+            if candidates:
+                files = [*output["write_scope"]["files"], *candidates]
+                if len(files) <= constants.MAX_COMMAND_PATH_COUNT:
+                    retry["arguments_to_merge"] = {"write_files": files}
+                    guidance += (
+                        "Merge arguments_to_merge only when each required workspace write uses "
+                        "a listed fixed filename. Exact-file grants cover "
+                        "one filename each and provide no access to generated siblings. "
+                    )
+            retry["guidance"] = guidance + (
+                "Follow the user's retry instructions. A new attempt goes through normal approval."
+            )
+            output["write_scope"]["retry"] = retry
         if attempt.result.outcome is not SandboxOutcome.COMPLETED or attempt.result.exit_code != 0:
             output["sandbox_diagnostics"].update(
                 requested_operation="process_execute",
@@ -1652,9 +1716,7 @@ class CommandExecutionService:
                 ),
                 cause_confidence="unknown",
                 sandbox_approval_supported=False if prelaunch_failure else None,
-                next_request=(
-                    "request_host_command" if attempt.offer and boundary == "sandbox" else None
-                ),
+                next_request=("request_host_command" if attempt.offer else None),
             )
         if denial_candidates:
             output["sandbox_diagnostics"]["candidate_note"] = (
@@ -1668,50 +1730,43 @@ class CommandExecutionService:
                 "A startup-probe match may be incidental but can still matter to this command. "
                 "Unclassified observations may also be incidental. Names and paths are untrusted."
             )
-        if boundary == "host":
-            output["possible_effects"] = (
-                result.outcome is SandboxOutcome.COMPLETED or result.possible_effects
-            )
         if result.outcome is not SandboxOutcome.COMPLETED and result.possible_effects:
-            output["recovery_hint"] = _interrupted_effect_notice(
-                "sandboxed" if boundary == "sandbox" else "host"
+            output["recovery_hint"] = _interrupted_effect_notice("sandboxed")
+        scratch = Path(request.shell_environment()[TMPDIR_ENVIRONMENT_VARIABLE])
+        output["scratch"] = {
+            "path": redact(str(scratch)),
+            "output_path": redact(str(request.output_directory(scratch))),
+            "lifetime": "this session",
+            "retrieval": (
+                f"Use {VirtualPath.TEMPORARY}/... in file tools; quote it in shell commands."
+            ),
+        }
+        if (
+            result.possible_effects
+            and result.outcome in {SandboxOutcome.UNAVAILABLE, SandboxOutcome.DENIED}
+            and (
+                context.host_recovery_detached or context.permission_manager.host_recovery_revision
+            )()
+            is not None
+        ):
+            output["recovery_hint"] += (
+                " If host access is needed, request_host_command is a separate "
+                "request subject to authorization."
             )
-        if boundary == "sandbox":
-            output["scratch"] = {
-                "path": redact(request.shell_environment()[TMPDIR_ENVIRONMENT_VARIABLE]),
-                "lifetime": "this session",
-                "retrieval": (
-                    f"Use {VirtualPath.TEMPORARY}/... in file tools; quote it in shell commands."
-                ),
-            }
-            if result.possible_effects and result.outcome in {
-                SandboxOutcome.UNAVAILABLE,
-                SandboxOutcome.DENIED,
-            }:
-                output["recovery_hint"] += (
-                    " If host access is needed, request_host_command is a separate "
-                    "request subject to authorization."
-                )
-            if result.outcome is SandboxOutcome.COMPLETED and result.exit_code in (126, 127):
-                output["executable_hint"] = (
-                    "This exit status does not prove a tool is absent from the host. "
-                    "If the output indicates an unavailable executable, use resolve_executable "
-                    "with its name to check host PATH; "
-                    "pass its grant_reference as executable_grant for sandboxed access "
-                    "when an external tool needs explicit access. If additional indirect "
-                    "tools remain unidentified, look up only those needed. "
-                    "The command may already have had effects; inspect state before another run."
-                )
+        if result.outcome is SandboxOutcome.COMPLETED and result.exit_code in (126, 127):
+            output["executable_hint"] = (
+                "This exit status does not prove a tool is absent from the host. "
+                "If the output indicates an unavailable executable, use resolve_executable "
+                "with its name to check host PATH; "
+                "pass its grant_reference as executable_grant for sandboxed access "
+                "when an external tool needs explicit access. If additional indirect "
+                "tools remain unidentified, look up only those needed. "
+                "The command may already have had effects; inspect state before another run."
+            )
         if observed_denial:
             observed = redact(observed_denial)
-            if boundary == "sandbox":
-                output["sandbox_diagnostic"] = observed
-            else:
-                output["sandbox_attempt"] = {
-                    "exit_code": attempt.result.exit_code,
-                    "observed_denial": observed,
-                }
-        if attempt.offer is not None and boundary == "sandbox":
+            output["sandbox_diagnostic"] = observed
+        if attempt.offer is not None:
             failure = redact(result.detail)
             output["host_offer"] = (
                 f"Sandbox failure: {failure}\nCommand: "
@@ -1729,7 +1784,7 @@ class CommandExecutionService:
                 )
             return output
         return Problem(
-            code=f"{boundary if boundary == 'sandbox' else 'host_command'}.{result.outcome.value}",
+            code=f"sandbox.{result.outcome.value}",
             title="Sandbox command did not complete"
             if boundary == "sandbox"
             else "Host command did not complete",
@@ -1955,9 +2010,8 @@ class CommandExecutionService:
         context: ToolContext,
         command: str,
         cwd: str = ".",
-        read_only: bool = False,
         read_roots: list[str] | None = None,
-        write_roots: list[str] | None = None,
+        write_roots: Literal["scratch"] | list[str] | None = None,
         executable_grant: str | list[str] | None = None,
         network: bool = False,
         git_write: bool = False,
@@ -1967,6 +2021,10 @@ class CommandExecutionService:
         wait_seconds: float | None = None,
         job: CommandJob | None = None,
         admission_cancellation_event: threading.Event | None = None,
+        local_ipc: bool = False,
+        ingress_port: int | None = None,
+        write_files: list[str] | None = None,
+        backend_options: tuple[str, ...] = (),
     ) -> dict | Problem:
         """Bind and authorize a shell request, with separate host recovery when needed.
 
@@ -1974,15 +2032,20 @@ class CommandExecutionService:
             context (ToolContext): Registered identity and dispatch authority.
             command (str): Opaque source passed to the host shell.
             cwd (str): Resolved host working directory.
-            read_only (bool): Disable workspace writes while permitting private scratch writes.
             read_roots (list[str] | None): Additional explicitly approved read roots.
-            write_roots (list[str] | None): Additional identity-bound writable directories.
+            write_roots (Literal["scratch"] | list[str] | None): Private scratch only, explicit
+                writable directories, or None to use the workspace's ordinary write preference.
             executable_grant (str | list[str] | None): Bound references from executable lookups.
             network (bool): Request general network egress.
             egress_origins (list[str] | None): Canonical HTTP(S) origins for a qualified mediator.
             git_write (bool): Request Git metadata write authority.
             reason (str | None): Explanation shown to the user for additional sandbox authority.
             interactive (bool): Return an owned terminal handle after approval where qualified.
+            local_ipc (bool): Request the backend's optional attempt-local communication scope.
+            backend_options (tuple[str, ...]): Runtime services requested for this command or
+                bound to a saved task.
+            ingress_port (int | None): Exact host-loopback port for one isolated service attempt.
+            write_files (list[str] | None): Exact writable paths inside the workspace.
             wait_seconds (float | None): Initial wait after admission, or None for the configured
                 default, bounded by ``command_max_wait_seconds``.
             job (CommandJob | None): Internal owner of a previously reserved command attempt.
@@ -2005,7 +2068,6 @@ class CommandExecutionService:
                 context,
                 command,
                 cwd=cwd,
-                read_only=read_only,
                 read_roots=read_roots,
                 write_roots=write_roots,
                 executable_grant=executable_grant,
@@ -2014,6 +2076,10 @@ class CommandExecutionService:
                 reason=reason,
                 egress_origins=egress_origins,
                 interactive=interactive,
+                local_ipc=local_ipc,
+                backend_options=backend_options,
+                ingress_port=ingress_port,
+                write_files=write_files,
                 wait_seconds=wait_seconds,
                 job=job,
                 admission_cancellation_event=admission_cancellation_event,
@@ -2024,9 +2090,8 @@ class CommandExecutionService:
         context: ToolContext,
         command: str,
         cwd: str = ".",
-        read_only: bool = False,
         read_roots: list[str] | None = None,
-        write_roots: list[str] | None = None,
+        write_roots: Literal["scratch"] | list[str] | None = None,
         executable_grant: str | list[str] | None = None,
         network: bool = False,
         git_write: bool = False,
@@ -2036,8 +2101,19 @@ class CommandExecutionService:
         wait_seconds: float | None = None,
         job: CommandJob | None = None,
         admission_cancellation_event: threading.Event | None = None,
+        local_ipc: bool = False,
+        ingress_port: int | None = None,
+        write_files: list[str] | None = None,
+        backend_options: tuple[str, ...] = (),
     ) -> dict | Problem:
         """Bind and execute a command while its selected backend lease remains active."""
+        if write_files and SandboxCapability.WRITE_FILES not in self.backend_capabilities:
+            return Problem(
+                code="sandbox.unsupported",
+                title="Exact write files unavailable",
+                detail="This native sandbox does not support exact workspace file writes.",
+                operation=context.tool_name,
+            )
         try:
             command_deadline(
                 context.settings.command_job_runtime_limit_seconds,
@@ -2060,6 +2136,40 @@ class CommandExecutionService:
                 code="command_terminal.unavailable",
                 title="Interactive terminal unavailable",
                 detail="This native sandbox has no qualified owned interactive terminal.",
+                operation=context.tool_name,
+            )
+        if ingress_port is not None and (
+            SandboxCapability.INGRESS not in self.requestable_backend_capabilities
+            or network
+            or egress_origins
+            or interactive
+        ):
+            return Problem(
+                code="sandbox.unsupported",
+                title="Service publication unavailable",
+                detail="Ingress requires qualified isolated nonterminal service execution; "
+                "it cannot share a broad-network or mediated-egress request.",
+                operation=context.tool_name,
+            )
+        if local_ipc and SandboxCapability.LOCAL_IPC not in self.requestable_backend_capabilities:
+            return Problem(
+                code="sandbox.unsupported",
+                title="Local IPC unavailable",
+                detail="This platform does not support an explicit local Unix IPC request.",
+                operation=context.tool_name,
+            )
+        if local_ipc and network:
+            return Problem(
+                code="sandbox.unsupported",
+                title="Local IPC unavailable",
+                detail="A private Unix IPC request cannot share a general network grant.",
+                operation=context.tool_name,
+            )
+        if backend_options and not set(backend_options) <= set(self.backend_options):
+            return Problem(
+                code="sandbox.unsupported",
+                title="Requested sandbox access unavailable",
+                detail="The active native sandbox cannot enforce the selected optional access.",
                 operation=context.tool_name,
             )
         if interactive and egress_origins:
@@ -2106,7 +2216,8 @@ class CommandExecutionService:
                     detail=(
                         "The initial wait must be finite and between 0 and "
                         f"{runtime_settings.command_max_wait_seconds:g} seconds, as configured by "
-                        "tools.command_max_wait_seconds."
+                        "tools.command_max_wait_seconds. Use JSON null for the default wait, "
+                        "including for long commands. Poll any returned job handle for completion."
                     ),
                     operation=context.tool_name,
                 )
@@ -2155,7 +2266,7 @@ class CommandExecutionService:
                     def execute(owned: CommandJob) -> dict | Problem:
                         """Run the exact planned command once under a job-owned cancel signal."""
                         with (
-                            manager.interaction_execution(session_id)
+                            manager.command_job_storage(session_id)
                             if manager is not None
                             else standalone()
                         ):
@@ -2169,7 +2280,6 @@ class CommandExecutionService:
                                 ),
                                 command,
                                 cwd,
-                                read_only,
                                 read_roots,
                                 write_roots,
                                 executable_grant,
@@ -2178,6 +2288,10 @@ class CommandExecutionService:
                                 reason,
                                 egress_origins,
                                 interactive=interactive,
+                                local_ipc=local_ipc,
+                                backend_options=backend_options,
+                                ingress_port=ingress_port,
+                                write_files=write_files,
                                 job=owned,
                                 admission_cancellation_event=context.cancellation_event,
                             )
@@ -2252,7 +2366,10 @@ class CommandExecutionService:
                 detail=network_limit,
                 operation=context.tool_name,
             )
-        if egress_origins and SandboxCapability.MEDIATED_EGRESS not in self.backend_capabilities:
+        if (
+            egress_origins
+            and SandboxCapability.MEDIATED_EGRESS not in self.requestable_backend_capabilities
+        ):
             return Problem(
                 code="sandbox.unavailable",
                 title="Mediated egress unavailable",
@@ -2295,7 +2412,33 @@ class CommandExecutionService:
                 if context.instructions_manager is not None
                 else command_cwd
             )
-            path_value = os.environ.get(PATH_ENVIRONMENT_VARIABLE, MINIMAL_SYSTEM_PATH)
+            path_value = _sandbox_search_path(context)
+            configured_environment = context.settings.sandbox_environment.copy()
+            configured_environment.pop(PATH_ENVIRONMENT_VARIABLE, None)
+            if any(
+                re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None
+                or name.startswith("LOOP_")
+                or name
+                in {
+                    "IFS",
+                    WORKSPACE_ROOT_ENVIRONMENT_VARIABLE,
+                    HOME_ENVIRONMENT_VARIABLE,
+                    TMPDIR_ENVIRONMENT_VARIABLE,
+                    TMP_ENVIRONMENT_VARIABLE,
+                    TEMP_ENVIRONMENT_VARIABLE,
+                    XDG_CACHE_HOME_ENVIRONMENT_VARIABLE,
+                }
+                or (isinstance(value, str) and "\x00" in value)
+                for name, value in configured_environment.items()
+            ):
+                return Problem(
+                    code="sandbox.invalid",
+                    title="Invalid sandbox environment",
+                    detail=(
+                        "The workspace sandbox environment contains a reserved or invalid entry."
+                    ),
+                    operation=context.tool_name,
+                )
             analysis = context.permission_manager.analyze_command(command)
             discovery_source = workspace_command_source(command, workspace, command_cwd)
             discovery_analysis = (
@@ -2312,6 +2455,16 @@ class CommandExecutionService:
                 else context.permission_manager.temporary_directory
             )
             trusted_system_path = getattr(type(self._backend), "trusted_system_path", None)
+
+            def may_read_project(path: Path) -> bool:
+                """Apply current command read policy to an advisory workspace inspection."""
+                return context.permission_manager.can_inspect_command_path(
+                    context.tool_name,
+                    workspace,
+                    path,
+                    directory=False,
+                )
+
             scratch_source = (
                 discover_scratch_shell_source(
                     discovery_source,
@@ -2319,6 +2472,12 @@ class CommandExecutionService:
                     command_cwd,
                     path_value,
                     lambda path: trusted_system_path(self._backend, path),
+                    may_read=lambda path: context.permission_manager.can_inspect_command_path(
+                        context.tool_name,
+                        scratch,
+                        path,
+                        directory=False,
+                    ),
                 )
                 if prelaunch_failure is None and callable(trusted_system_path)
                 else None
@@ -2374,7 +2533,14 @@ class CommandExecutionService:
             make_source = child_source or discovery_source
             make_analysis = child_analysis or discovery_analysis
             make_recipes = (
-                discover_makefile_commands(make_source, workspace, command_cwd, path_value)
+                discover_makefile_commands(
+                    make_source,
+                    workspace,
+                    command_cwd,
+                    path_value,
+                    may_read=may_read_project,
+                    environment_names=configured_environment,
+                )
                 if prelaunch_failure is None
                 else ()
             )
@@ -2463,34 +2629,41 @@ class CommandExecutionService:
                     workspace=workspace,
                     temporary_directory=context.permission_manager.temporary_directory,
                 )
-            manual_reads = tuple(
-                Path(
-                    paths.resolve(root)
-                    if any(
-                        root == virtual or root.startswith(f"{virtual}/")
-                        for virtual, _ in paths.command_roots()
-                    )
-                    else root
-                ).resolve(strict=True)
-                for root in read_roots or ()
-            )
-            manual_writes = tuple(
+
+            def resolve_directory(root: str) -> Path:
+                """Resolve relative and virtual roots against the current workspace."""
+                path = Path(root) if Path(root).is_absolute() else Path(paths.resolve(root))
+                return path.resolve(strict=True)
+
+            manual_reads = tuple(resolve_directory(root) for root in read_roots or ())
+            scope_policy_revision = None
+            if write_roots is None and write_files is None:
+                manual_writes, scope_policy_revision = (
+                    context.permission_manager.sandbox_default_write_scope(workspace)
+                )
+            elif isinstance(write_roots, list):
+                manual_writes = tuple(
+                    dict.fromkeys(resolve_directory(root) for root in write_roots)
+                )
+            else:
+                manual_writes = ()
+            exact_writes = tuple(
                 dict.fromkeys(
-                    Path(
-                        paths.resolve(root)
-                        if any(
-                            root == virtual or root.startswith(f"{virtual}/")
-                            for virtual, _ in paths.command_roots()
-                        )
-                        else root
-                    ).resolve(strict=True)
-                    for root in write_roots or ()
+                    workspace / name.removeprefix(f"{VirtualPath.WORKSPACE}/")
+                    for name in write_files or ()
                 )
             )
-            if read_only and manual_writes:
-                raise ValueError("Read-only workspace commands cannot request write roots.")
+            if context.sandbox_output_only and any(
+                workspace.is_relative_to(root)
+                or any(root.samefile(ancestor) for ancestor in (workspace, *workspace.parents))
+                for root in manual_writes
+            ):
+                raise ValueError(
+                    "Saved verification tasks require scratch, exact files or bounded output "
+                    "directories. Review the task with /verify show before changing its scope."
+                )
             if write_limit := context.permission_manager.sandbox_write_root_limit(
-                workspace, manual_writes
+                workspace, (*manual_writes, *exact_writes)
             ):
                 raise ValueError(write_limit)
             system_make_names = []
@@ -2560,10 +2733,6 @@ class CommandExecutionService:
                         "than the sandbox can bind."
                     ),
                 )
-            findings = analysis.findings
-            git_write = git_write or any(finding.requests_git_write for finding in findings)
-            if read_only and git_write:
-                raise ValueError("A read-only command cannot request Git metadata writes.")
             git_reads, git_roots, git_create = (
                 context.permission_manager.git_sandbox_roots(
                     workspace, read=analysis.git_read, write=git_write
@@ -2581,8 +2750,20 @@ class CommandExecutionService:
                 if grant is None:
                     raise ValueError("Executable grant reference is unknown or expired.")
                 explicit_grants[reference] = grant
+            policy_reads, path_policy_revision = self._sandbox_path_reads(
+                context,
+                workspace,
+                (*manual_writes, *git_roots, scratch),
+                requested_writes=manual_writes,
+            )
+            if scope_policy_revision is None and policy_reads:
+                scope_policy_revision = path_policy_revision
             direct_grants = self._automatic_tool_grants(
-                context, eligible_executables, workspace, command_cwd
+                context,
+                eligible_executables,
+                workspace,
+                command_cwd,
+                policy_reads=policy_reads,
             )
             make_grants = []
             for name in make_names:
@@ -2602,6 +2783,7 @@ class CommandExecutionService:
                     workspace if context.instructions_manager is not None else None,
                     match=match,
                     optional_metadata=True,
+                    policy_reads=policy_reads,
                 )
                 if grant is not None:
                     make_grants.append(grant)
@@ -2618,17 +2800,6 @@ class CommandExecutionService:
                 dict.fromkeys(
                     root
                     for grant in grants
-                    for root in self._executable_read_roots(
-                        grant, workspace, path_value, command_cwd
-                    )
-                )
-            )
-            automatic_reads = tuple(
-                dict.fromkeys(
-                    root
-                    for grant in grants
-                    if grant.managed_package
-                    and (grant in direct_grants or grant in explicit_grants.values())
                     for root in self._executable_read_roots(
                         grant, workspace, path_value, command_cwd
                     )
@@ -2662,42 +2833,6 @@ class CommandExecutionService:
                     )
                 )
             )
-            runtime_candidates = discover_workspace_runtimes(
-                discovery_source,
-                discovery_analysis,
-                workspace,
-                command_cwd,
-                path_value,
-                executable_identities,
-            )
-            if child_source is not None and child_analysis is not None:
-                runtime_candidates += discover_workspace_runtimes(
-                    child_source,
-                    child_analysis,
-                    workspace,
-                    command_cwd,
-                    path_value,
-                    executable_identities,
-                )
-            if scratch_source is not None and scratch_analysis is not None:
-                runtime_candidates += discover_workspace_runtimes(
-                    scratch_source,
-                    scratch_analysis,
-                    workspace,
-                    command_cwd,
-                    path_value,
-                    executable_identities,
-                )
-            for recipe in make_recipes:
-                candidate_analysis = context.permission_manager.analyze_command(recipe)
-                runtime_candidates += discover_workspace_runtimes(
-                    recipe,
-                    candidate_analysis,
-                    workspace,
-                    command_cwd,
-                    path_value,
-                    executable_identities,
-                )
             selected_workspace = selected_workspace_executable(
                 discovery_source, discovery_analysis, workspace
             )
@@ -2723,6 +2858,7 @@ class CommandExecutionService:
                     path_value,
                     command_cwd,
                     workspace,
+                    may_read=may_read_project,
                     allow_path_lookup=discovery_analysis.first_path_inherited,
                     first_arguments=discovery_analysis.first_executable_arguments
                     or (
@@ -2750,6 +2886,7 @@ class CommandExecutionService:
                     path_value,
                     command_cwd,
                     workspace,
+                    may_read=may_read_project,
                 )
                 script_discovery = WorkspaceScriptInterpreters(
                     tuple(
@@ -2763,16 +2900,6 @@ class CommandExecutionService:
                     ),
                 )
             workspace_links = script_discovery.workspace_links
-            runtime_candidates = tuple(
-                dict.fromkeys(
-                    (
-                        *runtime_candidates,
-                        *discover_workspace_interpreters(
-                            workspace, script_discovery.workspace_links
-                        ),
-                    )
-                )
-            )
             runtime_reader = getattr(type(self._backend), "automatic_tool_read_roots", None)
             path_roots = path_search_roots({PATH_ENVIRONMENT_VARIABLE: path_value}, command_cwd)
             runtime_reads = (
@@ -2780,42 +2907,6 @@ class CommandExecutionService:
                 if runtime_reader is not None
                 else ()
             )
-            runtime_candidates = tuple(
-                candidate
-                for candidate in runtime_candidates
-                if not any(candidate.identity[2].is_relative_to(root) for root in runtime_reads)
-            )
-            candidate_reads = ()
-            candidate_rejected = False
-            if runtime_reader is not None and runtime_candidates:
-                try:
-                    candidate_reads = runtime_reader(
-                        self._backend,
-                        workspace,
-                        tuple(
-                            (item.identity[1].parent, item.identity[1].parent.resolve())
-                            for item in runtime_candidates
-                        ),
-                        tuple(item.identity for item in runtime_candidates),
-                    )
-                except TimeoutError:
-                    raise
-                except (OSError, ValueError):
-                    candidate_reads = ()
-                    candidate_rejected = True
-                original_candidate_reads = candidate_reads
-                candidate_reads = tuple(
-                    root
-                    for root in candidate_reads
-                    if not root.is_relative_to(workspace)
-                    and any(
-                        candidate.identity[2].is_relative_to(root)
-                        for candidate in runtime_candidates
-                    )
-                )
-                if original_candidate_reads and not candidate_reads:
-                    candidate_rejected = True
-                runtime_reads = tuple(dict.fromkeys((*runtime_reads, *candidate_reads)))
             runtime_reads = tuple(
                 root for root in runtime_reads if not root.is_relative_to(workspace)
             )
@@ -2826,11 +2917,6 @@ class CommandExecutionService:
             selected_runtimes = (
                 *(() if manual_reads else workspace_link_names),
                 *script_discovery.interpreters,
-                *(
-                    tuple(str(candidate.alias_executable) for candidate in runtime_candidates)
-                    if not candidate_reads and not candidate_rejected
-                    else ()
-                ),
             )
             identified_reads = (
                 _interpreter_runtime_roots(
@@ -2844,29 +2930,6 @@ class CommandExecutionService:
                 if selected_runtimes
                 else ()
             )
-            active_candidates = tuple(
-                candidate
-                for candidate in runtime_candidates
-                if any(
-                    candidate.identity[2].is_relative_to(root)
-                    for root in (*candidate_reads, *identified_reads, *manual_reads)
-                )
-            )
-            package_reads, package_aliases = _installed_runtime_packages(
-                self._backend,
-                active_candidates,
-                workspace,
-                (*manual_reads, *grant_reads, *runtime_reads, *identified_reads, *system_roots),
-            )
-            workspace_links = tuple(
-                dict.fromkeys(
-                    (
-                        *workspace_links,
-                        *(WorkspaceExecutableLink(*item.identity) for item in active_candidates),
-                    )
-                )
-            )
-            workspace_link_names = tuple(item.name for item in workspace_links)
             alias_roots = tuple(
                 root
                 for root in (*manual_reads, *grant_reads, *identified_reads)
@@ -2893,28 +2956,17 @@ class CommandExecutionService:
                     path_value,
                     command_cwd,
                     workspace,
+                    may_read=may_read_project,
                     allow_path_lookup=analysis.first_path_inherited,
                 ).interpreters
             selected_alias_names = (
                 *workspace_link_names,
                 *eligible_executables,
-                *(str(candidate.alias_executable) for candidate in active_candidates),
             )
             read_aliases = tuple(
                 dict.fromkeys(
                     (
                         *read_aliases,
-                        *package_aliases,
-                        *_approved_executable_aliases(
-                            tuple(
-                                str(candidate.alias_executable) for candidate in runtime_candidates
-                            ),
-                            path_value,
-                            command_cwd,
-                            candidate_reads,
-                            workspace,
-                            system_roots,
-                        ),
                         *_approved_executable_aliases(
                             selected_alias_names,
                             path_value,
@@ -2991,12 +3043,53 @@ class CommandExecutionService:
                         *manual_reads,
                         *runtime_reads,
                         *identified_reads,
-                        *package_reads,
                         *skill_reads,
                     )
                 )
                 if not root.is_relative_to(workspace)
+                and not any(root.is_relative_to(path) for path in policy_reads)
             )
+            read_aliases = tuple(
+                alias
+                for alias in read_aliases
+                if not any(alias.is_relative_to(root) for root in policy_reads)
+            )
+            if configured_aliases := context.settings.sandbox_path_aliases:
+                selected_links = {
+                    link
+                    for link, _, _ in _executable_directory_links(
+                        (*selected_alias_names, *make_names, *script_discovery.interpreters),
+                        path_value,
+                        command_cwd,
+                    )
+                }
+                authorized_roots = (
+                    *policy_reads,
+                    *(root for root in manual_reads if root in extra_reads),
+                )
+                for value in configured_aliases:
+                    alias = Path(value)
+                    if not alias.is_absolute() or ".." in alias.parts or not alias.is_symlink():
+                        continue
+                    try:
+                        target = alias.resolve(strict=True)
+                    except (OSError, RuntimeError):
+                        continue
+                    if target.is_dir() and any(
+                        target.is_relative_to(root) for root in authorized_roots
+                    ):
+                        read_aliases = tuple(dict.fromkeys((*read_aliases, alias)))
+                    elif alias in selected_links and alias not in read_aliases:
+                        return Problem(
+                            code="sandbox.invalid",
+                            title="Unapproved sandbox directory alias",
+                            detail=(
+                                "The selected executable needs a configured directory alias "
+                                "whose target is outside the approved read roots. Request read "
+                                "access to the canonical runtime directory."
+                            ),
+                            operation=context.tool_name,
+                        )
             if any(is_protected_external_read(root) for root in extra_reads):
                 raise ValueError("Protected external directory cannot be a read root.")
             read_context = context.permission_manager.describe_sandbox_reads(
@@ -3004,7 +3097,7 @@ class CommandExecutionService:
                 extra_reads,
                 tuple(root for root in manual_reads if not root.is_relative_to(workspace)),
                 tuple(grant.name for grant in grants),
-                bool(grant_reads) and set(grant_reads) <= set(automatic_reads),
+                False,
             )
             if identified_reads:
                 read_context = (
@@ -3012,12 +3105,6 @@ class CommandExecutionService:
                 )
             if make_grants:
                 detail = "identified indirect tool folder, including neighboring files"
-                read_context = f"{read_context}; {detail}" if read_context else f"Read {detail}"
-            if candidate_reads:
-                detail = "selected project runtime folder, including neighboring files"
-                read_context = f"{read_context}; {detail}" if read_context else f"Read {detail}"
-            if package_reads:
-                detail = "selected runtime packages and their declared dependencies"
                 read_context = f"{read_context}; {detail}" if read_context else f"Read {detail}"
             selected_identities = tuple(
                 tuple(identity)
@@ -3044,7 +3131,7 @@ class CommandExecutionService:
                 and (value == str(scratch) or value.startswith(f"{scratch}/"))
             )
 
-            redaction_roots = {*extra_reads, *read_aliases, *git_reads}
+            redaction_roots = {*extra_reads, *policy_reads, *read_aliases, *git_reads}
             advertised_roots = {root for _, root in paths.command_roots()}
             native_output_roots = ()
 
@@ -3073,46 +3160,214 @@ class CommandExecutionService:
             ):
                 raise ValueError("Executable grant reference is unknown or expired.")
 
-            request = SandboxRequest.create(
-                source=command,
-                terminal=interactive,
-                cleanup_proof=True,
-                scratch_root=scratch,
-                scratch_data=scratch == context.permission_manager.temporary_directory
-                and context.permission_manager.temporary_directory_allows_private_names,
-                cwd=command_cwd,
-                workspace=workspace,
-                read_roots=(*extra_reads, *git_reads),
-                write_roots=()
-                if read_only
-                else tuple(dict.fromkeys((workspace, *git_roots, *manual_writes))),
-                network=network,
-                egress_origins=tuple(egress_origins or ()),
-                local_network=network
-                or (
-                    SandboxCapability.LOCAL_NETWORK in self.backend_capabilities
-                    and context.permission_manager.sandbox_local_network_enabled()
-                ),
-                environment=environment,
-                policy_version=self._backend.policy_version
-                if isinstance(getattr(self._backend, "policy_version", None), str)
-                else "native-v1",
-                deadline=time.monotonic() + context.settings.command_job_runtime_limit_seconds,
-                workspace_id=str(workspace),
-                git_create=git_create,
-                read_context=read_context,
-                read_aliases=read_aliases,
-                executable_identities=executable_identities,
-                workspace_executable_identities=selected_identities,
-                automatic_tool_reads=automatic_reads,
-                protected_instruction_names=context.permission_manager.protected_sandbox_paths(
-                    context.instructions_manager.agents_filenames
-                    if context.instructions_manager is not None
-                    else ()
-                ).instruction_names,
-                generated_environment=generated_environment,
-                file_creation_mask=file_creation_mask,
-            )
+            def bind_request(additional: tuple[Path, ...] = ()) -> SandboxRequest:
+                """Bind each selected installation to the same native request and review path."""
+                approved = (*policy_reads, *extra_reads, *additional)
+                tools = tuple(
+                    link
+                    for root, links in project_tools.items()
+                    if any(root.is_relative_to(bound) for bound in approved)
+                    for link in links
+                )
+                tool_aliases = _approved_executable_aliases(
+                    tuple(link.name for link in tools),
+                    path_value,
+                    command_cwd,
+                    approved,
+                    workspace,
+                    system_roots,
+                )
+                program_ids = tuple(
+                    identity for root in additional for identity in launcher_tools.get(root, ())
+                )
+                bound = SandboxRequest.create(
+                    source=command,
+                    execution_source=(
+                        "export "
+                        + " ".join(
+                            f'{name}="${{{OUTPUT_DIRECTORY_ENVIRONMENT_VARIABLE}:?}}"/'
+                            f"{shlex.quote(value.output)}"
+                            if isinstance(value, SandboxOutputPath)
+                            else f"{name}={shlex.quote(value)}"
+                            for name, value in configured_environment.items()
+                        )
+                        + "\n"
+                        + command
+                        if configured_environment
+                        else None
+                    ),
+                    terminal=interactive,
+                    cleanup_proof=True,
+                    scratch_root=scratch,
+                    scratch_data=scratch == context.permission_manager.temporary_directory
+                    and context.permission_manager.temporary_directory_allows_private_names,
+                    cwd=command_cwd,
+                    workspace=workspace,
+                    read_roots=(*policy_reads, *extra_reads, *git_reads, *additional),
+                    policy_read_roots=policy_reads,
+                    permission_revision=scope_policy_revision,
+                    write_roots=tuple(dict.fromkeys((*git_roots, *manual_writes))),
+                    write_files=exact_writes,
+                    network=network,
+                    egress_origins=tuple(egress_origins or ()),
+                    backend_options=backend_options,
+                    hardlink_sources=hardlink_source_paths(backend_options),
+                    ingress_port=ingress_port,
+                    local_network=network
+                    or local_ipc
+                    or ingress_port is not None
+                    or (
+                        SandboxCapability.LOCAL_IPC not in self.requestable_backend_capabilities
+                        and SandboxCapability.LOCAL_NETWORK in self.backend_capabilities
+                        and context.permission_manager.sandbox_local_network_enabled(
+                            context.tool_name
+                        )
+                    ),
+                    environment=environment,
+                    policy_version=self._backend.policy_version
+                    if isinstance(getattr(self._backend, "policy_version", None), str)
+                    else "native-v1",
+                    deadline=time.monotonic() + context.settings.command_job_runtime_limit_seconds,
+                    workspace_id=str(workspace),
+                    git_create=git_create,
+                    read_context=(
+                        "Read the selected project tool installation, including its libraries"
+                        if additional
+                        else read_context
+                    ),
+                    read_aliases=tuple(dict.fromkeys((*read_aliases, *tool_aliases))),
+                    executable_identities=tuple(
+                        dict.fromkeys((*executable_identities, *program_ids))
+                    ),
+                    workspace_executable_identities=tuple(
+                        dict.fromkeys((*selected_identities, *tools))
+                    ),
+                    protected_instruction_names=context.permission_manager.protected_sandbox_paths(
+                        context.instructions_manager.agents_filenames
+                        if context.instructions_manager is not None
+                        else ()
+                    ).instruction_names,
+                    generated_environment=generated_environment,
+                    file_creation_mask=file_creation_mask,
+                )
+                if ordinary and self.backend_options:
+                    return context.permission_manager.prepare_sandbox_options(
+                        bound, self.backend_options, project=project
+                    )
+                return bound
+
+            project_tools = {}
+            launcher_tools = {}
+            project = bool(make_recipes or script_discovery.interpreters)
+            ordinary = not context.sandbox_output_only and prelaunch_failure is None
+            if (
+                prelaunch_failure is None
+                and context.instructions_manager is not None
+                and context.interaction
+                and (ordinary or policy_reads or extra_reads)
+            ):
+                programs = workspace_shell_programs(
+                    command,
+                    workspace,
+                    command_cwd,
+                    may_read_project,
+                )
+                project = project or programs is not None
+                if project:
+                    installations = linked_project_installations(
+                        workspace,
+                        system_roots,
+                        lambda path: context.permission_manager.can_inspect_command_path(
+                            context.tool_name, workspace, path, directory=True
+                        ),
+                    )
+                    active_directories = {directory for _, directory in path_roots}
+                    project_tools = {
+                        root: links
+                        for root, links in installations.items()
+                        if len(installations) == 1
+                        or any(link.spelling.parent in active_directories for link in links)
+                    }
+                for identity in _automatic_executable_identities(
+                    programs if ordinary and programs else (),
+                    path_value,
+                    command_cwd,
+                    trusted_owners=trusted_owners,
+                ):
+                    _, spelling, resolved, _, _ = identity
+                    root = resolved.parent
+                    if (
+                        root.name in {"bin", "sbin"}
+                        and spelling.parent == root
+                        and not any(
+                            root.is_relative_to(bound)
+                            for bound in (workspace, *system_roots, *policy_reads, *extra_reads)
+                        )
+                    ):
+                        launcher_tools.setdefault(root, []).append(identity)
+
+            request = bind_request()
+            prepared_access = False
+            if ordinary and project and context.interaction is not None:
+                additional: tuple[Path, ...] = ()
+                for root in (*launcher_tools, *project_tools):
+                    if any(root.is_relative_to(bound) for bound in request.read_roots):
+                        continue
+                    try:
+                        candidate = bind_request((*additional, root))
+                    except (OSError, RuntimeError, ValueError):
+                        continue
+                    if (
+                        context.permission_manager.sandbox_access_for_review(
+                            candidate, context.tool_name
+                        )
+                        and candidate.paths_are_current()
+                    ):
+                        additional = (*additional, root)
+                        request = candidate
+                        prepared_access = True
+
+            if (
+                ordinary
+                and not write_roots
+                and not write_files
+                and getattr(context.interaction, "supports_fresh_host_approval", False) is True
+            ):
+
+                def read_only_program(argv: tuple[str, ...]) -> bool:
+                    """Recognize selected stock programs with a read-only invocation."""
+                    name = Path(argv[0]).name
+                    if name == "git":
+                        if match_git_mutation(list(argv)) is not None:
+                            return False
+                    elif name not in {"cat", "cmp", "cut", "grep", "head", "ls", "tail", "wc"}:
+                        return False
+                    selected = _selected_executable(argv[0], path_value, command_cwd)
+                    return (
+                        selected is not None
+                        and callable(trusted_system_path)
+                        and all(trusted_system_path(self._backend, path) for path in selected)
+                    )
+
+                candidate = context.permission_manager.prepare_sandbox_workspace_writes(
+                    request,
+                    context.tool_name,
+                    read_only_program,
+                    prepared_access=prepared_access,
+                )
+                prepared_access = prepared_access or candidate.write_roots != request.write_roots
+                request = candidate
+
+            infer = getattr(type(self._backend), "inferred_options", None)
+            if callable(infer) and prelaunch_failure is None:
+                request = context.permission_manager.prepare_sandbox_options(
+                    request,
+                    self.backend_options,
+                    project=False,
+                    infer=lambda snapshot: infer(self._backend, snapshot),
+                    saved=context.sandbox_output_only,
+                )
+
             output_paths = getattr(type(self._backend), "output_path_roots", None)
             if output_paths is not None:
                 native_output_roots = output_paths(self._backend, request)
@@ -3150,6 +3405,7 @@ class CommandExecutionService:
                 prelaunch_failure=prelaunch_failure,
                 reason=reason,
                 job=job,
+                prepared_access=prepared_access,
                 skill_snapshot=skill_snapshot,
                 admission_cancellation_event=admission_cancellation_event,
             )

@@ -134,8 +134,8 @@ _CONFIGURATION_ERROR_POLICY = {
         }
     ),
     "redacted_prefixes": {
-        "Persistent app.yolo source is untrusted:": (
-            "Persistent app.yolo source is untrusted; verify the user configuration file."
+        "Persistent execution setting source is untrusted:": (
+            "Persistent execution setting source is untrusted; verify the user configuration file."
         ),
     },
 }
@@ -177,6 +177,8 @@ class ConfigurationManager:
     _retry_environment: dict[str, str]
     _session_values: dict[str, Any]
     _defaults_only: bool
+    _recovery_files: dict[Path, bytes | None]
+    _recovery_saved: set[Path]
     _state_lock: RLock
 
     def __init__(self, path: Path | str, workspace_path: Path | str | None = None) -> None:
@@ -197,6 +199,8 @@ class ConfigurationManager:
         self._retry_environment = {}
         self._session_values = {}
         self._defaults_only = False
+        self._recovery_files = {}
+        self._recovery_saved = set()
         self._state_lock = RLock()
 
     @property
@@ -214,21 +218,14 @@ class ConfigurationManager:
         Returns:
             Path: The existing or newly created configuration path.
         """
-        with self._state_lock:
-            if self._defaults_only:
-                try:
-                    self.path.lstat()
-                except FileNotFoundError:
-                    self._require_durable_writes()
+        with self._state_lock, self._lock_for("user"):
+            try:
+                self.path.lstat()
+            except FileNotFoundError:
+                self._document = self._default_document()
+                self._save_scope("user")
+            else:
                 return self.path
-            with self._lock_for("user"):
-                try:
-                    self.path.lstat()
-                except FileNotFoundError:
-                    self._document = self._default_document()
-                    self._save_document(self.path, self._document)
-                else:
-                    return self.path
         return self.path
 
     def load(self, environment: Mapping[str, str] | None = None) -> ApplicationSettings:
@@ -261,15 +258,25 @@ class ConfigurationManager:
             self._effective = effective
             self._sources = sources
             self._defaults_only = False
+            self._recovery_files.clear()
+            self._recovery_saved.clear()
             return effective
 
     def use_defaults(self) -> ApplicationSettings:
         """Use built-in settings for this process while protecting saved configuration.
 
         Returns:
-            ApplicationSettings: Built-in settings with persistent writes disabled until reload.
+            ApplicationSettings: Built-in settings; saved files stay intact until an explicit save.
         """
         with self._state_lock:
+            self._recovery_files = {}
+            self._recovery_saved.clear()
+            for path in (self.path, self._workspace_path):
+                if path is not None:
+                    try:
+                        self._recovery_files[path] = self._read_optional_file(path)
+                    except OSError:
+                        pass
             self._document = self._default_document()
             self._workspace_document = tomlkit.document()
             self._environment = {}
@@ -313,7 +320,7 @@ class ConfigurationManager:
                     ConfigurationSectionError,
                     ValidationError,
                 ) as found:
-                    same = type(found) is type(error) and str(found) == str(error)
+                    same = isinstance(found, type(error)) and str(found) == str(error)
                     if isinstance(found, ValidationError) and isinstance(error, ValidationError):
                         same = found.errors(include_url=False) == error.errors(include_url=False)
                     if same:
@@ -433,7 +440,10 @@ class ConfigurationManager:
         """
         while True:
             try:
+                missing = not os.path.lexists(self.path)
                 self.initialize()
+                if missing:
+                    interaction.info(f"Created default configuration at {self.path}.")
                 return self.load()
             except (OSError, ValueError) as error:
                 problem = Problem(
@@ -479,7 +489,7 @@ class ConfigurationManager:
                 settings = self.use_defaults()
                 interaction.warning(
                     "Using built-in defaults, including the default backend, with saved "
-                    "configuration writes disabled until a successful reload."
+                    "files unchanged until you explicitly save replacement settings."
                 )
                 return settings
 
@@ -590,7 +600,7 @@ class ConfigurationManager:
         Returns:
             bool | None: Saved activation, or None when the file was bypassed during recovery.
         """
-        if self._defaults_only:
+        if self._defaults_only and self.path not in self._recovery_saved:
             return None
         table = self._document.get("app")
         return table.unwrap().get("yolo", False) is True if isinstance(table, Mapping) else False
@@ -616,21 +626,20 @@ class ConfigurationManager:
             ApplicationSettings: Validated configuration after the edit.
 
         Raises:
-            ValueError: If durable writes are suspended during recovery, YOLO is assigned to
-                workspace scope, given an ambiguous value, or enabled from an untrusted destination.
+            ValueError: If YOLO is assigned to workspace scope, given an ambiguous value, or
+                enabled from an untrusted destination.
         """
-        self._require_durable_writes()
         with self._state_lock, self._lock_for(scope):
-            self._require_durable_writes()
-            if dotted_path == "app.yolo" and scope != "user":
-                raise ValueError("app.yolo can only be saved for the user or this session.")
-            if dotted_path == "app.yolo":
-                value = self._normalize_yolo_value(value)
+            if dotted_path in {"app.yolo", "app.allow_direct_host_execution"} and scope != "user":
+                raise ValueError(f"{dotted_path} can only be saved for the user or this session.")
+            if dotted_path in {"app.yolo", "app.allow_direct_host_execution"}:
+                value = self._normalize_trusted_boolean(value, dotted_path)
                 if value:
-                    self._require_yolo_destination()
+                    self._require_trusted_execution_destination()
             sections = self._split_path(dotted_path)
             document = self._document_for_write(scope)
             original = tomlkit.dumps(document)
+            recovering = self._defaults_only
             table = document.get(sections[0])
             defaults = ApplicationSettings().model_dump(mode="python")
             if sections[0] not in defaults or sections[1] not in defaults[sections[0]]:
@@ -643,10 +652,11 @@ class ConfigurationManager:
                 self._validate_candidate()
                 if before_save is not None:
                     before_save()
-                self._require_durable_writes()
+                if self._defaults_only != recovering:
+                    raise ValueError("Configuration entered recovery during this save; retry it.")
                 self._save_scope(scope)
             except BaseException:
-                if not self._defaults_only:
+                if self._defaults_only == recovering:
                     if scope == "workspace" and self._workspace_path is not None:
                         self._workspace_document = tomlkit.parse(original)
                     else:
@@ -670,8 +680,8 @@ class ConfigurationManager:
         """
         section, field = self._split_path(dotted_path)
         dotted_path = f"{section}.{field}"
-        if dotted_path == "app.yolo":
-            value = self._normalize_yolo_value(value)
+        if dotted_path in {"app.yolo", "app.allow_direct_host_execution"}:
+            value = self._normalize_trusted_boolean(value, dotted_path)
         previous = self._session_values.copy()
         self._session_values[dotted_path] = value
         try:
@@ -725,23 +735,20 @@ class ConfigurationManager:
             ApplicationSettings: Effective configuration after the reset.
 
         Raises:
-            ValueError: If a durable reset is attempted while recovery defaults are active.
+            OSError: If a saved file changed during recovery or cannot be archived.
         """
         if scope == "session":
             self._session_values = {
                 entry.path: self._default_value(entry.path) for entry in self.entries
             }
             return self._resolve()
-        self._require_durable_writes()
         if scope == "workspace":
             with self._state_lock, self._lock_for(scope):
-                self._require_durable_writes()
                 self._workspace_document = tomlkit.document()
                 self._save_scope("workspace")
             return self._resolve()
         with self._state_lock, self._lock_for(scope):
-            self._require_durable_writes()
-            self._document = self._read_document()
+            self._document = self._document_for_write("user")
             default_values = self._stored_defaults()
             self._document["config_version"] = default_values["config_version"]
             for section, settings in default_values.items():
@@ -757,7 +764,7 @@ class ConfigurationManager:
                             del table[field]
                     else:
                         table[field] = value
-            self._save_document(self.path, self._document)
+            self._save_scope("user")
         return self._resolve()
 
     def unset(
@@ -776,15 +783,13 @@ class ConfigurationManager:
             ApplicationSettings: Validated settings after the removal.
 
         Raises:
-            ValueError: If durable writes are suspended or the field is not present.
+            ValueError: If the field is not present.
         """
         if scope == "user":
             return self.set(dotted_path, self._default_value(dotted_path), scope="user")
-        self._require_durable_writes()
-        if dotted_path == "app.yolo":
-            raise ValueError("Workspace configuration cannot control app.yolo.")
+        if dotted_path in {"app.yolo", "app.allow_direct_host_execution"}:
+            raise ValueError("Workspace configuration cannot control trusted execution settings.")
         with self._state_lock, self._lock_for(scope):
-            self._require_durable_writes()
             section, field = self._split_path(dotted_path)
             document = self._document_for_write(scope)
             table = document.get(section)
@@ -842,17 +847,26 @@ class ConfigurationManager:
             Path: Persisted configuration path.
 
         Raises:
-            ValueError: If recovery defaults are active and durable writes are suspended.
+            OSError: If a saved file changed during recovery or cannot be archived.
         """
-        self._require_durable_writes()
         with self._state_lock, self._lock_for("user"):
-            self._require_durable_writes()
-            return self._save_document(self.path, self._document)
+            return self._save_scope("user")
 
-    def _require_durable_writes(self) -> None:
-        """Keep an explicitly bypassed file intact until a successful reload."""
-        if self._defaults_only:
-            raise ValueError("Repair and reload configuration before saving changes.")
+    def _archive_recovery_file(self, path: Path) -> None:
+        """Preserve the bypassed bytes before an explicitly requested durable write."""
+        if not self._defaults_only or path in self._recovery_saved:
+            return
+        if path not in self._recovery_files:
+            raise OSError("Configuration could not be read for recovery; repair and reload it.")
+        expected = self._recovery_files[path]
+        if self._read_optional_file(path) != expected:
+            raise OSError("Configuration changed during recovery; reload before saving.")
+        if expected is not None:
+            directory = Path(tempfile.mkdtemp(prefix=f".{path.name}.backup-", dir=path.parent))
+            backup = directory / path.name
+            with backup.open("xb") as stream:
+                stream.write(expected)
+            backup.chmod(constants.PRIVATE_FILE_MODE)
 
     @staticmethod
     def _save_document(path: Path, document: tomlkit.TOMLDocument) -> Path:
@@ -878,12 +892,15 @@ class ConfigurationManager:
             return self._default_document()
         document = self._parse_document(self.path, raw)
         table = document.get("app")
-        if isinstance(table, Mapping) and "yolo" in table:
-            value = document.unwrap()["app"]["yolo"]
-            if not isinstance(value, bool):
-                raise ValueError("Persistent app.yolo must be a TOML boolean.")
-            if value:
-                self._verify_trusted_yolo_source(raw)
+        if isinstance(table, Mapping):
+            for field in ("yolo", "allow_direct_host_execution"):
+                value = document.unwrap()["app"].get(field, False)
+                if not isinstance(value, bool):
+                    raise ValueError(  # noqa: TRY004 - configuration recovery handles ValueError.
+                        f"Persistent app.{field} must be a TOML boolean."
+                    )
+                if value:
+                    self._verify_trusted_execution_source(raw)
         return document
 
     @staticmethod
@@ -898,19 +915,19 @@ class ConfigurationManager:
         return document
 
     @staticmethod
-    def _normalize_yolo_value(value: Any) -> bool:
-        """Accept only an explicit boolean for trusted YOLO configuration."""
+    def _normalize_trusted_boolean(value: Any, dotted_path: str) -> bool:
+        """Accept only an explicit boolean for trusted execution configuration."""
         if isinstance(value, bool):
             return value
         if isinstance(value, str) and value.strip().lower() in {"true", "false"}:
             return value.strip().lower() == "true"
-        raise ValueError("app.yolo requires true or false.")
+        raise ValueError(f"{dotted_path} requires true or false.")
 
-    def _verify_trusted_yolo_source(self, raw: bytes) -> None:
+    def _verify_trusted_execution_source(self, raw: bytes) -> None:
         """Reject a persistent activation whose owner or inode cannot be verified."""
         path = self.path
         try:
-            self._require_yolo_destination()
+            self._require_trusted_execution_destination()
             before = path.lstat()
             if (
                 not stat.S_ISREG(before.st_mode)
@@ -918,27 +935,35 @@ class ConfigurationManager:
                 or before.st_nlink != 1
                 or stat.S_IMODE(before.st_mode) != constants.PRIVATE_FILE_MODE
             ):
-                raise ValueError("Persistent app.yolo requires an owner-controlled user config.")
+                raise ValueError(
+                    "Persistent execution setting requires an owner-controlled user config."
+                )
             descriptor = open_selected_file(path.parent, path, (before.st_dev, before.st_ino))
             with os.fdopen(descriptor, "rb") as stream:
                 if has_extended_access_acl(stream.fileno()):
-                    raise ValueError("Persistent app.yolo config has an extended access ACL.")
+                    raise ValueError(
+                        "Persistent execution setting config has an extended access ACL."
+                    )
                 content = stream.read()
             after = path.lstat()
             if content != raw or (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino):
-                raise ValueError("Persistent app.yolo changed while its source was verified.")
+                raise ValueError(
+                    "Persistent execution setting changed while its source was verified."
+                )
         except (OSError, ValueError) as error:
-            raise ValueError(f"Persistent app.yolo source is untrusted: {error}") from error
+            raise ValueError(
+                f"Persistent execution setting source is untrusted: {error}"
+            ) from error
 
-    def _require_yolo_destination(self) -> None:
+    def _require_trusted_execution_destination(self) -> None:
         """Keep a persistent activation in real, private storage outside the workspace."""
         if self._workspace_path is not None and self.path.resolve().is_relative_to(
             self._workspace_path.parent.parent
         ):
-            raise ValueError("Persistent app.yolo config cannot be inside the workspace.")
+            raise ValueError("Persistent execution setting config cannot be inside the workspace.")
         ensure_private_directory(self.path.parent, create=False)
         if self.path.is_symlink():
-            raise ValueError("Persistent app.yolo cannot use an aliased user config.")
+            raise ValueError("Persistent execution setting cannot use an aliased user config.")
 
     def _read_workspace_document(self) -> tomlkit.TOMLDocument:
         """Return the sparse workspace document or an empty document."""
@@ -988,7 +1013,10 @@ class ConfigurationManager:
             raise ConfigurationParseError(path, error) from None
 
     def _document_for_write(self, scope: Literal["user", "workspace"]) -> tomlkit.TOMLDocument:
-        """Reload and return the requested durable configuration document."""
+        """Return recovery defaults or reload the requested durable document."""
+        path = self._workspace_path if scope == "workspace" else self.path
+        if self._defaults_only and path not in self._recovery_saved:
+            return self._workspace_document if scope == "workspace" else self._document
         if scope == "workspace":
             self._workspace_document = self._read_workspace_document()
             return self._workspace_document
@@ -997,15 +1025,19 @@ class ConfigurationManager:
 
     def _save_scope(self, scope: Literal["user", "workspace"]) -> Path:
         """Persist one durable configuration scope."""
-        if scope == "user":
-            return self._save_document(self.path, self._document)
-        if self._workspace_path is None:
+        path = self.path if scope == "user" else self._workspace_path
+        if path is None:
             raise RuntimeError("Workspace path is not configured.")
-        if not self._workspace_document:
-            path = self._workspace_path
+        self._archive_recovery_file(path)
+        document = self._document if scope == "user" else self._workspace_document
+        if scope == "workspace" and not document:
             path.unlink(missing_ok=True)
-            return path
-        return self._save_document(self._workspace_path, self._workspace_document)
+        else:
+            self._save_document(path, document)
+        if self._defaults_only:
+            self._recovery_files[path] = self._read_optional_file(path)
+            self._recovery_saved.add(path)
+        return path
 
     def _lock_for(self, scope: Literal["user", "workspace"]) -> FileLock:
         """Return the interprocess lock protecting one complete TOML transaction."""
@@ -1041,12 +1073,16 @@ class ConfigurationManager:
         sources = self._configured_sources(
             values, "user" if self._workspace_path is not None else "workspace"
         )
-        if "app.yolo" in sources:
-            sources["app.yolo"] = "user"
+        for path in ("app.yolo", "app.allow_direct_host_execution"):
+            if path in sources:
+                sources[path] = "user"
         workspace_values = workspace_document.unwrap()
         self._validate_loaded_fields(workspace_values, str(self._workspace_path))
-        if isinstance(workspace_values.get("app"), Mapping) and "yolo" in workspace_values["app"]:
-            raise ValueError("Workspace configuration cannot control app.yolo.")
+        if isinstance(workspace_values.get("app"), Mapping) and {
+            "yolo",
+            "allow_direct_host_execution",
+        }.intersection(workspace_values["app"]):
+            raise ValueError("Workspace configuration cannot control trusted execution settings.")
         for section, table in workspace_values.items():
             if section == "config_version":
                 continue

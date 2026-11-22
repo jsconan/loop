@@ -168,6 +168,7 @@ def test_memory_working_storage_accepts_shared_temporary_parents(
     """Private memory-store roots do not require a private system temporary parent."""
     parent = tmp_path / parent_name
     parent.mkdir(mode=0o755)
+    parent.chmod(0o755)
     monkeypatch.setattr(tempfile, "tempdir", str(parent))
     manager = SessionManager()
 
@@ -1018,6 +1019,60 @@ def test_manager_does_not_conflate_sessions_from_independent_memory_stores():
 
     with first.execution(), second.execution():
         pass
+
+
+def test_detached_job_retains_storage_without_occupying_the_next_foreground_turn():
+    """After the launching owner exits, jobs retain the generation and a single foreground slot."""
+    store = MemorySessionStore()
+    manager = SessionManager(session_store=store)
+    contender = SessionManager(session=manager.session, session_store=store)
+    session_id = manager.session.id
+
+    async def scenario():
+        """Start a job under a distinct task and poll its storage after the launcher settles."""
+        started, finished = asyncio.Event(), asyncio.Event()
+
+        async def hold_job():
+            """Keep the detached native command alive while other tasks request ownership."""
+            with manager.command_job_storage(session_id):
+                started.set()
+                await finished.wait()
+
+        async def launch():
+            """Release the launcher's foreground role before the next model turn."""
+            with manager.interaction_execution(session_id):
+                job = asyncio.create_task(hold_job())
+                await started.wait()
+                return job
+
+        job = await asyncio.create_task(launch())
+        try:
+            with pytest.raises(SessionExecutionConflictError), contender.execution():
+                pytest.fail("A different manager acquired a running command's storage.")
+            with pytest.raises(SessionExecutionConflictError):
+                manager.discard_working_directory()
+            with pytest.raises(SessionExecutionConflictError):
+                manager.new_session()
+            with manager.execution() as directory:
+                assert directory == manager.temporary_directory.get()
+
+                async def competing_turn():
+                    """Reject a second ordinary foreground turn from this same manager."""
+                    with pytest.raises(SessionExecutionConflictError), manager.execution():
+                        pytest.fail("Two foreground turns were admitted concurrently.")
+
+                await asyncio.create_task(competing_turn())
+                finished.set()
+                await job
+                with pytest.raises(SessionExecutionConflictError), contender.execution():
+                    pytest.fail("Finishing the job released a live turn's storage.")
+            with contender.execution() as directory:
+                assert directory == manager.temporary_directory.get()
+        finally:
+            finished.set()
+            await job
+
+    asyncio.run(scenario())
 
 
 def test_manager_rejects_same_session_execution_across_threads():
@@ -3986,6 +4041,121 @@ def test_working_binding_rejects_unrecognized_relative_authority(tmp_path, gener
     store.bind_working_directory(manager.session.id, WorkingDirectoryBinding(generation, 1, 2))
     with pytest.raises(ValueError, match="invalid binding"):
         _ = manager.temporary_directory
+
+
+def test_durable_short_scratch_uses_bound_location_and_retires_only_its_generation(tmp_path):
+    """Short scratch is independent of the database path and isolated across sessions."""
+    database = tmp_path / "Application Support" / "sessions.db"
+    root = tmp_path / "scratch"
+    store = SQLiteSessionStore(database, workspace_id="workspace", scratch_roots=(root,))
+    manager = SessionManager(session_store=store)
+    original = manager.temporary_directory.get()
+    (original / ".env").write_text("retained")
+    sibling = SessionManager(session_store=store).temporary_directory.get()
+    assert original.parent.parent == sibling.parent.parent == root
+    assert not any(character.isspace() for character in str(original))
+    assert original != sibling
+    restored = SessionManager(
+        session=manager.session,
+        session_store=SQLiteSessionStore(database, workspace_id="workspace", scratch_roots=(root,)),
+    )
+    assert restored.temporary_directory.get() == original
+    assert restored.working_directory_allows_private_names()
+    assert (original / ".env").read_text() == "retained"
+    restored.discard_working_directory()
+    assert not original.parent.exists()
+    assert sibling.is_dir()
+    assert restored.temporary_directory.get().parent.parent == root
+
+
+def test_durable_short_scratch_preserves_existing_relative_bindings(tmp_path):
+    """Both retained generations and adopted legacy files stay at their original paths."""
+    database = tmp_path / "storage" / "sessions.db"
+    previous = SQLiteSessionStore(database, workspace_id="workspace")
+    new = SQLiteSessionStore(
+        database, workspace_id="workspace", scratch_roots=(tmp_path / "short",)
+    )
+    legacy = Session(id="legacy")
+    adopted = previous.temporary_root / sha256_digest(legacy.id.encode())
+    ensure_private_directory(adopted)
+    existing = SessionManager(session_store=previous)
+    original = existing.temporary_directory.get()
+    assert (
+        SessionManager(session=existing.session, session_store=new).temporary_directory == original
+    )
+    assert SessionManager(session=legacy, session_store=new).temporary_directory == adopted
+
+
+def test_durable_short_scratch_reopens_an_eligible_previously_selected_root(tmp_path):
+    """A newly eligible preferred root cannot relocate an existing working generation."""
+    database = tmp_path / "storage" / "sessions.db"
+    preferred = tmp_path / "preferred"
+    fallback = tmp_path / "fallback"
+    previous = SQLiteSessionStore(database, workspace_id="workspace", scratch_roots=(fallback,))
+    manager = SessionManager(session_store=previous)
+    original = manager.temporary_directory.get()
+    (original / "artifact").write_text("retained")
+    updated = SQLiteSessionStore(
+        database, workspace_id="workspace", scratch_roots=(preferred, fallback)
+    )
+    reopened = SessionManager(session=manager.session, session_store=updated)
+    assert reopened.temporary_directory.get() == original
+    assert (reopened.temporary_directory.get() / "artifact").read_text() == "retained"
+    assert (
+        SessionManager(session_store=updated).temporary_directory.get().parent.parent == preferred
+    )
+
+
+@pytest.mark.parametrize("occupied", ["file", "unsafe-directory"])
+def test_durable_short_scratch_selects_an_available_private_namespace(tmp_path, occupied):
+    """A fresh session can use its fallback without modifying an unsafe preferred path."""
+    preferred = tmp_path / "preferred"
+    if occupied == "file":
+        preferred.write_text("existing file")
+    else:
+        preferred.mkdir()
+        preferred.chmod(0o755)
+    before = preferred.lstat()
+    fallback = tmp_path / "usable fallback"
+    store = SQLiteSessionStore(
+        tmp_path / "sessions.db", workspace_id="workspace", scratch_roots=(preferred, fallback)
+    )
+    assert SessionManager(session_store=store).temporary_directory.get().parent.parent == fallback
+    assert preferred.lstat() == before
+    fallback.chmod(0o755)
+    with pytest.raises(ValueError, match="no private namespace available"):
+        _ = SessionManager(session_store=store).temporary_directory
+
+
+@pytest.mark.parametrize(
+    "failure", ["missing", "unsafe", "replacement", "location", "binding", "leaf"]
+)
+def test_durable_short_scratch_rejects_changed_authority(tmp_path, failure):
+    """Lost or changed namespaces and malformed bindings cannot replace retained working files."""
+    database = tmp_path / "storage" / "sessions.db"
+    root = tmp_path / "short"
+    store = SQLiteSessionStore(database, workspace_id="workspace", scratch_roots=(root,))
+    manager = SessionManager(session_store=store)
+    original = manager.temporary_directory.get()
+    if failure == "missing":
+        root.rename(root.with_name("preserved"))
+    elif failure == "unsafe":
+        root.chmod(0o755)
+    elif failure == "replacement":
+        original.rename(original.with_name("preserved"))
+        original.mkdir(mode=0o700)
+    elif failure == "location":
+        store = SQLiteSessionStore(
+            database, workspace_id="workspace", scratch_roots=(tmp_path / "other",)
+        )
+    else:
+        binding = store.working_binding(manager.session.id)
+        invalid = (
+            root / "invalid" / "files" if failure == "binding" else original.with_name("other")
+        )
+        store.bind_working_directory(manager.session.id, replace(binding, generation=str(invalid)))
+    with pytest.raises(ValueError, match="recovery failed|private real directory"):
+        _ = SessionManager(session=manager.session, session_store=store).temporary_directory
 
 
 @pytest.mark.parametrize("bound", [False, True])

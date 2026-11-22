@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import subprocess
 import threading
 import time
 from collections.abc import Callable
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
 from pathlib import Path
 from time import get_clock_info
@@ -29,12 +31,27 @@ from ..telemetry import telemetry_audit
 from ..utils import (
     ProcessCaptureStatus,
     kill_process_group,
+    open_selected_parent,
     read_bounded_stream,
     sha256_digest,
     supervise_process,
 )
 from ..utils.process import is_finite_deadline
 from .sandbox import CommandProcessResult, SandboxBackend, SandboxOutcome, SandboxRequest
+
+
+def _prepare_command_output(request: SandboxRequest) -> None:
+    """Create a fresh private output directory under the admitted scratch identity."""
+    scratch = request.scratch_root
+    if scratch is None:
+        return
+    output = request.output_directory(scratch)
+    if request.denies_path(output):
+        raise ValueError("Command output storage is denied by policy.")
+    with open_selected_parent(output) as parent:
+        if not request.directory_matches_descriptor(scratch, parent):
+            raise ValueError("Command scratch changed before output directory creation.")
+        os.mkdir(output.name, constants.PRIVATE_DIRECTORY_MODE, dir_fd=parent)
 
 
 def _check_command_deadlines(request: SandboxRequest, timeout: float | None) -> None:
@@ -233,6 +250,7 @@ class HostCommandOffer:
         warning (str): Full user-facing host execution warning.
         tool_id (str): Original execution tool identity used for policy checks. Defaults to
             ``run_command`` for callers constructing an offer directly.
+        policy_revision (int | None): Authority at offer creation; absent offers cannot launch.
     """
 
     token: str
@@ -240,6 +258,7 @@ class HostCommandOffer:
     failure: CommandProcessResult | None
     warning: str
     tool_id: str = "run_command"
+    policy_revision: int | None = None
 
 
 @dataclass(frozen=True)
@@ -265,6 +284,8 @@ class CommandExecutionCoordinator:
         interaction (Interaction | None): Actual user prompt surface, or None in headless mode.
         auto_approval (bool): Whether ordinary prompts use automatic input. This does not
             authorize host execution; trusted YOLO is a distinct permission-manager decision.
+        host_recovery_revision (Callable[[], int | None] | None): Independent hint eligibility
+            reader, or None to use the permission manager.
         host_audit (Callable[..., None] | None): Thread-safe host audit callback, or None to use
             the permission manager.
     """
@@ -276,6 +297,7 @@ class CommandExecutionCoordinator:
     _auto_approval: bool
     _offers: dict[str, HostCommandOffer]
     _host_audit: Callable[..., None]
+    _host_recovery_revision: Callable[[], int | None]
 
     def __init__(
         self,
@@ -286,6 +308,7 @@ class CommandExecutionCoordinator:
         *,
         auto_approval: bool = False,
         host_audit: Callable[..., None] | None = None,
+        host_recovery_revision: Callable[[], int | None] | None = None,
     ) -> None:
         self._backend = backend
         self._host_executor = host_executor
@@ -294,6 +317,7 @@ class CommandExecutionCoordinator:
         self._auto_approval = auto_approval
         self._offers = {}
         self._host_audit = host_audit or permissions.record_host_boundary
+        self._host_recovery_revision = host_recovery_revision or permissions.host_recovery_revision
 
     def run_sandboxed(
         self,
@@ -302,13 +326,17 @@ class CommandExecutionCoordinator:
         *,
         prelaunch_failure: CommandProcessResult | None = None,
         reason: str | None = None,
+        prepared_access: bool = False,
         execution_timeout: float | None = None,
         cancellation_event: threading.Event | None = None,
         admission_cancellation_event: threading.Event | None = None,
-        on_admitted: Callable[[], bool | None] | None = None,
+        on_admitted: Callable[[], bool | str | None] | None = None,
         output_observer: Callable[[str, str], None] | None = None,
         terminal_input: Callable[[], bytes | None] | None = None,
         egress_authority: object | None = None,
+        sandbox_admission: (
+            Callable[..., AbstractContextManager[SandboxRequest | None]] | None
+        ) = None,
     ) -> CommandAttempt:
         """Run an authorized request or offer retry for a no-effects boundary failure.
 
@@ -317,6 +345,7 @@ class CommandExecutionCoordinator:
             tool_id (str): Registered execution tool identity used for permission evaluation.
             prelaunch_failure (CommandProcessResult | None): Typed startup capability failure to
                 return without invoking the backend, after authorization and path validation.
+            prepared_access (bool): Require an exact approval for automatically prepared access.
             reason (str | None): Explanation for additional sandbox authority.
             execution_timeout (float | None): Runtime seconds starting at native launch, with a
                 separate 60-second preparation ceiling after approval. None preserves the
@@ -324,13 +353,16 @@ class CommandExecutionCoordinator:
             cancellation_event (threading.Event | None): Optional run cancellation signal.
             admission_cancellation_event (threading.Event | None): Original run stop signal
                 checked until a detached job is admitted; later signals do not cancel that job.
-            on_admitted (Callable[[], bool | None] | None): Callback after approval and final
-                prelaunch validation. Returning False refuses native admission.
+            on_admitted (Callable[[], bool | str | None] | None): Callback after approval and
+                prelaunch validation. False or a refusal detail blocks native admission.
             output_observer (Callable[[str, str], None] | None): Bounded native output sink.
             terminal_input (Callable[[], bytes | None] | None): Transient control frames for an
                 approved receiver-owned terminal.
             egress_authority (object | None): Thread-safe restricted egress authority, or None
                 to use the permission manager.
+            sandbox_admission (Callable[..., AbstractContextManager[SandboxRequest | None]] |
+                None): Thread-safe native admission retained across owner-loop handoff, or None
+                to use the manager. Accepts request, revision and cancellation event.
 
         Returns:
             CommandAttempt: Sandboxed result and optional unexecuted host offer.
@@ -343,14 +375,16 @@ class CommandExecutionCoordinator:
             return CommandAttempt(CommandProcessResult(SandboxOutcome.CANCELLED), None)
         reason_argument = {"reason": reason} if reason is not None else {}
         approved_revision: list[int] = []
-        if not self._permissions.authorize_sandboxed_command(
+        runtime_roots = getattr(self._backend, "system_read_roots", ())
+        authorized = self._permissions.authorize_sandboxed_command(
             request,
             tool_id=tool_id,
             interaction=self._interaction,
             approved_revision=approved_revision,
+            runtime_read_roots=runtime_roots if isinstance(runtime_roots, tuple) else (),
+            **({"prepared_access": True} if prepared_access else {}),
             **reason_argument,
-        ):
-            return CommandAttempt(None, None)
+        )
         request = _renew_command_deadline(
             request,
             execution_timeout,
@@ -361,6 +395,8 @@ class CommandExecutionCoordinator:
                 SandboxOutcome.STALE,
                 detail="Approved path identity changed before launch.",
             )
+        elif not authorized:
+            return CommandAttempt(None, None)
         elif time.monotonic() >= request.deadline:
             result = CommandProcessResult(
                 SandboxOutcome.TIMED_OUT, detail="Command deadline expired before launch."
@@ -383,9 +419,13 @@ class CommandExecutionCoordinator:
                 SandboxOutcome.STALE, detail="Permission policy changed before launch."
             )
         else:
-            if on_admitted is not None and on_admitted() is False:
+            admission = on_admitted() if on_admitted is not None else None
+            if admission is False or isinstance(admission, str):
                 result = CommandProcessResult(
-                    SandboxOutcome.STALE, detail="Command authority changed before launch."
+                    SandboxOutcome.STALE,
+                    detail=admission
+                    if isinstance(admission, str)
+                    else "Command authority changed before launch.",
                 )
             else:
                 output_argument = (
@@ -393,24 +433,36 @@ class CommandExecutionCoordinator:
                 )
                 if terminal_input is not None:
                     output_argument["terminal_input"] = terminal_input
-                if request.egress_origins:
-                    result = self._backend.run(
-                        request,
-                        policy_authority=egress_authority or self._permissions,
-                        approved_revision=approved_revision[0],
-                        **(
-                            {"cancellation_event": cancellation_event} if cancellation_event else {}
-                        ),
-                        **output_argument,
-                    )
-                else:
-                    result = self._backend.run(
-                        request,
-                        **(
-                            {"cancellation_event": cancellation_event} if cancellation_event else {}
-                        ),
-                        **output_argument,
-                    )
+                cancellation = cancellation_event or threading.Event()
+                admit = sandbox_admission or self._permissions.sandbox_attempt
+                with admit(request, approved_revision[0], cancellation) as bound:
+                    if bound is None:
+                        result = CommandProcessResult(
+                            SandboxOutcome.STALE, detail="Permission policy changed before launch."
+                        )
+                    else:
+                        try:
+                            _prepare_command_output(bound)
+                        except (OSError, RuntimeError, ValueError):
+                            result = CommandProcessResult(
+                                SandboxOutcome.INVALID,
+                                detail="Private command output directory could not be prepared.",
+                            )
+                        else:
+                            authority = (
+                                {
+                                    "policy_authority": egress_authority or self._permissions,
+                                    "approved_revision": approved_revision[0],
+                                }
+                                if request.egress_origins or request.ingress_port is not None
+                                else {}
+                            )
+                            result = self._backend.run(
+                                bound,
+                                cancellation_event=cancellation,
+                                **authority,
+                                **output_argument,
+                            )
         telemetry_audit(
             "sandbox.completed",
             workspace_id=request.workspace_id,
@@ -421,7 +473,11 @@ class CommandExecutionCoordinator:
             result.outcome not in {SandboxOutcome.UNAVAILABLE, SandboxOutcome.DENIED}
             or result.possible_effects
             or request.egress_origins
+            or request.ingress_port is not None
         ):
+            return CommandAttempt(result, None)
+        recovery_revision = self._host_recovery_revision()
+        if recovery_revision is None:
             return CommandAttempt(result, None)
         warning = PermissionManager.host_retry_prompt(
             request.source,
@@ -432,7 +488,14 @@ class CommandExecutionCoordinator:
         )
         if request.execution_source != request.source:
             warning += f"\nExecuted command: {json.dumps(request.execution_source)}"
-        offer = HostCommandOffer(str(uuid4()), request, result, warning, tool_id)
+        offer = HostCommandOffer(
+            str(uuid4()),
+            request,
+            result,
+            warning,
+            tool_id,
+            recovery_revision,
+        )
         self._offers[offer.token] = offer
         telemetry_audit(
             "host_command.offered",
@@ -478,13 +541,23 @@ class CommandExecutionCoordinator:
             f"Command: {json.dumps(request.source)}\n"
             f"Executed command: {json.dumps(request.execution_source)}\n"
             f"Working directory: {json.dumps(str(request.cwd))}\n"
-            f"Reason: {json.dumps(reason)}\n"
+            f"Agent-supplied reason: {json.dumps(reason)}\n"
             "The sandbox restrictions do not apply. The command runs with the host user's "
             "authority, subject to independent OS and outer-environment restrictions. It can "
             "read private files, change files outside the workspace, and use the network. "
-            "Previous attempts may already have had effects; running again may repeat them."
+            "No prior result is bound to this request; prior effects are unknown. "
+            "Previous attempts may already have had effects; running again may repeat them. "
+            "Remembered grants match source, not script contents or dependencies. "
+            "A user grant applies across workspaces with the same relative working directory."
         )
-        offer = HostCommandOffer(str(uuid4()), request, None, warning, tool_id)
+        offer = HostCommandOffer(
+            str(uuid4()),
+            request,
+            None,
+            warning,
+            tool_id,
+            self._permissions.evaluate_with_revision(())[1],
+        )
         self._offers[offer.token] = offer
         self._record_host_boundary("host_command.offered", offer)
         return self.retry_host_command(
@@ -527,8 +600,10 @@ class CommandExecutionCoordinator:
         """
         _check_command_deadlines(current_request, execution_timeout)
         issued = self._offers.pop(offer.token, None)
+        ambient_path = os.environ.get("PATH")
         if (
             issued != offer
+            or offer.policy_revision != self._permissions.evaluate_with_revision(())[1]
             or self._host_identity(current_request) != self._host_identity(offer.request)
             or not offer.request.paths_are_current()
             or not current_request.paths_are_current()
@@ -579,18 +654,14 @@ class CommandExecutionCoordinator:
             )
             self._record_host_boundary("host_command.denied", offer, source="policy")
             return None
-        explicit_asks = {
-            source
-            for source in host_policy.sources
-            if host_policy.decision is Decision.ASK
-            and source.startswith(("rule:", "managed:human:"))
-        }
-        managed_human = any(source.startswith("managed:human:") for source in explicit_asks)
+        fresh_approval = host_policy.decision is Decision.ASK and any(
+            source.startswith(("rule:", "managed:human:")) for source in host_policy.sources
+        )
         reusable = (
             offer.failure is not None
             and offer.failure.outcome in {SandboxOutcome.UNAVAILABLE, SandboxOutcome.DENIED}
             and not offer.failure.possible_effects
-            and not explicit_asks
+            and not fresh_approval
         )
         rule = self._permissions.matching_host_command_rule(current_request) if reusable else None
         trusted = (
@@ -603,14 +674,13 @@ class CommandExecutionCoordinator:
             )
             if offer.failure is None
             and current_request.source == current_request.execution_source
-            and not managed_human
+            and not fresh_approval
             else None
         )
         grantable = (
             offer.failure is None
-            and offer.tool_id == "request_host_command"
-            and current_request.source == current_request.execution_source
-            and not managed_human
+            and not fresh_approval
+            and self._permissions.can_remember_host_command(current_request, offer.tool_id)
         )
         if trusted is not None:
             answer = "trusted"
@@ -618,7 +688,7 @@ class CommandExecutionCoordinator:
                 self._interaction.info(offer.warning)
         elif rule is not None:
             answer = "rule"
-        elif self._permissions.yolo:
+        elif self._permissions.yolo and not fresh_approval:
             answer = "yolo"
             if self._interaction is not None:
                 self._interaction.warning(offer.warning)
@@ -639,19 +709,38 @@ class CommandExecutionCoordinator:
             )
             return None
         else:
-            self._interaction.info(offer.warning)
-            choices, index = self._permissions.host_retry_choices(reusable, grantable)
-            answer = self._interaction.prompt(
-                "Run this exact command without the OS sandbox?",
-                exit_commands=None,
-                choices=choices,
-                index=index,
-            )
+            warning = offer.warning
+            if not (reusable or grantable):
+                warning += "\nThis host command requires fresh approval each time."
+            choices, index = self._permissions.host_retry_choices(reusable, trusted=grantable)
+            full = False
+            while True:
+                self._interaction.info(
+                    warning + f"\nWorking directory: {json.dumps(str(current_request.cwd))}"
+                    if full
+                    else warning
+                )
+                answer = self._interaction.prompt(
+                    "Run this exact command without the OS sandbox?",
+                    exit_commands=None,
+                    choices=choices,
+                    index=index,
+                )
+                if answer != "details":
+                    if answer not in choices:
+                        answer = "deny"
+                    break
+                full = not full
+                choices = {
+                    **choices,
+                    "details": "Show reduced scope" if full else "Show full scope",
+                }
+                index = {**index, "details": "R" if full else "F"}
         if cancellation_event is not None and cancellation_event.is_set():
             self._record_host_boundary("host_command.cancelled", offer)
             return None
         allowed_answers = {"approve", "session", "rule"} if reusable else {"approve", "trusted"}
-        if self._permissions.yolo and offer.failure is None:
+        if self._permissions.yolo and offer.failure is None and not fresh_approval:
             allowed_answers.add("yolo")
         if grantable:
             allowed_answers.update({"trust_session", "trust_workspace", "trust_user"})
@@ -687,6 +776,7 @@ class CommandExecutionCoordinator:
         current_policy, current_revision = self._permissions.evaluate_with_revision(host_operations)
         if (
             not authority_current
+            or os.environ.get("PATH") != ambient_path
             or current_policy.decision is Decision.DENY
             or current_revision != policy_revision
         ):
@@ -777,6 +867,17 @@ class CommandExecutionCoordinator:
                 on_admitted()
             if cancellation_event is not None and cancellation_event.is_set():
                 self._record_host_boundary("host_command.cancelled", offer)
+                return None
+            admission_policy, admission_revision = self._permissions.evaluate_with_revision(
+                host_operations
+            )
+            if (
+                admission_policy.decision is Decision.DENY
+                or admission_revision != final_revision
+                or os.environ.get("PATH") != ambient_path
+                or not current_request.paths_are_current()
+            ):
+                self._record_host_boundary("host_command.stale", offer)
                 return None
             host_arguments = {}
             if cancellation_event is not None:

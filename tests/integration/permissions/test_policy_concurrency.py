@@ -3,13 +3,14 @@
 import asyncio
 import errno
 import fcntl
+import json
 import os
 import sqlite3
 import subprocess
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -17,6 +18,10 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from loop import BUILTIN_TOOLS, ToolRegistry
+from loop.execution import CommandExecutionService
+from loop.execution.sandbox import CommandProcessResult, SandboxOutcome
+from loop.interaction import ConsoleInteraction
 from loop.permissions import (
     Action,
     ApprovalChoice,
@@ -36,6 +41,89 @@ from loop.workspace import Workspace, WorkspaceRepository
 
 pytestmark = pytest.mark.integration
 _SOURCE_ROOT = Path(__file__).resolve().parents[3] / "src"
+
+
+def test_workspace_command_approvals_do_not_stale_another_workspace(tmp_path):
+    """Two open workspaces can remember native commands without changing shared policy."""
+    catalog = tmp_path / "state" / "workspaces.sqlite"
+    shared_policy = catalog.parent / "permissions.yaml"
+    repository = WorkspaceRepository(catalog)
+
+    with ExitStack() as cleanup:
+
+        def open_workspace(name):
+            """Create a workspace with independent policy and shared user storage."""
+            root = tmp_path / name
+            root.mkdir()
+            workspace = repository.initialize(Workspace.discover(root))
+            manager = PermissionManager(
+                root,
+                configuration_path=catalog.parent
+                / "workspaces"
+                / workspace.id
+                / "permissions.yaml",
+                user_configuration_path=shared_policy,
+                workspace_id=workspace.id,
+                namespace_catalog_path=catalog,
+                user_namespace_identity=str(catalog.parent),
+                bootstrap_pristine_policy=True,
+            )
+            cleanup.callback(manager.close)
+            backend = Mock()
+            backend.run.return_value = CommandProcessResult(
+                SandboxOutcome.COMPLETED, exit_code=0, stdout=name
+            )
+            registry = ToolRegistry(
+                BUILTIN_TOOLS,
+                permission_manager=manager,
+                execution_service=CommandExecutionService(backend, Mock()),
+            )
+            cleanup.callback(registry.close)
+            interaction = Mock(spec=ConsoleInteraction, supports_fresh_host_approval=True)
+            return registry, interaction, manager, backend
+
+        first, first_input, first_policy, first_backend = open_workspace("first")
+        second, second_input, second_policy, second_backend = open_workspace("second")
+        user_before = shared_policy.read_bytes()
+        second_input.prompt_async = AsyncMock(return_value="workspace")
+
+        async def dispatch(registry, interaction):
+            """Run one exact command through the asynchronous public registry."""
+            return json.loads(
+                await registry.call_async(
+                    "run_command",
+                    json.dumps({"command": "printf verified", "wait_seconds": 5}),
+                    interaction=interaction,
+                )
+            )
+
+        async def approve_first(*_args, **_kwargs):
+            """Let the second workspace save its approval while the first prompt is open."""
+            assert (await dispatch(second, second_input))["ok"]
+            return "workspace"
+
+        async def exercise():
+            """Approve both workspaces and use their saved grants without a new prompt."""
+            first_input.prompt_async = AsyncMock(side_effect=approve_first)
+            assert (result := await dispatch(first, first_input))["ok"], result
+            assert (await dispatch(first, first_input))["ok"]
+            assert (await dispatch(second, second_input))["ok"]
+            listing = json.loads(
+                await first.call_async(
+                    "list_folder",
+                    json.dumps({"path": str(tmp_path / "first")}),
+                    interaction=first_input,
+                )
+            )
+            assert listing["ok"], listing
+
+        asyncio.run(exercise())
+        first_input.prompt_async.assert_awaited_once()
+        second_input.prompt_async.assert_awaited_once()
+        assert first_backend.run.call_count == second_backend.run.call_count == 2
+        assert shared_policy.read_bytes() == user_before
+        assert len(first_policy.sandboxed_command_rules(ApprovalChoice.WORKSPACE)) == 1
+        assert len(second_policy.sandboxed_command_rules(ApprovalChoice.WORKSPACE)) == 1
 
 
 def test_async_revision_checks_leave_policy_evaluation_worker_available():
@@ -460,8 +548,8 @@ manager.close()
     assert result.returncode == 0, result.stderr
 
 
-def test_first_use_refuses_an_audit_veto_on_backup_listing(tmp_path):
-    """A denied directory listing cannot hide recovery evidence and publish defaults."""
+def test_missing_policy_defaults_preserve_unlisted_backups(tmp_path):
+    """Missing policies are initialized without inspecting or modifying existing backups."""
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     catalog = tmp_path / "private" / "workspaces.sqlite"
@@ -486,9 +574,8 @@ manager = PermissionManager(
     workspace_id=workspace_id, namespace_catalog_path=catalog,
     user_namespace_identity=str(catalog.parent), bootstrap_pristine_policy=True,
 )
-if 'Policy backup evidence cannot be inspected' not in manager.describe():
-    raise RuntimeError('Backup listing veto did not require recovery')
-if path.exists(): raise RuntimeError('Published defaults despite hidden backup')
+manager.require_policy_ready()
+if not path.exists(): raise RuntimeError('Missing policy was not recreated')
 manager.close()
 """
     result = subprocess.run(
@@ -500,7 +587,7 @@ manager.close()
         env={**os.environ, "PYTHONPATH": str(_SOURCE_ROOT)},
     )
     assert result.returncode == 0, result.stderr
-    assert not path.exists()
+    assert path.exists()
     assert backup.read_text(encoding="utf-8").endswith("filesystem.read: deny\n")
 
 
@@ -1003,7 +1090,7 @@ def test_preset_preview_cannot_mix_old_values_with_a_new_revision(tmp_path, monk
 def test_workspace_update_cannot_restore_a_concurrently_revoked_host_limit(tmp_path, monkeypatch):
     """A stale unrelated policy write cannot overwrite a completed host revocation."""
     manager = PermissionManager(tmp_path)
-    manager.set_limit("allow_host_processes", True, scope=PolicyScope.WORKSPACE)
+    manager.set_direct_host_execution(True)
     probe = policy_entry_probe(manager, monkeypatch)
     original = PermissionConfiguration.model_copy
     copied = threading.Event()
@@ -1032,7 +1119,7 @@ def test_workspace_update_cannot_restore_a_concurrently_revoked_host_limit(tmp_p
         """Publish a workspace host-process revocation."""
         probe.owner.append(threading.get_ident())
         revocation_started.set()
-        manager.set_limit("allow_host_processes", False, scope=PolicyScope.WORKSPACE)
+        manager.set_direct_host_execution(False)
         revoked.set()
 
     with ThreadPoolExecutor(max_workers=2) as executor:
@@ -1054,7 +1141,8 @@ def test_workspace_update_cannot_restore_a_concurrently_revoked_host_limit(tmp_p
             reloaded = PermissionManager(tmp_path)
             try:
                 assert reloaded.configuration.defaults[Action.FILESYSTEM_READ] is Decision.DENY
-                assert not reloaded.configuration.limits.allow_host_processes
+                assert not reloaded.direct_host_execution_enabled
+                assert not manager.direct_host_execution_enabled
             finally:
                 reloaded.close()
         finally:
@@ -1223,6 +1311,7 @@ def test_sandbox_rule_revocation_during_lookup_prevents_authorization(
     interaction = Mock()
     interaction.prompt.return_value = "session"
     manager = PermissionManager(tmp_path, interaction=interaction)
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
     request = SandboxRequest.create(
         source="cat file",
         cwd=tmp_path,

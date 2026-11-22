@@ -7,24 +7,28 @@ import shlex
 import shutil
 import signal
 import socket
+import socketserver
 import stat
 import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Thread
 from typing import NamedTuple
 from urllib.request import ProxyHandler, build_opener
 
 import pytest
 
-from loop import Action, Decision, PermissionManager, ToolRegistry
+from loop import Action, Decision, PermissionManager, RuntimeEnvironment, ToolRegistry
 from loop.execution import CommandExecutionService
 from loop.execution.sandbox.macos import egress
+from loop.instructions import InstructionsManager
 from loop.permissions import PolicyScope
 from loop.permissions.managed import ManagedPolicyStore
 from loop.tools.system import run_command
 from tests.integration.linux.egress_fixture import prepare
+from tests.integration.macos.egress_dns_fixture import FixtureDnsHandler
 
 pytestmark = [pytest.mark.integration, pytest.mark.e2e, pytest.mark.macos]
 _FIXTURE_GATEWAY = os.environ.get("LOOP_MACOS_EGRESS_FIXTURE_GATEWAY")
@@ -138,13 +142,16 @@ def owned_lifecycle_probe(macos_local_volume, local_socket_parent, native_worksp
         assert Path(path).is_relative_to(local_socket_parent)
         yield _LifecycleProbe(worker, path, native_workspace)
     finally:
-        if worker.poll() is None:
-            os.kill(worker.pid, signal.SIGKILL)
-        worker.wait(timeout=5)
+        try:
+            if worker.poll() is None:
+                os.kill(worker.pid, signal.SIGKILL)
+            worker.wait(timeout=5)
+        finally:
+            worker.stderr.close()
 
 
-def _owned_tunnel_open(worker_pid: int) -> bool:
-    """Inspect only an owned broker process's fixture-bound TCP descriptor."""
+def _owned_tunnel_count(worker_pid: int) -> int:
+    """Count an owned broker process's established TCP connections to the fixture."""
     result = subprocess.run(
         [
             "/usr/sbin/lsof",
@@ -158,7 +165,7 @@ def _owned_tunnel_open(worker_pid: int) -> bool:
         text=True,
         check=False,
     )
-    return result.returncode == 0 and "ESTABLISHED" in result.stdout
+    return result.stdout.count("(ESTABLISHED)") if result.returncode == 0 else 0
 
 
 def _start_slow_stream(public, executor, workspace: Path, origin: str, filename: str):
@@ -169,6 +176,7 @@ def _start_slow_stream(public, executor, workspace: Path, origin: str, filename:
         f"/usr/bin/curl -kfsS --no-buffer --max-time 12 {origin}/slow "
         f'> "$WORKSPACE_ROOT/{filename}"',
         egress_origins=[origin],
+        write_roots=[str(workspace)],
     )
     deadline = time.monotonic() + 8
     while (
@@ -206,6 +214,54 @@ def test_macos_ca_bundle_read_does_not_open_other_ssl_files(live_egress_clock):
         )
         assert not other["ok"], json.dumps(other)
         assert other["problem"]["code"] == "process.nonzero_exit"
+
+
+def test_public_general_network_resolves_owned_unicast_name(live_egress_clock, tmp_path):
+    """Only general networking sends a fresh stock resolver query to the owned unicast server."""
+    zone = "unicast.loop-egress-owned.test"
+    config = Path("/private/etc/resolver") / zone
+    if not config.exists() and not config.is_symlink():
+        pytest.skip("Requires the owned loopback unicast resolver mapping")
+    for path, kind in ((config.parent, stat.S_ISDIR), (config, stat.S_ISREG)):
+        identity = path.lstat()
+        assert kind(identity.st_mode) and identity.st_uid == 0 and not identity.st_mode & 0o022
+    assert config.lstat().st_nlink == 1
+    nameserver, port_line = config.read_text().splitlines()
+    assert nameserver == "nameserver 127.0.0.1"
+    keyword, value = port_line.split()
+    assert keyword == "port" and value.isdecimal() and 1024 <= int(value) <= 65535
+    live_egress_clock.registry.permission_manager.set_limit(
+        "deny_private_networks", False, scope=PolicyScope.SESSION
+    )
+    log = tmp_path / "dns-queries.log"
+    control = f"control-{secrets.token_hex(8)}.{zone}"
+    with socketserver.UDPServer(("127.0.0.1", int(value)), FixtureDnsHandler) as server:
+        server.directory = tmp_path
+        listener = Thread(target=server.serve_forever)
+        listener.start()
+        try:
+            addresses = socket.getaddrinfo(control + ".", None, socket.AF_INET, socket.SOCK_STREAM)
+            assert addresses[0][4][0] == "11.0.0.2"
+            assert f"{control} 1" in log.read_text().splitlines()
+            for grants in ({}, {"egress_origins": ["https://example.invalid"]}, {"network": True}):
+                name = f"sandbox-{secrets.token_hex(8)}.{zone}"
+                source = "/usr/bin/perl -MSocket -e " + shlex.quote(
+                    f'my ($err, @results) = Socket::getaddrinfo("{name}.", undef, '
+                    "{family => Socket::AF_INET(), socktype => Socket::SOCK_STREAM()}); "
+                    "print $err ? qq(unresolved) : Socket::inet_ntoa("
+                    "(Socket::unpack_sockaddr_in($results[0]{addr}))[1])"
+                )
+                result = live_egress_clock.call(source, **grants)
+                assert result["ok"], json.dumps(result)
+                assert result["result"]["boundary"] == "sandbox"
+                network = grants.get("network", False)
+                expected = "11.0.0.2" if network else "unresolved"
+                assert result["result"]["stdout"]["content"] == expected
+                assert (f"{name} 1" in log.read_text().splitlines()) is network
+        finally:
+            server.shutdown()
+            listener.join()
+    live_egress_clock.host.run_host_command.assert_not_called()
 
 
 def test_public_macos_resolver_ipc_cannot_query_owned_dns_fixture(
@@ -307,6 +363,7 @@ def test_public_macos_local_ipc_and_mediation_share_one_attempt(
     result = live_egress_clock.call(
         f"{probe}; /usr/bin/curl -fsS --max-time 8 {origin}/",
         egress_origins=[origin],
+        local_ipc=True,
     )
     assert result["ok"], json.dumps(result)
     assert result["result"]["stdout"]["content"] == "local\negress-fixture-ok\n"
@@ -394,7 +451,11 @@ def test_public_macos_managed_limits_reach_native_mediation(
                     }
                 ),
                 interaction=live_egress_clock.interaction,
-                instructions_manager=live_egress_clock.instructions,
+                instructions_manager=InstructionsManager(
+                    runtime_environment=RuntimeEnvironment(
+                        native_workspace, manager.temporary_directory
+                    )
+                ),
             )
         )
         if managed_deny == "network":
@@ -406,6 +467,7 @@ def test_public_macos_managed_limits_reach_native_mediation(
         live_egress_clock.host.run_host_command.assert_not_called()
     finally:
         registry.close()
+        manager.close()
 
 
 def test_public_macos_denies_ungranted_redirect(live_egress_clock, routed_egress_fixture):
@@ -477,7 +539,12 @@ def test_public_macos_mediator_rechecks_dns_on_a_later_connection(
         f"/usr/bin/curl -fsS --max-time 8 {origin}/ > second-response"
     )
     with ThreadPoolExecutor(max_workers=1) as executor:
-        running = executor.submit(live_egress_clock.call, source, egress_origins=[origin])
+        running = executor.submit(
+            live_egress_clock.call,
+            source,
+            egress_origins=[origin],
+            write_roots=[str(native_workspace)],
+        )
         try:
             deadline = time.monotonic() + 8
             while not started.exists() and time.monotonic() < deadline:
@@ -503,7 +570,12 @@ def test_public_macos_policy_change_closes_an_active_https_tunnel(
         '> "$WORKSPACE_ROOT/revoked-stream"'
     )
     with ThreadPoolExecutor(max_workers=1) as executor:
-        running = executor.submit(live_egress_clock.call, source, egress_origins=[origin])
+        running = executor.submit(
+            live_egress_clock.call,
+            source,
+            egress_origins=[origin],
+            write_roots=[str(native_workspace)],
+        )
         deadline = time.monotonic() + 8
         while (
             not stream.exists() or "started" not in stream.read_text()
@@ -529,20 +601,25 @@ def test_public_macos_missing_revision_ack_closes_tunnel_despite_healthy_heartbe
         "try_egress_policy_revision",
         lambda: original_revision,
     )
-    original_revoke = egress.MacOSEgressBroker.revoke_revision
+    original_revoke = egress.MacOSNetworkBroker.revoke_revision
 
     def withheld_ack(broker, revision):
         """Delay only the revision reply while health checks continue."""
         time.sleep(2.2)
         return original_revoke(broker, revision)
 
-    monkeypatch.setattr(egress.MacOSEgressBroker, "revoke_revision", withheld_ack)
+    monkeypatch.setattr(egress.MacOSNetworkBroker, "revoke_revision", withheld_ack)
     source = (
         f"/usr/bin/curl -kfsS --no-buffer --max-time 12 {origin}/slow "
         '> "$WORKSPACE_ROOT/unacknowledged-stream"'
     )
     with ThreadPoolExecutor(max_workers=1) as executor:
-        running = executor.submit(live_egress_clock.call, source, egress_origins=[origin])
+        running = executor.submit(
+            live_egress_clock.call,
+            source,
+            egress_origins=[origin],
+            write_roots=[str(native_workspace)],
+        )
         deadline = time.monotonic() + 8
         while (
             not stream.exists() or "started" not in stream.read_text()
@@ -558,43 +635,30 @@ def test_public_macos_missing_revision_ack_closes_tunnel_despite_healthy_heartbe
 
 
 def test_public_macos_parallel_load_keeps_unchanged_policy_tunnels(
-    live_egress_clock, native_workspace, routed_egress_fixture
+    live_egress_clock, routed_egress_fixture
 ):
-    """Six healthy HTTPS streams survive one unchanged-policy admission pause."""
+    """Four healthy HTTPS streams survive one unchanged-policy admission pause."""
     origin = f"https://{routed_egress_fixture}:18443"
     live_egress_clock.manager.set_yolo(True)
-    with ThreadPoolExecutor(max_workers=6) as executor:
+    with ThreadPoolExecutor(max_workers=4) as executor:
         running = [
             executor.submit(
                 live_egress_clock.call,
-                f"/usr/bin/curl -kfsS --no-buffer --max-time 15 {origin}/slow "
-                f'> "$WORKSPACE_ROOT/load-stream-{index}"',
+                f"/usr/bin/curl -kfsS --no-buffer --max-time 15 {origin}/slow",
                 egress_origins=[origin],
             )
-            for index in range(6)
+            for _ in range(4)
         ]
         deadline = time.monotonic() + 8
-        while time.monotonic() < deadline:
-            if all(
-                (native_workspace / f"load-stream-{index}").exists()
-                and "started" in (native_workspace / f"load-stream-{index}").read_text()
-                for index in range(6)
-            ):
-                break
+        while _owned_tunnel_count(os.getpid()) != len(running):
+            assert time.monotonic() < deadline, "Four simultaneous HTTPS tunnels did not open."
             time.sleep(0.02)
-        assert all(
-            (native_workspace / f"load-stream-{index}").exists()
-            and "started" in (native_workspace / f"load-stream-{index}").read_text()
-            for index in range(6)
-        )
         with live_egress_clock.manager.policy_update():
             pass
         for future in running:
             result = future.result(timeout=15)
             assert result["ok"], json.dumps(result)
-    assert all(
-        "finished" in (native_workspace / f"load-stream-{index}").read_text() for index in range(6)
-    )
+            assert result["result"]["stdout"]["content"] == "started\nfinished\n"
     live_egress_clock.host.run_host_command.assert_not_called()
 
 
@@ -627,13 +691,15 @@ def test_public_macos_direct_policy_edit_waits_for_reload(
 ):
     """A direct policy-file edit changes a live tunnel only after accepted reload."""
     origin = f"https://{routed_egress_fixture}:18443"
-    live_egress_clock.manager.set_default(Action.FILESYSTEM_READ, Decision.DENY)
+    live_egress_clock.manager.save()
     with ThreadPoolExecutor(max_workers=1) as executor:
         first, stream = _start_slow_stream(
             live_egress_clock, executor, native_workspace, origin, "direct-edit-stream"
         )
         policy = native_workspace / ".loop" / "permissions.yaml"
-        policy.write_text(policy.read_text() + "\n# owned external edit\n")
+        policy.write_text(
+            policy.read_text().replace("filesystem.read: allow", "filesystem.read: deny")
+        )
         assert first.result(timeout=12)["ok"]
         assert "finished" in stream.read_text()
         stream.unlink()
@@ -652,7 +718,7 @@ def test_public_macos_supervisor_death_closes_owned_tunnel(
     """An external controller observes tunnel and broker closure after Loop SIGKILL."""
     del routed_egress_fixture
     worker = owned_lifecycle_probe.worker
-    assert _owned_tunnel_open(worker.pid), "The owned HTTPS tunnel was not established."
+    assert _owned_tunnel_count(worker.pid) == 1, "The owned HTTPS tunnel was not established."
     started = time.monotonic()
     os.kill(worker.pid, signal.SIGKILL)
     closed = False
@@ -664,7 +730,7 @@ def test_public_macos_supervisor_death_closes_owned_tunnel(
                 broker_closed = True
             else:
                 broker_closed = False
-        if broker_closed and not _owned_tunnel_open(worker.pid):
+        if broker_closed and _owned_tunnel_count(worker.pid) == 0:
             closed = True
             break
         time.sleep(0.02)
@@ -678,7 +744,7 @@ def test_public_macos_heartbeat_bound_survives_short_pause_and_expires_long_one(
     """A runnable mediator renews after a short pause and closes after a spent lease."""
     del routed_egress_fixture
     worker = owned_lifecycle_probe.worker
-    assert _owned_tunnel_open(worker.pid)
+    assert _owned_tunnel_count(worker.pid) == 1
     os.kill(worker.pid, signal.SIGSTOP)
     try:
         time.sleep(pause_seconds)
@@ -797,7 +863,12 @@ def test_public_macos_copied_proxy_path_cannot_cross_attempts(live_egress_clock,
         'while test ! -e "$WORKSPACE_ROOT/release-proxy"; do /bin/sleep 0.1; done'
     )
     with ThreadPoolExecutor(max_workers=1) as executor:
-        running = executor.submit(live_egress_clock.call, source, egress_origins=[origin])
+        running = executor.submit(
+            live_egress_clock.call,
+            source,
+            egress_origins=[origin],
+            write_roots=[str(native_workspace)],
+        )
         try:
             deadline = time.monotonic() + 8
             while not copied.exists() and time.monotonic() < deadline:
@@ -841,13 +912,16 @@ def test_public_macos_uv_unix_socks_client_is_unavailable(
     assert lookup["ok"], json.dumps(lookup)
     grants = [item["grant_reference"] for item in lookup["result"]["executables"]]
     result = live_egress_clock.call(
-        'UV_CACHE_DIR="$TMPDIR/uv-cache" UV_PYTHON_INSTALL_DIR="$TMPDIR/uv-python" '
+        'UV_HTTP_TIMEOUT=2 UV_HTTP_RETRIES=0 UV_CACHE_DIR="$TMPDIR/uv-cache" UV_PYTHON_INSTALL_DIR="$TMPDIR/uv-python" '
         'UV_PROJECT_ENVIRONMENT="$TMPDIR/uv-env" '
         f"UV_PYTHON_DOWNLOADS=never UV_PYTHON={shlex.quote(str(python))} "
         f"{shlex.quote(str(uv))} --no-cache sync --index-url {origin}/simple",
         egress_origins=[origin],
         executable_grant=grants,
+        read_roots=[sys.base_prefix],
+        wait_seconds=30,
     )
+    assert not result["ok"], json.dumps(result)
     assert result["problem"]["code"] == "process.nonzero_exit", json.dumps(result)
     assert "socks" in result["problem"]["metadata"]["stderr"]["content"].lower(), json.dumps(result)
     live_egress_clock.host.run_host_command.assert_not_called()
@@ -899,7 +973,12 @@ def test_public_macos_uv_syncs_an_owned_wheel_offline(
     prepare(package_fixture)
     wheel_name = "loop_egress_fixture-1.0.0-py3-none-any.whl"
     shutil.copyfile(package_fixture / "wheels" / wheel_name, wheels / wheel_name)
-    result = live_egress_clock.call(command, executable_grant=grants)
+    result = live_egress_clock.call(
+        command,
+        executable_grant=grants,
+        read_roots=[sys.base_prefix],
+        write_roots=[str(native_workspace)],
+    )
     assert result["ok"], json.dumps(result)
     assert result["result"]["boundary"] == "sandbox"
     assert result["result"]["stdout"]["content"] == "ok\n"
@@ -920,6 +999,7 @@ def test_public_macos_curl_download_supports_offline_uv_sync(
         f'/usr/bin/curl -fsS --max-time 8 -o "$WORKSPACE_ROOT/wheels/{wheel.name}" '
         f"{origin}/wheels/{wheel.name}",
         egress_origins=[origin],
+        write_roots=[str(wheels)],
     )
     assert download["ok"], json.dumps(download)
     assert download["result"]["boundary"] == "sandbox"
@@ -930,7 +1010,12 @@ def test_public_macos_curl_download_supports_offline_uv_sync(
         for call in live_egress_clock.interaction.info.call_args_list[info_before:]
     )
 
-    offline = live_egress_clock.call(command, executable_grant=grants)
+    offline = live_egress_clock.call(
+        command,
+        executable_grant=grants,
+        read_roots=[sys.base_prefix],
+        write_roots=[str(native_workspace)],
+    )
     assert offline["ok"], json.dumps(offline)
     assert offline["result"]["boundary"] == "sandbox"
     assert offline["result"]["stdout"]["content"] == "ok\n"

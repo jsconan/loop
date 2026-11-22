@@ -5,11 +5,29 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
+from os.path import samestat
 from pathlib import Path
 
 from platformdirs import PlatformDirs
 
 from .. import constants
+
+
+def _contains_directory(root: Path, path: Path) -> bool:
+    """Recognize containment through both spelling and existing directory identity."""
+    if path.is_relative_to(root):
+        return True
+    try:
+        identity = root.stat()
+    except FileNotFoundError:
+        return False
+    for candidate in (path, *path.parents):
+        try:
+            if samestat(identity, candidate.stat()):
+                return True
+        except FileNotFoundError:
+            continue
+    return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,12 +39,14 @@ class WorkspacePaths:
         configuration (Path): Project-local sparse configuration override.
         sessions (Path): Central session database.
         permissions (Path): Central permission policy.
+        scratch_roots (tuple[Path, ...]): Eligible private namespaces, with compact paths first.
     """
 
     data: Path
     configuration: Path
     sessions: Path
     permissions: Path
+    scratch_roots: tuple[Path, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,6 +157,15 @@ class ApplicationPaths:
         """
         return self.state_root / constants.OPERATIONAL_LOG_FILENAME
 
+    @property
+    def session_scratch(self) -> Path:
+        """Return the default namespace for durable session working files.
+
+        Returns:
+            Path: Dedicated user-home path independent of application directory overrides.
+        """
+        return Path.home().resolve() / f".{constants.APP_NAME}-scratch"
+
     def for_workspace(self, workspace_id: str, root: Path | str) -> WorkspacePaths:
         """Derive immutable storage paths for an initialized workspace.
 
@@ -148,16 +177,27 @@ class ApplicationPaths:
             WorkspacePaths: Paths owned by the identified workspace.
 
         Raises:
-            ValueError: If the identifier is empty or path-like.
+            ValueError: The identifier is invalid or no safe scratch namespace is available.
         """
         if not workspace_id or Path(workspace_id).name != workspace_id:
             raise ValueError("Workspace identifier must be a non-empty path segment.")
+        checkout = Path(root).resolve()
+        eligible = (
+            scratch
+            for scratch in (self.session_scratch, self.data_root / "scratch")
+            if not _contains_directory(checkout, scratch)
+            and not _contains_directory(scratch, checkout)
+        )
+        scratch_roots = tuple(
+            sorted(eligible, key=lambda path: any(character.isspace() for character in str(path)))
+        )
+        if not scratch_roots:
+            raise ValueError("Session scratch requires a private path outside the workspace.")
         data = self.data_root / "workspaces" / workspace_id
         return WorkspacePaths(
             data=data,
-            configuration=Path(root).resolve()
-            / constants.APP_DIRECTORY
-            / constants.APP_CONFIGURATION_FILENAME,
+            configuration=checkout / constants.APP_DIRECTORY / constants.APP_CONFIGURATION_FILENAME,
             sessions=data / constants.SESSION_DATABASE_FILENAME,
             permissions=data / constants.PERMISSIONS_FILENAME,
+            scratch_roots=scratch_roots,
         )

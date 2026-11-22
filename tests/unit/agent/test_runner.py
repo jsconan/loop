@@ -14,6 +14,7 @@ from openai.types.responses import ResponseFunctionToolCall
 
 from loop import (
     BUILTIN_TOOLS,
+    Action,
     AnswerDelta,
     ApprovalChoice,
     BackendConnectionError,
@@ -22,6 +23,7 @@ from loop import (
     BackendRepetitionError,
     ConsoleInteraction,
     ContextReference,
+    Decision,
     InstructionsManager,
     Interaction,
     Message,
@@ -76,6 +78,13 @@ from loop.utils import PathHolder, VirtualPath, await_value_async, content_diges
 from tests.scheduling import deliver_callbacks
 
 from ..execution.sandbox.helpers import logical_private_name
+
+
+def automatic_process_policy(root, *, allow_direct_host_execution=False):
+    """Explicitly allow processes while retaining resource approvals for facade tests."""
+    manager = PermissionManager(root, allow_direct_host_execution=allow_direct_host_execution)
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
+    return manager
 
 
 def agent_runner(
@@ -253,7 +262,9 @@ def file_runner(tmp_path, backend, *, registry=None, sessions=None, run_control=
         backend.prepare_context.side_effect = list
     interaction = MagicMock(spec=Interaction)
     interaction.response_context.side_effect = nullcontext
-    interaction.prompt.return_value = ApprovalChoice.ONCE
+    interaction.prompt.side_effect = lambda *args, **kwargs: next(
+        key for key, index in kwargs["index"].items() if index == "Y"
+    )
     sessions = sessions or SessionManager(interaction=interaction)
     instructions = InstructionsManager()
     instructions.set_runtime_environment(
@@ -588,12 +599,13 @@ def test_runner_uses_existing_executable_grant_in_one_tool_call(tmp_path, monkey
     model.get_response.side_effect = [model_calls(call), [ResponseCompleted(answer="done")]]
     registry = ToolRegistry(
         [run_command],
-        permission_manager=PermissionManager(tmp_path),
+        permission_manager=automatic_process_policy(tmp_path),
         execution_service=service,
     )
     runner = file_runner(tmp_path, model, registry=registry)
     runner.session_manager.add_user_message("Run the builder")
 
+    runner.interaction.prompt.return_value = "approve"
     result = runner.run()
 
     output = next(
@@ -604,7 +616,7 @@ def test_runner_uses_existing_executable_grant_in_one_tool_call(tmp_path, monkey
     assert output["ok"] and output["result"]["boundary"] == "sandbox"
     assert result.turns == model.get_response.call_count == 2
     assert native.run.call_count == 1
-    runner.interaction.prompt.assert_not_called()
+    runner.interaction.prompt.assert_called_once()
 
 
 @pytest.mark.parametrize("spelling", ["None", "nOnE", "null", "NULL"])
@@ -620,7 +632,6 @@ def test_runner_normalizes_optional_capability_null_spellings_in_one_call(tmp_pa
         arguments=json.dumps(
             {
                 "command": "printf ready",
-                "read_only": True,
                 "read_roots": spelling,
                 "write_roots": spelling,
                 "executable_grant": spelling,
@@ -632,7 +643,7 @@ def test_runner_normalizes_optional_capability_null_spellings_in_one_call(tmp_pa
     model.get_response.side_effect = [model_calls(call), [ResponseCompleted(answer="done")]]
     registry = ToolRegistry(
         [run_command],
-        permission_manager=PermissionManager(tmp_path),
+        permission_manager=automatic_process_policy(tmp_path),
         execution_service=CommandExecutionService(native, host),
     )
     runner = file_runner(tmp_path, model, registry=registry)
@@ -683,6 +694,7 @@ def test_runner_executes_reused_provider_id_in_distinct_responses(tmp_path, monk
         [ResponseCompleted(answer="done")],
     ]
     runner = file_runner(tmp_path, model, registry=registry, sessions=sessions)
+    runner.permission_manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
     runner.permission_manager.bind_temporary_directory(sessions.temporary_directory)
     runner.instructions_manager.set_runtime_environment(
         RuntimeEnvironment(
@@ -734,13 +746,13 @@ def test_runner_reports_executable_failure_without_replaying_or_extra_tool_calls
     call = ToolCall(
         call_id="command",
         name="run_command",
-        arguments=json.dumps({"command": "exit 127", "read_only": True}),
+        arguments=json.dumps({"command": "exit 127"}),
     )
     model = Mock()
     model.get_response.side_effect = [model_calls(call), [ResponseCompleted(answer="done")]]
     registry = ToolRegistry(
         [run_command],
-        permission_manager=PermissionManager(tmp_path),
+        permission_manager=automatic_process_policy(tmp_path),
         execution_service=CommandExecutionService(native, host),
     )
     runner = file_runner(tmp_path, model, registry=registry)
@@ -791,12 +803,13 @@ def test_runner_discovers_managed_executable_without_extra_turns(tmp_path, monke
     model.get_response.side_effect = [model_calls(call), [ResponseCompleted(answer="done")]]
     registry = ToolRegistry(
         [run_command],
-        permission_manager=PermissionManager(tmp_path),
+        permission_manager=automatic_process_policy(tmp_path),
         execution_service=CommandExecutionService(native, Mock()),
     )
     runner = file_runner(tmp_path, model, registry=registry)
     runner.session_manager.add_user_message("Run the project task")
 
+    runner.interaction.prompt.return_value = "approve"
     result = runner.run()
 
     output = next(
@@ -807,8 +820,9 @@ def test_runner_discovers_managed_executable_without_extra_turns(tmp_path, monke
     assert output["ok"], output
     assert result.turns == model.get_response.call_count == 2
     assert len(result.metrics.tools) == native.run.call_count == 1
-    assert native.run.call_args.args[0].automatic_tool_reads == (tools,)
-    runner.interaction.prompt.assert_not_called()
+    assert native.run.call_args.args[0].automatic_tool_reads == ()
+    assert native.run.call_args.args[0].read_roots == (tools,)
+    runner.interaction.prompt.assert_called_once()
 
 
 @pytest.mark.parametrize(
@@ -1010,7 +1024,6 @@ def test_runner_executes_scoped_executable_in_the_original_call(
                     if selection == "literal-fixed"
                     else "./launcher"
                 ),
-                "read_only": True,
             }
             | (
                 {}
@@ -1076,7 +1089,7 @@ def test_runner_prepares_selected_runtime_without_an_extra_turn(
     tmp_path = shebang_root
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    environment = workspace / ".venv"
+    environment = workspace / "tools"
     commands = environment / "bin"
     commands.mkdir(parents=True)
     runtime = tmp_path / "runtime"
@@ -1084,17 +1097,13 @@ def test_runner_prepares_selected_runtime_without_an_extra_turn(
     interpreter = runtime / "engine"
     interpreter.write_text("fixture", encoding="utf-8")
     interpreter.chmod(0o755)
-    (commands / "python").symlink_to(interpreter)
-    (environment / "pyvenv.cfg").write_text(
-        f"home = {runtime}\nimplementation = CPython\nversion_info = 3.14.2\n", encoding="utf-8"
-    )
-    (workspace / "pyproject.toml").write_text('[project]\nname = "fixture"\n', encoding="utf-8")
+    (commands / "engine").symlink_to(interpreter)
     script = workspace / "fixture-task"
-    script.write_text(f"#!{commands / 'python'}\n", encoding="utf-8")
+    script.write_text(f"#!{commands / 'engine'}\n", encoding="utf-8")
     script.chmod(0o755)
     tools = tmp_path / "tools"
     tools.mkdir()
-    executable = tools / "uv"
+    executable = tools / "launcher"
     executable.write_text("fixture", encoding="utf-8")
     executable.chmod(0o755)
     monkeypatch.setenv("PATH", str(tools))
@@ -1109,7 +1118,7 @@ def test_runner_prepares_selected_runtime_without_an_extra_turn(
         type(native),
         "automatic_tool_read_roots",
         lambda _self, _workspace, _roots, identities: (
-            (runtime,) if any(identity[1] == commands / "python" for identity in identities) else ()
+            (runtime,) if any(identity[1] == commands / "engine" for identity in identities) else ()
         ),
         raising=False,
     )
@@ -1119,13 +1128,13 @@ def test_runner_prepares_selected_runtime_without_an_extra_turn(
         arguments=json.dumps(
             {
                 "command": (
-                    "uv run --no-sync pytest"
+                    "launcher task"
                     if selection == "project"
-                    else "./.venv/bin/python -c pass"
+                    else "./tools/bin/engine -c pass"
                     if selection == "direct"
                     else "./fixture-task"
                 ),
-                "read_only": True,
+                **({"read_roots": [str(runtime)]} if selection == "project" else {}),
             }
         ),
     )
@@ -1135,6 +1144,7 @@ def test_runner_prepares_selected_runtime_without_an_extra_turn(
         [run_command],
         permission_manager=PermissionManager(workspace),
         execution_service=CommandExecutionService(native, Mock()),
+        settings=ToolRuntimeSettings(sandbox_environment={"MODE": "prepared"}),
     )
     runner = file_runner(workspace, model, registry=registry)
     runner.interaction.prompt.return_value = "approve"
@@ -1152,6 +1162,7 @@ def test_runner_prepares_selected_runtime_without_an_extra_turn(
     assert len(result.metrics.tools) == native.run.call_count == 1
     assert runner.interaction.prompt.call_count == 1
     assert native.run.call_args.args[0].read_roots == (runtime,)
+    assert native.run.call_args.args[0].execution_source.startswith("export MODE=prepared\n")
 
 
 @pytest.mark.parametrize("selection", ["direct", "forwarded", "safe_options"])
@@ -1231,13 +1242,13 @@ def test_runner_waits_for_one_configured_command_without_an_extra_turn(tmp_path,
     call = ToolCall(
         call_id="command",
         name="run_command",
-        arguments=json.dumps({"command": "printf ready", "read_only": True}),
+        arguments=json.dumps({"command": "printf ready"}),
     )
     model = Mock()
     model.get_response.side_effect = [model_calls(call), [ResponseCompleted(answer="done")]]
     registry = ToolRegistry(
         [run_command],
-        permission_manager=PermissionManager(tmp_path),
+        permission_manager=automatic_process_policy(tmp_path),
         execution_service=CommandExecutionService(native, Mock()),
         settings=ToolRuntimeSettings(
             command_default_initial_wait_seconds=75,
@@ -1268,8 +1279,6 @@ def test_runner_ignores_unidentified_runtime_metadata_in_the_original_call(tmp_p
     executable.write_text("fixture executable", encoding="utf-8")
     executable.chmod(0o755)
     (tmp_path / "pyvenv.cfg").symlink_to(tmp_path / "unrelated")
-    home = tmp_path.parent / "fixture-home"
-    home.mkdir()
     monkeypatch.setenv("PATH", str(tools))
     monkeypatch.setattr(
         "loop.execution.facade.is_protected_external_read",
@@ -1278,10 +1287,6 @@ def test_runner_ignores_unidentified_runtime_metadata_in_the_original_call(tmp_p
     monkeypatch.setattr(
         "loop.execution.sandbox.linux.paths.is_protected_external_read",
         lambda path: logical_private_name(path, tmp_path.parent),
-    )
-    monkeypatch.setattr(
-        "loop.execution.sandbox.linux.paths.pwd.getpwuid",
-        lambda _uid: SimpleNamespace(pw_dir=str(home)),
     )
     monkeypatch.setattr("loop.execution.sandbox.linux.backend.runtime_read_roots", lambda: ())
     monkeypatch.setattr(LinuxNativeBackend, "file_creation_mask", 0o077)
@@ -1292,13 +1297,13 @@ def test_runner_ignores_unidentified_runtime_metadata_in_the_original_call(tmp_p
     call = ToolCall(
         call_id="command",
         name="run_command",
-        arguments=json.dumps({"command": executable.name, "read_only": True}),
+        arguments=json.dumps({"command": executable.name}),
     )
     model = Mock()
     model.get_response.side_effect = [model_calls(call), [ResponseCompleted(answer="done")]]
     registry = ToolRegistry(
         [run_command],
-        permission_manager=PermissionManager(tmp_path),
+        permission_manager=automatic_process_policy(tmp_path),
         execution_service=service,
     )
     runner = file_runner(tmp_path, model, registry=registry)
@@ -1974,7 +1979,7 @@ def test_deletion_warning_allows_reconsidered_creation_with_normal_authorization
     def approve_creation(*args, **kwargs):
         """Insert a competing file after inspection but before an approved creation."""
         target.write_text("external", encoding="utf-8")
-        return ApprovalChoice.ONCE
+        return next(key for key, index in kwargs["index"].items() if index == "Y")
 
     def generate(**request):
         """Mutate disk during inference and inspect warnings before choosing a fresh operation."""
@@ -1999,6 +2004,7 @@ def test_deletion_warning_allows_reconsidered_creation_with_normal_authorization
             if outcome == "competing":
                 target.write_text("external", encoding="utf-8")
             elif outcome == "denied":
+                runner.interaction.prompt.side_effect = None
                 runner.interaction.prompt.return_value = ApprovalChoice.DENY
             elif outcome == "race":
                 runner.interaction.prompt.side_effect = approve_creation

@@ -63,7 +63,7 @@ from .constants import (
     SYSTEM_RUNTIME_DIRECTORY,
     SYSTEMD_SOCKET_UNIT_SUFFIX,
 )
-from .egress import EgressBroker
+from .egress import NetworkBroker
 from .host import (
     bind_host_file,
     discover_tool,
@@ -75,7 +75,7 @@ from .host import (
 from .namespace import namespace_arguments
 from .policy import payload_profile
 from .records import read_generation
-from .seccomp import local_network_filter
+from .seccomp import descriptor_filter, local_network_filter
 from .supervision import guard_client_disconnect, supervise_payload
 from .transport import exchange_request
 
@@ -91,6 +91,8 @@ _REVIEWED_CONSTANTS_DIGEST = hashlib.sha256(
 _SECCOMP_ARTIFACT = linux_constants.LINUX_ARTIFACT_DIRECTORY + "seccomp.py"
 _UNIX_ISOLATION_FEATURE = "NATIVE_UNIX_HOST_SOCKET_ISOLATION_V1"
 _SOCKET_FAMILY_FEATURE = "NATIVE_SCOPED_SOCKET_FAMILIES_V1"
+_EXACT_WRITE_FILES_FEATURE = "sandbox-exact-write-files-v1"
+_HARDLINK_SOURCES_FEATURE = "hardlink-sources-v1"
 _WIRE_ARTIFACT = f"{PACKAGE_ARTIFACT_PREFIX}execution/sandbox/contracts.py"
 _WIRE_DECLARATIONS = frozenset(
     {
@@ -276,6 +278,28 @@ def _require_wire_capabilities(installed, payload: bytes, deadline: float | None
     if envelope["request"].get("policy_version") != NATIVE_POLICY_VERSION:
         raise NativeFeatureUnavailable("Installed Linux sandbox policy revision is unsupported.")
     features = set(capabilities["NATIVE_REQUEST_FEATURES"])
+    if envelope["request"].get("hardlink_source_identities") and not _supports_hardlink_sources(
+        capabilities
+    ):
+        raise NativeFeatureUnavailable(
+            "Installed Linux sandbox cannot verify shared dependencies; use /sandbox refresh."
+        )
+    if envelope["request"].get("write_files") and not _supports_write_files(capabilities):
+        raise NativeFeatureUnavailable(
+            "Installed Linux sandbox cannot enforce exact file writes; use /sandbox refresh."
+        )
+    if "native-hard-policy-v1" not in features:
+        raise NativeFeatureUnavailable(
+            "Installed Linux sandbox cannot enforce hard resource policy; use /sandbox refresh."
+        )
+    if (
+        envelope["request"].get("protected_host_roots")
+        and "protected-host-scratch-v1" not in features
+    ):
+        raise NativeFeatureUnavailable(
+            "Installed Linux sandbox cannot separate agent data from control state; "
+            "use /sandbox refresh."
+        )
     if (
         envelope["request"].get("local_network") is False
         and "sandbox-local-network-v1" not in features
@@ -303,12 +327,46 @@ def _require_wire_capabilities(installed, payload: bytes, deadline: float | None
         raise NativeFeatureUnavailable("Installed Linux sandbox cannot bind executable aliases.")
     if envelope["request"].get("egress_origins") and "mediated-egress-v1" not in features:
         raise NativeFeatureUnavailable("Installed Linux sandbox cannot mediate external egress.")
+    if envelope["request"].get("ingress_port") and "attempt-ingress-v1" not in features:
+        raise NativeFeatureUnavailable("Installed Linux sandbox lacks attempt-bound ingress.")
     if envelope["request"].get("terminal") and "owned-terminal-v1" not in features:
         raise NativeFeatureUnavailable("Installed Linux sandbox lacks owned terminal support.")
     if envelope["request"].get("stream_output") and "live-output-beyond-capture-v1" not in features:
         raise NativeFeatureUnavailable(
             "Installed Linux sandbox cannot continue live output; use /sandbox refresh."
         )
+
+
+def _supports_write_files(capabilities: dict[str, tuple]) -> bool:
+    """Check the retained optional wire field and its enforcing policy revision."""
+    return {"write_files", "_write_file_identities"}.issubset(
+        capabilities["NATIVE_REQUEST_OPTIONAL_FIELDS"]
+    ) and _EXACT_WRITE_FILES_FEATURE in capabilities["NATIVE_REQUEST_FEATURES"]
+
+
+def _supports_hardlink_sources(capabilities: dict[str, tuple]) -> bool:
+    """Require both the optional identity field and its native enforcement revision."""
+    return (
+        "hardlink_source_identities" in capabilities["NATIVE_REQUEST_OPTIONAL_FIELDS"]
+        and _HARDLINK_SOURCES_FEATURE in capabilities["NATIVE_REQUEST_FEATURES"]
+    )
+
+
+def installed_optional_support(record: Path) -> tuple[bool, bool]:
+    """Identify optional file-write and hardlink-source support in retained receiver metadata.
+
+    Args:
+        record (Path): Original protected installation management record.
+
+    Returns:
+        tuple[bool, bool]: Support for exact file writes and external hardlink accounting.
+    """
+    try:
+        installed, _ = read_generation(record)
+        capabilities = _wire_capabilities(installed, None)
+        return _supports_write_files(capabilities), _supports_hardlink_sources(capabilities)
+    except (OSError, ValueError):
+        return False, False
 
 
 def _require_runtime_revision(installed, *, deadline: float | None = None) -> None:
@@ -557,16 +615,24 @@ def execute_installed_request(
     ):
         broker = None
         bridge_child = None
-        if isinstance(request.egress_origins, tuple) and request.egress_origins:
+        if (isinstance(request.egress_origins, tuple) and request.egress_origins) or (
+            request.ingress_port is not None
+        ):
             bridge_host, bridge_child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET)
             pins.enter_context(bridge_host)
             pins.enter_context(bridge_child)
-            broker = EgressBroker(request, bridge_host)
+            broker = NetworkBroker(request, bridge_host)
             pins.callback(broker.close)
         try:
-            arguments, inherited = prepared_paths.enter_context(
+            arguments, inherited, mounted_request = prepared_paths.enter_context(
                 namespace_arguments(request, Path(scratch), empty_mask=empty_mask)
             )
+            if mounted_request.hardlink_source_identities:
+                # Host-only inode witnesses have served their purpose before namespace entry.
+                mounted_request = replace(mounted_request, hardlink_source_identities=())
+            if mounted_request is not request:
+                payload = replace(mounted_request, deadline=execution_deadline).to_wire()
+                request = mounted_request
         except ValueError as error:
             return CommandProcessResult(
                 SandboxOutcome.INVALID,
@@ -604,12 +670,12 @@ def execute_installed_request(
                 or (current_group.st_dev, current_group.st_ino) != group_identity
             ):
                 raise ValueError("Generation tracking directory changed before binding.")
-            profile = (
-                payload_profile(request, Path(scratch), cache.path, runtime_roots)
-                + "_"
-                + sha256_digest(group.name)[:NATIVE_PROFILE_GROUP_HASH_CHARS]
-            )
             try:
+                profile = (
+                    payload_profile(request, Path(scratch), cache.path, runtime_roots)
+                    + "_"
+                    + sha256_digest(group.name)[:NATIVE_PROFILE_GROUP_HASH_CHARS]
+                )
                 compiled = compile_payload(
                     request,
                     Path(scratch),
@@ -621,6 +687,12 @@ def execute_installed_request(
                 )
             except CompilationCancelled:
                 return CommandProcessResult(SandboxOutcome.CANCELLED)
+            except ValueError as error:
+                return CommandProcessResult(
+                    SandboxOutcome.INVALID,
+                    detail=str(error),
+                    failure_context="Native sandbox policy preparation was refused.",
+                )
             value = {
                 "request": base64.b64encode(payload).decode("ascii"),
                 "compiled": base64.b64encode(compiled).decode("ascii"),
@@ -631,9 +703,19 @@ def execute_installed_request(
                 **({"egress_fd": bridge_child.fileno()} if bridge_child is not None else {}),
                 **(
                     {
+                        "payload_descriptor_filter": base64.b64encode(
+                            descriptor_filter(deadline=request.deadline)
+                        ).decode("ascii")
+                    }
+                    if request.ingress_port is not None
+                    else {}
+                ),
+                **(
+                    {
                         "local_network_filter": base64.b64encode(
                             local_network_filter(
-                                mediated_egress=bool(request.egress_origins),
+                                mediated_egress=bool(request.egress_origins)
+                                or request.ingress_port is not None,
                                 deadline=request.deadline,
                             )
                         ).decode("ascii")
@@ -761,7 +843,7 @@ def execute_installed_request(
                 )
             if bridge_child is not None:
                 bridge_child.close()
-                broker.start_lease()
+                broker.start_lease(request.deadline)
                 connection.sendall(b"E")
             output_lock = Lock() if request.stream_output is True else None
             output_marker = NATIVE_PAYLOAD_MARKER_PREFIX + request.attempt_id + "\n"

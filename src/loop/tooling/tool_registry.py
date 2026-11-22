@@ -11,7 +11,7 @@ import logging
 from collections.abc import Awaitable, Callable, Generator, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from dataclasses import is_dataclass
+from dataclasses import is_dataclass, replace
 from enum import Enum
 from functools import partial
 from pathlib import Path
@@ -33,7 +33,7 @@ from ..constants import (
 from ..errors import Problem, ProblemException, log_problem
 from ..execution import CommandExecutionService
 from ..instructions import InstructionsManager
-from ..interaction import Interaction, require_async_interaction
+from ..interaction import Interaction
 from ..models import (
     ToolDefinition,
     ToolExecutionResult,
@@ -42,6 +42,7 @@ from ..models import (
 from ..permissions import (
     Action,
     Decision,
+    FileTarget,
     Operation,
     OperationPlan,
     OperationPlanner,
@@ -55,12 +56,13 @@ from ..utils import (
     VirtualPath,
     WorkerCapacity,
     WorkerEntry,
+    bound_tool_result,
     callable_name,
     has_running_event_loop,
     is_async_callable,
     settle_future_async,
 )
-from .context import ToolContext
+from .context import ToolContext, VerificationScope
 from .file_observations import FileObservations
 from .models import (
     ToolExecutionAdmissionRejected,
@@ -1070,18 +1072,42 @@ class ToolRegistry:
         Returns:
             list[ToolDefinition]: Supported function-tool definitions in registration order.
         """
+        supported = getattr(self._execution_service, "backend_options", ())
+        services = (
+            self._permission_manager.requestable_sandbox_options(supported)
+            if isinstance(supported, tuple) and supported
+            else ()
+        )
         definitions = []
         for tool in self._tools.values():
+            if (
+                tool.requires_fresh_host_approval
+                and not self._permission_manager.host_tool_available(tool.name)
+            ):
+                continue
             if tool.platform_capability and not self._platform_capability(tool.platform_capability):
                 continue
             definition = tool.definition()
             for item in tool.platform_argument_capabilities:
                 item = cast(PlatformArgumentCapability, item)
-                if not self._platform_capability(item.capability):
+                capabilities = getattr(
+                    self._execution_service, "requestable_backend_capabilities", frozenset()
+                )
+                if not (
+                    isinstance(capabilities, frozenset)
+                    and item.capability in capabilities
+                    or self._platform_capability(item.capability)
+                ):
                     definition.parameters["properties"].pop(item.argument)
                     definition.parameters["required"].remove(item.argument)
+                else:
+                    guidance = getattr(self._execution_service, "backend_capability_guidance", {})
+                    if isinstance(guidance, dict) and item.capability in guidance:
+                        definition.parameters["properties"][item.argument]["description"] += (
+                            " " + guidance[item.capability]
+                        )
             if tool.definition_transform is not None:
-                definition = tool.definition_transform(definition, self._settings)
+                definition = tool.definition_transform(definition, self._settings, services)
             definitions.append(definition)
         return definitions
 
@@ -1539,6 +1565,7 @@ class ToolRegistry:
             if worker_context is not None:
                 context.file_versions.update(worker_context.file_versions)
                 context.read_versions.update(worker_context.read_versions)
+                context.file_read_paths.update(worker_context.file_read_paths)
         output = result.output
         output = self._model_result(
             output,
@@ -1560,6 +1587,7 @@ class ToolRegistry:
         *,
         interaction: Interaction | None = None,
         instructions_manager: InstructionsManager | None = None,
+        verification_scope: VerificationScope | None = None,
     ) -> ToolExecutionResult:
         """Dispatch a planned user-command tool call without permission evaluation.
 
@@ -1570,6 +1598,8 @@ class ToolRegistry:
                 registry default.
             instructions_manager (InstructionsManager | None): Instruction manager active for the
                 current conversation.
+            verification_scope (VerificationScope | None): Private owner-selected task constraints.
+
         Returns:
             ToolExecutionResult: Serialized result and its user-presentation metadata.
 
@@ -1629,9 +1659,13 @@ class ToolRegistry:
             instructions_manager=instructions_manager,
             operations=plan.operations,
             prerequisite_operations=plan.prerequisite_operations,
-            permission_manager=(self._permission_manager if tool.execution_authorization else None),
+            permission_manager=self._permission_manager,
             command_paths=command_paths,
         )
+        if not tool.execution_authorization:
+            context = replace(context, additional_authorizer=None, additional_authorizer_async=None)
+        elif verification_scope is not None:
+            context = verification_scope.bind(context)
         result = tool.execute(
             plan.arguments,
             context,
@@ -1664,16 +1698,35 @@ class ToolRegistry:
             ):
                 value["read_versions"] = context.read_versions
             output = json.dumps(value, ensure_ascii=False)
+
+        def bounded(value: str) -> str:
+            """Retain source authority when caching an oversized file-tool result."""
+            if context is None:
+                return value
+            sources = context.file_read_paths | {
+                operation.target.path
+                for operation in context.operations + context.prerequisite_operations
+                if isinstance(operation.target, FileTarget)
+                and operation.action in {Action.FILESYSTEM_READ, Action.FILESYSTEM_LIST}
+            }
+            if not sources:
+                return value
+            return bound_tool_result(
+                value,
+                f"tool result {context.call_id or context.tool_name}",
+                file_sources=tuple(sorted(sources)),
+            )[0]
+
         if instructions_manager is None:
-            return output
+            return bounded(output)
         try:
             value = json.loads(output)
         except (json.JSONDecodeError, TypeError):
-            return output
+            return bounded(output)
         problem = value.get("problem") if isinstance(value, dict) else None
         problem_detail = problem.get("detail") if isinstance(problem, dict) else None
         if not tool.result_path_fields and not isinstance(problem_detail, str):
-            return output
+            return bounded(output)
         paths = virtual_paths or instructions_manager.virtual_paths
         prepared = (
             paths.metadata(value, tool.result_path_fields) if tool.result_path_fields else value
@@ -1687,7 +1740,7 @@ class ToolRegistry:
                     "detail": paths.redact(problem["detail"], roots=redaction_roots),
                 },
             }
-        return output if value == prepared else json.dumps(prepared, ensure_ascii=False)
+        return bounded(output if value == prepared else json.dumps(prepared, ensure_ascii=False))
 
     def _plan(self, tool: Tool, arguments: dict[str, object]) -> OperationPlan:
         """Run and normalize one planner through the synchronous host policy."""
@@ -1893,7 +1946,18 @@ class ToolRegistry:
                 )
             plan = self._plan(tool, arguments)
             prerequisites = ()
-            while plan.continuation is not None:
+            while True:
+                file_operations = tuple(
+                    operation
+                    for operation in plan.boundary_operations + plan.operations
+                    if isinstance(operation.target, FileTarget)
+                )
+                if file_operations:
+                    denial = self._permission_manager.check_boundaries(file_operations)
+                    if denial is not None:
+                        return None, self._denied_problem(tool, denial.reason)
+                if plan.continuation is None:
+                    break
                 prerequisites += plan.operations
                 plan = tool.normalize_plan(self._invoke(tool, plan.continuation))
             return plan.model_copy(
@@ -2009,6 +2073,11 @@ class ToolRegistry:
             file_versions={},
             read_versions={},
             cancellation_event=context.cancellation_event,
+            sandbox_attempt_detached=(
+                context.permission_manager.sandbox_attempt
+                if context.permission_manager is not None
+                else None
+            ),
         )
 
     def _authorize(
@@ -2125,33 +2194,6 @@ class ToolRegistry:
             )
         policy = permission_manager.evaluate(operations)
         if policy.decision is Decision.DENY:
-            revision = permission_manager.host_gate_enable_revision(operations)
-            if (
-                revision is None
-                or active_interaction is None
-                or (getattr(active_interaction, "supports_fresh_host_approval", False) is not True)
-            ):
-                self._record_host_denial(permission_manager, operation, "policy")
-                return self._denied_problem(tool, policy.reason)
-            active_interaction.info(
-                "Enable host-process eligibility for this session? This allows future explicit "
-                "host requests to ask for approval; it does not approve any command."
-            )
-            answer = active_interaction.prompt(
-                "Enable session host-process eligibility?",
-                exit_commands=None,
-                choices={"deny": "Deny", "enable": "Enable for this session"},
-                index={"deny": "N", "enable": "Y"},
-            )
-            if answer != "enable" or not permission_manager.enable_host_gate_if_current(
-                operations, revision
-            ):
-                self._record_host_denial(
-                    permission_manager, operation, "eligibility_declined_or_stale"
-                )
-                return self._denied_problem(tool, "Host eligibility was declined or changed.")
-            policy = permission_manager.evaluate(operations)
-        if policy.decision is Decision.DENY:
             self._record_host_denial(permission_manager, operation, "policy")
             return self._denied_problem(tool, policy.reason)
         if not self._trusted_host_rule(operation, permission_manager) and (
@@ -2192,60 +2234,6 @@ class ToolRegistry:
                 tool.name or "tool",
             )
         policy = await permission_manager.evaluate_async(operations)
-        if policy.decision is Decision.DENY:
-            revision = await self._run_worker_async(
-                partial(permission_manager.host_gate_enable_revision, operations),
-                operation="host gate eligibility",
-            )
-            if (
-                revision is None
-                or active_interaction is None
-                or (getattr(active_interaction, "supports_fresh_host_approval", False) is not True)
-            ):
-                await self._run_worker_async(
-                    partial(self._record_host_denial, permission_manager, operation, "policy"),
-                    operation="host denial audit",
-                )
-                return self._denied_problem(tool, policy.reason)
-            active_interaction.info(
-                "Enable host-process eligibility for this session? This allows future explicit "
-                "host requests to ask for approval; it does not approve any command."
-            )
-            answer = await require_async_interaction(
-                active_interaction, "host eligibility"
-            ).prompt_async(
-                "Enable session host-process eligibility?",
-                exit_commands=None,
-                choices={"deny": "Deny", "enable": "Enable for this session"},
-                index={"deny": "N", "enable": "Y"},
-            )
-            if answer != "enable":
-                await self._run_worker_async(
-                    partial(
-                        self._record_host_denial,
-                        permission_manager,
-                        operation,
-                        "eligibility_declined",
-                    ),
-                    operation="host denial audit",
-                )
-                return self._denied_problem(tool, "Host eligibility was declined.")
-            enabled = await self._run_worker_async(
-                partial(permission_manager.enable_host_gate_if_current, operations, revision),
-                operation="host gate enablement",
-            )
-            if not enabled:
-                await self._run_worker_async(
-                    partial(
-                        self._record_host_denial,
-                        permission_manager,
-                        operation,
-                        "eligibility_stale",
-                    ),
-                    operation="host denial audit",
-                )
-                return self._denied_problem(tool, "Host eligibility was declined or changed.")
-            policy = await permission_manager.evaluate_async(operations)
         if policy.decision is Decision.DENY:
             await self._run_worker_async(
                 partial(self._record_host_denial, permission_manager, operation, "policy"),

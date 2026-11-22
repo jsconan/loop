@@ -25,7 +25,8 @@ import pytest
 from loop.execution.sandbox import SandboxCapability, SandboxOutcome, SandboxRequest, selection
 from loop.execution.sandbox.contracts import CommandProcessResult, DirectoryIdentity
 from loop.execution.sandbox.macos import backend as macos_backend
-from loop.execution.sandbox.macos.backend import MacOSSeatbeltBackend
+from loop.execution.sandbox.macos.backend import MacOSSeatbeltBackend, environment_value_patterns
+from loop.permissions.protection import is_environment_value
 from loop.telemetry import MemoryTelemetryAdapter, Telemetry, set_telemetry
 from loop.utils import ProcessCapture, ProcessCaptureStatus
 
@@ -40,6 +41,7 @@ def macos_environment(monkeypatch, tmp_path, request):
     """Keep macOS backend unit tests independent of native host services."""
     local_root = tmp_path.parent / "local-sockets"
     local_root.mkdir(mode=0o700)
+    monkeypatch.setattr(macos_backend, "_PRIVATE_TEMP_ROOT", tmp_path.parent)
     original_stat = Path.stat
 
     def fake_volume_stat(path, *args, **kwargs):
@@ -60,6 +62,7 @@ def macos_environment(monkeypatch, tmp_path, request):
         ),
     )
     monkeypatch.setattr(macos_backend, "_eject_local_socket_volume", lambda _volume: None)
+    monkeypatch.setattr(macos_backend, "SynchronizationBroker", MagicMock())
     monkeypatch.setattr(
         "loop.utils.process.os.waitid",
         lambda _kind, pid, _options: SimpleNamespace(si_pid=pid),
@@ -109,12 +112,14 @@ def request(root: Path, **changes) -> SandboxRequest:
         "read_roots": (),
         "write_roots": (root,),
         "network": False,
+        "local_network": False,
         "environment": {"PATH": os.environ["PATH"], "LANG": "C"},
-        "policy_version": "macos-seatbelt-v2",
+        "policy_version": "macos-seatbelt-v6",
         "deadline": time.monotonic() + 30,
         "workspace_id": "test",
     }
     values.update(changes)
+    values["local_network"] = changes.get("local_network", values["network"])
     return SandboxRequest.create(**values)
 
 
@@ -718,6 +723,8 @@ def local_volume_simulator(monkeypatch, tmp_path):
                 return SimpleNamespace(returncode=0, stdout=b"x" * (256 * 1024 + 1))
             if state.case == "registry_bad_plist":
                 return SimpleNamespace(returncode=0, stdout=b"invalid")
+            if state.case in {"registry_absent", "registry_empty_error"}:
+                return SimpleNamespace(returncode=0, stdout=b"")
             if state.case == "pin_unenforced_removed" and state.registry_calls > 1:
                 return SimpleNamespace(returncode=0, stdout=plistlib.dumps([]))
             media = {
@@ -786,6 +793,10 @@ def local_volume_simulator(monkeypatch, tmp_path):
         if verb == "attach":
             if state.case == "attach_exception":
                 raise OSError("Attachment failed before returning its device")
+            if state.case == "attach_interrupt":
+                raise KeyboardInterrupt
+            if state.case == "attach_timeout":
+                raise subprocess.TimeoutExpired(argv, 1)
             return SimpleNamespace(
                 returncode=1 if state.case == "attach_failure" else 0,
                 stdout="bad device\n" if state.case == "bad_device" else "/dev/disk99\n",
@@ -851,7 +862,7 @@ def local_volume_simulator(monkeypatch, tmp_path):
             ProcessCaptureStatus.COMPLETED,
             process.returncode,
             value[:stdout_limit],
-            "",
+            "registry inspection failed" if state.case == "registry_empty_error" else "",
             stdout_discarded=max(0, len(value) - stdout_limit),
             stderr_discarded=1 if state.case == "registry_stderr_discarded" else 0,
         )
@@ -997,9 +1008,8 @@ def test_detached_socket_attachment_needs_no_pending_cleanup(local_volume_simula
     backend = MacOSSeatbeltBackend(MagicMock())
     monkeypatch.setattr(backend, "_qualify_terminal", MagicMock())
 
-    backend.complete_qualification(
-        request(local_volume_simulator.mount.parent, local_network=False)
-    )
+    result = backend.run(request(local_volume_simulator.mount.parent, local_network=True))
+    assert result.outcome is SandboxOutcome.UNAVAILABLE
     assert SandboxCapability.LOCAL_NETWORK not in backend.capabilities
     backend.close()
 
@@ -1008,22 +1018,22 @@ def test_detached_socket_attachment_needs_no_pending_cleanup(local_volume_simula
     assert not any(call[1] == "eject" for call in local_volume_simulator.state.calls)
 
 
+@pytest.mark.parametrize("stage", ["attach", "format"])
 def test_interrupted_local_socket_setup_preserves_the_interrupt(
-    local_volume_simulator, monkeypatch
+    local_volume_simulator, monkeypatch, stage
 ):
     """An interruption remains visible even when its attachment cannot be safely removed."""
-    local_volume_simulator.state.case = "format_interrupt"
+    local_volume_simulator.state.case = f"{stage}_interrupt"
     audit = MagicMock()
     monkeypatch.setattr(macos_backend, "telemetry_audit", audit)
 
     with pytest.raises(KeyboardInterrupt):
         _MOUNT_LOCAL_SOCKET_VOLUME(time.monotonic() + 30)
 
-    audit.assert_called_once_with(
-        "sandbox.local_socket_volume.cleanup_pending",
-        device="/dev/disk99",
-        attachment="LoopOwned4d2deadbeef",
-    )
+    identity = {"attachment": "LoopOwned4d2deadbeef"}
+    if stage == "format":
+        identity["device"] = "/dev/disk99"
+    audit.assert_called_once_with("sandbox.local_socket_volume.cleanup_pending", **identity)
 
 
 @pytest.mark.parametrize("case", ["attach_failure", "attach_exception", "bad_device"])
@@ -1035,13 +1045,52 @@ def test_uncertain_local_socket_attach_reports_its_marker(
     audit = MagicMock()
     monkeypatch.setattr(macos_backend, "telemetry_audit", audit)
 
-    with pytest.raises(OSError):
+    with pytest.raises(macos_backend.LocalSocketAttachmentError) as caught:
         _MOUNT_LOCAL_SOCKET_VOLUME(time.monotonic() + 30)
 
+    assert caught.value.device is None
+    assert caught.value.marker == "LoopOwned4d2deadbeef"
     audit.assert_called_once_with(
         "sandbox.local_socket_volume.cleanup_pending", attachment="LoopOwned4d2deadbeef"
     )
     assert not any(call[1] == "eject" for call in local_volume_simulator.state.calls)
+
+
+@pytest.mark.parametrize(
+    ("failure", "outcome"),
+    [
+        ("bad_device", SandboxOutcome.UNAVAILABLE),
+        ("attach_timeout", SandboxOutcome.TIMED_OUT),
+    ],
+)
+@pytest.mark.parametrize(
+    "registry", ["registry_absent", "registry_owner", "registry_empty_error", "owned"]
+)
+def test_backend_closes_only_the_owned_marker_after_an_uncertain_attach(
+    local_volume_simulator, monkeypatch, failure, outcome, registry
+):
+    """Resolve only the original marked RAM attachment even when attach returned no disk name."""
+    state = local_volume_simulator.state
+    state.case = failure
+    monkeypatch.setattr(macos_backend, "_mount_local_socket_volume", _MOUNT_LOCAL_SOCKET_VOLUME)
+    backend = MacOSSeatbeltBackend(MagicMock())
+    selected = request(local_volume_simulator.mount.parent, local_network=True)
+
+    result = backend.run(selected)
+
+    assert result.outcome is outcome
+    assert not result.possible_effects
+    assert not any(call[1] == "eject" for call in state.calls)
+    state.case = registry
+    if registry in {"registry_owner", "registry_empty_error"}:
+        with pytest.raises(macos_backend.LocalSocketAttachmentError, match="checked cleanup"):
+            backend.close()
+        assert not any(call[1] == "eject" for call in state.calls)
+        state.case = "registry_absent"
+    backend.close()
+    assert [call for call in state.calls if call[1] == "eject"] == (
+        [("/usr/sbin/diskutil", "eject", "/dev/disk99")] if registry == "owned" else []
+    )
 
 
 @pytest.mark.parametrize(
@@ -1092,6 +1141,7 @@ def test_optional_local_socket_qualification_runs_its_own_command(monkeypatch, t
 
     backend._qualify_local_network(core)
 
+    assert SandboxCapability.LOCAL_NETWORK in backend.requestable_capabilities
     assert SandboxCapability.LOCAL_NETWORK in backend.capabilities
     probe = qualified.call_args.args[0]
     assert probe.local_network is True
@@ -1111,8 +1161,8 @@ def test_uncertain_socket_attachment_retains_identity_for_checked_close(monkeypa
     monkeypatch.setattr(macos_backend, "_remove_local_socket_attachment", remove)
     monkeypatch.setattr(backend, "_qualify_terminal", MagicMock())
 
-    backend.complete_qualification(request(tmp_path, local_network=False))
-    backend.complete_qualification(request(tmp_path, local_network=False))
+    assert backend.run(request(tmp_path, local_network=True)).outcome is SandboxOutcome.UNAVAILABLE
+    assert backend.run(request(tmp_path, local_network=True)).outcome is SandboxOutcome.UNAVAILABLE
 
     assert SandboxCapability.LOCAL_NETWORK not in backend.capabilities
     with (
@@ -1187,7 +1237,7 @@ def test_uncertain_socket_qualification_is_retained_before_concurrent_close(monk
     assert remove.call_args.args[:2] == (pending.device, pending.marker)
 
 
-@pytest.mark.parametrize("case", ["available", "refused", "exception", "no-local", "no-scratch"])
+@pytest.mark.parametrize("case", ["available", "refused", "exception", "no-scratch"])
 def test_optional_macos_egress_qualification_requires_exact_native_socket(
     monkeypatch, tmp_path, case
 ):
@@ -1196,8 +1246,6 @@ def test_optional_macos_egress_qualification_requires_exact_native_socket(
     scratch = tmp_path / "scratch"
     scratch.mkdir(mode=0o700)
     environment = {"PATH": os.environ["PATH"], "LANG": "C", "TMPDIR": str(scratch)}
-    if case == "no-local":
-        backend.capabilities = frozenset()
     if case == "no-scratch":
         environment.pop("TMPDIR")
     native = request(
@@ -1223,7 +1271,7 @@ def test_optional_macos_egress_qualification_requires_exact_native_socket(
         assert "(remote unix-socket (literal " in probe[2]
         assert "cross-use" in probe[-1]
     else:
-        assert not run.called if case in {"no-local", "no-scratch"} else run.called
+        assert not run.called if case == "no-scratch" else run.called
     backend.close()
 
 
@@ -1232,11 +1280,16 @@ def test_optional_macos_egress_qualification_requires_exact_native_socket(
 )
 def test_optional_local_socket_mount_failure_keeps_core_commands(monkeypatch, tmp_path, failure):
     """An unavailable local volume removes only optional IPC from the native backend."""
+    expected = (
+        SandboxOutcome.TIMED_OUT
+        if isinstance(failure, subprocess.TimeoutExpired)
+        else SandboxOutcome.UNAVAILABLE
+    )
     backend = MacOSSeatbeltBackend(MagicMock())
     monkeypatch.setattr(macos_backend, "_mount_local_socket_volume", MagicMock(side_effect=failure))
-    backend._qualify_local_network(request(tmp_path, local_network=False))
+    assert backend.run(request(tmp_path, local_network=True)).outcome is expected
     assert backend.capabilities == frozenset()
-    assert backend.run(request(tmp_path)).outcome is SandboxOutcome.UNAVAILABLE
+    assert backend.run(request(tmp_path, local_network=True)).outcome is expected
     monkeypatch.setattr(
         macos_backend.subprocess, "run", MagicMock(return_value=MagicMock(returncode=0))
     )
@@ -1258,18 +1311,18 @@ def test_optional_local_socket_probe_failure_reclaims_or_retains_volume(
     eject = MagicMock(side_effect=OSError("eject failed") if probe_failure == "eject" else None)
     monkeypatch.setattr(macos_backend, "_eject_local_socket_volume", eject)
 
-    backend._qualify_local_network(request(tmp_path, local_network=False))
-
+    result = backend.run(request(tmp_path, local_network=True))
+    assert result.outcome is SandboxOutcome.UNAVAILABLE
+    assert result.detail == (
+        "eject failed"
+        if probe_failure == "eject"
+        else "Attempt-local Unix socket qualification failed."
+    )
     assert backend.capabilities == frozenset()
     eject.assert_called_once()
-    if probe_failure == "eject":
-        assert backend._local_volume is not None
-        eject.side_effect = None
-        backend.close()
-        assert eject.call_count == 2
-    else:
-        assert backend._local_volume is None
-        backend.close()
+    eject.side_effect = None
+    backend.close()
+    assert eject.call_count == (2 if probe_failure == "eject" else 1)
 
 
 def test_local_socket_volume_close_waits_for_active_attempt(monkeypatch, tmp_path):
@@ -1277,37 +1330,44 @@ def test_local_socket_volume_close_waits_for_active_attempt(monkeypatch, tmp_pat
     backend = MacOSSeatbeltBackend(MagicMock())
     eject = MagicMock()
     monkeypatch.setattr(macos_backend, "_eject_local_socket_volume", eject)
-    with backend._local_socket_directory(request(tmp_path), tmp_path) as directory:
-        assert directory.is_dir()
+
+    def close_during_probe(_request):
+        """Close the owning backend while the active attempt still holds its lease."""
         backend.close()
         eject.assert_not_called()
+        return CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=1)
+
+    monkeypatch.setattr(backend, "qualification_probe", close_during_probe)
+    value = request(tmp_path, local_network=True)
+    assert backend.run(value).outcome is SandboxOutcome.UNAVAILABLE
     eject.assert_called_once()
-    with (
-        pytest.raises(OSError, match="closed"),
-        backend._local_socket_directory(request(tmp_path), tmp_path),
-    ):
-        pass
+    assert "filesystem is closed" in backend.run(value).detail
 
 
 def test_local_socket_volume_close_retries_failed_eject(monkeypatch, tmp_path):
     """A failed eject keeps its verified identity available for the next close attempt."""
     backend = MacOSSeatbeltBackend(MagicMock())
-    with backend._local_socket_directory(request(tmp_path), tmp_path):
-        pass
     eject = MagicMock(side_effect=[OSError("busy"), None])
     monkeypatch.setattr(macos_backend, "_eject_local_socket_volume", eject)
-    with pytest.raises(OSError, match="busy"):
-        backend.close()
-    assert backend._local_volume is not None
+    monkeypatch.setattr(
+        backend,
+        "qualification_probe",
+        MagicMock(return_value=CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=1)),
+    )
+    value = request(tmp_path, local_network=True)
+    assert backend.run(value).detail == "busy"
+    assert "filesystem is closed" in backend.run(value).detail
+    eject.assert_called_once()
     backend.close()
-    assert backend._local_volume is None
     assert eject.call_count == 2
 
 
 @pytest.mark.parametrize("case", ["changed", "ancestor", "same_device"])
 def test_local_socket_volume_rejects_changed_or_shared_device(monkeypatch, tmp_path, case):
-    """A local volume cannot be shared with an approved writable root or change devices."""
+    """A changed or shared volume triggers checked eject before the attempt returns."""
     backend = MacOSSeatbeltBackend(MagicMock())
+    eject = MagicMock()
+    monkeypatch.setattr(macos_backend, "_eject_local_socket_volume", eject)
     local_root = tmp_path.parent / "local-sockets"
     writable = tmp_path
     if case == "changed":
@@ -1335,12 +1395,16 @@ def test_local_socket_volume_rejects_changed_or_shared_device(monkeypatch, tmp_p
             return details
 
         monkeypatch.setattr(Path, "stat", shared_stat)
-    with (
-        pytest.raises(OSError, match="changed|shares"),
-        backend._local_socket_directory(request(tmp_path, write_roots=(writable,)), tmp_path),
-    ):
-        pass
+    result = backend.run(request(tmp_path, local_network=True, write_roots=(writable,)))
+    assert result.outcome is SandboxOutcome.UNAVAILABLE
+    assert result.detail == (
+        "The macOS local socket filesystem changed."
+        if case == "changed"
+        else "A writable command root shares the local socket filesystem."
+    )
+    eject.assert_called_once()
     backend.close()
+    eject.assert_called_once()
 
 
 @pytest.mark.parametrize(
@@ -1739,7 +1803,7 @@ def test_backend_expired_budget_is_timeout_before_native_launch(monkeypatch, tmp
 
 
 def test_backend_builds_profile_and_runs_child(monkeypatch, tmp_path):
-    """A successful launch keeps private scratch and denies the shared directory helper."""
+    """General networking keeps scratch private and withholds host directory services."""
     probe = MagicMock(returncode=0, stderr="")
     process = Process()
     popen = MagicMock(return_value=process)
@@ -1749,7 +1813,9 @@ def test_backend_builds_profile_and_runs_child(monkeypatch, tmp_path):
     monkeypatch.setattr("loop.execution.sandbox.macos.backend.subprocess.Popen", popen)
     monkeypatch.setattr("loop.execution.sandbox.macos.backend.kill_process_group", MagicMock())
 
-    result = MacOSSeatbeltBackend().run(request(tmp_path, network=True))
+    result = MacOSSeatbeltBackend().run(
+        request(tmp_path, network=True, protected_host_roots=(tmp_path / "control",))
+    )
 
     assert result.outcome is SandboxOutcome.COMPLETED
     assert result.stdout == "ok"
@@ -1757,20 +1823,68 @@ def test_backend_builds_profile_and_runs_child(monkeypatch, tmp_path):
     assert argv[-2:] == ["loop-shell", "printf ok"]
     assert argv[3:5] == ["/bin/sh", "-c"]
     assert "(allow network*)" in argv[2]
+    assert "(allow process-exec)" not in argv[2]
+    assert "(allow file-read* process-exec" in argv[2]
     assert '"com.apple.bsd.dirhelper"' not in argv[2]
-    assert '"com.apple.system.opendirectoryd.libinfo"' in argv[2]
+    assert '"com.apple.system.opendirectoryd.libinfo"' not in argv[2]
     assert "xcrun_db" not in argv[2]
     assert popen.call_args.kwargs["close_fds"] is True
     assert Path(popen.call_args.kwargs["env"]["TMPDIR"]).is_relative_to(
         Path(tempfile.gettempdir()).resolve()
     )
     assert "LOOP_LOCAL_SOCKET_DIR" not in popen.call_args.kwargs["env"]
+    assert "LOOP_SYNC_SOCKET" not in popen.call_args.kwargs["env"]
+
+
+def test_unknown_option_cannot_run_under_a_weaker_profile(tmp_path):
+    """An unsupported native resource refuses execution even for direct backend callers."""
+    result = MacOSSeatbeltBackend().run(request(tmp_path, backend_options=("unknown",)))
+    assert result.outcome is SandboxOutcome.UNSUPPORTED
+
+
+@pytest.mark.parametrize("lookup", [False, True])
+@pytest.mark.parametrize("pools", [False, True])
+def test_backend_adds_only_the_requested_host_compatibility_rules(
+    monkeypatch, tmp_path, lookup, pools
+):
+    """Each explicit request enables only its native operations in an offline command."""
+    popen = MagicMock(return_value=Process())
+    monkeypatch.setattr(macos_backend.subprocess, "run", MagicMock(return_value=Process()))
+    monkeypatch.setattr(macos_backend.subprocess, "Popen", popen)
+    backend = MacOSSeatbeltBackend()
+    assert {
+        "account_lookup",
+        "process_pools",
+    } == set(backend.backend_options)
+    result = backend.run(
+        request(
+            tmp_path,
+            backend_options=tuple(
+                name
+                for name, enabled in (
+                    ("account_lookup", lookup),
+                    ("process_pools", pools),
+                )
+                if enabled
+            ),
+        )
+    )
+    assert result.outcome is SandboxOutcome.COMPLETED
+    profile = popen.call_args.args[0][2]
+    assert (
+        '(allow mach-lookup (global-name "com.apple.system.opendirectoryd.libinfo"))' in profile
+    ) is lookup
+    assert "(allow ipc-posix-sem)" not in profile
+    assert ("(allow ipc-posix-sem (semaphore-owner same-sandbox))" in profile) is pools
+    assert ('(allow sysctl-read (sysctl-name "kern.sysv.semmns"))' in profile) is pools
+    assert "(allow network*)" not in profile
+    assert "LOOP_LOCAL_SOCKET_DIR" not in popen.call_args.kwargs["env"]
 
 
 @pytest.mark.parametrize("local_network", [True, False])
 def test_backend_scopes_attempt_local_unix_sockets(monkeypatch, tmp_path, local_network):
     """Offline Unix sockets use one disposable path or stay denied by a local limit."""
-    popen = MagicMock(return_value=Process())
+    popen = MagicMock(side_effect=lambda *args, **kwargs: Process())
     monkeypatch.setattr(
         "loop.execution.sandbox.macos.backend.subprocess.run",
         MagicMock(return_value=MagicMock(returncode=0, stderr="")),
@@ -1787,10 +1901,19 @@ def test_backend_scopes_attempt_local_unix_sockets(monkeypatch, tmp_path, local_
         assert path.parent == tmp_path.parent / "local-sockets"
         assert f'(allow network-bind (local unix-socket (subpath "{path}")))' in profile
         assert f'(allow network-outbound (remote unix-socket (subpath "{path}")))' in profile
+        synchronization = Path(environment["LOOP_SYNC_SOCKET"])
+        assert synchronization.parent.parent == path.parent
+        assert f'(deny file-write* (subpath "{synchronization.parent}")' in profile
+        assert (
+            f'(allow network-outbound (remote unix-socket (literal "{synchronization}")))'
+            in profile
+        )
+        assert not synchronization.parent.exists()
         assert "(allow network*)" not in profile
         assert not path.exists()
     else:
         assert "LOOP_LOCAL_SOCKET_DIR" not in environment
+        assert "LOOP_SYNC_SOCKET" not in environment
         assert "(allow network-" not in profile
 
 
@@ -1800,10 +1923,7 @@ def test_backend_scopes_attempt_local_unix_sockets(monkeypatch, tmp_path, local_
 def test_backend_mediated_egress_uses_one_private_native_proxy(monkeypatch, tmp_path, case):
     """A mediated request needs exact policy authority and a scoped native broker path."""
     native = MacOSSeatbeltBackend()
-    if case != "unqualified":
-        native.capabilities = frozenset(
-            {SandboxCapability.LOCAL_NETWORK, SandboxCapability.MEDIATED_EGRESS}
-        )
+    monkeypatch.setattr(native, "_qualify_mediated_egress", lambda _request: case != "unqualified")
     popen = MagicMock(return_value=Process())
     monkeypatch.setattr(macos_backend.subprocess, "Popen", popen)
     monkeypatch.setattr(
@@ -1815,7 +1935,7 @@ def test_backend_mediated_egress_uses_one_private_native_proxy(monkeypatch, tmp_
     broker.interrupted = case == "interrupted"
     broker_factory = MagicMock(return_value=broker)
     broker.__enter__.return_value = broker
-    monkeypatch.setattr(macos_backend, "MacOSEgressBroker", broker_factory)
+    monkeypatch.setattr(macos_backend, "MacOSNetworkBroker", broker_factory)
     authority = MagicMock()
     value = request(
         tmp_path,
@@ -2260,7 +2380,7 @@ def test_backend_uses_owned_scratch_under_private_temporary_ancestry(monkeypatch
     profile = popen.call_args.args[0][2]
     assert scratch.parent == private
     assert f'(require-all (require-not (subpath "{scratch}")) (require-any' in profile
-    assert f"^{re.escape(str(scratch))}/(.*/)?" not in regex_patterns(profile)
+    assert f"^{re.escape(str(scratch))}/([^/]*/)*" not in regex_patterns(profile)
 
 
 def test_backend_accepts_unbound_scratch_under_the_temporary_root(monkeypatch, tmp_path):
@@ -2409,7 +2529,7 @@ def test_backend_granted_git_metadata_keeps_nested_git_protected(monkeypatch, tm
     result = MacOSSeatbeltBackend().run(request(tmp_path, write_roots=(tmp_path, git)))
     assert result.outcome is SandboxOutcome.COMPLETED
     profile = popen.call_args.args[0][2]
-    assert "/.+/\\.git" in regex_patterns(profile)
+    assert "/[^/]+/([^/]*/)*\\.git" in regex_patterns(profile)
 
 
 def test_backend_allows_approved_fresh_git_metadata_only_at_workspace_root(monkeypatch, tmp_path):
@@ -2424,12 +2544,13 @@ def test_backend_allows_approved_fresh_git_metadata_only_at_workspace_root(monke
     result = MacOSSeatbeltBackend().run(request(tmp_path, git_create=True))
     assert result.outcome is SandboxOutcome.COMPLETED
     profile = popen.call_args.args[0][2]
-    assert "/.+/\\.git" in regex_patterns(profile)
-    assert f'"^{tmp_path}/.*[.]git(/.*)?$"' not in profile
+    assert "/[^/]+/([^/]*/)*\\.git" in regex_patterns(profile)
+    assert f'"^{tmp_path}/.*[.]git(/[^/]*)*$"' not in profile
 
 
-def test_backend_read_only_profile_has_no_workspace_write_grant(monkeypatch, tmp_path):
-    """The OS profile denies workspace writes for an auto-approved read request."""
+@pytest.mark.parametrize("grant_file", [False, True])
+def test_backend_exact_file_profile_has_no_workspace_write_grant(monkeypatch, tmp_path, grant_file):
+    """An exact file rule grants regular-file writes without granting the parent directory."""
     popen = MagicMock(return_value=Process())
     monkeypatch.setattr(
         "loop.execution.sandbox.macos.backend.subprocess.run",
@@ -2437,13 +2558,19 @@ def test_backend_read_only_profile_has_no_workspace_write_grant(monkeypatch, tmp
     )
     monkeypatch.setattr("loop.execution.sandbox.macos.backend.subprocess.Popen", popen)
     monkeypatch.setattr("loop.execution.sandbox.macos.backend.kill_process_group", MagicMock())
-    result = MacOSSeatbeltBackend().run(request(tmp_path, write_roots=()))
+    target = tmp_path / ".coverage"
+    result = MacOSSeatbeltBackend().run(
+        request(tmp_path, write_roots=(), write_files=(target,) if grant_file else ())
+    )
     assert result.outcome is SandboxOutcome.COMPLETED
     profile = popen.call_args.args[0][2]
     write_rule = next(
         line for line in profile.splitlines() if line.startswith("(allow file-write* ")
     )
-    assert str(tmp_path) not in write_rule
+    assert f'(subpath "{tmp_path}")' not in write_rule
+    exact_rule = f'(require-all (literal "{target}") (vnode-type REGULAR-FILE))'
+    assert (exact_rule in write_rule) is grant_file
+    assert profile.rfind("(deny file-read* file-write*") > profile.rfind("(allow ")
 
 
 def test_backend_rejects_scratch_without_its_own_prefix(tmp_path):
@@ -2478,7 +2605,7 @@ def test_backend_encodes_complete_regex_strings(monkeypatch, tmp_path, name):
     encoded = json.dumps(
         "^"
         + re.escape(str(workspace))
-        + "/(.*/)?(AGENTS\\.md|SKILL\\.md|"
+        + "/([^/]*/)*(AGENTS\\.md|SKILL\\.md|"
         + re.escape(instruction_name)
         + ")$",
         ensure_ascii=False,
@@ -2683,9 +2810,9 @@ def test_backend_protects_instruction_files_even_with_workspace_write_grant(monk
     assert MacOSSeatbeltBackend().run(request(tmp_path)).outcome is SandboxOutcome.COMPLETED
     profile = popen.call_args.args[0][2]
     assert "(AGENTS\\.md|SKILL\\.md)" in regex_patterns(profile)
-    assert "/(.*/)?\\.agents/skills(/.*)?$" in regex_patterns(profile)
-    assert "/(.*/)?\\.gitignore$" in regex_patterns(profile)
-    assert "/(.*/)?\\.agentignore$" in regex_patterns(profile)
+    assert "/([^/]*/)*\\.agents/skills(/[^/]*)*$" in regex_patterns(profile)
+    assert "/([^/]*/)*\\.gitignore$" in regex_patterns(profile)
+    assert "/([^/]*/)*\\.agentignore$" in regex_patterns(profile)
     assert profile.index("(deny file-write* ") > profile.index("(allow file-write* ")
 
 
@@ -2703,7 +2830,7 @@ def test_backend_protects_configured_instruction_name_at_every_depth(monkeypatch
     assert MacOSSeatbeltBackend().run(bound).outcome is SandboxOutcome.COMPLETED
     profile = popen.call_args.args[0][2]
     assert r"AGENTS\.md|SKILL\.md|POLICY\+\.md" in regex_patterns(profile)
-    assert f"{re.escape(str(tmp_path))}/(.*/)?(" in regex_patterns(profile)
+    assert f"{re.escape(str(tmp_path))}/([^/]*/)*(" in regex_patterns(profile)
     assert r"POLICY\+\.md)$" in regex_patterns(profile)
 
 
@@ -2746,8 +2873,8 @@ def test_backend_denies_private_reads_inside_every_granted_root(monkeypatch, tmp
     names += r"\.[cC][oO][nN][fF][iI][gG]|\.[lL][oO][oO][pP]|[lL][iI][bB][rR][aA][rR][yY])"
     scratch = Path(popen.call_args.kwargs["env"]["TMPDIR"])
     for root in (workspace, extra, writable, target):
-        assert f"{re.escape(str(root))}/(.*/)?{names}(/.*)?$" in regex_patterns(profile)
-    assert f"{re.escape(str(scratch))}/(.*/)?{names}(/.*)?$" not in regex_patterns(profile)
+        assert f"{re.escape(str(root))}/([^/]*/)*{names}(/[^/]*)*$" in regex_patterns(profile)
+    assert f"{re.escape(str(scratch))}/([^/]*/)*{names}(/[^/]*)*$" not in regex_patterns(profile)
     assert profile.index("(deny file-read-data") > profile.index("(allow file-read*")
     assert profile.index("(deny file-write* ") > profile.index("(allow file-write* ")
 
@@ -2801,8 +2928,9 @@ def test_backend_limits_baseline_reads_to_system_managed_roots(monkeypatch, tmp_
 
     backend = MacOSSeatbeltBackend()
     assert backend.automatic_tool_read_roots(tmp_path, (), ()) == ()
-    assert backend.policy_version == "macos-seatbelt-v2"
-    assert SandboxCapability.LOCAL_NETWORK in backend.capabilities
+    assert backend.policy_version == "macos-seatbelt-v6"
+    assert SandboxCapability.LOCAL_NETWORK in backend.requestable_capabilities
+    assert SandboxCapability.LOCAL_NETWORK not in backend.capabilities
     assert backend.scratch_prefix == "loop-seatbelt-"
     assert backend.trusted_file_owner_ids == tuple(dict.fromkeys((0, os.getuid())))
     result = backend.run(request(tmp_path))
@@ -2812,7 +2940,7 @@ def test_backend_limits_baseline_reads_to_system_managed_roots(monkeypatch, tmp_
     names = r"(\.[sS][sS][hH]|\.[aA][wW][sS]|\.[gG][nN][uU][pP][gG]|"
     names += r"\.[cC][oO][nN][fF][iI][gG]|\.[lL][oO][oO][pP]|[lL][iI][bB][rR][aA][rR][yY])"
     for root in backend.system_read_roots:
-        assert f"{re.escape(str(root))}/(.*/)?{names}(/.*)?$" in regex_patterns(profile)
+        assert f"{re.escape(str(root))}/([^/]*/)*{names}(/[^/]*)*$" in regex_patterns(profile)
     assert '(subpath "/System/Library")' in profile
     assert '(subpath "/System")' not in profile
     for root in ("/usr", "/usr/local", "/Library", "/opt/homebrew"):
@@ -3433,8 +3561,10 @@ def test_backend_external_path_grants_only_metadata_even_with_hardlink(monkeypat
 
 
 @pytest.mark.parametrize("config_kind", ["missing", "regular", "symlink", "hardlink"])
-def test_backend_grants_only_safe_python_environment_config(monkeypatch, tmp_path, config_kind):
-    """A Python search root permits absent metadata, grants exact files and rejects aliases."""
+def test_backend_external_search_root_never_reads_sibling_metadata(
+    monkeypatch, tmp_path, config_kind
+):
+    """A read grant for an external search root never exposes sibling files."""
     workspace = tmp_path / "work"
     workspace.mkdir()
     external = tmp_path / "venv"
@@ -3459,17 +3589,10 @@ def test_backend_grants_only_safe_python_environment_config(monkeypatch, tmp_pat
     result = MacOSSeatbeltBackend().run(
         request(workspace, read_roots=(search,), environment={"PATH": str(search), "LANG": "C"})
     )
-    if config_kind == "missing":
-        assert result.outcome is SandboxOutcome.COMPLETED
-        assert str(config) not in popen.call_args.args[0][2]
-    elif config_kind == "regular":
-        assert result.outcome is SandboxOutcome.COMPLETED
-        assert f'(literal "{config}")' in popen.call_args.args[0][2]
-        assert f'(subpath "{external}")' not in popen.call_args.args[0][2]
-    else:
-        assert result.outcome is SandboxOutcome.INVALID
-        assert "Unsafe Python environment configuration" in result.detail
-        popen.assert_not_called()
+    assert result.outcome is SandboxOutcome.COMPLETED
+    profile = popen.call_args.args[0][2]
+    assert str(config) not in profile
+    assert f'(subpath "{external}")' not in profile
 
 
 @pytest.mark.parametrize("config_kind", ["missing", "regular", "symlink"])
@@ -3543,8 +3666,9 @@ def test_backend_preserves_nonstandard_exit_after_real_denial(monkeypatch, tmp_p
 
 def test_backend_reports_live_denial_provenance(monkeypatch, tmp_path):
     """A live tagged record remains available when the bounded snapshot is empty."""
+    denial = "Sandbox: cat(123) deny(1) file-read-data /outside/secret"
     monitor = MagicMock()
-    monitor.denial.return_value = "Sandbox: cat(123) deny(1) file-read-data /outside/secret"
+    monitor.denial.side_effect = [None, denial]
     monkeypatch.setattr(
         "loop.execution.sandbox.macos.backend.SeatbeltDiagnosticService.monitor",
         lambda self, deadline: monitor,
@@ -3554,7 +3678,7 @@ def test_backend_reports_live_denial_provenance(monkeypatch, tmp_path):
 
     result, popen = run_with_log(monkeypatch, tmp_path, None)
 
-    assert result.observed_denial == monitor.denial.return_value
+    assert result.observed_denial == denial
     assert result.diagnostic_status == "available"
     assert result.diagnostic_source == "macos-kernel-log"
     assert popen.call_count == 1
@@ -3614,6 +3738,28 @@ def test_backend_merges_live_and_delayed_candidates(monkeypatch, tmp_path):
     assert result.outcome is SandboxOutcome.COMPLETED
     candidates, _ = MacOSSeatbeltBackend().classify_denial_candidates(result.observed_denial)
     assert candidates == ((later, False), (live, False))
+
+
+@pytest.mark.parametrize("arrives", [False, True])
+def test_backend_retries_when_live_and_snapshot_only_show_startup(monkeypatch, tmp_path, arrives):
+    """A startup record cannot prematurely end the bounded search for a failed command's logs."""
+    startup = "Sandbox: true(1) deny(1) file-read-data /system/cache"
+    live = "Sandbox: sh(2) deny(1) file-read-data /system/cache"
+    later = "Sandbox: cat(3) deny(1) file-read-data /outside/secret"
+    monitor = MagicMock()
+    monitor.denial.side_effect = [startup, live]
+    monkeypatch.setattr(macos_backend.SeatbeltDiagnosticService, "monitor", lambda *_: monitor)
+    snapshot = MagicMock(side_effect=[live, later] if arrives else [live, None, live])
+    monkeypatch.setattr(macos_backend, "_read_denial_from_log", snapshot)
+
+    result, _ = run_with_log(monkeypatch, tmp_path, None, returncode=7)
+
+    assert result.outcome is SandboxOutcome.COMPLETED
+    assert result.exit_code == 7
+    assert result.diagnostic_status == "available"
+    assert live in result.observed_denial
+    assert (later in result.observed_denial) is arrives
+    assert snapshot.call_count == (2 if arrives else 3)
 
 
 @pytest.mark.parametrize(
@@ -3982,13 +4128,13 @@ def test_backend_cancels_before_child_launch(monkeypatch, tmp_path):
     launch.assert_not_called()
 
 
-def test_backend_rejects_hardlinked_writable_file(tmp_path):
-    """The mandatory preflight rejects preexisting hardlinks before launch."""
-    source = tmp_path / "one"
+def test_backend_rejects_incomplete_hardlinked_writable_file(tmp_path):
+    """The mandatory preflight rejects unaccounted outside aliases before launch."""
+    source = tmp_path.parent / "one"
     source.write_text("safe")
     os.link(source, tmp_path / "two")
     result = MacOSSeatbeltBackend().run(request(tmp_path))
-    assert "hardlinked file" in result.detail
+    assert "Incomplete hardlink aliases" in result.detail
 
 
 @pytest.mark.parametrize("root_kind", ["workspace", "extra", "read_alias"])
@@ -4019,7 +4165,7 @@ def test_backend_rejects_hardlinked_read_root_even_when_read_only(tmp_path, root
     )
 
     assert result.outcome is SandboxOutcome.INVALID
-    assert "hardlinked file" in result.detail
+    assert "unsafe hardlinked file" in result.detail
 
 
 @pytest.mark.parametrize("root_kind", ["workspace", "extra", "read_alias", "write"])
@@ -4070,6 +4216,7 @@ def test_backend_rejects_symlink_replacement_at_preflight(monkeypatch, tmp_path)
     tmp_path.rename(real)
     tmp_path.symlink_to(real, target_is_directory=True)
     monkeypatch.setattr(SandboxRequest, "paths_are_current", lambda self: True)
+    monkeypatch.setattr(macos_backend, "inspect_hardlink_aliases", lambda *_args, **_kwargs: {})
     result = MacOSSeatbeltBackend().run(value)
     assert "not a real directory" in result.detail
 
@@ -4615,6 +4762,7 @@ def test_backend_binds_durable_scratch_without_exposing_private_neighbors(
         tmp_path,
         environment={"PATH": "/usr/bin:/bin", "TMPDIR": str(scratch)},
         scratch_root=scratch,
+        protected_host_roots=(scratch.parent,),
     )
 
     result = MacOSSeatbeltBackend().run(value)
@@ -4623,7 +4771,8 @@ def test_backend_binds_durable_scratch_without_exposing_private_neighbors(
     assert popen.call_args.kwargs["env"]["TMPDIR"] == str(scratch)
     profile = popen.call_args.args[0][2]
     assert f"(require-not (subpath {json.dumps(str(scratch), ensure_ascii=False)}))" in profile
-    assert re.escape(str(scratch)) + "/(.*/)?" in regex_patterns(profile)
+    assert re.escape(str(scratch)) + "/([^/]*/)*" in regex_patterns(profile)
+    assert any(re.search(pattern, str(scratch / ".env")) for pattern in regex_patterns(profile))
     assert scratch.is_dir()
 
 
@@ -4646,10 +4795,289 @@ def test_fresh_session_data_profile_preserves_outside_private_denials(monkeypatc
         environment={"PATH": "/usr/bin:/bin", "TMPDIR": str(scratch)},
         scratch_root=scratch,
         scratch_data=True,
+        protected_host_roots=(scratch.parent,),
     )
     assert MacOSSeatbeltBackend().run(approved).outcome is SandboxOutcome.COMPLETED
     profile = popen.call_args.args[0][2]
     patterns = regex_patterns(profile)
-    assert f"^{re.escape(str(scratch))}/(.*/)?" not in patterns
-    assert f"^{re.escape(str(workspace))}/(.*/)?" in patterns
+    assert f"^{re.escape(str(scratch))}/([^/]*/)*" not in patterns
+    assert f"^{re.escape(str(workspace))}/([^/]*/)*" in patterns
     assert f'(require-not (subpath "{scratch}"))' in profile
+
+
+@pytest.mark.parametrize("case", ["runtime", "environment-root"])
+def test_backend_refuses_unaccountable_hard_scope_before_launch(tmp_path, monkeypatch, case):
+    """Runtime hard designations and environment-valued grant roots never widen a profile."""
+    root = tmp_path / ".env.production"
+    root.mkdir()
+    options = (
+        {"hard_denied_paths": (Path("/usr/bin/designated"),)}
+        if case == "runtime"
+        else {"read_roots": (root,)}
+    )
+    launch = MagicMock()
+    monkeypatch.setattr(macos_backend.subprocess, "Popen", launch)
+    result = MacOSSeatbeltBackend().run(request(tmp_path, **options))
+    assert result.outcome is SandboxOutcome.INVALID
+    assert not result.possible_effects
+    assert ("runtime root" if case == "runtime" else "Environment values") in result.detail
+    launch.assert_not_called()
+
+
+def test_backend_admits_complete_benign_links_and_keeps_final_hard_rules(tmp_path, monkeypatch):
+    """A fully accounted benign inode reaches native launch with environment denial last."""
+    source = tmp_path / "ordinary"
+    source.write_text("safe")
+    os.link(source, tmp_path / "alias")
+    probe = MagicMock(returncode=0, stderr="")
+    launch = MagicMock(return_value=Process())
+    monkeypatch.setattr(macos_backend.subprocess, "run", MagicMock(return_value=probe))
+    monkeypatch.setattr(macos_backend.subprocess, "Popen", launch)
+    result = MacOSSeatbeltBackend().run(request(tmp_path))
+    assert result.outcome is SandboxOutcome.COMPLETED
+    profile = launch.call_args.args[0][2]
+    assert "[^.-/]" in profile
+    assert profile.rfind("(deny file-read* file-write*") > profile.rfind("(allow ")
+
+
+@pytest.mark.parametrize("write_scope", ["none", "workspace", "both"])
+def test_backend_preserves_each_alias_write_scope(tmp_path, monkeypatch, write_scope):
+    """Complete aliases must share write authority before any payload can launch."""
+    outside = tmp_path.parent / "outside"
+    outside.mkdir()
+    source = outside / "ordinary"
+    source.write_text("read-only")
+    os.link(source, tmp_path / "alias")
+    launch = MagicMock(return_value=Process())
+    monkeypatch.setattr(
+        macos_backend.subprocess, "run", MagicMock(return_value=MagicMock(returncode=0, stderr=""))
+    )
+    monkeypatch.setattr(macos_backend.subprocess, "Popen", launch)
+    roots = (
+        ()
+        if write_scope == "none"
+        else (tmp_path, outside)
+        if write_scope == "both"
+        else (tmp_path,)
+    )
+    result = MacOSSeatbeltBackend().run(request(tmp_path, read_roots=(outside,), write_roots=roots))
+    if write_scope == "workspace":
+        assert result.outcome is SandboxOutcome.INVALID
+        assert not result.possible_effects
+        assert "read/write scopes" in result.detail
+        launch.assert_not_called()
+    else:
+        assert result.outcome is SandboxOutcome.COMPLETED
+        launch.assert_called_once()
+
+
+def test_backend_refuses_hardlink_published_during_exact_file_admission(tmp_path, monkeypatch):
+    """A hardlink published during the census cannot make an ungranted inode writable."""
+    outside = tmp_path.parent / "outside"
+    outside.mkdir()
+    source = outside / "ordinary"
+    source.write_text("read-only")
+    target = tmp_path / ".coverage"
+    native = request(tmp_path, read_roots=(outside,), write_roots=(), write_files=(target,))
+    inspect = macos_backend.inspect_hardlink_aliases
+
+    def publish_link_then_inspect(roots, deadline, *, scratch):
+        """Publish an owned fixture alias after the first identity check."""
+        target.hardlink_to(source)
+        return inspect(roots, deadline, scratch=scratch)
+
+    monkeypatch.setattr(macos_backend, "inspect_hardlink_aliases", publish_link_then_inspect)
+    result = MacOSSeatbeltBackend().run(native)
+
+    assert result.outcome is SandboxOutcome.INVALID
+    assert not result.possible_effects
+    assert "read/write scopes" in result.detail
+    assert source.read_text() == "read-only"
+
+
+@pytest.mark.parametrize(
+    "link", ["same-runtime", "cross-inventory", "private-link", "private-hardlink"]
+)
+def test_configured_runtime_inventory_accounts_for_every_alias(tmp_path, monkeypatch, link):
+    """Disjoint runtime inventories preserve ordinary links and refuse unsafe aliases."""
+    runtime = tmp_path.parent / "runtime"
+    runtime.mkdir()
+    original = runtime / "original"
+    original.write_text("runtime")
+    if link == "private-link":
+        (runtime / ".env").symlink_to(original)
+    elif link == "private-hardlink":
+        (runtime / ".env").hardlink_to(original)
+    else:
+        (runtime if link == "same-runtime" else tmp_path).joinpath("alias").hardlink_to(original)
+    launch = MagicMock(return_value=Process())
+    monkeypatch.setattr(
+        macos_backend.subprocess, "run", MagicMock(return_value=MagicMock(returncode=0, stderr=""))
+    )
+    monkeypatch.setattr(macos_backend.subprocess, "Popen", launch)
+    backend = MacOSSeatbeltBackend()
+    result = backend.run(
+        request(
+            tmp_path,
+            read_roots=(runtime,),
+            policy_read_roots=(runtime,),
+            permission_revision=0,
+        )
+    )
+    if link == "same-runtime":
+        assert result.outcome is SandboxOutcome.COMPLETED
+        launch.assert_called_once()
+    else:
+        assert result.outcome is SandboxOutcome.INVALID
+        assert not result.possible_effects
+        expected = {
+            "cross-inventory": "Incomplete hardlink aliases",
+            "private-link": "hard-protected symlink",
+            "private-hardlink": "unsafe hardlinked file",
+        }
+        assert expected[link] in result.detail
+        launch.assert_not_called()
+
+
+def test_backend_refuses_hard_name_symlink_even_to_otherwise_readable_content(tmp_path):
+    """Resolving a protected name into a public pathname cannot erase its hard classification."""
+    target = tmp_path / "ordinary"
+    target.write_text("public-target")
+    (tmp_path / ".env").symlink_to(target)
+    result = MacOSSeatbeltBackend().run(request(tmp_path))
+    assert result.outcome is SandboxOutcome.INVALID
+    assert not result.possible_effects
+    assert "hard-protected symlink" in result.detail
+
+
+def test_failed_local_preflight_prevents_payload_and_releases_volume(monkeypatch, tmp_path):
+    """A failed optional probe rejects only that request before executing user source."""
+    backend = MacOSSeatbeltBackend(MagicMock())
+    monkeypatch.setattr(
+        backend, "qualification_probe", lambda _request: CommandProcessResult(SandboxOutcome.DENIED)
+    )
+    launch = MagicMock()
+    monkeypatch.setattr(macos_backend.subprocess, "Popen", launch)
+    eject = MagicMock()
+    monkeypatch.setattr(macos_backend, "_eject_local_socket_volume", eject)
+    result = backend.run(request(tmp_path, local_network=True))
+    assert result.outcome is SandboxOutcome.UNAVAILABLE
+    assert result.detail == "Attempt-local Unix socket qualification failed."
+    assert result.possible_effects is False
+    launch.assert_not_called()
+    eject.assert_called_once()
+    backend.close()
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "approved",
+        "lost-identity",
+        "missing-transport",
+        "missing-authority",
+        "eject-failed",
+        "connector-and-eject-failed",
+    ],
+)
+def test_ingress_owns_transport_and_closes_before_foreground_reaping(monkeypatch, tmp_path, case):
+    """Approved publication retains foreground identity and settles routes before process cleanup."""
+    native = MacOSSeatbeltBackend()
+    qualify = native.qualification_probe
+    monkeypatch.setattr(
+        native,
+        "qualification_probe",
+        lambda _request: CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0),
+    )
+    monkeypatch.setattr(
+        macos_backend.subprocess, "run", MagicMock(return_value=MagicMock(returncode=0, stderr=""))
+    )
+    process = Process()
+    popen = MagicMock(return_value=process)
+    monkeypatch.setattr(macos_backend.subprocess, "Popen", popen)
+    broker = MagicMock()
+    broker.interrupted = case == "connector-and-eject-failed"
+    broker.failure_detail = "The native macOS ingress connector failed."
+    broker.__enter__.return_value = broker
+    factory = MagicMock(return_value=broker)
+    monkeypatch.setattr(macos_backend, "MacOSNetworkBroker", factory)
+    if case == "lost-identity":
+        broker.bind_service.side_effect = OSError("foreground exited")
+    if case in {"eject-failed", "connector-and-eject-failed"}:
+        eject = MagicMock(side_effect=[OSError("Volume is busy."), None])
+        monkeypatch.setattr(macos_backend, "_eject_local_socket_volume", eject)
+    events = []
+    broker.close.side_effect = lambda: events.append("close") or True
+    monkeypatch.setattr(macos_backend, "kill_process_group", lambda _: events.append("kill"))
+
+    def supervise(process, _deadline, **kwargs):
+        """Observe cleanup ordering without spawning or reaping a real process."""
+        kwargs["terminate"](process)
+        return ProcessCapture(
+            ProcessCaptureStatus.COMPLETED, exit_code=0, stdout=process.stdout.read()
+        )
+
+    monkeypatch.setattr(macos_backend, "supervise_process", supervise)
+    value = request(tmp_path, local_network=True, ingress_port=8123)
+    if case == "missing-transport":
+        value = replace(value, local_network=False)
+    if case == "missing-authority":
+        result = qualify(value)
+    else:
+        result = native.run(value, policy_authority=MagicMock(), approved_revision=7)
+    if case == "approved":
+        assert result.outcome is SandboxOutcome.COMPLETED
+        endpoint = factory.call_args.args[1]
+        assert endpoint.name == "service.sock"
+        assert popen.call_args.kwargs["env"]["LOOP_INGRESS_SOCKET"] == str(endpoint)
+        assert "LOOP_SYNC_SOCKET" not in popen.call_args.kwargs["env"]
+        broker.bind_service.assert_called_once_with(process.pid, None)
+    elif case in {"eject-failed", "connector-and-eject-failed"}:
+        assert result.outcome is SandboxOutcome.UNAVAILABLE
+        assert result.possible_effects and result.exit_code is None
+        assert result.stdout == "ok"
+        assert "Native sandbox cleanup could not be confirmed. Volume is busy." in result.detail
+        assert (broker.failure_detail in result.detail) is broker.interrupted
+        eject.assert_called_once()
+    else:
+        assert result.outcome is (
+            SandboxOutcome.UNAVAILABLE if case == "lost-identity" else SandboxOutcome.INVALID
+        )
+    if case in {"missing-transport", "missing-authority"}:
+        popen.assert_not_called()
+    else:
+        assert events == ["close", "kill"]
+    native.close()
+    if case in {"eject-failed", "connector-and-eject-failed"}:
+        assert eject.call_count == 2
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        ".env",
+        ".env.",
+        ".env.local",
+        ".ENV.PRODUCTION",
+        ".env.example",
+        ".env.production.example",
+        ".env.sample",
+        ".env.template",
+        ".env.ſample",
+        ".env.Ŀample",
+        ".env.\nexample",
+        ".env.éexample",
+        ".env.\texample",
+        ".env.template.local",
+        ".env.xsample",
+        ".env.examplex",
+        ".env.sampl",
+        "ordinary",
+    ],
+)
+def test_native_value_patterns_preserve_the_shared_basename_language(name):
+    """Native suffix partitions preserve exact templates, including UTF-8 case-fold edges."""
+    patterns = environment_value_patterns()
+    matched = any(re.fullmatch(pattern, name.casefold()) for pattern in patterns)
+    assert any("[^.-/]" in pattern for pattern in patterns)
+    assert bool(matched) is is_environment_value(name)

@@ -24,6 +24,7 @@ __all__ = [
     "ToolRuntimeSettings",
     "ToolStatus",
     "ToolWorkerContextTransform",
+    "VerificationScope",
     "get_tool_arguments_model",
     "get_tool_description",
     "get_tool_schema",
@@ -35,7 +36,7 @@ __all__ = [
 ]
 
 from .commands import ToolCommands
-from .context import ToolContext
+from .context import ToolContext, VerificationScope
 from .file_observations import FileObservations
 from .models import (
     TOOL_READY,

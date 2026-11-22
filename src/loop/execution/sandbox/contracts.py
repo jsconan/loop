@@ -19,7 +19,12 @@ from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
 from ... import constants
-from ...permissions.protection import ProtectedWorkspacePaths, protected_workspace_paths
+from ...permissions.protection import (
+    ProtectedWorkspacePaths,
+    protected_workspace_paths,
+    validate_hard_denied_paths,
+    write_file_state,
+)
 from ...utils.hashing import sha256_digest
 from ...utils.json import load_unique_json
 from ...utils.process import is_finite_deadline
@@ -36,6 +41,9 @@ class SandboxCapability(StrEnum):
     MEDIATED_EGRESS = "mediated_egress"
     INNER_SECCOMP = "inner_seccomp"
     LOCAL_NETWORK = "local_network"
+    LOCAL_IPC = "local_ipc"
+    INGRESS = "ingress"
+    WRITE_FILES = "write_files"
 
 
 class QualificationProbeLayout(NamedTuple):
@@ -62,12 +70,18 @@ NATIVE_REQUEST_FEATURES = (
     "owned-terminal-v1",
     "sandbox-local-network-v1",
     "live-output-beyond-capture-v1",
+    "native-hard-policy-v1",
+    "protected-host-scratch-v1",
+    "attempt-ingress-v1",
+    "sandbox-exact-write-files-v1",
+    "hardlink-sources-v1",
 )
 NATIVE_RESULT_SCHEMAS = (1,)
 # The client may decode more result schemas than this retained receiver can emit.
 NATIVE_ACCEPTED_RESULT_SCHEMAS = (1, 2)
 NATIVE_POLICY_CAPABILITIES = ("linux-native-v1", "unix-host-isolation-v1")
 NATIVE_REQUEST_OPTIONAL_FIELDS = (
+    "hardlink_source_identities",
     "workspace_executable_identities",
     "egress_origins",
     "stream_output",
@@ -75,9 +89,16 @@ NATIVE_REQUEST_OPTIONAL_FIELDS = (
     "cleanup_proof",
     "terminal",
     "local_network",
+    "hard_denied_paths",
+    "protected_host_roots",
+    "permission_revision",
+    "ingress_port",
+    "write_files",
+    "_write_file_identities",
 )
 NATIVE_REQUEST_SCHEMA2_ABSENT_FIELDS = ("execution_source",)
 NATIVE_REQUEST_FIELDS = (
+    "hardlink_source_identities",
     "source",
     "cwd",
     "workspace",
@@ -110,6 +131,12 @@ NATIVE_REQUEST_FIELDS = (
     "cleanup_proof",
     "terminal",
     "local_network",
+    "hard_denied_paths",
+    "protected_host_roots",
+    "permission_revision",
+    "ingress_port",
+    "write_files",
+    "_write_file_identities",
 )
 
 
@@ -325,6 +352,30 @@ def path_search_roots(environment: dict[str, str], cwd: Path) -> tuple[tuple[Pat
     return tuple(dict.fromkeys(roots))
 
 
+def _request_directories(
+    cwd: Path,
+    workspace: Path,
+    roots: tuple[Path, ...],
+    aliases: tuple[tuple[Path, int, int, Path], ...],
+    search: tuple[tuple[Path, Path], ...],
+    scratch: str | None,
+) -> tuple[Path, ...]:
+    """Order the directory snapshot consistently for admission and restricted views."""
+    return tuple(
+        dict.fromkeys(
+            (
+                cwd,
+                workspace,
+                *roots,
+                *(alias.parent for alias, _, _, _ in aliases),
+                *(target for _, _, _, target in aliases),
+                *(real for _, real in search),
+                *((Path(scratch),) if scratch is not None else ()),
+            )
+        )
+    )
+
+
 def resolve_host_executable(
     name: str,
     path_value: str,
@@ -448,6 +499,20 @@ class SandboxRequest:
         terminal (bool): Request one receiver-owned pseudo-terminal for the command's standard
             streams; ordinary commands keep separate pipes.
         local_network (bool): Permit attempt-local loopback when the platform qualifies it.
+        backend_options (tuple[str, ...]): Explicitly selected optional native authorities.
+        reviewed_backend_options (tuple[str, ...]): Resources bound for review of this attempt.
+        hard_denied_paths (tuple[Path, ...]): Frozen exact hard read/write denials from trusted
+            policy.
+        protected_host_roots (tuple[Path, ...]): Application control roots denied except for the
+            bound private session scratch subtree; explicit hard denials have no exception.
+        permission_revision (int | None): Approving manager revision, or None for trusted probes.
+        ingress_port (int | None): Exact host-loopback publication port for this attempt. Linux
+            forwards to the same private port; macOS uses the foreground service Unix socket.
+        policy_read_roots (tuple[Path, ...]): Subset of read roots supplied by the trusted
+            path policy. This client-side classification conveys no extra receiver authority.
+        write_files (tuple[Path, ...]): Approved exact file paths inside the workspace.
+        hardlink_source_identities (tuple[DirectoryIdentity, ...]): Private host directories
+            available only to native metadata verification. These grant no namespace mount.
     """
 
     source: str
@@ -482,6 +547,51 @@ class SandboxRequest:
     cleanup_proof: bool = False
     terminal: bool = False
     local_network: bool = True
+    hard_denied_paths: tuple[Path, ...] = ()
+    protected_host_roots: tuple[Path, ...] = ()
+    permission_revision: int | None = None
+    ingress_port: int | None = None
+    policy_read_roots: tuple[Path, ...] = ()
+    write_files: tuple[Path, ...] = ()
+    _write_file_identities: tuple[tuple[Path, tuple[int, int] | None], ...] = ()
+    backend_options: tuple[str, ...] = ()
+    reviewed_backend_options: tuple[str, ...] = ()
+    hardlink_source_identities: tuple[DirectoryIdentity, ...] = ()
+
+    @property
+    def hardlink_sources(self) -> tuple[Path, ...]:
+        """Return the approved metadata source names for native link verification."""
+        return tuple(item.path for item in self.hardlink_source_identities)
+
+    def with_backend_options(
+        self, options: tuple[str, ...], source_paths: tuple[Path, ...]
+    ) -> SandboxRequest:
+        """Bind newly selected host metadata directories while preserving existing snapshots.
+
+        Args:
+            options (tuple[str, ...]): Reviewed option keys for this request.
+            source_paths (tuple[Path, ...]): Fixed host metadata directories for those options.
+
+        Returns:
+            SandboxRequest: Immutable selection with an identity for each metadata source.
+        """
+        existing = {item.path: item for item in self.hardlink_source_identities}
+        return replace(
+            self,
+            backend_options=options,
+            hardlink_source_identities=tuple(
+                existing.get(path) or DirectoryIdentity.capture(path) for path in source_paths
+            ),
+        )
+
+    @property
+    def write_paths(self) -> tuple[Path, ...]:
+        """Return the path names covered by either kind of write request.
+
+        Returns:
+            tuple[Path, ...]: Write directories and exact file paths, in that order.
+        """
+        return (*self.write_roots, *self.write_files)
 
     @property
     def read_alias_targets(self) -> tuple[Path, ...]:
@@ -501,6 +611,21 @@ class SandboxRequest:
             bool: Whether an explicit session root binds scratch.
         """
         return self.scratch_root is not None
+
+    def denies_path(self, path: Path) -> bool:
+        """Apply explicit hard denials and application-state protection to a physical path.
+
+        Args:
+            path (Path): Canonical absolute path inspected by the native backend.
+
+        Returns:
+            bool: Whether native access must be denied. Only the bound agent-data scratch
+                subtree is exempt from application-state protection, never from explicit policy.
+        """
+        return any(path.is_relative_to(root) for root in self.hard_denied_paths) or (
+            any(path.is_relative_to(root) for root in self.protected_host_roots)
+            and not (self.scratch_root is not None and path.is_relative_to(self.scratch_root))
+        )
 
     @property
     def protected_paths(self) -> ProtectedWorkspacePaths:
@@ -543,6 +668,14 @@ class SandboxRequest:
         cleanup_proof: bool = False,
         terminal: bool = False,
         local_network: bool = True,
+        hard_denied_paths: tuple[Path, ...] = (),
+        protected_host_roots: tuple[Path, ...] = (),
+        permission_revision: int | None = None,
+        ingress_port: int | None = None,
+        policy_read_roots: tuple[Path, ...] = (),
+        write_files: tuple[Path, ...] = (),
+        backend_options: tuple[str, ...] = (),
+        hardlink_sources: tuple[Path, ...] = (),
     ) -> SandboxRequest:
         """Create a request and capture every authority-bearing directory identity.
 
@@ -552,6 +685,7 @@ class SandboxRequest:
             workspace (Path): Absolute real workspace root.
             read_roots (tuple[Path, ...]): Additional readable directory roots.
             write_roots (tuple[Path, ...]): Writable directory roots.
+            write_files (tuple[Path, ...]): Exact writable workspace files or future file paths.
             network (bool): Explicit general egress grant.
             egress_origins (tuple[str, ...]): Exact mediated HTTP(S) origins, or empty for none.
             stream_output (bool): Request bounded live output over native transport.
@@ -560,6 +694,8 @@ class SandboxRequest:
             cleanup_proof (bool): Request an authenticated descendant-cleanup verdict.
             terminal (bool): Request a receiver-owned pseudo-terminal for one interactive job.
             local_network (bool): Permit isolated attempt-local loopback when qualified.
+            ingress_port (int | None): Exact loopback publication port, with no broad, mediated
+                egress or terminal authority in the same request.
             environment (dict[str, str]): Sanitized effective environment. An included TMPDIR
                 must name a live private directory in the process temp root or the bound
                 ``$TMPDIR`` root.
@@ -587,13 +723,22 @@ class SandboxRequest:
                 validation.
             scratch_data (bool): Allow ordinary names in fresh agent-only scratch. Requires an
                 explicit disjoint scratch_root; defaults to restricted scratch semantics.
+            backend_options (tuple[str, ...]): Explicitly selected optional native authorities.
+            hardlink_sources (tuple[Path, ...]): Selected metadata directories for hardlink checks.
+            protected_host_roots (tuple[Path, ...]): Protected application roots with access only
+                to the bound private session scratch subtree.
+            hard_denied_paths (tuple[Path, ...]): Exact trusted read/write denials; future names
+                are valid. Empty keeps only the built-in native hard rules.
+            permission_revision (int | None): Approving manager revision, or None for trusted
+                probes.
+            policy_read_roots (tuple[Path, ...]): Read roots already granted by path policy.
 
         Returns:
             SandboxRequest: Immutable request with bound directory identities.
 
         Raises:
             ValueError: If source, policy, identity, environment, or a directory is invalid.
-            TypeError: If the streaming flag is not a Boolean.
+            TypeError: If a checked authority flag is not a Boolean.
             OSError: If an approved directory cannot be inspected.
         """
         if (
@@ -612,7 +757,7 @@ class SandboxRequest:
             or not 0 <= file_creation_mask <= constants.FILE_MODE_PERMISSION_MASK
         ):
             raise ValueError("Sandbox file creation mask is invalid.")
-        protected_workspace_paths(protected_instruction_names)
+        protection = protected_workspace_paths(protected_instruction_names)
         if execution_source is not None and not execution_source:
             raise ValueError("Translated sandbox source cannot be empty.")
         if git_create and (workspace / ".git").is_symlink():
@@ -706,6 +851,10 @@ class SandboxRequest:
             not executable_identities or not set(automatic_tool_reads) <= set(read_roots)
         ):
             raise ValueError("Automatic tool reads require bound executable roots.")
+        if policy_read_roots and (
+            permission_revision is None or not set(policy_read_roots) <= set(read_roots)
+        ):
+            raise ValueError("Path policy reads require a current policy snapshot and bound roots.")
         read_alias_identities = []
         for alias in read_aliases:
             details = alias.lstat()
@@ -718,27 +867,48 @@ class SandboxRequest:
             ):
                 raise ValueError("Invalid executable read alias.")
             read_alias_identities.append((alias, details.st_dev, details.st_ino, target))
-        directories = tuple(
-            dict.fromkeys(
-                (
-                    cwd,
-                    workspace,
-                    *read_roots,
-                    *write_roots,
-                    *(alias.parent for alias in read_aliases),
-                    *(target for _, _, _, target in read_alias_identities),
-                    *(real for _, real in path_roots),
-                    *((scratch,) if scratch_value is not None else ()),
-                )
-            )
+        if len(write_files) > constants.MAX_COMMAND_PATH_COUNT or any(
+            path == workspace or not path.is_relative_to(workspace) for path in write_files
+        ):
+            raise ValueError("Exact write files must identify bounded paths inside the workspace.")
+        if any(protection.protects_write_file(path.relative_to(workspace)) for path in write_files):
+            raise ValueError("An exact write file intersects protected workspace control data.")
+        write_file_identities = tuple((path, write_file_state(path)) for path in write_files)
+        directories = _request_directories(
+            cwd,
+            workspace,
+            (*read_roots, *write_roots, *(path.parent for path in write_files)),
+            tuple(read_alias_identities),
+            path_roots,
+            scratch_value,
         )
         identities = tuple(DirectoryIdentity.capture(path) for path in directories)
         if not cwd.is_relative_to(workspace):
             raise ValueError("Sandbox cwd must be inside the approved workspace.")
+        if ingress_port is not None and (
+            not isinstance(ingress_port, int)
+            or isinstance(ingress_port, bool)
+            or not 1 <= ingress_port <= 65535
+            or network
+            or egress_origins
+            or terminal
+            or not local_network
+        ):
+            raise ValueError(
+                "Ingress requires a valid port and isolated, nonterminal local service."
+            )
         if network and egress_origins:
             raise ValueError("General and mediated network grants cannot be combined.")
         if not isinstance(local_network, bool):
             raise TypeError("Native local-network flag must be a boolean.")
+        if not isinstance(backend_options, tuple):
+            raise TypeError("Native sandbox options must be a tuple.")
+        if any(
+            not isinstance(key, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", key)
+            for key in backend_options
+        ) or len(set(backend_options)) != len(backend_options):
+            raise ValueError("Native sandbox option keys must be valid and unique.")
+        backend_options = tuple(sorted(backend_options))
         if network and not local_network:
             raise ValueError("A general network grant cannot enforce a local-network deny.")
         if (
@@ -758,6 +928,14 @@ class SandboxRequest:
             not is_finite_deadline(runtime_timeout) or runtime_timeout <= 0
         ):
             raise ValueError("Native command runtime budget must be positive and finite.")
+        if permission_revision is not None and (
+            not isinstance(permission_revision, int)
+            or isinstance(permission_revision, bool)
+            or permission_revision < 0
+        ):
+            raise ValueError("Native permission revision must be a nonnegative integer.")
+        for path in (*hard_denied_paths, *protected_host_roots):
+            validate_hard_denied_paths((str(path),))
         return cls(
             source,
             cwd,
@@ -791,6 +969,17 @@ class SandboxRequest:
             cleanup_proof,
             terminal,
             local_network,
+            tuple(dict.fromkeys(hard_denied_paths)),
+            tuple(dict.fromkeys(protected_host_roots)),
+            permission_revision,
+            ingress_port,
+            policy_read_roots,
+            write_files,
+            write_file_identities,
+            backend_options,
+            hardlink_source_identities=tuple(
+                DirectoryIdentity.capture(path) for path in hardlink_sources
+            ),
         )
 
     def directory_matches_descriptor(self, path: Path, descriptor: int) -> bool:
@@ -817,15 +1006,23 @@ class SandboxRequest:
             return False
 
     def paths_are_current(self) -> bool:
-        """Check directory identities and generated scratch containment before launch.
+        """Check bound path identities and generated scratch containment before launch.
 
         Returns:
-            bool: Whether directory identities and generated scratch containment remain valid.
+            bool: Whether bound path identities and generated scratch containment remain valid.
         """
-        if not all(identity.is_current() for identity in self._identities) or (
+        if not all(
+            identity.is_current()
+            for identity in (*self._identities, *self.hardlink_source_identities)
+        ) or (
             _generated_environment_values(self.shell_environment(), self.generated_environment)
             is None
         ):
+            return False
+        try:
+            if any(write_file_state(path) != state for path, state in self._write_file_identities):
+                return False
+        except (OSError, RuntimeError, ValueError):
             return False
         for name, spelling, resolved, device, inode in self.executable_identities:
             try:
@@ -882,6 +1079,64 @@ class SandboxRequest:
         """
         return dict(self.environment)
 
+    def output_directory(self, scratch: Path) -> Path:
+        """Derive the command's output path beneath the native or host scratch spelling.
+
+        Args:
+            scratch (Path): The already bound scratch directory in the selected filesystem view.
+
+        Returns:
+            Path: The attempt-specific output path.
+        """
+        return scratch / f"output-{UUID(self.attempt_id).hex}"
+
+    def without_hidden_search_paths(self, hidden: tuple[Path, ...]) -> SandboxRequest:
+        """Remove executable lookup paths covered by the trusted native filesystem view.
+
+        Retain original identities, file grants, executable selections and PATH order. The
+        caller must apply the same masks before command entry. Wire validation still requires
+        the resulting search path and selected executable identities to match the snapshot.
+
+        Args:
+            hidden (tuple[Path, ...]): Directories covered by trusted native masks.
+
+        Returns:
+            SandboxRequest: Request with search paths restricted to its visible directories.
+        """
+
+        def visible(pair: tuple[Path, Path]) -> bool:
+            """Exclude both path spellings and resolved directories below a mask."""
+            return not any(path.is_relative_to(root) for path in pair for root in hidden)
+
+        search = tuple(pair for pair in self.path_roots if visible(pair))
+        if search == self.path_roots:
+            return self
+        environment = self.shell_environment()
+        entries = [
+            entry
+            for entry in environment[PATH_ENVIRONMENT_VARIABLE].split(os.pathsep)
+            if all(
+                visible(pair)
+                for pair in path_search_roots({PATH_ENVIRONMENT_VARIABLE: entry}, self.cwd)
+            )
+        ]
+        environment[PATH_ENVIRONMENT_VARIABLE] = os.pathsep.join(entries) if entries else os.devnull
+        identities = {identity.path: identity for identity in self._identities}
+        directories = _request_directories(
+            self.cwd,
+            self.workspace,
+            (*self.read_roots, *self.write_roots, *(path.parent for path in self.write_files)),
+            self._read_alias_identities,
+            search,
+            environment.get(TMPDIR_ENVIRONMENT_VARIABLE),
+        )
+        return replace(
+            self,
+            environment=tuple(sorted(environment.items())),
+            path_roots=search,
+            _identities=tuple(identities[path] for path in directories),
+        )
+
     def to_wire(self) -> bytes:
         """Serialize an exact current request snapshot for authenticated local admission.
 
@@ -893,13 +1148,25 @@ class SandboxRequest:
             bytes: Canonical UTF-8 request snapshot of at most 64 KiB.
 
         Raises:
-            ValueError: Authority is stale, the deadline is nonfinite or the snapshot is oversized.
+            ValueError: Authority is stale or unsupported by this receiver, the deadline is
+                nonfinite, or the snapshot is oversized.
         """
+        if self.backend_options:
+            raise ValueError("The receiver cannot enforce optional sandbox authorities.")
         if not is_finite_deadline(self.deadline) or not self.paths_are_current():
             raise ValueError("Sandbox request authority is stale or its deadline is invalid.")
         value = asdict(self)
+        if not self.hardlink_source_identities:
+            del value["hardlink_source_identities"]
+        del value["policy_read_roots"]
+        del value["backend_options"], value["reviewed_backend_options"]
+        if not self.write_files:
+            del value["write_files"]
+            del value["_write_file_identities"]
         if not self.workspace_executable_identities:
             del value["workspace_executable_identities"]
+        if self.ingress_port is None:
+            del value["ingress_port"]
         if not self.egress_origins:
             del value["egress_origins"]
         if not self.stream_output:
@@ -912,6 +1179,12 @@ class SandboxRequest:
             del value["terminal"]
         if self.local_network:
             del value["local_network"]
+        if not self.hard_denied_paths:
+            del value["hard_denied_paths"]
+        if not self.protected_host_roots:
+            del value["protected_host_roots"]
+        if self.permission_revision is None:
+            del value["permission_revision"]
         envelope = {"schema": 1, "request": value}
         data = json.dumps(
             envelope,
@@ -974,33 +1247,17 @@ class SandboxRequest:
             or isinstance(envelope["schema"], bool)
             or envelope["schema"] not in (1, 2)
             or not isinstance(envelope["request"], dict)
-            or frozenset(envelope["request"])
-            not in {
-                frozenset(
-                    {field.name for field in fields(cls)}
-                    - omitted
-                    - streaming
-                    - runtime
-                    - proof
-                    - terminal
-                    - local
-                    - ({"execution_source"} if envelope["schema"] == 2 else set())
-                )
-                for omitted in (
-                    set(),
-                    {"workspace_executable_identities"},
-                    {"egress_origins"},
-                    {"workspace_executable_identities", "egress_origins"},
-                )
-                for streaming in (set(), {"stream_output"})
-                for runtime in (set(), {"runtime_timeout"})
-                for proof in (set(), {"cleanup_proof"})
-                for terminal in (set(), {"terminal"})
-                for local in (set(), {"local_network"})
-            }
+            or not set(envelope["request"]) <= set(NATIVE_REQUEST_FIELDS)
+            or not (
+                set(NATIVE_REQUEST_FIELDS)
+                - set(NATIVE_REQUEST_OPTIONAL_FIELDS)
+                - ({"execution_source"} if envelope["schema"] == 2 else set())
+            )
+            <= set(envelope["request"])
         ):
             raise ValueError("Invalid sandbox request schema.")
         value = dict(envelope["request"])
+        value.setdefault("write_files", [])
         value.setdefault("workspace_executable_identities", [])
         value.setdefault("egress_origins", [])
         value.setdefault("stream_output", False)
@@ -1008,6 +1265,10 @@ class SandboxRequest:
         value.setdefault("cleanup_proof", False)
         value.setdefault("terminal", False)
         value.setdefault("local_network", True)
+        value.setdefault("hard_denied_paths", [])
+        value.setdefault("protected_host_roots", [])
+        value.setdefault("permission_revision", None)
+        value.setdefault("ingress_port", None)
         if envelope["schema"] == 2:
             value["execution_source"] = value["source"]
         deadline = value["deadline"]
@@ -1047,6 +1308,7 @@ class SandboxRequest:
         collections = (
             "read_roots",
             "write_roots",
+            "write_files",
             "read_aliases",
             "automatic_tool_reads",
             "environment",
@@ -1055,12 +1317,20 @@ class SandboxRequest:
             "generated_environment",
             "protected_instruction_names",
             "egress_origins",
+            "hard_denied_paths",
+            "protected_host_roots",
         )
         if any(not isinstance(value[name], list) for name in collections):
             raise ValueError("Invalid sandbox request collection.")
         paths = {
             name: tuple(Path(_wire_text(path)) for path in value[name])
-            for name in ("read_roots", "write_roots", "read_aliases", "automatic_tool_reads")
+            for name in (
+                "read_roots",
+                "write_roots",
+                "write_files",
+                "read_aliases",
+                "automatic_tool_reads",
+            )
         }
         restored = cls.create(
             source=text["source"],
@@ -1098,7 +1368,26 @@ class SandboxRequest:
             cleanup_proof=value["cleanup_proof"],
             terminal=value["terminal"],
             local_network=value["local_network"],
+            hard_denied_paths=tuple(Path(_wire_text(path)) for path in value["hard_denied_paths"]),
+            protected_host_roots=tuple(
+                Path(_wire_text(path)) for path in value["protected_host_roots"]
+            ),
+            permission_revision=value["permission_revision"],
+            ingress_port=value["ingress_port"],
         )
+        if "hardlink_source_identities" in value:
+            sources = value["hardlink_source_identities"]
+            if (
+                restored.permission_revision is None
+                or not isinstance(sources, list)
+                or not 0 < len(sources) <= constants.MAX_COMMAND_PATH_COUNT
+                or any(not isinstance(item, dict) or "path" not in item for item in sources)
+            ):
+                raise ValueError("Invalid hardlink source authority.")
+            paths = tuple(Path(_wire_text(item["path"])) for item in sources)
+            if len(set(paths)) != len(paths):
+                raise ValueError("Duplicate hardlink source.")
+            restored = restored.with_backend_options((), paths)
         restored = replace(restored, attempt_id=text["attempt_id"])
         canonical = json.dumps(
             envelope, ensure_ascii=True, allow_nan=False, sort_keys=True, separators=(",", ":")
@@ -1146,6 +1435,7 @@ class SandboxRequest:
             self.workspace,
             *self.read_roots,
             *self.write_roots,
+            *(path.parent for path in self.write_files),
             *(alias.parent for alias in self.read_aliases),
             *(target for _, _, _, target in self._read_alias_identities),
             *(target for _, target in self.path_roots),
@@ -1196,6 +1486,8 @@ class SandboxRequest:
         )
         if self.workspace_executable_identities:
             payload = (*payload, self.workspace_executable_identities)
+        if self.write_files:
+            payload = (*payload, self._write_file_identities)
         if self.egress_origins:
             payload = (*payload, self.egress_origins)
         if not self.local_network:
@@ -1209,16 +1501,20 @@ class SandboxRequest:
             identity (str): Scope-specific policy identity selected by the permission manager.
 
         Returns:
-            str: SHA-256 digest binding the sandbox authority to the selected identity, paths,
-                environment, policy version, and executable source.
+            str: SHA-256 digest binding the selected authority, directory and alias identities,
+                environment, hard resource protections, policy version, and executable source.
+                Private scratch generations remain interchangeable within the approved scope.
         """
         relative_cwd = str(self.cwd.relative_to(self.workspace))
         roots = tuple(
             "workspace" if root == self.workspace else str(root) for root in self.write_roots
         )
+        temporary = self.shell_environment().get(TMPDIR_ENVIRONMENT_VARIABLE)
+        scratch = self.scratch_root or (Path(temporary) if temporary is not None else None)
         payload = (
             identity,
             relative_cwd,
+            tuple(bound for bound in self._identities if bound.path != scratch),
             self.read_roots,
             self.automatic_tool_reads,
             self.read_aliases,
@@ -1238,16 +1534,27 @@ class SandboxRequest:
             self.file_creation_mask,
             self.scratch_root is not None,
             self.scratch_data,
-            (),  # Preserve stored approval signatures for requests without virtual aliases.
+            self._read_alias_identities,
+            tuple(sorted(self.hard_denied_paths)),
+            tuple(sorted(self.protected_host_roots)),
         )
         if self.execution_source != self.source:
             payload = (*payload, self.execution_source)
+        if self.write_files:
+            payload = (*payload, "write-files", self.write_files)
         if self.workspace_executable_identities:
             payload = (*payload, self.workspace_executable_identities)
         if self.egress_origins:
             payload = (*payload, self.egress_origins)
         if not self.local_network:
             payload = (*payload, "local-network-denied")
+        if self.network:
+            payload = (*payload, "separate-broad-network-v1")
+        payload = (*payload, *self.backend_options)
+        if self.hardlink_source_identities:
+            payload = (*payload, self.hardlink_source_identities)
+        if self.ingress_port is not None:
+            payload = (*payload, "attempt-ingress-v1", self.ingress_port, self.attempt_id)
         return sha256_digest(repr(payload))
 
 
@@ -1536,13 +1843,13 @@ class SandboxBackend(Protocol):
         """
 
     def managed_tool_root(self, root: Path) -> bool:
-        """Report whether one installed tool root has verified automatic-read provenance.
+        """Report whether one installed tool root has verified installation provenance.
 
         Args:
             root (Path): Canonical installation directory.
 
         Returns:
-            bool: Whether the backend permits this root without an extra prompt.
+            bool: Whether installation metadata supports this candidate; approval remains separate.
         """
 
     def installed_tool_roots(

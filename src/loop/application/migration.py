@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import shutil
 from pathlib import Path
 
 from .. import constants
 from ..permissions import SQLitePermissionAudit
 from ..session import SQLiteSessionStore
 from ..telemetry import SQLiteTelemetryAdapter, import_legacy_operational_log
+from ..utils import YAMLError, dump_yaml, load_yaml
 from ..workspace import Workspace
 from .paths import ApplicationPaths, WorkspacePaths
 
@@ -100,12 +100,23 @@ class ApplicationMigration:
             pass
 
     def _copy_policy(self) -> None:
-        """Copy the opaque legacy permission policy when no central policy exists."""
+        """Import legacy permission policy without granting centrally enrolled host services."""
         source = self._legacy_root / constants.PERMISSIONS_FILENAME
         destination = self._workspace_paths.permissions
         if not source.is_file() or destination.exists():
             return
+        content = source.read_bytes()
+        try:
+            policy = load_yaml(content.decode("utf-8"))
+        except (UnicodeError, YAMLError):
+            # The policy loader reports the original invalid input through its recovery path.
+            policy = None
+        if isinstance(policy, dict) and (
+            "backend_options" in policy or "command_backend_options" in policy
+        ):
+            policy.update(backend_options=[], command_backend_options={})
+            content = dump_yaml(policy).encode("utf-8")
         destination.parent.mkdir(mode=constants.PRIVATE_DIRECTORY_MODE, parents=True, exist_ok=True)
-        with source.open("rb") as input_file, destination.open("xb") as output_file:
-            shutil.copyfileobj(input_file, output_file)
+        with destination.open("xb") as output_file:
+            output_file.write(content)
         destination.chmod(constants.PRIVATE_FILE_MODE)

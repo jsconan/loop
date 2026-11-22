@@ -12,6 +12,7 @@ import stat
 import tempfile
 import time
 from contextlib import ExitStack, closing, contextmanager, nullcontext
+from dataclasses import replace
 from pathlib import Path
 from threading import Barrier, Event, Thread, get_ident
 from types import SimpleNamespace
@@ -56,10 +57,12 @@ from loop.permissions import (
     PermissionLoadFailure,
     PermissionNamespaceError,
     SandboxedCommandRule,
+    SandboxPathAccess,
     UserPermissionConfiguration,
 )
 from loop.permissions import manager as manager_module
 from loop.permissions.managed import ManagedPolicyStore
+from loop.sandbox_catalog import SANDBOX_OPTIONS
 from loop.telemetry import MemoryTelemetryAdapter, Telemetry, set_telemetry
 from loop.telemetry.policy import thaw
 from loop.utils import PathHolder, ShutdownRequested
@@ -68,6 +71,82 @@ from loop.workspace import Workspace, WorkspaceRepository
 from tests.scheduling import deliver_callbacks
 
 _HARD_LEGACY_READ_POLICY = "version: 1\nlimits:\n  readable_roots: []\n"
+
+
+def test_open_read_file_checks_hard_policy_kind_and_authorized_identity(tmp_path):
+    """The descriptor boundary rejects protected, nonregular and replaced selections."""
+    manager = PermissionManager(tmp_path)
+    secret = tmp_path / ".env"
+    secret.write_text("secret", encoding="utf-8")
+    with pytest.raises(PermissionError, match="protected_path"):
+        manager.open_read_file(secret)
+    with pytest.raises(OSError, match="regular file"):
+        manager.open_read_file(tmp_path)
+    public = tmp_path / "public"
+    public.write_text("public", encoding="utf-8")
+    with pytest.raises(OSError, match="changed before opening"):
+        manager.open_read_file(public, (0, 0, 0, 0))
+    status = public.stat()
+    with pytest.raises(OSError, match="changed before opening"):
+        manager.open_read_file(public, (status.st_dev, status.st_ino, -1, status.st_nlink))
+    selected, descriptor = manager.open_read_file(public)
+    assert selected == public
+    with os.fdopen(descriptor, "r") as stream:
+        assert stream.read() == "public"
+
+
+@pytest.mark.parametrize("change", ["link", "same-time-link", "scope"])
+def test_open_read_file_rechecks_aliases_and_scope_after_open(tmp_path, monkeypatch, change):
+    """A changed alias or resolved scope closes the descriptor before returning authority."""
+    policy = tmp_path / "policy.json"
+    policy.write_text(PermissionConfiguration().model_dump_json(), encoding="utf-8")
+    manager = PermissionManager(tmp_path, configuration_path=policy)
+    source = tmp_path / "source"
+    source.write_text("public", encoding="utf-8")
+    original_open = manager_module.open_selected_file
+    original_fstat = os.fstat
+    original_time = source.stat().st_ctime_ns
+    descriptors = []
+
+    def change_after_open(root, path, identity):
+        """Change only the selected name once its descriptor has opened."""
+        descriptor = original_open(root, path, identity)
+        descriptors.append(descriptor)
+        if change != "scope":
+            (tmp_path / "alias").hardlink_to(source)
+        else:
+            policy.write_text(
+                PermissionConfiguration(
+                    limits=PolicyLimits(hard_denied_paths=(str(source),))
+                ).model_dump_json(),
+                encoding="utf-8",
+            )
+            manager.reload()
+        return descriptor
+
+    monkeypatch.setattr(manager_module, "open_selected_file", change_after_open)
+    if change == "same-time-link":
+
+        def unchanged_time(descriptor):
+            """Model two link states sharing a filesystem timestamp tick."""
+            result = original_fstat(descriptor)
+            if descriptor not in descriptors:
+                return result
+            return SimpleNamespace(
+                **{
+                    name: original_time if name == "st_ctime_ns" else getattr(result, name)
+                    for name in dir(result)
+                    if name.startswith("st_")
+                }
+            )
+
+        monkeypatch.setattr(os, "fstat", unchanged_time)
+    error = OSError if change != "scope" else PermissionError
+    message = "changed before opening" if change != "scope" else "protected_path"
+    with pytest.raises(error, match=message):
+        manager.open_read_file(source)
+    with pytest.raises(OSError):
+        os.fstat(descriptors[0])
 
 
 def prompt_scope(message, *, full=False):
@@ -85,7 +164,9 @@ def managed_store(
     require_sandbox=False,
     forbid_host=False,
     deny_local_networks=False,
+    forbidden_backend_options=(),
     forbid_yolo=False,
+    hard_denied_paths=(),
 ):
     """Build an owned stand-in for the fixed protected administrator installation."""
     directory = tmp_path / "system" / "loop"
@@ -106,13 +187,105 @@ def managed_store(
                 "require_sandbox": require_sandbox,
                 "forbid_host": forbid_host,
                 "deny_local_networks": deny_local_networks,
+                "forbidden_backend_options": list(forbidden_backend_options),
                 "forbid_yolo": forbid_yolo,
+                "hard_denied_paths": hard_denied_paths,
             }
         )
     )
     (directory.parent / "loop.managed.expect.json").chmod(0o644)
     (directory / "managed-policy.json").chmod(0o644)
     return ManagedPolicyStore(directory, trust_anchor=tmp_path, owner_uid=os.getuid())
+
+
+def test_managed_hard_designation_survives_workspace_declassification_and_yolo(tmp_path):
+    """Administrator file/directory designations dominate ordinary automatic authority."""
+    directory = tmp_path / "ordinary"
+    directory.mkdir()
+    source = directory / ".env.example"
+    source.write_text("secret", encoding="utf-8")
+    store = managed_store(tmp_path, hard_denied_paths=(str(directory),))
+    manager = PermissionManager(tmp_path, managed_policy_store=store, yolo=True)
+    for action, target in (
+        (Action.FILESYSTEM_READ, FileTarget(path=str(source))),
+        (Action.FILESYSTEM_CREATE, FileTarget(path=str(directory / "future"))),
+        (Action.FILESYSTEM_DELETE, FileTarget(path=str(tmp_path), recursive=True)),
+    ):
+        decision = manager.evaluate((Operation(tool_id="file", action=action, target=target),))
+        assert decision.decision is Decision.DENY
+        assert decision.sources == ("boundary:protected_path",)
+
+
+@pytest.mark.parametrize("decision", ["deny", "ask"])
+def test_file_discovery_requires_independent_managed_child_authority(tmp_path, decision):
+    """A granted tree cannot reveal a child requiring its own administrator decision."""
+    selected = tmp_path / "withheld"
+    selected.write_text("owned test data")
+    alias = tmp_path / "alternative"
+    alias.symlink_to(selected)
+    store = managed_store(
+        tmp_path,
+        rules=(
+            {
+                "id": "withheld-child",
+                "decision": decision,
+                "action": "filesystem.read",
+                "resource": str(selected),
+            },
+        ),
+    )
+    manager = PermissionManager(tmp_path, managed_policy_store=store)
+    for action, tool in (
+        (Action.FILESYSTEM_READ, "search_text"),
+        (Action.FILESYSTEM_LIST, "list_folder"),
+    ):
+        for candidate in (selected, alias):
+            assert not manager.can_inspect_file(
+                candidate, tool_id=tool, action=action, approved_root=FileTarget(path=str(tmp_path))
+            )
+    with pytest.raises(PermissionError, match="Administrator policy"):
+        manager.open_read_file(
+            selected, tool_id="search_text", approved_root=FileTarget(path=str(tmp_path))
+        )
+
+
+def test_file_discovery_inherits_only_an_approved_ancestor_default(tmp_path):
+    """An approved search tree may retain default review for its children alone."""
+    manager = PermissionManager(tmp_path)
+    manager.set_default(Action.FILESYSTEM_READ, Decision.ASK, scope=PolicyScope.SESSION)
+    inside = tmp_path / "inside" / "child"
+    inside.parent.mkdir()
+    outside = tmp_path / "neighbor"
+    inside.touch()
+    for root, path, allowed in (
+        (tmp_path, inside, True),
+        (tmp_path / "inside", outside, False),
+        (tmp_path / "missing", outside, False),
+        (None, inside, False),
+        (inside, inside, True),
+    ):
+        target = None
+        if root is not None:
+            if root.exists():
+                details = root.stat()
+                target = FileTarget(
+                    path=str(root),
+                    expected_device=details.st_dev,
+                    expected_inode=details.st_ino,
+                    expected_ctime_ns=details.st_ctime_ns,
+                    expected_link_count=details.st_nlink,
+                )
+            else:
+                target = FileTarget(path=str(root))
+        assert (
+            manager.can_inspect_file(
+                path,
+                tool_id="search_text",
+                action=Action.FILESYSTEM_READ,
+                approved_root=target,
+            )
+            is allowed
+        )
 
 
 def test_uncertain_retry_generation_requires_current_human_decisions(tmp_path):
@@ -406,7 +579,7 @@ def test_managed_denial_and_host_prohibition_override_user_grants(tmp_path, yolo
         ),
     )
     assert manager.evaluate(host).sources == ("managed:sandbox_required",)
-    assert manager.host_gate_enable_revision(host) is None
+    assert manager.direct_host_execution_enabled is False
     assert "identity=" in manager.describe("managed")
     protected = (file_operation(Action.FILESYSTEM_READ, store.directory / "managed-policy.json"),)
     assert manager.evaluate(protected).sources == ("boundary:protected_path",)
@@ -448,7 +621,7 @@ def test_managed_fresh_human_rule_never_uses_yolo_or_remembered_approval(
         interaction.prompt_async.assert_not_called()
     else:
         selected = interaction.prompt_async if asynchronous else interaction.prompt
-        assert set(selected.call_args.kwargs["choices"]) == {"deny", "once"}
+        assert set(selected.call_args.kwargs["choices"]) == {"deny", "once", "details"}
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
@@ -641,6 +814,7 @@ def test_yolo_scoped_sandbox_approval_does_not_persist_or_relax_hard_limits(tmp_
 def test_yolo_host_gate_is_transient_and_explicit_deny_still_wins(tmp_path):
     """Only active YOLO bypasses the user-changeable host gate for an exact host plan."""
     manager = PermissionManager(tmp_path)
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ASK)
     operations = (
         operation(
             Action.PROCESS_EXECUTE,
@@ -655,6 +829,8 @@ def test_yolo_host_gate_is_transient_and_explicit_deny_still_wins(tmp_path):
     assert manager.confirmation_decision() is None
     manager.set_yolo(True)
     manager.set_yolo(True)
+    assert manager.evaluate(operations).decision is Decision.DENY
+    manager.set_direct_host_execution(True)
     assert manager.evaluate(operations).decision is Decision.ASK
     assert manager.confirmation_decision() is True
     assert manager.confirmation_decision(certain=False) is False
@@ -668,7 +844,7 @@ def test_yolo_host_gate_is_transient_and_explicit_deny_still_wins(tmp_path):
     manager.set_yolo(False)
     assert manager.evaluate(operations).decision is Decision.DENY
     assert manager.confirmation_decision() is None
-    assert manager.configuration.limits.allow_host_processes is False
+    assert "allow_host_processes" not in PolicyLimits.model_fields
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
@@ -782,6 +958,896 @@ def native_request(root: Path, source: str = "git status", **changes) -> Sandbox
     return SandboxRequest.create(**values)
 
 
+@pytest.mark.parametrize("name", ["account_lookup", "process_pools"])
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_macos_opt_in_requires_scoped_consent_and_rechecks_revocation(tmp_path, name, asynchronous):
+    """Owner opt-ins retain human scope approval under YOLO and revoke pending and active work."""
+    arguments, _, _ = durable_policy_inputs(tmp_path)
+    interaction = Mock(spec=ConsoleInteraction)
+    interaction.prompt.side_effect = ["details", "session"]
+    interaction.prompt_async = AsyncMock(side_effect=["details", "session"])
+    manager = PermissionManager(
+        **arguments, bootstrap_pristine_policy=True, interaction=interaction
+    )
+    request = native_request(tmp_path, read_roots=(), write_roots=(), backend_options=(name,))
+    assert "Workspace opt-in is off" in manager.sandbox_scope_limit(request)
+    manager.set_sandbox_option(name, True)
+    manager.set_sandbox_option(name, True)
+    assert manager.configuration.defaults[Action.PROCESS_EXECUTE] is Decision.ASK
+    assert PermissionManager(**arguments).sandbox_option_limit(name) is None
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
+    manager.set_yolo(True)
+    revisions = []
+
+    def authorize(selected=request):
+        """Run the selected public approval path for the same bound command."""
+        kwargs = {"tool_id": "run_command", "approved_revision": revisions}
+        if asynchronous:
+            return asyncio.run(manager.authorize_sandboxed_command_async(selected, **kwargs))
+        return manager.authorize_sandboxed_command(selected, **kwargs)
+
+    assert authorize()
+    prompt = interaction.prompt_async if asynchronous else interaction.prompt
+    assert prompt.call_count == 2
+    assert all(
+        SANDBOX_OPTIONS[name]["notice"] in call.args[0]
+        for call in interaction.info.call_args_list[-2:]
+    )
+    assert len(manager.sandboxed_command_rules(ApprovalChoice.SESSION)) == 1
+    assert authorize()
+    assert prompt.call_count == 2
+    other = "account_lookup" if name == "process_pools" else "process_pools"
+    manager.set_sandbox_option(other, True)
+    prompt.side_effect = ["deny"]
+    assert not authorize(replace(request, backend_options=tuple(sorted((name, other)))))
+    assert prompt.call_count == 3
+    assert authorize()
+    foreign = native_request(
+        tmp_path.parent, read_roots=(), write_roots=(), backend_options=(name,)
+    )
+    assert "only to their enrolled workspace" in manager.sandbox_scope_limit(foreign)
+    cancelled = Event()
+    with manager.sandbox_attempt(request, revisions[-1], cancelled) as bound:
+        assert bound is not None
+        manager.set_sandbox_option(name, False)
+        assert cancelled.is_set()
+    with manager.sandbox_attempt(request, revisions[-1], Event()) as stale:
+        assert stale is None
+    assert not authorize()
+
+
+@pytest.mark.parametrize(
+    "scope", [ApprovalChoice.SESSION, ApprovalChoice.WORKSPACE, ApprovalChoice.USER]
+)
+def test_disabling_unenrolled_option_revokes_only_its_exact_approvals(tmp_path, scope):
+    """Revocation interrupts active use and requires new consent for one workspace option."""
+    arguments, _, _ = durable_policy_inputs(tmp_path)
+    interaction = Mock(spec=Interaction)
+    interaction.prompt.side_effect = [scope.value, scope.value, "deny"]
+    manager = PermissionManager(**arguments, bootstrap_pristine_policy=True)
+
+    def prepared(name):
+        """Prepare an explicitly requested workspace option under the current policy."""
+        request = native_request(tmp_path, read_roots=(), write_roots=(), backend_options=(name,))
+        return manager.prepare_sandbox_options(request, (name,), project=False)
+
+    def approve(name):
+        """Authorize the current request and retain its admitted revision for the lifecycle check."""
+        request = prepared(name)
+        revisions = []
+        assert manager.authorize_sandboxed_command(
+            request, tool_id="run_command", interaction=interaction, approved_revision=revisions
+        )
+        return request, revisions[-1]
+
+    approve("account_lookup")
+    approve("process_pools")
+    current, revision = approve("account_lookup")
+    cancellation = Event()
+    assert "Workspace opt-in is off" in manager.sandbox_option_limit("account_lookup")
+    with manager.sandbox_attempt(current, revision, cancellation) as admitted:
+        assert admitted is not None
+        manager.set_sandbox_option("account_lookup", False)
+        assert cancellation.is_set()
+    approve("process_pools")
+    if scope is not ApprovalChoice.SESSION:
+        manager.close()
+        manager = PermissionManager(**arguments)
+        approve("process_pools")
+    assert not manager.authorize_sandboxed_command(
+        prepared("account_lookup"), tool_id="run_command", interaction=interaction
+    )
+    assert interaction.prompt.call_count == 3
+
+
+@pytest.mark.parametrize("name", ["account_lookup", "process_pools"])
+def test_macos_opt_in_uses_only_enrolled_owner_state_below_managed_ceiling(
+    tmp_path, name, monkeypatch
+):
+    """Legacy inputs cannot grant host services, and each managed prohibition is independent."""
+    monkeypatch.setattr("loop.permissions.manager.sandbox_options", lambda: SANDBOX_OPTIONS)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    arguments, _, _ = durable_policy_inputs(workspace)
+    path = arguments["configuration_path"]
+    path.parent.mkdir(parents=True)
+    path.write_text(dump_yaml({"backend_options": [name]}))
+    other = "process_pools" if name == "account_lookup" else "account_lookup"
+    manager = PermissionManager(**arguments, bootstrap_pristine_policy=True)
+    assert name not in manager.configuration.backend_options
+    manager.set_sandbox_option(name, True)
+    assert f"{SANDBOX_OPTIONS[name]['label']}: workspace requests on" in manager.describe(
+        "effective"
+    )
+    managed = managed_store(tmp_path, forbidden_backend_options=(name,))
+    restricted = PermissionManager(**arguments, managed_policy_store=managed)
+    assert "Administrator policy prohibits" in restricted.sandbox_option_limit(name)
+    attempted = native_request(workspace, read_roots=(), write_roots=(), backend_options=(name,))
+    assert "Administrator policy prohibits" in restricted.sandbox_scope_limit(
+        replace(attempted, reviewed_backend_options=(name,))
+    )
+    assert restricted.requestable_sandbox_options((name,)) == ()
+
+    assert f"{SANDBOX_OPTIONS[name]['label']}: workspace requests on" in restricted.describe(
+        "workspace"
+    )
+    assert f"{SANDBOX_OPTIONS[name]['label']}: unavailable (Administrator" in restricted.describe(
+        "effective"
+    )
+    with pytest.raises(ValueError, match="Administrator policy prohibits"):
+        restricted.set_sandbox_option(name, True)
+    restricted.set_sandbox_option(name, False)
+    restricted.set_sandbox_option(other, True)
+    assert restricted.sandbox_option_limit(other) is None
+    assert f"forbidden_backend_options=['{name}']" in restricted.describe("managed")
+    path.write_text(path.read_text() + "\n")
+    assert "recovery required" in restricted.sandbox_option_limit(other)
+
+
+def test_macos_workspace_capability_refuses_untrusted_policy_and_values(tmp_path):
+    """An unbound or checkout-managed permission manager cannot supply these workspace opt-ins."""
+    manager = PermissionManager(tmp_path)
+    with pytest.raises(ValueError, match="an enrolled workspace policy outside the checkout"):
+        manager.set_sandbox_option("account_lookup", True)
+    with pytest.raises(ValueError, match="boolean setting"):
+        manager.set_sandbox_option("process_pools", "true")
+    with pytest.raises(ValueError, match="unknown|Unknown"):
+        manager.sandbox_option_limit("unrelated")
+    with pytest.raises(ValueError, match="known sandbox"):
+        manager.set_sandbox_option("unrelated", False)
+
+
+@pytest.mark.parametrize("version", [6, 7])
+def test_existing_enrolled_workspace_without_macos_fields_stays_strict(tmp_path, version):
+    """Earlier enrolled policy files cannot assert host services absent from their schema."""
+    arguments, _, _ = durable_policy_inputs(tmp_path)
+    manager = PermissionManager(**arguments, bootstrap_pristine_policy=True)
+    generation = manager.configuration.namespace_generation
+    manager.close()
+    path = arguments["configuration_path"]
+    payload = load_yaml(path.read_text())
+    payload["version"] = version
+    del payload["workspace_command_writes"]
+    del payload["backend_options"], payload["command_backend_options"]
+    payload["backend_options"] = ["process_pools"]
+    payload["command_backend_options"] = {"1" * 64: ["process_pools"]}
+    path.write_text(dump_yaml(payload))
+    reopened = PermissionManager(**arguments)
+    assert reopened.configuration.namespace_generation == generation
+    assert not reopened.configuration.workspace_command_writes
+    for name in ("account_lookup", "process_pools"):
+        assert "Workspace opt-in is off" in reopened.sandbox_option_limit(name)
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_macos_approval_rechecks_owner_revocation_from_another_session(tmp_path, asynchronous):
+    """A separately persisted owner revocation invalidates even an affirmative pending answer."""
+    arguments, _, _ = durable_policy_inputs(tmp_path)
+    interaction = Mock(spec=ConsoleInteraction)
+    manager = PermissionManager(
+        **arguments, bootstrap_pristine_policy=True, interaction=interaction
+    )
+    manager.set_sandbox_option("process_pools", True)
+    other = PermissionManager(**arguments)
+    request = native_request(
+        tmp_path, read_roots=(), write_roots=(), backend_options=("process_pools",)
+    )
+    revisions = []
+
+    def revoke_and_approve(*_args, **_kwargs):
+        """Disable the requested service in the other session before returning the human answer."""
+        other.set_sandbox_option("process_pools", False)
+        return "approve"
+
+    if asynchronous:
+        interaction.prompt_async = AsyncMock(side_effect=revoke_and_approve)
+        authorized = asyncio.run(
+            manager.authorize_sandboxed_command_async(
+                request, tool_id="run_command", approved_revision=revisions
+            )
+        )
+        interaction.prompt_async.assert_awaited_once()
+    else:
+        interaction.prompt.side_effect = revoke_and_approve
+        authorized = manager.authorize_sandboxed_command(
+            request, tool_id="run_command", approved_revision=revisions
+        )
+        interaction.prompt.assert_called_once()
+    assert not authorized
+    assert not revisions
+    assert "recovery required" in manager.sandbox_scope_limit(request)
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("selected", ["deny", "approve", "session", "workspace", "user"])
+def test_exact_prepared_scope_is_approved_in_one_prompt(tmp_path, asynchronous, selected):
+    """One decision covers the full proposal, and an unrelated command requires fresh consent."""
+    arguments, _, _ = durable_policy_inputs(tmp_path)
+    manager = PermissionManager(**arguments, bootstrap_pristine_policy=True)
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
+    manager.set_yolo(True)
+    interaction = Mock(spec=ConsoleInteraction)
+    interaction.prompt.return_value = selected
+    interaction.prompt_async = AsyncMock(return_value=selected)
+    request = native_request(tmp_path, read_roots=(), write_roots=(), local_network=False)
+    kwargs = {"tool_id": "run_command", "interaction": interaction, "prepared_access": True}
+
+    def authorize(command):
+        """Ask the real command permission manager through the selected interaction surface."""
+        if asynchronous:
+            return asyncio.run(manager.authorize_sandboxed_command_async(command, **kwargs))
+        return manager.authorize_sandboxed_command(command, **kwargs)
+
+    assert authorize(request) is (selected != "deny")
+    prompt = interaction.prompt_async if asynchronous else interaction.prompt
+    prompt.assert_called_once()
+    assert prompt.call_args.kwargs["choices"] == {
+        "deny": "Deny",
+        "approve": "Allow once",
+        "session": "Allow for this session",
+        "workspace": "Allow in this workspace",
+        "user": "Allow for this user",
+        "details": "Show full scope",
+    }
+    assert "Project files are read-only." in interaction.info.call_args.args[0]
+    prompt.return_value = "deny"
+    remembered = selected in {"session", "workspace", "user"}
+    assert authorize(request) is remembered
+    assert prompt.call_count == (1 if remembered else 2)
+    assert not authorize(replace(request, source="other", execution_source="other"))
+    assert not manager.configuration.command_backend_options
+    assert not manager.configuration.sandbox_paths
+    manager.update_sandbox_paths(ApprovalChoice.SESSION, {str(tmp_path): SandboxPathAccess.DENY})
+    assert "blocked" in manager.sandbox_scope_limit(replace(request, read_roots=(tmp_path,)))
+
+
+@pytest.mark.parametrize("selection", ["approve", "session", "deny"])
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_prepared_workspace_writes_use_the_regular_approval(tmp_path, selection, asynchronous):
+    """Each user choice applies to the same disclosed and audited workspace scope."""
+    interaction = Mock(spec=ConsoleInteraction)
+    interaction.prompt.side_effect = ["details", selection]
+    interaction.prompt_async = AsyncMock(side_effect=["details", selection])
+    audit_path = tmp_path / "audit.db"
+    manager = PermissionManager(
+        tmp_path,
+        interaction=interaction,
+        audit_path=audit_path,
+        workspace_id="workspace-1",
+        user_configuration_path=tmp_path / "user.yaml",
+    )
+    original = native_request(tmp_path, "./wrapper", read_roots=(), write_roots=())
+    request = manager.prepare_sandbox_workspace_writes(original, "run_command", lambda _argv: False)
+    approved_revision = []
+    arguments = {
+        "tool_id": "run_command",
+        "approved_revision": approved_revision,
+        "prepared_access": True,
+    }
+
+    if asynchronous:
+        approved = asyncio.run(manager.authorize_sandboxed_command_async(request, **arguments))
+        prompt = interaction.prompt_async
+    else:
+        approved = manager.authorize_sandboxed_command(request, **arguments)
+        prompt = interaction.prompt
+
+    assert approved is (selection != "deny")
+    assert prompt.call_count == 2
+    for entry in prompt.call_args_list:
+        choices = entry.kwargs["choices"]
+        assert set(choices) == {"deny", "approve", "session", "workspace", "user", "details"}
+        assert choices["workspace"] == "Allow in this workspace"
+    assert (
+        "This command can write project files except protected paths."
+        in (interaction.info.call_args.args[0])
+    )
+    assert not original.write_roots
+    assert request.write_roots == (tmp_path,)
+    assert approved_revision == ([manager.egress_policy_revision()] if approved else [])
+    assert bool(manager.sandboxed_command_rules(ApprovalChoice.SESSION)) is (selection == "session")
+    assert not manager.configuration.workspace_command_writes
+    with closing(sqlite3.connect(audit_path)) as connection:
+        rows = connection.execute(
+            "SELECT payload_json FROM permission_audit_records "
+            "WHERE event_name = 'sandbox.permission_scope' ORDER BY rowid"
+        ).fetchall()
+    (scope,) = [json.loads(row[0]) for row in rows]
+    assert scope["attempt_id"] == request.attempt_id
+    assert scope["write_roots"] == [str(tmp_path)]
+
+
+@pytest.mark.parametrize(
+    "restriction",
+    [
+        "yolo",
+        "reader",
+        "explicit",
+        "foreign",
+        "unbound",
+        "protected",
+        "read_only",
+        "nested",
+        "stale",
+    ],
+)
+def test_workspace_write_preparation_preserves_narrow_and_denied_scopes(tmp_path, restriction):
+    """Inferred checkout write authority requires current identities and eligible file policy."""
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    manager = PermissionManager(
+        workspace,
+        protected_host_roots=(workspace,) if restriction == "protected" else (),
+    )
+    request = native_request(
+        tmp_path if restriction == "foreign" else workspace,
+        "printf report" if restriction == "reader" else "./wrapper",
+        read_roots=(),
+        write_roots=(workspace,) if restriction == "explicit" else (),
+    )
+    if restriction == "yolo":
+        manager.set_yolo(True)
+    elif restriction == "unbound":
+        workspace.rename(tmp_path / "earlier")
+        workspace.mkdir()
+    elif restriction == "read_only":
+        (workspace / "existing").mkdir()
+        manager.update_sandbox_paths(
+            ApprovalChoice.SESSION, {str(workspace / "existing"): SandboxPathAccess.READ_ONLY}
+        )
+    elif restriction == "nested":
+        manager.add_rule(
+            PermissionRule(
+                decision=Decision.DENY,
+                tool="run_command",
+                action=Action.FILESYSTEM_REPLACE,
+                target=FileTarget(path=str(workspace / "existing")),
+            ),
+            scope=PolicyScope.SESSION,
+        )
+    elif restriction == "stale":
+        request = replace(request, permission_revision=manager.egress_policy_revision())
+        manager.set_workspace_command_writes(True)
+
+    assert (
+        manager.prepare_sandbox_workspace_writes(request, "run_command", lambda _argv: False)
+        is request
+    )
+
+
+@pytest.mark.parametrize(
+    ("source", "other_review", "by_rule", "review_writes"),
+    [
+        ("./wrapper", False, False, False),
+        ("./wrapper", False, True, False),
+        ("./wrapper", True, False, True),
+        ("printf data > report", False, False, True),
+    ],
+)
+def test_workspace_write_preparation_preserves_automatic_process_scope(
+    tmp_path, source, other_review, by_rule, review_writes
+):
+    """Keep automatic runs narrow unless the command already needs a human review."""
+    manager = PermissionManager(tmp_path)
+    if by_rule:
+        manager.add_rule(
+            PermissionRule(
+                tool="run_command", action=Action.PROCESS_EXECUTE, decision=Decision.ALLOW
+            ),
+            scope=PolicyScope.WORKSPACE,
+        )
+    else:
+        manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
+    request = native_request(tmp_path, source, read_roots=(), write_roots=())
+
+    prepared = manager.prepare_sandbox_workspace_writes(
+        request, "run_command", lambda _argv: False, prepared_access=other_review
+    )
+
+    assert bool(prepared.write_roots) is review_writes
+
+
+@pytest.mark.parametrize("change", ["policy", "directory"])
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_prepared_workspace_approval_cannot_remember_changed_authority(
+    tmp_path, change, asynchronous
+):
+    """A pending prepared approval cannot persist after a change to its scope."""
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    interaction = Mock(spec=ConsoleInteraction)
+    manager = PermissionManager(workspace, interaction=interaction)
+    original = native_request(workspace, "./wrapper", read_roots=(), write_roots=())
+    request = manager.prepare_sandbox_workspace_writes(original, "run_command", lambda _argv: False)
+
+    def change_before_choosing(*_args, **kwargs):
+        """Withdraw the proposed write authority while awaiting the human decision."""
+        assert "session" in kwargs["choices"]
+        if change == "policy":
+            manager.set_workspace_command_writes(True)
+        else:
+            workspace.rename(tmp_path / "earlier")
+            workspace.mkdir()
+        return "session"
+
+    interaction.prompt.side_effect = change_before_choosing
+    interaction.prompt_async = AsyncMock(side_effect=change_before_choosing)
+    approved_revision = []
+    arguments = {
+        "tool_id": "run_command",
+        "approved_revision": approved_revision,
+        "prepared_access": True,
+    }
+
+    if asynchronous:
+        assert not asyncio.run(manager.authorize_sandboxed_command_async(request, **arguments))
+        interaction.prompt_async.assert_awaited_once()
+    else:
+        assert not manager.authorize_sandboxed_command(request, **arguments)
+        interaction.prompt.assert_called_once()
+    assert not manager.sandboxed_command_rules(ApprovalChoice.SESSION)
+    assert not approved_revision
+
+
+def test_prepare_project_and_explicit_resources_obeys_workspace_and_admin_limits(
+    tmp_path, monkeypatch
+):
+    """Only enrolled or requested services are prepared and their full effects remain reviewable."""
+    monkeypatch.setattr(manager_module, "sandbox_options", lambda: SANDBOX_OPTIONS)
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    arguments, _, _ = durable_policy_inputs(workspace)
+    manager = PermissionManager(**arguments, bootstrap_pristine_policy=True)
+    options = ("account_lookup", "process_pools")
+    request = native_request(workspace, read_roots=(), write_roots=())
+    assert "unknown" in manager.sandbox_scope_limit(replace(request, backend_options=("unknown",)))
+    assert manager.prepare_sandbox_options(request, options, project=True) is request
+    assert manager.requestable_sandbox_options((*options, "absent")) == options
+    manager.set_sandbox_option(options[0], True)
+    assert manager.prepare_sandbox_options(request, options, project=False) is request
+    prepared = manager.prepare_sandbox_options(request, options, project=True)
+    assert prepared.backend_options == (options[0],)
+    explicit = replace(request, backend_options=(options[1],))
+    assert (
+        manager.prepare_sandbox_options(explicit, options, project=True).backend_options == options
+    )
+    foreign = replace(request, workspace=tmp_path.parent)
+    assert manager.prepare_sandbox_options(foreign, options, project=True) is foreign
+    with pytest.raises(ValueError, match="current workspace policy"):
+        manager.prepare_sandbox_options(
+            replace(explicit, workspace=tmp_path.parent), options, project=True
+        )
+    with pytest.raises(ValueError, match="unavailable"):
+        manager.prepare_sandbox_options(explicit, (), project=True)
+    managed = managed_store(tmp_path, forbidden_backend_options=(options[1],))
+    restricted = PermissionManager(**arguments, managed_policy_store=managed)
+    assert restricted.requestable_sandbox_options(options) == (options[0],)
+    with pytest.raises(ValueError, match="Administrator policy prohibits"):
+        restricted.prepare_sandbox_options(explicit, options, project=True)
+    stale = replace(request, permission_revision=manager.egress_policy_revision() + 1)
+    assert manager.prepare_sandbox_options(stale, options, project=True) is stale
+    assert manager.prepare_sandbox_options(request, ("unavailable",), project=True) is request
+
+
+def test_hardlink_option_requires_selected_host_path_and_regular_read_policy(tmp_path, monkeypatch):
+    """A metadata grant is visible at approval and obeys the owner's hard read ceiling."""
+    cache = tmp_path / "cache"
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    arguments, _, _ = durable_policy_inputs(workspace)
+    manager = PermissionManager(**arguments, bootstrap_pristine_policy=True)
+    name = "shared_dependencies"
+    monkeypatch.setattr(
+        manager_module, "hardlink_source_paths", lambda names: (cache,) if name in names else ()
+    )
+    strict = native_request(workspace, read_roots=(), write_roots=())
+    monkeypatch.setitem(SANDBOX_OPTIONS[name], "automatic", True)
+    assert manager.prepare_sandbox_options(strict, (name,), project=False) is strict
+    cache.mkdir()
+    assert manager.prepare_sandbox_options(strict, (name,), project=False) is strict
+    infer = Mock(return_value=(name,))
+    selected = manager.prepare_sandbox_options(strict, (name,), project=False, infer=infer)
+    assert selected.hardlink_sources == (cache,)
+    assert manager.sandbox_scope_limit(selected) is None
+    assert manager._sandbox_scope(selected)["hardlink_metadata"] == [str(cache)]
+    display = manager._sandbox_permission_message(
+        selected, scratch_roots=set(), findings=(), explicit_ask=True, reason=None
+    )
+    assert "hardlink_metadata" not in prompt_scope(display)
+    assert SANDBOX_OPTIONS[name]["notice"] in display
+    assert str(cache) not in display
+    operations = manager._sandbox_operations(selected, "run_command", ())
+    assert {op.action for op in operations if getattr(op.target, "path", None) == str(cache)} == {
+        Action.FILESYSTEM_LIST,
+        Action.FILESYSTEM_READ,
+    }
+    unselected = replace(selected, backend_options=())
+    assert "differ" in manager.sandbox_scope_limit(unselected)
+    assert name not in manager.requestable_sandbox_options((name,))
+    assert manager.prepare_sandbox_options(
+        strict, (name,), project=True, infer=infer, saved=True
+    ).hardlink_sources == (cache,)
+    assert infer.call_args.args[0].permission_revision == manager.egress_policy_revision()
+    assert (
+        manager.prepare_sandbox_options(strict, (name,), project=False, infer=lambda _: ())
+        is strict
+    )
+    unready = replace(strict, permission_revision=manager.egress_policy_revision() + 1)
+    infer.reset_mock()
+    assert manager.prepare_sandbox_options(unready, (name,), project=False, infer=infer) is unready
+    infer.assert_not_called()
+
+    def revise(_request):
+        """Replace the observed revision before inferred authority can be used."""
+        manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
+        return (name,)
+
+    assert manager.prepare_sandbox_options(strict, (name,), project=False, infer=revise) is strict
+    cache.rmdir()
+    assert manager.prepare_sandbox_options(strict, (name,), project=False, infer=infer) is strict
+    cache.mkdir()
+    manager.classify_limit("readable_roots", LimitClassification.HARD)
+    assert manager.prepare_sandbox_options(strict, (name,), project=False, infer=infer) is strict
+    assert "readable_roots limit is hard" in manager.sandbox_scope_limit(
+        replace(selected, permission_revision=manager.egress_policy_revision())
+    )
+
+    def absent_account(_options):
+        """Simulate an unmapped operating system account after enrollment."""
+        raise ValueError("The account home is unavailable.")
+
+    monkeypatch.setattr(manager_module, "hardlink_source_paths", absent_account)
+    assert manager.sandbox_access_for_review(selected, "run_command") is None
+    assert "account home" in manager.sandbox_scope_limit(
+        replace(selected, permission_revision=manager.egress_policy_revision())
+    )
+
+
+def test_workspace_command_write_scope_is_persistent_bound_and_revocable(tmp_path):
+    """Only the selected workspace inherits its default and losing that policy rejects admission."""
+    manager = PermissionManager(tmp_path)
+    assert manager.sandbox_default_write_scope(tmp_path) == ((), None)
+    manager.set_workspace_command_writes(True)
+    roots, revision = manager.sandbox_default_write_scope(tmp_path)
+    assert roots == (tmp_path,)
+    assert revision is not None
+    assert manager.sandbox_default_write_scope(tmp_path.parent) == ((), None)
+    assert manager.configuration.defaults[Action.PROCESS_EXECUTE] is Decision.ASK
+    manager.set_workspace_command_writes(True)
+    assert manager.sandbox_default_write_scope(tmp_path) == (roots, revision)
+
+    reopened = PermissionManager(tmp_path)
+    assert reopened.sandbox_default_write_scope(tmp_path)[0] == roots
+    request = native_request(tmp_path, read_roots=(), permission_revision=revision)
+    assert manager.sandbox_scope_limit(request) is None
+    manager.set_workspace_command_writes(False)
+    assert manager.sandbox_default_write_scope(tmp_path) == ((), None)
+    assert "changed during preparation" in manager.sandbox_scope_limit(request)
+    assert not manager.authorize_sandboxed_command(request, tool_id="run_command")
+
+
+def test_workspace_command_writes_require_a_bound_workspace():
+    """A policy manager with no checkout cannot select a default live write scope."""
+    manager = PermissionManager()
+
+    with pytest.raises(ValueError, match="require a bound workspace policy"):
+        manager.set_workspace_command_writes(True)
+
+
+@pytest.mark.parametrize(
+    "scope", [ApprovalChoice.SESSION, ApprovalChoice.WORKSPACE, ApprovalChoice.USER]
+)
+def test_sandbox_path_rules_apply_to_later_commands_at_the_selected_lifetime(tmp_path, scope):
+    """Read grants are scoped, editable and independent of command approvals."""
+    workspace = tmp_path / "workspace"
+    runtime = tmp_path / "runtime"
+    workspace.mkdir()
+    runtime.mkdir()
+    configuration = tmp_path / "workspace.yaml"
+    user_configuration = tmp_path / "user.yaml"
+    settings = {"configuration_path": configuration, "user_configuration_path": user_configuration}
+    manager = PermissionManager(workspace, **settings)
+    assert manager.update_sandbox_paths(scope, {str(runtime): Decision.ALLOW})
+    assert not manager.update_sandbox_paths(scope, {str(runtime): Decision.ALLOW})
+    assert manager.sandbox_path_rules(scope) == {str(runtime): SandboxPathAccess.READ}
+    assert manager.sandbox_path_read_roots(workspace, (), (), "run_command")[0] == (runtime,)
+    manager.close()
+
+    reopened = PermissionManager(workspace, **settings)
+    expected = {} if scope is ApprovalChoice.SESSION else {str(runtime): SandboxPathAccess.READ}
+    assert reopened.sandbox_path_rules(scope) == expected
+    assert reopened.update_sandbox_paths(scope, {str(runtime): None}) is bool(expected)
+    assert not reopened.sandbox_path_rules(scope)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "denied",
+        "restricted",
+        "hard-ceiling",
+        "private",
+        "overlap",
+        "missing",
+        "symlink",
+        "io-error",
+    ],
+)
+def test_path_preset_respects_existing_denials_and_directory_authority(tmp_path, monkeypatch, case):
+    """Optional runtime paths cannot override narrower policy or follow a redirected directory."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    runtime = tmp_path / (".ssh" if case == "private" else "runtime")
+    manager = PermissionManager(workspace)
+    if case != "missing":
+        runtime.mkdir()
+    if case == "denied":
+        manager.update_sandbox_paths(ApprovalChoice.SESSION, {str(runtime): Decision.DENY})
+    elif case == "restricted":
+        manager.add_rule(
+            PermissionRule(
+                tool="run_command",
+                action=Action.FILESYSTEM_READ,
+                resource=str(runtime / "private"),
+                decision=Decision.DENY,
+            )
+        )
+    elif case == "hard-ceiling":
+        manager.classify_limit("readable_roots", LimitClassification.HARD)
+    elif case == "symlink":
+        runtime.rmdir()
+        runtime.symlink_to(workspace)
+    elif case == "io-error":
+        resolve = Path.resolve
+
+        def refuse(path, *args, **kwargs):
+            """Deny resolution of the candidate without changing unrelated policy paths."""
+            if path == runtime:
+                raise PermissionError("runtime metadata refused")
+            return resolve(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "resolve", refuse)
+    excluded = (runtime,) if case == "overlap" else ()
+
+    assert manager.sandbox_path_read_roots(workspace, (runtime,), excluded, "run_command")[0] == ()
+
+
+def test_sandbox_path_rules_reject_unsafe_new_grants(tmp_path):
+    """User-managed allows require a canonical public directory and a valid scope."""
+    manager = PermissionManager(tmp_path, protected_host_roots=(tmp_path / "control",))
+    private, control, public = (tmp_path / item for item in (".ssh", "control", "public"))
+    for root in (private, control, public):
+        root.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(public)
+    file = public / "file"
+    file.touch()
+    for path in (private, control, alias, file):
+        with pytest.raises(ValueError, match="public real directory"):
+            manager.update_sandbox_paths(ApprovalChoice.WORKSPACE, {str(path): Decision.ALLOW})
+    with pytest.raises(ValueError, match="use session, workspace, or user"):
+        manager.sandbox_path_rules(ApprovalChoice.ONCE)
+    assert not manager.sandbox_path_rules(ApprovalChoice.WORKSPACE)
+
+
+@pytest.mark.parametrize("revoke", ["remove", "reset"])
+def test_configured_path_snapshot_requires_process_approval_and_tracks_revocation(tmp_path, revoke):
+    """Removing a read grant stops owned attempts and invalidates the old admission scope."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    interaction = Mock(spec=ConsoleInteraction)
+    interaction.prompt.return_value = "approve"
+    manager = PermissionManager(workspace, interaction=interaction)
+    manager.update_sandbox_paths(ApprovalChoice.SESSION, {str(runtime): Decision.ALLOW})
+    roots, revision = manager.sandbox_path_read_roots(workspace, (), (), "run_command")
+    request = native_request(
+        workspace,
+        "printf ready",
+        read_roots=roots,
+        policy_read_roots=roots,
+        permission_revision=revision,
+    )
+    approved_revision = []
+    assert manager.authorize_sandboxed_command(
+        request, tool_id="run_command", approved_revision=approved_revision
+    )
+    assert approved_revision == [revision]
+    interaction.prompt.assert_called_once()
+    assert "read files outside" not in interaction.info.call_args.args[0]
+    cancellation = Event()
+    with manager.sandbox_attempt(request, revision, cancellation) as bound:
+        assert bound is not None and not cancellation.is_set()
+        another_runtime = tmp_path / "other"
+        another_runtime.mkdir()
+        manager.update_sandbox_paths(ApprovalChoice.SESSION, {str(another_runtime): Decision.ALLOW})
+        assert not cancellation.is_set()
+        if revoke == "reset":
+            assert manager.reset_session()
+        else:
+            assert manager.update_sandbox_paths(ApprovalChoice.SESSION, {str(runtime): None})
+        assert cancellation.is_set()
+    assert "path policy changed" in manager.sandbox_scope_limit(request).lower()
+    assert not manager.authorize_sandboxed_command(request, tool_id="run_command")
+
+
+def test_command_approval_preserves_independent_read_path_policy(tmp_path):
+    """A command approval lists its new read root but never creates a reusable file grant."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    working = workspace / "tests"
+    working.mkdir()
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    interaction = Mock(spec=ConsoleInteraction)
+    interaction.prompt.return_value = "approve"
+    manager = PermissionManager(workspace, interaction=interaction)
+    request = native_request(
+        workspace, "echo ready", cwd=working, read_roots=(runtime,), write_roots=()
+    )
+    assert manager.authorize_sandboxed_command(request, tool_id="run_command")
+    assert prompt_scope(interaction.info.call_args.args[0])["read_roots"] == [str(runtime)]
+    assert prompt_scope(interaction.info.call_args.args[0])["working_directory"] == str(working)
+    assert not manager.sandbox_path_rules(ApprovalChoice.WORKSPACE)
+
+
+@pytest.mark.parametrize("change", ["withdraw", "read-only"])
+def test_saved_write_access_is_explicit_and_live_grants_can_be_revoked(tmp_path, change):
+    """Path entries authorize only requested writes and cancel affected owned attempts."""
+    workspace = tmp_path / "workspace"
+    output = tmp_path / "output"
+    nested = output / "nested"
+    workspace.mkdir()
+    nested.mkdir(parents=True)
+    manager = PermissionManager(workspace)
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
+    manager.update_sandbox_paths(ApprovalChoice.SESSION, {str(output): SandboxPathAccess.WRITE})
+    roots, revision = manager.sandbox_path_read_roots(
+        workspace, (), (output,), "run_command", requested_writes=(output,)
+    )
+    assert roots == (output,)
+    request = native_request(
+        workspace,
+        "printf data",
+        read_roots=roots,
+        policy_read_roots=roots,
+        permission_revision=revision,
+        write_roots=(output,),
+    )
+    assert manager.authorize_sandboxed_command(request, tool_id="run_command")
+    cancellation = Event()
+    with manager.sandbox_attempt(request, revision, cancellation) as bound:
+        assert bound is not None
+        if change == "withdraw":
+            manager.update_sandbox_paths(ApprovalChoice.SESSION, {str(output): None})
+        else:
+            manager.update_sandbox_paths(
+                ApprovalChoice.SESSION, {str(nested): SandboxPathAccess.READ_ONLY}
+            )
+        assert cancellation.is_set()
+
+    current = native_request(workspace, "printf data", write_roots=(output,))
+    assert not manager.authorize_sandboxed_command(current, tool_id="run_command")
+    if change == "read-only":
+        assert "read-only" in manager.sandbox_scope_limit(current)
+
+
+@pytest.mark.parametrize("decision", [Decision.ASK, Decision.DENY])
+def test_saved_write_never_supersedes_explicit_operation_policy(tmp_path, decision):
+    """Existing fresh asks and denials still apply to each native write capability."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    manager = PermissionManager(workspace)
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
+    manager.update_sandbox_paths(ApprovalChoice.SESSION, {str(workspace): SandboxPathAccess.WRITE})
+    manager.add_rule(
+        PermissionRule(
+            tool="run_command",
+            action=Action.FILESYSTEM_DELETE,
+            target=FileTarget(path=str(workspace), recursive=True),
+            decision=decision,
+        )
+    )
+    assert not manager.authorize_sandboxed_command(
+        native_request(workspace, "printf data", write_roots=(workspace,)), tool_id="run_command"
+    )
+
+
+@pytest.mark.parametrize("exact", [False, True])
+def test_command_approval_preserves_independent_write_path_policy(tmp_path, exact):
+    """A listed output belongs to one exact command and never changes the workspace default."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    output = workspace / "output"
+    if not exact:
+        output.mkdir()
+    interaction = Mock(spec=ConsoleInteraction)
+    interaction.prompt.return_value = "approve"
+    manager = PermissionManager(workspace, interaction=interaction)
+    request = native_request(
+        workspace,
+        "echo ready",
+        read_roots=(),
+        write_roots=() if exact else (output,),
+        write_files=(output,) if exact else (),
+    )
+    assert manager.authorize_sandboxed_command(request, tool_id="run_command")
+    assert prompt_scope(interaction.info.call_args.args[0])[
+        "write_files" if exact else "write_roots"
+    ] == [str(output)]
+    assert not manager.sandbox_path_rules(ApprovalChoice.WORKSPACE)
+    assert not manager.configuration.workspace_command_writes
+
+
+def test_exact_write_grant_cancellation_and_read_only_precedence(tmp_path):
+    """Withdraw a saved file scope from owned attempts and refuse an overlapping read-only rule."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    output = workspace / ".coverage"
+    manager = PermissionManager(workspace)
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
+    manager.update_sandbox_paths(
+        ApprovalChoice.SESSION, {str(output): SandboxPathAccess.WRITE_FILE}
+    )
+    request = native_request(
+        workspace,
+        "printf ready",
+        read_roots=(),
+        write_roots=(),
+        write_files=(output,),
+        local_network=False,
+    )
+    _, revision = manager.sandbox_path_read_roots(workspace, (), (), "run_command")
+    assert manager.authorize_sandboxed_command(request, tool_id="run_command")
+    cancellation = Event()
+    with manager.sandbox_attempt(request, revision, cancellation) as bound:
+        assert bound is not None
+        manager.update_sandbox_paths(ApprovalChoice.SESSION, {str(output): None})
+        assert cancellation.is_set()
+    manager.update_sandbox_paths(
+        ApprovalChoice.SESSION, {str(output): SandboxPathAccess.WRITE_FILE}
+    )
+    manager.update_sandbox_paths(
+        ApprovalChoice.WORKSPACE, {str(workspace): SandboxPathAccess.READ_ONLY}
+    )
+    assert "read-only" in manager.sandbox_scope_limit(request)
+    assert not manager.authorize_sandboxed_command(request, tool_id="run_command")
+
+
+@pytest.mark.parametrize("name", [".env", "AGENTS.md", "../outside"])
+def test_exact_write_rule_refuses_protected_or_external_files(tmp_path, name):
+    """A trusted exact write grant must stay within eligible workspace files."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    manager = PermissionManager(workspace)
+    path = (workspace / name).resolve()
+    with pytest.raises(ValueError, match="public workspace file"):
+        manager.update_sandbox_paths(
+            ApprovalChoice.SESSION, {str(path): SandboxPathAccess.WRITE_FILE}
+        )
+
+
 def durable_policy_inputs(root: Path) -> tuple[dict, str, str]:
     """Create an independent workspace registry and return bound policy inputs."""
     catalog = root.parent / f"{root.name}-policy-data" / "workspaces.sqlite"
@@ -881,8 +1947,9 @@ def test_pristine_policy_namespaces_bootstrap_without_user_steps(tmp_path):
     other.close()
 
 
-def test_pristine_bootstrap_keeps_backup_and_initialized_missing_policy_closed(tmp_path):
-    """Automatic first use never discards backup evidence or recreates a lost marked policy."""
+@pytest.mark.parametrize("notify", [False, True])
+def test_bootstrap_preserves_backups_and_recreates_deleted_policy(tmp_path, notify):
+    """Missing policies are recreated with notice while existing backups remain untouched."""
     arguments, _workspace_id, _ = durable_policy_inputs(tmp_path)
     user_path = arguments["user_configuration_path"]
     backup = user_path.with_name(user_path.name + ".bak")
@@ -890,8 +1957,8 @@ def test_pristine_bootstrap_keeps_backup_and_initialized_missing_policy_closed(t
 
     blocked = PermissionManager(**arguments, bootstrap_pristine_policy=True)
     assert blocked.configuration.namespace_generation is not None
-    assert "user namespace recovery required" in blocked.describe()
-    assert backup.exists() and not user_path.exists()
+    blocked.require_policy_ready()
+    assert backup.exists() and user_path.exists()
     blocked.close()
 
     backup.unlink()
@@ -904,9 +1971,17 @@ def test_pristine_bootstrap_keeps_backup_and_initialized_missing_policy_closed(t
     )
     initialized.close()
     user_path.unlink()
-    missing = PermissionManager(**arguments, bootstrap_pristine_policy=True)
-    assert "Initialized policy is missing" in missing.describe()
-    assert not user_path.exists()
+    interaction = Mock(spec=Interaction)
+    missing = PermissionManager(
+        **arguments, bootstrap_pristine_policy=True, interaction=interaction if notify else None
+    )
+    missing.require_policy_ready()
+    if notify:
+        interaction.warning.assert_called_once()
+        assert "created defaults" in interaction.warning.call_args.args[0]
+    else:
+        interaction.warning.assert_not_called()
+    assert user_path.is_file()
     missing.close()
 
 
@@ -978,6 +2053,11 @@ def test_markerless_legacy_policy_migrates_missing_local_limit_as_deny(tmp_path)
     path.parent.mkdir(parents=True)
     payload = PermissionConfiguration().model_dump(mode="json")
     payload["version"] = 1
+    if "defaults" in payload:
+        payload["defaults"].pop("filesystem.execute", None)
+        payload["defaults"].pop("network.local", None)
+        payload["defaults"].pop("network.broad", None)
+        payload["defaults"].pop("network.ingress", None)
     payload.pop("namespace_generation")
     payload["limits"].pop("deny_local_networks")
     original = dump_yaml(payload).encode("utf-8")
@@ -992,7 +2072,8 @@ def test_markerless_legacy_policy_migrates_missing_local_limit_as_deny(tmp_path)
         set_telemetry(None)
 
     assert migrated.configuration.limits.deny_local_networks is True
-    assert migrated.configuration.version == 2
+    assert migrated.configuration.version == 10
+    assert migrated.configuration.backend_option_revisions.keys() == SANDBOX_OPTIONS.keys()
     generation = migrated.configuration.namespace_generation
     assert path.with_name(f"{path.name}.{generation}.legacy.bak").read_bytes() == original
     assert any(
@@ -1005,7 +2086,7 @@ def test_markerless_legacy_policy_migrates_missing_local_limit_as_deny(tmp_path)
             "SELECT payload_json FROM permission_audit_records "
             "WHERE event_name = 'permission.policy_legacy_migrated'"
         ).fetchone()
-    assert json.loads(row[0]) == {"scope": "workspace", "version": 2}
+    assert json.loads(row[0]) == {"scope": "workspace", "version": 10}
     migrated.close()
 
 
@@ -1129,8 +2210,11 @@ def test_policy_namespace_resumes_new_publication_after_interruption(tmp_path, m
 
 
 @pytest.mark.parametrize("scope", ["workspace", "user"])
-def test_reserved_new_namespace_refuses_later_backup_evidence(tmp_path, monkeypatch, scope):
-    """A paused first-use reservation cannot discard backup evidence added before restart."""
+@pytest.mark.parametrize("bootstrap", [False, True])
+def test_reserved_new_namespace_preserves_backups_when_recreating_defaults(
+    tmp_path, monkeypatch, scope, bootstrap
+):
+    """Resuming a missing policy preserves existing backups and publishes defaults."""
     arguments, workspace_id, user_identity = durable_policy_inputs(tmp_path)
     manager = PermissionManager(**arguments)
     if scope == "user":
@@ -1146,15 +2230,19 @@ def test_reserved_new_namespace_refuses_later_backup_evidence(tmp_path, monkeypa
     backup = path.with_name(path.name + ".old.bak")
     backup.write_bytes(b"prior-restrictive-policy")
 
-    blocked = PermissionManager(**arguments, bootstrap_pristine_policy=True)
+    blocked = PermissionManager(**arguments, bootstrap_pristine_policy=bootstrap)
 
-    assert "Reserved new policy has backup evidence requiring recovery" in blocked.describe()
-    assert not path.exists()
+    if bootstrap:
+        blocked.require_policy_ready()
+        assert path.exists()
+    else:
+        assert "Reserved new policy has backup evidence requiring recovery" in blocked.describe()
+        assert not path.exists()
     assert backup.read_bytes() == b"prior-restrictive-policy"
 
 
-def test_pristine_namespace_refuses_unverifiable_backup_listing(tmp_path, monkeypatch):
-    """A directory inspection error cannot hide a backup and initialize defaults."""
+def test_missing_policy_does_not_require_inspecting_unrelated_backups(tmp_path, monkeypatch):
+    """Missing-file recovery does not modify backups or depend on listing them."""
     arguments, _workspace_id, _user_identity = durable_policy_inputs(tmp_path)
     path = arguments["configuration_path"]
     path.parent.mkdir(parents=True)
@@ -1171,8 +2259,8 @@ def test_pristine_namespace_refuses_unverifiable_backup_listing(tmp_path, monkey
     monkeypatch.setattr(manager_module.os, "scandir", refuse_policy_listing)
     blocked = PermissionManager(**arguments, bootstrap_pristine_policy=True)
 
-    assert "Policy backup evidence cannot be inspected" in blocked.describe()
-    assert not path.exists()
+    blocked.require_policy_ready()
+    assert path.exists()
     assert backup.read_bytes() == b"prior-restrictive-policy"
 
 
@@ -1333,6 +2421,12 @@ def test_marked_previous_workspace_schema_migrates_with_exact_backup(tmp_path, l
     payload = load_yaml(path.read_text(encoding="utf-8"))
     generation = payload["namespace_generation"]
     payload["version"] = 1
+    payload.pop("backend_option_revisions")
+    if "defaults" in payload:
+        payload["defaults"].pop("filesystem.execute", None)
+        payload["defaults"].pop("network.local", None)
+        payload["defaults"].pop("network.broad", None)
+        payload["defaults"].pop("network.ingress", None)
     if local_network is None:
         payload["limits"].pop("deny_local_networks")
     else:
@@ -1350,14 +2444,15 @@ def test_marked_previous_workspace_schema_migrates_with_exact_backup(tmp_path, l
         set_telemetry(None)
     assert "recovery required" not in migrated.describe()
     migrated.require_policy_ready()
-    assert migrated.configuration.version == 2
+    assert migrated.configuration.version == 10
     assert migrated.configuration.namespace_generation == generation
+    assert migrated.configuration.backend_option_revisions.keys() == SANDBOX_OPTIONS.keys()
     assert migrated.configuration.defaults[Action.FILESYSTEM_READ] is Decision.DENY
-    assert migrated.authorize_sandboxed_command(
+    assert not migrated.authorize_sandboxed_command(
         native_request(tmp_path, "pwd", read_roots=(), local_network=False), tool_id="run_command"
     )
     saved = load_yaml(path.read_text(encoding="utf-8"))
-    assert saved["version"] == 2
+    assert saved["version"] == 10
     assert saved["limits"]["deny_local_networks"] is (
         True if local_network is None else local_network
     )
@@ -1383,6 +2478,11 @@ def test_marked_schema_migration_rejects_conflicting_archive(tmp_path):
     payload = load_yaml(path.read_text(encoding="utf-8"))
     generation = payload["namespace_generation"]
     payload["version"] = 1
+    if "defaults" in payload:
+        payload["defaults"].pop("filesystem.execute", None)
+        payload["defaults"].pop("network.local", None)
+        payload["defaults"].pop("network.broad", None)
+        payload["defaults"].pop("network.ingress", None)
     payload["limits"].pop("deny_local_networks")
     original = dump_yaml(payload).encode("utf-8")
     path.write_bytes(original)
@@ -1408,6 +2508,11 @@ def test_marked_schema_migration_refuses_changed_policy(tmp_path, monkeypatch, o
     path = arguments["configuration_path"]
     payload = load_yaml(path.read_text(encoding="utf-8"))
     payload["version"] = 1
+    if "defaults" in payload:
+        payload["defaults"].pop("filesystem.execute", None)
+        payload["defaults"].pop("network.local", None)
+        payload["defaults"].pop("network.broad", None)
+        payload["defaults"].pop("network.ingress", None)
     payload["limits"].pop("deny_local_networks")
     path.write_text(dump_yaml(payload), encoding="utf-8")
     original_read = PermissionManager._read_namespaced_file
@@ -1451,6 +2556,11 @@ def test_marked_previous_schema_still_rejects_other_missing_limits(tmp_path):
     path = arguments["configuration_path"]
     payload = load_yaml(path.read_text(encoding="utf-8"))
     payload["version"] = 1
+    if "defaults" in payload:
+        payload["defaults"].pop("filesystem.execute", None)
+        payload["defaults"].pop("network.local", None)
+        payload["defaults"].pop("network.broad", None)
+        payload["defaults"].pop("network.ingress", None)
     payload["limits"].pop("deny_private_networks")
     path.write_text(dump_yaml(payload), encoding="utf-8")
 
@@ -1473,7 +2583,7 @@ def test_invalid_marked_policy_stops_before_model_work_with_repair_path(tmp_path
         else arguments["configuration_path"]
     )
     payload = load_yaml(path.read_text(encoding="utf-8"))
-    payload["version"] = 3
+    payload["version"] = 999
     path.write_text(dump_yaml(payload), encoding="utf-8")
 
     refused = PermissionManager(**arguments)
@@ -2261,21 +3371,22 @@ def test_async_sandbox_admission_revokes_live_egress_on_namespace_change(
         other.close()
 
 
-def test_cancelled_async_sandbox_admission_does_not_publish_approval_revision(tmp_path):
-    """A cancelled final check cannot leave an approved revision for launch."""
+@pytest.mark.parametrize("check", ["sandbox_scope_limit", "_sandbox_policy_revision_unless_busy"])
+def test_cancelled_async_sandbox_admission_does_not_publish_approval_revision(tmp_path, check):
+    """Cancellation during a worker scope or revision check cannot publish a launch approval."""
     manager = PermissionManager(tmp_path)
     request = native_request(tmp_path, "printf safe", read_roots=())
     approved_revision = []
 
-    async def cancel_final_check():
-        """Cancel admission after the worker completes its final revision check."""
+    async def cancel_check():
+        """Cancel admission after the worker completes the selected check."""
         checked = asyncio.Event()
         release = asyncio.Event()
 
         async def paused_runner(function, *args):
-            """Hold the completed final revision result until the caller is cancelled."""
+            """Hold the completed worker result until the caller is cancelled."""
             result = await asyncio.to_thread(function, *args)
-            if function == manager._sandbox_policy_revision_unless_busy:
+            if function == getattr(manager, check):
                 checked.set()
                 await release.wait()
             return result
@@ -2293,7 +3404,7 @@ def test_cancelled_async_sandbox_admission_does_not_publish_approval_revision(tm
             await pending
 
     try:
-        asyncio.run(cancel_final_check())
+        asyncio.run(cancel_check())
         assert approved_revision == []
     finally:
         manager.close()
@@ -2306,7 +3417,8 @@ def test_async_sandbox_admission_waits_without_occupying_worker_on_policy_lock(
     inspection = Mock(spec=CommandInspection)
     manager = PermissionManager(tmp_path, command_inspection=inspection)
     manager.set_async_blocking_runner(lambda function, *args: asyncio.to_thread(function, *args))
-    request = native_request(tmp_path, "printf safe", read_roots=())
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
+    request = native_request(tmp_path, "printf safe", read_roots=(), write_roots=())
     entered = Event()
     release = Event()
 
@@ -2618,7 +3730,7 @@ def test_revision_bound_host_rule_rejects_peer_policy_change(tmp_path, monkeypat
 
 def test_trusted_host_grant_binds_exact_root_source_and_registered_tool(tmp_path):
     """A human session grant matches only its exact command and live workspace root."""
-    manager = PermissionManager(tmp_path)
+    manager = PermissionManager(tmp_path, allow_direct_host_execution=True)
     with pytest.raises(ValueError, match="exact host command"):
         manager.trust_host_command(" ")
     with pytest.raises(ValueError, match="exact host command"):
@@ -2668,14 +3780,14 @@ def test_trusted_host_grant_binds_exact_root_source_and_registered_tool(tmp_path
 
 def test_trusted_host_grant_refuses_missing_or_untrusted_workspace(tmp_path):
     """No grant can be installed without a live workspace and valid policy namespace."""
-    without_root = PermissionManager()
+    without_root = PermissionManager(allow_direct_host_execution=True)
     with pytest.raises(ValueError, match="current workspace"):
         without_root.trust_host_command("printf host")
     without_root.close()
 
     root = tmp_path / "workspace"
     root.mkdir()
-    manager = PermissionManager(root)
+    manager = PermissionManager(root, allow_direct_host_execution=True)
     manager.trust_host_command("printf host")
     root.rename(tmp_path / "moved")
     assert (
@@ -2687,7 +3799,7 @@ def test_trusted_host_grant_refuses_missing_or_untrusted_workspace(tmp_path):
     manager.close()
 
     arguments, _workspace_id, _user_identity = durable_policy_inputs(tmp_path / "moved")
-    uninitialized = PermissionManager(**arguments)
+    uninitialized = PermissionManager(**arguments, allow_direct_host_execution=True)
     with pytest.raises(ValueError, match="recovery is required"):
         uninitialized.trust_host_command("printf host")
     assert (
@@ -2704,7 +3816,8 @@ def test_host_grants_require_validated_namespace_for_durable_scopes(tmp_path):
     user_path = tmp_path.parent / f"{tmp_path.name}-user-policy.yaml"
     manager = PermissionManager(tmp_path, user_configuration_path=user_path)
     choices, _ = manager.host_retry_choices(False, trusted=True)
-    assert "trust_session" in choices
+    assert choices["approve"] == "Approve this one host run"
+    assert choices["trust_session"] == "Trust this exact host command for this session"
     assert "trust_workspace" not in choices
     assert "trust_user" not in choices
     with pytest.raises(ValueError, match="validated durable user permission policy"):
@@ -2715,7 +3828,7 @@ def test_host_grants_require_validated_namespace_for_durable_scopes(tmp_path):
 
 def test_trusted_host_grant_expires_when_session_scratch_or_path_changes(tmp_path, monkeypatch):
     """A new scratch generation or process PATH invalidates an exact no-prompt grant."""
-    manager = PermissionManager(tmp_path)
+    manager = PermissionManager(tmp_path, allow_direct_host_execution=True)
     rule = manager.trust_host_command("printf host")
     scratch = tmp_path / "scratch"
     scratch.mkdir(mode=0o700)
@@ -2737,7 +3850,7 @@ def test_trusted_host_grant_expires_when_session_scratch_or_path_changes(tmp_pat
 def test_trusted_host_grants_persist_by_scope_and_revoke_across_restart(tmp_path):
     """Workspace and user grants survive restart without binding the old session scratch."""
     arguments, workspace_id, user_identity = durable_policy_inputs(tmp_path)
-    manager = PermissionManager(**arguments)
+    manager = PermissionManager(**arguments, allow_direct_host_execution=True)
     manager.initialize_policy_namespace("workspace", workspace_id, authorized=True)
     manager.initialize_policy_namespace("user", user_identity, authorized=True)
     workspace_rule = manager.trust_host_command("printf workspace", ApprovalChoice.WORKSPACE)
@@ -2749,7 +3862,9 @@ def test_trusted_host_grants_persist_by_scope_and_revoke_across_restart(tmp_path
     manager.close()
 
     unvalidated = PermissionManager(
-        tmp_path, user_configuration_path=arguments["user_configuration_path"]
+        tmp_path,
+        user_configuration_path=arguments["user_configuration_path"],
+        allow_direct_host_execution=True,
     )
     assert unvalidated.trusted_host_command_rules() == ()
     assert (
@@ -2760,7 +3875,7 @@ def test_trusted_host_grants_persist_by_scope_and_revoke_across_restart(tmp_path
     )
     unvalidated.close()
 
-    reloaded = PermissionManager(**arguments)
+    reloaded = PermissionManager(**arguments, allow_direct_host_execution=True)
     assert (
         reloaded.matching_trusted_host_command_rule(
             "printf workspace", tmp_path, "request_host_command"
@@ -2781,7 +3896,7 @@ def test_trusted_host_grants_persist_by_scope_and_revoke_across_restart(tmp_path
     assert reloaded.remove_trusted_host_command_rule(workspace_rule.id, ApprovalChoice.WORKSPACE)
     assert reloaded.remove_trusted_host_command_rule(user_rule.id, ApprovalChoice.USER)
     reloaded.close()
-    final = PermissionManager(**arguments)
+    final = PermissionManager(**arguments, allow_direct_host_execution=True)
     assert final.trusted_host_command_rules() == ()
     final.close()
 
@@ -2791,7 +3906,7 @@ def test_user_host_grant_matches_another_registered_workspace(tmp_path):
     first = tmp_path / "first"
     first.mkdir()
     arguments, workspace_id, user_identity = durable_policy_inputs(first)
-    manager = PermissionManager(**arguments)
+    manager = PermissionManager(**arguments, allow_direct_host_execution=True)
     manager.initialize_policy_namespace("workspace", workspace_id, authorized=True)
     manager.initialize_policy_namespace("user", user_identity, authorized=True)
     manager.trust_host_command("printf workspace", ApprovalChoice.WORKSPACE)
@@ -2811,7 +3926,8 @@ def test_user_host_grant_matches_another_registered_workspace(tmp_path):
             "configuration_path": arguments["configuration_path"].parent.parent
             / workspace.id
             / "permissions.yaml",
-        }
+        },
+        allow_direct_host_execution=True,
     )
     other.initialize_policy_namespace("workspace", workspace.id, authorized=True)
     assert (
@@ -2825,9 +3941,42 @@ def test_user_host_grant_matches_another_registered_workspace(tmp_path):
     other.close()
 
 
+@pytest.mark.parametrize("scope", [ApprovalChoice.SESSION, ApprovalChoice.WORKSPACE])
+def test_scoped_trusted_host_grant_refuses_a_replaced_working_directory(tmp_path, scope):
+    """A scoped host grant requires the directory originally reviewed at that relative name."""
+    arguments, _, _ = durable_policy_inputs(tmp_path)
+    with closing(
+        PermissionManager(
+            **arguments, bootstrap_pristine_policy=True, allow_direct_host_execution=True
+        )
+    ) as manager:
+        directory = tmp_path / "subdirectory"
+        directory.mkdir()
+        request = native_request(tmp_path, source="printf host", cwd=directory)
+        _, revision = manager.evaluate_with_revision(())
+        remembered = manager.remember_trusted_host_command_rule_if_current(request, scope, revision)
+        assert remembered is not None
+        grant, _ = remembered
+        assert (
+            manager.matching_trusted_host_command_rule(
+                "printf host", directory, "request_host_command"
+            )
+            == grant
+        )
+
+        directory.rename(tmp_path / "retired")
+        directory.mkdir()
+        assert (
+            manager.matching_trusted_host_command_rule(
+                "printf host", directory, "request_host_command"
+            )
+            is None
+        )
+
+
 def test_trusted_host_grant_rejects_stale_installation_and_noncanonical_cwd(tmp_path, monkeypatch):
     """A changed revision or working-directory authority cannot install a host grant."""
-    manager = PermissionManager(tmp_path)
+    manager = PermissionManager(tmp_path, allow_direct_host_execution=True)
     request = native_request(tmp_path, source="printf host")
     _, revision = manager.evaluate_with_revision(())
     manager.set_default(Action.PROCESS_EXECUTE, Decision.DENY, scope=PolicyScope.SESSION)
@@ -2863,6 +4012,11 @@ def test_marked_user_policy_migrates_with_exact_backup(tmp_path, missing_host_gr
     payload = load_yaml(path.read_text(encoding="utf-8"))
     generation = payload["namespace_generation"]
     payload["version"] = 1
+    if "defaults" in payload:
+        payload["defaults"].pop("filesystem.execute", None)
+        payload["defaults"].pop("network.local", None)
+        payload["defaults"].pop("network.broad", None)
+        payload["defaults"].pop("network.ingress", None)
     if missing_host_grants:
         payload.pop("trusted_host_command_rules")
     original = dump_yaml(payload).encode("utf-8")
@@ -2871,7 +4025,7 @@ def test_marked_user_policy_migrates_with_exact_backup(tmp_path, missing_host_gr
     assert recovered.trusted_host_command_rules() == ()
     assert "recovery required" not in recovered.describe()
     saved = load_yaml(path.read_text(encoding="utf-8"))
-    assert saved["version"] == 2
+    assert saved["version"] == 10
     assert saved["trusted_host_command_rules"] == []
     assert saved["namespace_generation"] == generation
     assert path.with_name(f"{path.name}.{generation}.schema-v1.bak").read_bytes() == original
@@ -2881,7 +4035,7 @@ def test_marked_user_policy_migrates_with_exact_backup(tmp_path, missing_host_gr
 def test_trusted_host_grant_scope_does_not_bypass_workspace_identity(tmp_path):
     """A workspace grant stops matching when the registered workspace inode changes."""
     arguments, workspace_id, user_identity = durable_policy_inputs(tmp_path)
-    manager = PermissionManager(**arguments)
+    manager = PermissionManager(**arguments, allow_direct_host_execution=True)
     manager.initialize_policy_namespace("workspace", workspace_id, authorized=True)
     manager.initialize_policy_namespace("user", user_identity, authorized=True)
     manager.trust_host_command("printf host", ApprovalChoice.WORKSPACE)
@@ -2895,41 +4049,20 @@ def test_trusted_host_grant_scope_does_not_bypass_workspace_identity(tmp_path):
     manager.close()
 
 
-def test_host_gate_offer_requires_only_user_changeable_eligibility(tmp_path):
-    """A denied policy or changed gate prevents a stale eligibility grant."""
+def test_host_gate_requires_trusted_setting_and_does_not_reset_with_policy(tmp_path):
+    """Ordinary permission resets cannot enable or disable the trusted host setting."""
     manager = PermissionManager(tmp_path)
-    host = operation(
-        Action.PROCESS_EXECUTE,
-        tool="request_host_command",
-        target=ProcessTarget(
-            argv=("/bin/sh", "-c", "printf host"),
-            cwd=str(tmp_path),
-            boundary=ProcessBoundary.HOST,
-        ),
-    )
-    assert manager.host_gate_enable_revision(()) is None
-    assert (
-        manager.host_gate_enable_revision((file_operation(Action.FILESYSTEM_READ, tmp_path),))
-        is None
-    )
-    revision = manager.host_gate_enable_revision((host,))
-    assert revision is not None
-    assert not manager.enable_host_gate_if_current((host,), revision + 1)
-    manager.add_rule(
-        PermissionRule(
-            decision=Decision.DENY,
-            tool="request_host_command",
-            action=Action.PROCESS_EXECUTE,
-        ),
-        scope=PolicyScope.SESSION,
-    )
-    assert manager.host_gate_enable_revision((host,)) is None
-    assert not manager.enable_host_gate_if_current((host,), revision)
+    assert not manager.direct_host_execution_enabled
+    manager.set_yolo(True)
+    assert not manager.direct_host_execution_enabled
+    _, before = manager.evaluate_with_revision(())
+    manager.set_direct_host_execution(True)
+    _, after = manager.evaluate_with_revision(())
+    assert after > before
     manager.reset_session()
-    fresh = manager.host_gate_enable_revision((host,))
-    assert fresh is not None
-    assert manager.enable_host_gate_if_current((host,), fresh)
-    assert manager.host_gate_enable_revision((host,)) is None
+    assert manager.direct_host_execution_enabled
+    manager.set_direct_host_execution(False)
+    assert not manager.direct_host_execution_enabled
     manager.close()
 
 
@@ -2994,11 +4127,14 @@ def test_policy_snapshot_revision_identifies_later_change(tmp_path, asynchronous
 
 def test_host_policy_owns_input_configuration_and_rule_copies(tmp_path):
     """Mutating supplied models cannot bypass synchronized policy changes."""
-    configuration = PermissionConfiguration(limits=PolicyLimits(allow_host_processes=True))
-    manager = PermissionManager(tmp_path, configuration=configuration)
+    configuration = PermissionConfiguration(limits=PolicyLimits())
+    manager = PermissionManager(
+        tmp_path, configuration=configuration, allow_direct_host_execution=True
+    )
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ASK)
     target = ProcessTarget(argv=("/bin/sh", "-c", "true"), cwd=str(tmp_path))
     operations = (operation(Action.PROCESS_EXECUTE, target=target),)
-    configuration.limits.allow_host_processes = False
+    configuration.defaults[Action.PROCESS_EXECUTE] = Decision.DENY
     rule = PermissionRule(decision=Decision.DENY, action=Action.PROCESS_EXECUTE)
     manager.add_rule(rule, scope=PolicyScope.SESSION)
     rule.decision = Decision.ALLOW
@@ -3009,16 +4145,17 @@ def test_host_policy_owns_input_configuration_and_rule_copies(tmp_path):
 
 
 @pytest.mark.parametrize("write_roots", [(), "workspace"])
-def test_native_default_workspace_access_runs_without_prompt(tmp_path, write_roots):
-    """Routine workspace commands run in either write mode without a prompt."""
+def test_native_default_workspace_access_requires_process_approval(tmp_path, write_roots):
+    """Both scratch-only and writable commands require default process approval."""
     interaction = Mock(spec=Interaction)
     manager = PermissionManager(tmp_path, interaction=interaction)
     roots = (tmp_path,) if write_roots == "workspace" else ()
+    interaction.prompt.return_value = "approve"
     assert manager.authorize_sandboxed_command(
         native_request(tmp_path, "cat file", write_roots=roots, read_roots=()),
         tool_id="run_command",
     )
-    interaction.prompt.assert_not_called()
+    interaction.prompt.assert_called_once()
 
 
 def test_async_sandbox_approval_uses_native_prompt_and_returns_approved_result(tmp_path):
@@ -3044,15 +4181,18 @@ def test_async_sandbox_approval_uses_native_prompt_and_returns_approved_result(t
     }
 
 
-def test_async_sandbox_default_workspace_command_runs_without_prompt(tmp_path):
-    """Routine workspace commands retain prompt-free sandbox access asynchronously."""
+def test_async_sandbox_explicit_allow_runs_without_prompt(tmp_path):
+    """An explicit process allow permits scratch-only sandbox execution without a prompt."""
     interaction = ConsoleInteraction(console=Console(file=io.StringIO()), markdown=False)
     interaction.prompt_async = AsyncMock()
     manager = PermissionManager(tmp_path, interaction=interaction)
+    # Configure automatic process approval to isolate resource-grant behavior.
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
     request = native_request(
         tmp_path,
         "printf safe",
         read_roots=(),
+        write_roots=(),
         environment={"PATH": "/usr/bin:/bin", "TMPDIR": str(manager.temporary_directory)},
     )
     approved_revision = []
@@ -3078,6 +4218,8 @@ def test_default_sandbox_rechecks_policy_after_inspection(tmp_path, asynchronous
     inspection = Mock(spec=CommandInspection)
     manager = PermissionManager(tmp_path, interaction=interaction, command_inspection=inspection)
 
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
+
     def change_policy(*_args, **_kwargs):
         """Change policy while the initial command inspection is pending."""
         manager.add_rule(
@@ -3087,7 +4229,7 @@ def test_default_sandbox_rechecks_policy_after_inspection(tmp_path, asynchronous
         return ()
 
     inspection.inspect.side_effect = change_policy
-    request = native_request(tmp_path, "printf safe", read_roots=())
+    request = native_request(tmp_path, "printf safe", read_roots=(), write_roots=())
     if asynchronous:
         approved = asyncio.run(
             manager.authorize_sandboxed_command_async(request, tool_id="run_command")
@@ -3100,11 +4242,103 @@ def test_default_sandbox_rechecks_policy_after_inspection(tmp_path, asynchronous
     interaction.prompt_async.assert_not_awaited()
 
 
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize(
+    "scope", [ApprovalChoice.SESSION, ApprovalChoice.WORKSPACE, ApprovalChoice.USER]
+)
+def test_default_command_ask_remembers_only_reviewed_scope(tmp_path, asynchronous, scope):
+    """Default ask offers durable scopes while changed authority still requires approval."""
+    interaction = ConsoleInteraction(console=Console(file=io.StringIO()), markdown=False)
+    answer = scope.value
+    interaction.prompt = Mock(return_value=answer)
+    interaction.prompt_async = AsyncMock(return_value=answer)
+    user_path = tmp_path / "user.yaml"
+    manager = PermissionManager(
+        tmp_path, interaction=interaction, user_configuration_path=user_path
+    )
+    request = native_request(tmp_path, "printf safe", read_roots=(), write_roots=())
+
+    def authorize(selected):
+        """Use the public sync or async authorization entry point."""
+        if asynchronous:
+            return asyncio.run(
+                manager.authorize_sandboxed_command_async(selected, tool_id="run_command")
+            )
+        return manager.authorize_sandboxed_command(selected, tool_id="run_command")
+
+    assert manager.effective_configuration.defaults[Action.PROCESS_EXECUTE] is Decision.ASK
+    assert authorize(request)
+    prompt = interaction.prompt_async if asynchronous else interaction.prompt
+    assert {"approve", "workspace", "user"} <= set(prompt.call_args.kwargs["choices"])
+    assert manager.sandboxed_command_rules(scope)
+    if scope is not ApprovalChoice.SESSION:
+        manager.close()
+        manager = PermissionManager(
+            tmp_path, interaction=interaction, user_configuration_path=user_path
+        )
+    prompt.reset_mock()
+    prompt.return_value = "deny"
+    try:
+        assert authorize(request)
+        assert not prompt.called
+        assert not authorize(
+            native_request(tmp_path, "printf changed", read_roots=(), write_roots=())
+        )
+        assert prompt.call_count == 1
+        assert manager.effective_configuration.defaults[Action.PROCESS_EXECUTE] is Decision.ASK
+        assert not manager.direct_host_execution_enabled
+    finally:
+        manager.close()
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize(
+    "scope", [ApprovalChoice.SESSION, ApprovalChoice.WORKSPACE, ApprovalChoice.USER]
+)
+def test_remembered_sandbox_command_rechecks_the_hard_path_scope(tmp_path, asynchronous, scope):
+    """Removing a trusted hard denial requires review of the widened native scope."""
+    interaction = Mock(spec=ConsoleInteraction)
+    interaction.prompt = Mock(return_value=scope.value)
+    interaction.prompt_async = AsyncMock(return_value=scope.value)
+    request = native_request(tmp_path, "printf safe", read_roots=(), write_roots=())
+    protected = str(tmp_path / "restricted.txt")
+    with closing(
+        PermissionManager(
+            tmp_path, interaction=interaction, user_configuration_path=tmp_path / "user.yaml"
+        )
+    ) as manager:
+
+        def authorize():
+            """Review the same request under the current trusted path policy."""
+            if asynchronous:
+                return asyncio.run(
+                    manager.authorize_sandboxed_command_async(request, tool_id="run_command")
+                )
+            return manager.authorize_sandboxed_command(request, tool_id="run_command")
+
+        assert manager.update_sandbox_paths(
+            ApprovalChoice.WORKSPACE, {protected: SandboxPathAccess.DENY}
+        )
+        assert authorize()
+        assert manager.sandboxed_command_rules(scope)
+        prompt = interaction.prompt_async if asynchronous else interaction.prompt
+        prompt.reset_mock()
+        prompt.return_value = "deny"
+        assert authorize()
+        prompt.assert_not_called()
+
+        assert manager.update_sandbox_paths(ApprovalChoice.WORKSPACE, {protected: None})
+        assert not authorize()
+        prompt.assert_called_once()
+
+
 def test_async_sandbox_approval_remembers_session_rule_for_later_requests(tmp_path):
     """Async sandbox approval stores reusable choices and skips matching later prompts."""
     interaction = ConsoleInteraction(console=Console(file=io.StringIO()), markdown=False)
     interaction.prompt_async = AsyncMock(return_value="session")
     manager = PermissionManager(tmp_path, interaction=interaction)
+    # Configure automatic process approval to isolate resource-grant behavior.
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
     request = native_request(tmp_path, "cat file")
     approved_revision = []
 
@@ -3137,6 +4371,8 @@ def test_sandbox_rule_rejects_policy_change_during_lookup(
     interaction.prompt = Mock(return_value="session")
     interaction.prompt_async = AsyncMock(return_value="session")
     manager = PermissionManager(tmp_path, interaction=interaction)
+    # Configure automatic process approval to isolate resource-grant behavior.
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
     request = native_request(tmp_path, "cat file")
     assert manager.authorize_sandboxed_command(request, tool_id="run_command")
     rule_id = manager.sandboxed_command_rules(ApprovalChoice.SESSION)[0].id
@@ -3187,6 +4423,8 @@ def test_sandbox_prompt_does_not_open_after_policy_changes_during_empty_lookup(
     interaction.prompt = Mock(return_value="approve")
     interaction.prompt_async = AsyncMock(return_value="approve")
     manager = PermissionManager(tmp_path, interaction=interaction)
+    # Configure automatic process approval to isolate resource-grant behavior.
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
     original = manager.sandboxed_command_rules
     changed = False
 
@@ -3355,6 +4593,8 @@ def test_sandbox_explicit_ask_cannot_be_skipped_by_a_remembered_approval(tmp_pat
     interaction.prompt = Mock(side_effect=["session", "deny"])
     interaction.prompt_async = AsyncMock(side_effect=["session", "deny"])
     manager = PermissionManager(tmp_path, interaction=interaction)
+    # Configure automatic process approval to isolate resource-grant behavior.
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
     request = native_request(tmp_path, "cat file")
 
     if asynchronous:
@@ -3396,6 +4636,8 @@ def test_sandbox_remembering_rechecks_policy_after_signature_preparation(
     interaction = ConsoleInteraction(console=Console(file=io.StringIO()), markdown=False)
     interaction.info = Mock()
     manager = PermissionManager(tmp_path, interaction=interaction)
+    # Configure automatic process approval to isolate resource-grant behavior.
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
     original = SandboxRequest.sandbox_command_signature
     answered = False
     changed = False
@@ -3453,7 +4695,7 @@ def test_async_sandbox_approval_obeys_explicit_ask_rules(tmp_path):
         manager.authorize_sandboxed_command_async(request, tool_id="run_command")
     )
 
-    assert "run under your command approval rule" in console.file.getvalue()
+    assert "run under your command approval rule" in " ".join(console.file.getvalue().split())
     interaction.prompt_async.assert_awaited_once()
 
 
@@ -3555,6 +4797,8 @@ def test_async_sandbox_approval_cancellation_settles_owned_work(tmp_path, cancel
     interaction = ConsoleInteraction(console=Console(file=io.StringIO()), markdown=False)
     interaction.prompt_async = AsyncMock(return_value="session")
     manager = PermissionManager(tmp_path, interaction=interaction)
+    # Configure automatic process approval to isolate resource-grant behavior.
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
     request = native_request(tmp_path, "cat file")
 
     async def exercise():
@@ -3628,15 +4872,26 @@ def test_explicit_process_ask_rule_still_prompts_for_default_sandbox(tmp_path):
         "FOO=1 command mv source existing",
     ],
 )
-def test_native_destructive_workspace_commands_require_approval(tmp_path, source):
-    """Recognizable destructive shell actions ask even within default workspace access."""
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_native_destructive_workspace_commands_require_approval(tmp_path, source, asynchronous):
+    """Recognized destructive shell actions still ask under automatic process approval."""
     interaction = Mock(spec=Interaction)
     interaction.prompt.return_value = "deny"
     manager = PermissionManager(tmp_path, interaction=interaction)
-
-    assert not manager.authorize_sandboxed_command(
-        native_request(tmp_path, source, read_roots=()), tool_id="run_command"
-    )
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
+    request = native_request(tmp_path, source, read_roots=(), write_roots=())
+    if asynchronous:
+        interaction = Mock(spec=ConsoleInteraction)
+        interaction.prompt_async = AsyncMock(return_value="deny")
+        assert not asyncio.run(
+            manager.authorize_sandboxed_command_async(
+                request, tool_id="run_command", interaction=interaction
+            )
+        )
+        prompt = interaction.prompt_async
+    else:
+        assert not manager.authorize_sandboxed_command(request, tool_id="run_command")
+        prompt = interaction.prompt
     if "git" in source:
         assert "Review a Git state-changing command" in interaction.info.call_args.args[0]
         assert "change repository state" in interaction.info.call_args.args[0]
@@ -3645,8 +4900,7 @@ def test_native_destructive_workspace_commands_require_approval(tmp_path, source
     else:
         assert "Review a destructive workspace command" in interaction.info.call_args.args[0]
         assert "delete or overwrite files" in interaction.info.call_args.args[0]
-    assert "similar_session" not in interaction.prompt.call_args.kwargs["choices"]
-    assert set(interaction.prompt.call_args.kwargs["choices"]) == {"deny", "approve", "details"}
+    assert set(prompt.call_args.kwargs["choices"]) == {"deny", "approve", "details"}
 
 
 def test_git_write_requires_fresh_approval_after_prior_approval(tmp_path):
@@ -3696,6 +4950,8 @@ def test_fresh_command_finding_overrides_matching_remembered_rule(tmp_path):
     manager = PermissionManager(
         tmp_path, user_configuration_path=user_path, interaction=interaction
     )
+    # Configure automatic process approval to isolate resource-grant behavior.
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
     assert manager.authorize_sandboxed_command(
         native_request(tmp_path, "printf benign"), tool_id="run_command"
     )
@@ -3741,6 +4997,8 @@ def test_injected_inspection_controls_command_review_and_git_grant_intent(tmp_pa
     interaction.prompt.return_value = "deny"
     inspection = CommandInspection(()).with_matcher(match_special)
     manager = PermissionManager(tmp_path, interaction=interaction, command_inspection=inspection)
+    # Configure automatic process approval to isolate resource-grant behavior.
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
     assert manager.command_needs_git_write("special command")
     assert not manager.command_needs_git_write("git add file")
     assert not manager.authorize_sandboxed_command(
@@ -3749,7 +5007,7 @@ def test_injected_inspection_controls_command_review_and_git_grant_intent(tmp_pa
     )
     assert "Review a special command" in interaction.info.call_args.args[0]
     assert "run a special command" in interaction.info.call_args.args[0]
-    assert "session" in interaction.prompt.call_args.kwargs["choices"]
+    assert "approve" in interaction.prompt.call_args.kwargs["choices"]
 
 
 @pytest.mark.parametrize("source", ["printf '%s' 'rm -rf build'", "echo '"])
@@ -3757,8 +5015,10 @@ def test_native_non_destructive_or_invalid_source_does_not_trigger_review(tmp_pa
     """Literal output, empty segments, and invalid shell text do not claim destructive intent."""
     interaction = Mock(spec=Interaction)
     manager = PermissionManager(tmp_path, interaction=interaction)
+    # Configure automatic process approval to isolate resource-grant behavior.
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
     assert manager.authorize_sandboxed_command(
-        native_request(tmp_path, source, read_roots=()),
+        native_request(tmp_path, source, read_roots=(), write_roots=()),
         tool_id="run_command",
     )
     interaction.prompt.assert_not_called()
@@ -3771,10 +5031,16 @@ def test_unused_external_path_does_not_expand_read_authority(tmp_path):
     interaction = Mock(spec=Interaction)
     interaction.prompt.return_value = "deny"
     manager = PermissionManager(tmp_path, interaction=interaction)
+    # Configure automatic process approval to isolate resource-grant behavior.
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
     environment = {"PATH": str(tools), "LANG": "C"}
-    first = native_request(tmp_path, "printf first", read_roots=(), environment=environment)
+    first = native_request(
+        tmp_path, "printf first", read_roots=(), write_roots=(), environment=environment
+    )
     assert manager.authorize_sandboxed_command(first, tool_id="run_command")
-    second = native_request(tmp_path, "printf second", read_roots=(), environment=environment)
+    second = native_request(
+        tmp_path, "printf second", read_roots=(), write_roots=(), environment=environment
+    )
     assert manager.authorize_sandboxed_command(second, tool_id="run_command")
     interaction.prompt.assert_not_called()
     expanded = native_request(
@@ -3783,7 +5049,12 @@ def test_unused_external_path_does_not_expand_read_authority(tmp_path):
     assert not manager.authorize_sandboxed_command(expanded, tool_id="run_command")
     assert interaction.prompt.call_count == 1
     network = native_request(
-        tmp_path, "printf second", read_roots=(), environment=environment, network=True
+        tmp_path,
+        "printf second",
+        read_roots=(),
+        write_roots=(),
+        environment=environment,
+        network=True,
     )
     assert not manager.authorize_sandboxed_command(network, tool_id="run_command")
     assert interaction.prompt.call_count == 1
@@ -3933,13 +5204,10 @@ def test_generic_resource_rule_only_limits_possible_network_targets(tmp_path, re
     assert (
         manager.sandbox_egress_limit("run_command", ("https://example.com",)) is not None
     ) is limited
-    assert (
-        manager.authorize_sandboxed_command(
-            native_request(tmp_path, network=True, read_roots=()),
-            tool_id="run_command",
-        )
-        is not limited
-    )
+    assert manager.authorize_sandboxed_command(
+        native_request(tmp_path, network=True, read_roots=()),
+        tool_id="run_command",
+    ) is not (limited or resource in {"/bin/sh -c forbidden*", "[!h]ttps://example.com/private"})
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
@@ -4027,7 +5295,7 @@ def test_async_mediated_authorization_refuses_a_policy_change_after_snapshot(tmp
     """A revision change before the async egress check cannot reuse the old decision."""
     manager = PermissionManager(tmp_path, yolo=True)
     request = native_request(tmp_path, egress_origins=("https://example.com",))
-    evaluate = manager.evaluate_with_revision_async
+    evaluate = manager._sandbox_policy_snapshot_async
 
     async def change_after_snapshot(operations):
         """Publish a new policy immediately after the initial decision is captured."""
@@ -4035,7 +5303,7 @@ def test_async_mediated_authorization_refuses_a_policy_change_after_snapshot(tmp
         manager.update_limit_values("network_origins", "*", add=False, scope=PolicyScope.SESSION)
         return decision
 
-    monkeypatch.setattr(manager, "evaluate_with_revision_async", change_after_snapshot)
+    monkeypatch.setattr(manager, "_sandbox_policy_snapshot_async", change_after_snapshot)
 
     assert not asyncio.run(manager.authorize_sandboxed_command_async(request, tool_id="run"))
 
@@ -4198,6 +5466,8 @@ def test_mediated_remembered_approval_captures_its_new_policy_revision(tmp_path)
     interaction.info = Mock()
     interaction.prompt = Mock(return_value="session")
     manager = PermissionManager(tmp_path, interaction=interaction)
+    # Configure automatic process approval to isolate resource-grant behavior.
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
     request = native_request(tmp_path, egress_origins=("http://example.com",))
     approved_revision = []
     assert manager.authorize_sandboxed_command(
@@ -4311,6 +5581,7 @@ def test_legacy_read_ceiling_preserves_bound_automatic_tool_access(tmp_path):
         tmp_path,
         source="fixture-tool",
         read_roots=(installation,),
+        write_roots=(),
         environment={"PATH": str(installation), "LANG": "C"},
         executable_identities=(
             ("fixture-tool", executable, executable, details.st_dev, details.st_ino),
@@ -4321,6 +5592,7 @@ def test_legacy_read_ceiling_preserves_bound_automatic_tool_access(tmp_path):
     assert manager.configuration.limit_classifications.sources["readable_roots"] == "legacy"
     assert manager.sandbox_scope_limit(request) is None
     assert not manager.review_legacy_sandbox_read_limit(request, interaction)
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
     assert manager.authorize_sandboxed_command(request, tool_id="run_command")
     assert asyncio.run(manager.authorize_sandboxed_command_async(request, tool_id="run_command"))
     interaction.prompt.assert_not_called()
@@ -4379,7 +5651,7 @@ def test_legacy_read_review_refuses_stale_policy_choice(tmp_path):
 
     def update_policy(*_args, **_kwargs):
         """Change policy while the user reviews the old classification."""
-        manager.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+        manager.set_direct_host_execution(True)
         return "review"
 
     interaction.prompt.side_effect = update_policy
@@ -4426,7 +5698,7 @@ def test_legacy_read_review_async_preserves_denial_and_stale_choice(tmp_path):
 
     async def change_policy(*_args, **_kwargs):
         """Invalidate the reviewed revision while input is pending."""
-        manager.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+        manager.set_direct_host_execution(True)
         return "review"
 
     interaction.prompt_async.side_effect = change_policy
@@ -4546,6 +5818,8 @@ def test_native_scoped_approval_reuses_only_matching_authority(tmp_path, scope):
         user_configuration_path=tmp_path / "user.yaml",
         interaction=interaction,
     )
+    # Configure automatic process approval to isolate resource-grant behavior.
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
     manager.set_limit("deny_private_networks", False, scope=PolicyScope.SESSION)
     approved = native_request(tmp_path)
     assert manager.authorize_sandboxed_command(approved, tool_id="run_command") is True
@@ -4566,34 +5840,43 @@ def test_native_scoped_approval_reuses_only_matching_authority(tmp_path, scope):
     assert len(manager.user_rules) == 0
 
 
-def test_native_similar_rule_accepts_simple_prefix_only(tmp_path):
-    """A reviewed similar rule never matches a compound shell script."""
+def test_recorded_similar_rule_requires_exact_consent_for_prepared_access(tmp_path):
+    """A prior saved prefix remains valid for ordinary use and cannot grant a new proposal."""
     interaction = Mock(spec=Interaction)
-    interaction.prompt.return_value = "similar_session"
-    manager = PermissionManager(tmp_path, interaction=interaction)
-    assert (
-        manager.authorize_sandboxed_command(
-            native_request(tmp_path, "git status"), tool_id="run_command"
-        )
-        is True
-    )
-    interaction.prompt.reset_mock()
-    assert (
-        manager.authorize_sandboxed_command(
-            native_request(tmp_path, "git status --short"), tool_id="run_command"
-        )
-        is True
-    )
-    interaction.prompt.assert_not_called()
     interaction.prompt.return_value = "deny"
-    assert (
-        manager.authorize_sandboxed_command(
-            native_request(tmp_path, "git status; printf unsafe"), tool_id="run_command"
-        )
-        is False
+    user_path = tmp_path / "user.yaml"
+    first = native_request(tmp_path, "git status")
+    with closing(PermissionManager(tmp_path)) as initial:
+        _, revision = initial.evaluate_with_revision(())
+        with initial.sandbox_attempt(first, revision, Event()) as bound:
+            assert bound is not None
+            signature = bound.sandbox_command_signature(first.workspace_id)
+    configuration = UserPermissionConfiguration(
+        sandboxed_command_rules=[
+            SandboxedCommandRule(
+                signature=signature,
+                source="git status",
+                scope=ApprovalChoice.WORKSPACE,
+                similar=True,
+            )
+        ]
     )
-    assert interaction.prompt.call_count == 1
-    assert "similar_session" not in interaction.prompt.call_args.kwargs["choices"]
+    user_path.write_text(dump_yaml(configuration.model_dump(mode="json")))
+    manager = PermissionManager(
+        tmp_path, user_configuration_path=user_path, interaction=interaction
+    )
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
+    related = native_request(tmp_path, "git status --short")
+    assert manager.authorize_sandboxed_command(related, tool_id="run_command")
+    interaction.prompt.assert_not_called()
+    assert not manager.authorize_sandboxed_command(
+        related, tool_id="run_command", prepared_access=True
+    )
+    for source in ("git status; printf unsafe", "python -c print", "git --version"):
+        assert not manager.authorize_sandboxed_command(
+            native_request(tmp_path, source), tool_id="run_command"
+        )
+    assert interaction.prompt.call_count == 4
 
 
 def test_native_prompt_shows_command_reason_and_scope(tmp_path):
@@ -4657,8 +5940,9 @@ def test_native_prompt_reports_exact_authority_and_escapes_model_reason(tmp_path
     summary = prompt_scope(message)
     assert summary["workspace"] == str(workspace)
     assert summary["workspace_write"] is True
-    assert summary["write_roots"] == [str(external)]
-    assert summary["network"] is True and summary["git_create"] is True
+    assert summary["write_roots"] == [str(workspace), str(external)]
+    assert summary["network"] == "unrestricted, including private host and LAN services"
+    assert summary["git_create"] is True
     assert summary["automatic_tool_read_roots"] == 1
     for hidden in (scratch, alias):
         assert str(hidden) not in message
@@ -4755,7 +6039,13 @@ def test_sandbox_scope_can_be_toggled_before_deciding(tmp_path, asynchronous, de
     for prompt in prompts:
         labels = list(prompt["choices"].values())
         assert labels[-1] in {"Show full scope", "Show reduced scope"}
-        assert all(label == "Deny" or label.startswith("Allow") for label in labels[:-1])
+        assert labels[:-1] == [
+            "Deny",
+            "Allow once",
+            "Allow for this session",
+            "Allow in this workspace",
+            "Allow for this user",
+        ]
     assert [prompt["choices"]["details"] for prompt in prompts] == [
         "Show full scope",
         "Show reduced scope",
@@ -4811,6 +6101,8 @@ def test_native_path_read_authority_is_disclosed_and_bound_to_remembered_rule(tm
     interaction = Mock(spec=Interaction)
     interaction.prompt.side_effect = ["session", "deny"]
     manager = PermissionManager(workspace, interaction=interaction)
+    # Configure automatic process approval to isolate resource-grant behavior.
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
     initial = native_request(
         workspace, "tool", environment={"PATH": str(first)}, read_roots=(first,)
     )
@@ -4835,6 +6127,8 @@ def test_native_remembered_read_rule_binds_executable_identity(tmp_path):
     interaction = Mock(spec=Interaction)
     interaction.prompt.side_effect = ["session", "deny"]
     manager = PermissionManager(workspace, interaction=interaction)
+    # Configure automatic process approval to isolate resource-grant behavior.
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
     for name, expected in (("first", True), ("second", False)):
         executable = installation / name
         executable.write_text("#!/bin/sh\n", encoding="utf-8")
@@ -4868,6 +6162,8 @@ def test_native_persistent_rules_reload_and_can_be_removed(tmp_path):
     manager = PermissionManager(
         tmp_path, user_configuration_path=user_path, interaction=interaction
     )
+    # Configure automatic process approval to isolate resource-grant behavior.
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
     request = native_request(tmp_path, "printf workspace")
     interaction.prompt.return_value = "workspace"
     assert manager.authorize_sandboxed_command(request, tool_id="run_command")
@@ -4887,6 +6183,118 @@ def test_native_persistent_rules_reload_and_can_be_removed(tmp_path):
     assert not PermissionManager(
         tmp_path, user_configuration_path=user_path
     ).sandboxed_command_rules(ApprovalChoice.USER)
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_durable_workspace_command_grants_reload_from_their_supported_storage(tmp_path, legacy):
+    """New workspace grants stay local and previously stored user-file grants remain revocable."""
+    arguments, _, _ = durable_policy_inputs(tmp_path)
+    manager = PermissionManager(**arguments, bootstrap_pristine_policy=True)
+    interaction = Mock(spec=Interaction)
+    interaction.prompt.return_value = "workspace"
+    request = native_request(tmp_path, "printf safe", read_roots=(), write_roots=())
+    policy_path = arguments["configuration_path"]
+    user_path = arguments["user_configuration_path"]
+    user_before = user_path.read_bytes()
+
+    try:
+        assert manager.authorize_sandboxed_command(
+            request, tool_id="run_command", interaction=interaction
+        )
+        rule = manager.sandboxed_command_rules(ApprovalChoice.WORKSPACE)[0]
+        assert user_path.read_bytes() == user_before
+    finally:
+        manager.close()
+
+    workspace_policy = load_yaml(policy_path.read_text())
+    assert workspace_policy["sandboxed_command_rules"] == [rule.model_dump(mode="json")]
+    if legacy:
+        user_policy = load_yaml(user_path.read_text())
+        user_policy["sandboxed_command_rules"] = workspace_policy.pop("sandboxed_command_rules")
+        user_path.write_text(dump_yaml(user_policy))
+        policy_path.write_text(dump_yaml(workspace_policy))
+
+    reloaded = PermissionManager(**arguments)
+    try:
+        assert reloaded.authorize_sandboxed_command(request, tool_id="run_command")
+        assert reloaded.sandboxed_command_rules(ApprovalChoice.WORKSPACE) == (rule,)
+        assert reloaded.remove_sandboxed_command_rule(ApprovalChoice.WORKSPACE, rule.id)
+        assert not reloaded.sandboxed_command_rules(ApprovalChoice.WORKSPACE)
+        assert not reloaded.authorize_sandboxed_command(request, tool_id="run_command")
+        if not legacy:
+            assert user_path.read_bytes() == user_before
+    finally:
+        reloaded.close()
+
+
+def test_durable_workspace_command_grant_refuses_an_external_user_policy_edit(tmp_path):
+    """An external edit still invalidates approval while the command prompt is open."""
+    arguments, _, _ = durable_policy_inputs(tmp_path)
+    manager = PermissionManager(**arguments, bootstrap_pristine_policy=True)
+    interaction = Mock(spec=Interaction)
+    request = native_request(tmp_path, "printf safe", read_roots=(), write_roots=())
+    user_path = arguments["user_configuration_path"]
+
+    def edit_then_remember(*_args, **_kwargs):
+        """Change the shared file without giving the current manager a fresh snapshot."""
+        user_path.write_bytes(user_path.read_bytes() + b"\n# trusted external edit\n")
+        return "workspace"
+
+    interaction.prompt.side_effect = edit_then_remember
+    revisions = []
+    try:
+        assert not manager.authorize_sandboxed_command(
+            request,
+            tool_id="run_command",
+            interaction=interaction,
+            approved_revision=revisions,
+        )
+        assert not revisions
+        assert not manager.sandboxed_command_rules(ApprovalChoice.WORKSPACE)
+        assert "Policy changed since loading" in manager.evaluate(()).reason
+    finally:
+        manager.close()
+
+
+def test_legacy_workspace_policy_cannot_import_unregistered_command_approvals(tmp_path):
+    """A workspace policy originating in a checkout cannot enroll new native grants."""
+    arguments, _, _ = durable_policy_inputs(tmp_path)
+    path = arguments["configuration_path"]
+    path.parent.mkdir(parents=True)
+    rule = SandboxedCommandRule(
+        signature="unregistered", source="printf safe", scope=ApprovalChoice.WORKSPACE
+    )
+    path.write_text(
+        dump_yaml({"version": 1, "sandboxed_command_rules": [rule.model_dump(mode="json")]})
+    )
+
+    manager = PermissionManager(**arguments, bootstrap_pristine_policy=True)
+    try:
+        manager.require_policy_ready()
+        assert not manager.sandboxed_command_rules(ApprovalChoice.WORKSPACE)
+        assert not load_yaml(path.read_text())["sandboxed_command_rules"]
+    finally:
+        manager.close()
+
+
+def test_native_user_rule_requires_the_same_workspace_identity(tmp_path):
+    """A workspace rekey requires fresh sandbox consent even for user-stored approvals."""
+    interaction = Mock(spec=Interaction)
+    interaction.prompt.return_value = "user"
+    user_path = tmp_path / "user.yaml"
+    original = PermissionManager(
+        tmp_path, workspace_id="original", user_configuration_path=user_path
+    )
+    request = native_request(tmp_path, read_roots=(), write_roots=())
+    assert original.authorize_sandboxed_command(
+        request, tool_id="run_command", interaction=interaction
+    )
+    matching = PermissionManager(
+        tmp_path, workspace_id="original", user_configuration_path=user_path
+    )
+    assert matching.authorize_sandboxed_command(request, tool_id="run_command")
+    rekeyed = PermissionManager(tmp_path, workspace_id="rekeyed", user_configuration_path=user_path)
+    assert not rekeyed.authorize_sandboxed_command(request, tool_id="run_command")
 
 
 def test_native_persistent_rules_reject_duplicate_ids_and_unsupported_authority(tmp_path):
@@ -4927,22 +6335,37 @@ def test_native_persistent_rules_reject_duplicate_ids_and_unsupported_authority(
         PermissionManager(tmp_path, user_configuration_path=user_path)
 
 
-def test_native_workspace_approval_is_not_saved_in_repository_policy(tmp_path):
+@pytest.mark.parametrize("registered", [False, True])
+def test_native_workspace_approval_is_not_saved_in_repository_policy(tmp_path, registered):
     """A repository policy cannot become the source of a native allow decision."""
     interaction = Mock(spec=Interaction)
     interaction.prompt.return_value = "workspace"
-    user_path = tmp_path / "user.yaml"
-    manager = PermissionManager(
-        tmp_path, user_configuration_path=user_path, interaction=interaction
-    )
-    assert manager.authorize_sandboxed_command(native_request(tmp_path), tool_id="run_command")
-    assert manager.sandboxed_command_rules(ApprovalChoice.WORKSPACE)
     workspace_policy = tmp_path / ".loop" / "permissions.yaml"
-    assert (
-        not workspace_policy.exists()
-        or "sandboxed_command_rules" not in workspace_policy.read_text()
+    arguments = {
+        "workspace_root": tmp_path,
+        "configuration_path": workspace_policy,
+        "user_configuration_path": tmp_path / "user.yaml",
+    }
+    if registered:
+        arguments, _, _ = durable_policy_inputs(tmp_path)
+        arguments["configuration_path"] = workspace_policy
+    user_path = arguments["user_configuration_path"]
+    manager = PermissionManager(
+        **arguments, interaction=interaction, bootstrap_pristine_policy=True
     )
+    # Configure automatic process approval to isolate resource-grant behavior.
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
+    assert manager.authorize_sandboxed_command(native_request(tmp_path), tool_id="run_command")
+    (rule,) = manager.sandboxed_command_rules(ApprovalChoice.WORKSPACE)
+    payload = load_yaml(workspace_policy.read_text())
+    assert not payload["sandboxed_command_rules"]
     assert "sandboxed_command_rules" in user_path.read_text()
+    assert manager.remove_sandboxed_command_rule(ApprovalChoice.WORKSPACE, rule.id)
+    payload["sandboxed_command_rules"] = [rule.model_dump(mode="json")]
+    workspace_policy.write_text(dump_yaml(payload))
+    reloaded = PermissionManager(**arguments)
+    assert not reloaded.sandboxed_command_rules(ApprovalChoice.WORKSPACE)
+    assert not reloaded.authorize_sandboxed_command(native_request(tmp_path), tool_id="run_command")
 
 
 def test_native_session_rule_resets_and_rejects_invalid_scope(tmp_path):
@@ -4950,6 +6373,8 @@ def test_native_session_rule_resets_and_rejects_invalid_scope(tmp_path):
     interaction = Mock(spec=Interaction)
     interaction.prompt.return_value = "session"
     manager = PermissionManager(tmp_path, interaction=interaction)
+    # Configure automatic process approval to isolate resource-grant behavior.
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
     assert manager.authorize_sandboxed_command(native_request(tmp_path), tool_id="run_command")
     assert len(manager.sandboxed_command_rules(ApprovalChoice.SESSION)) == 1
     assert manager.reset_session()
@@ -4958,11 +6383,13 @@ def test_native_session_rule_resets_and_rejects_invalid_scope(tmp_path):
         manager.sandboxed_command_rules(ApprovalChoice.ONCE)
 
 
-def test_native_similar_rule_does_not_match_changed_environment(tmp_path):
-    """A similar source cannot reuse authority after environment changes."""
+def test_native_exact_rule_does_not_match_changed_environment(tmp_path):
+    """The same command cannot reuse authority after environment changes."""
     interaction = Mock(spec=Interaction)
-    interaction.prompt.return_value = "similar_session"
+    interaction.prompt.return_value = "approve"
     manager = PermissionManager(tmp_path, interaction=interaction)
+    # Configure automatic process approval to isolate resource-grant behavior.
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
     assert manager.authorize_sandboxed_command(native_request(tmp_path), tool_id="run_command")
     interaction.prompt.return_value = "deny"
     changed = native_request(tmp_path, environment={"PATH": "/bin", "LANG": "C"})
@@ -4974,6 +6401,8 @@ def test_native_derived_cache_path_keeps_approval_but_external_cache_does_not(tm
     interaction = Mock(spec=Interaction)
     interaction.prompt.return_value = "session"
     manager = PermissionManager(tmp_path, interaction=interaction)
+    # Configure automatic process approval to isolate resource-grant behavior.
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
 
     def request(scratch: Path, cache: Path, ruff_cache: Path | None = None) -> SandboxRequest:
         """Bind one command with an explicit process cache location."""
@@ -5030,7 +6459,7 @@ def test_native_derived_cache_path_keeps_approval_but_external_cache_does_not(tm
 
 def test_native_exception_grant_prompts_with_exact_path(tmp_path):
     """An extra read root prompts with its exact path."""
-    external = tmp_path / "external"
+    external = tmp_path.parent / "external"
     external.mkdir()
     interaction = Mock(spec=Interaction)
     interaction.prompt.return_value = "deny"
@@ -5140,7 +6569,7 @@ def test_native_automatic_tool_reads_are_not_presented_as_permission_reasons(tmp
 
 @pytest.mark.parametrize("escape", [False, True])
 def test_native_redirection_exemption_uses_bound_temporary_root(tmp_path, escape):
-    """Only a contained session-scratch destination can bypass output review."""
+    """Only output that resolves inside the bound scratch keeps its automatic exemption."""
     scratch = tmp_path.parent / "managed-scratch"
     scratch.mkdir(mode=0o700)
     (scratch / "link").symlink_to(tmp_path, target_is_directory=True)
@@ -5151,11 +6580,13 @@ def test_native_redirection_exemption_uses_bound_temporary_root(tmp_path, escape
         environment={"PATH": "/usr/bin:/bin", "TMPDIR": str(scratch)},
         scratch_root=scratch,
         read_roots=(),
-        write_roots=(tmp_path, scratch),
+        write_roots=(scratch,),
     )
     interaction = Mock(spec=Interaction)
     interaction.prompt.return_value = "deny"
     manager = PermissionManager(tmp_path, interaction=interaction)
+    # Configure automatic process approval to isolate resource-grant behavior.
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
     assert manager.authorize_sandboxed_command(bound, tool_id="run_command") is not escape
     assert interaction.prompt.call_count == int(escape)
 
@@ -5167,14 +6598,52 @@ def test_native_literal_command_scratch_redirection_needs_no_review(tmp_path):
         interaction = Mock(spec=Interaction)
         interaction.prompt.return_value = "deny"
         manager = PermissionManager(tmp_path, interaction=interaction)
+        # Configure automatic process approval to isolate resource-grant behavior.
+        manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
         bound = native_request(
             tmp_path,
             f"printf text >{shlex.quote(str(scratch / 'report'))}",
             read_roots=(),
+            write_roots=(),
             environment={"TMPDIR": str(scratch)},
         )
         assert manager.authorize_sandboxed_command(bound, tool_id="run_command")
         interaction.prompt.assert_not_called()
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("write_scope", ["scratch", "directory", "file"])
+def test_native_scratch_variable_redirections_respect_write_scope(
+    tmp_path, asynchronous, write_scope
+):
+    """An automatic process may redirect to private scratch without workspace write authority."""
+    scratch = tmp_path.parent / "managed-scratch"
+    scratch.mkdir(mode=0o700)
+    interaction = Mock(spec=ConsoleInteraction)
+    interaction.prompt.return_value = "deny"
+    interaction.prompt_async.return_value = "deny"
+    manager = PermissionManager(tmp_path, interaction=interaction)
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
+    for action in (Action.FILESYSTEM_CREATE, Action.FILESYSTEM_REPLACE, Action.FILESYSTEM_DELETE):
+        manager.set_default(action, Decision.ALLOW)
+    bound = native_request(
+        tmp_path,
+        'printf report > "$LOOP_OUTPUT_DIR/status"',
+        read_roots=(),
+        write_roots=(tmp_path,) if write_scope == "directory" else (),
+        write_files=(tmp_path / "output",) if write_scope == "file" else (),
+        environment={"TMPDIR": str(scratch)},
+        scratch_root=scratch,
+    )
+    if asynchronous:
+        result = asyncio.run(
+            manager.authorize_sandboxed_command_async(bound, tool_id="run_command")
+        )
+    else:
+        result = manager.authorize_sandboxed_command(bound, tool_id="run_command")
+    assert result is (write_scope == "scratch")
+    prompt = interaction.prompt_async if asynchronous else interaction.prompt
+    assert prompt.call_count == int(write_scope != "scratch")
 
 
 def test_native_read_scope_audit_and_prompt_show_exact_roots(tmp_path):
@@ -5209,6 +6678,7 @@ def test_native_similar_choice_excludes_script_engines_and_flag_prefixes(tmp_pat
     interaction = Mock(spec=Interaction)
     interaction.prompt.return_value = "deny"
     manager = PermissionManager(tmp_path, interaction=interaction)
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
     assert not manager.authorize_sandboxed_command(
         native_request(tmp_path, source), tool_id="run_command"
     )
@@ -5222,6 +6692,7 @@ def test_native_persistence_failure_denies_approval(tmp_path, monkeypatch):
     manager = PermissionManager(
         tmp_path, user_configuration_path=tmp_path / "user.yaml", interaction=interaction
     )
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
     monkeypatch.setattr(
         manager, "_replace_user_configuration", Mock(side_effect=OSError("disk full"))
     )
@@ -5233,6 +6704,8 @@ def test_native_rule_removal_rejects_once_scope_and_removes_session_rule(tmp_pat
     interaction = Mock(spec=Interaction)
     interaction.prompt.return_value = "session"
     manager = PermissionManager(tmp_path, interaction=interaction)
+    # Configure automatic process approval to isolate resource-grant behavior.
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
     assert manager.authorize_sandboxed_command(native_request(tmp_path), tool_id="run_command")
     rule_id = manager.sandboxed_command_rules(ApprovalChoice.SESSION)[0].id
     assert manager.remove_sandboxed_command_rule(ApprovalChoice.SESSION, rule_id)
@@ -5244,7 +6717,7 @@ def test_legacy_process_approval_never_approves_native_sandbox_request(tmp_path)
     """Persisted v1 host rules and process defaults cannot skip fresh native approval."""
     configuration = PermissionConfiguration(
         defaults={**PermissionConfiguration().defaults, Action.PROCESS_EXECUTE: Decision.ALLOW},
-        limits=PolicyLimits(allow_host_processes=True),
+        limits=PolicyLimits(),
         rules=[
             PermissionRule(
                 decision=Decision.ALLOW,
@@ -5271,7 +6744,10 @@ def test_legacy_process_approval_never_approves_native_sandbox_request(tmp_path)
     user_path = tmp_path / "user-permissions.yaml"
     user_path.write_text(dump_yaml({"version": 1, "rules": [user_rule.model_dump(mode="json")]}))
     manager = PermissionManager(
-        tmp_path, configuration_path=policy_path, user_configuration_path=user_path
+        tmp_path,
+        configuration_path=policy_path,
+        user_configuration_path=user_path,
+        allow_direct_host_execution=True,
     )
     request = SandboxRequest.create(
         source="printf ok",
@@ -5362,9 +6838,33 @@ def test_request_permission_forwards_index_map_to_prompt(tmp_path):
     assert index[ApprovalChoice.DENY] == "N"
     assert index[ApprovalChoice.ONCE] == "Y"
     assert index[ApprovalChoice.SESSION] == "S"
+    assert index["details"] == "F"
     assert index[ApprovalChoice.USER] == "U"
     interaction.info.assert_called_once_with("Approve?")
     assert interaction.prompt.call_args.args[0] == "Proceed?"
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_resource_approval_details_toggle_before_the_decision(tmp_path, asynchronous):
+    """The same disclosed resource and requested lifetime survive opening and closing details."""
+    interaction = Mock(spec=ConsoleInteraction)
+    answers = ["details", "details", ApprovalChoice.SESSION]
+    interaction.prompt.side_effect = answers
+    interaction.prompt_async = AsyncMock(side_effect=answers)
+    manager = PermissionManager(tmp_path, interaction=interaction)
+    if asynchronous:
+        result = asyncio.run(manager.request_permission_async("Load the project skill"))
+    else:
+        result = manager.request_permission("Load the project skill")
+    assert result is ApprovalChoice.SESSION
+    assert interaction.info.call_args_list[0] == interaction.info.call_args_list[2]
+    assert "tool, actions and resources" in interaction.info.call_args_list[1].args[0]
+    prompt = interaction.prompt_async if asynchronous else interaction.prompt
+    assert [c.kwargs["choices"]["details"] for c in prompt.call_args_list] == [
+        "Show full scope",
+        "Show reduced scope",
+        "Show full scope",
+    ]
 
 
 def test_request_permission_includes_workspace_index_when_configured(tmp_path):
@@ -5607,11 +7107,13 @@ def test_invalid_user_policy_reports_without_interaction_in_automatic_mode(tmp_p
     assert not manager.user_rules
 
 
-def test_unavailable_user_approval_fails_closed(tmp_path, monkeypatch):
-    """An unavailable user policy path cannot authorize a spoofed user selection."""
+@pytest.mark.parametrize("scope", [ApprovalChoice.USER, ApprovalChoice.WORKSPACE])
+def test_unavailable_approval_fails_closed(tmp_path, monkeypatch, scope):
+    """An unavailable policy path cannot authorize a spoofed lifetime selection."""
     interaction = Mock(spec=Interaction)
     manager = PermissionManager(tmp_path, interaction=interaction)
-    monkeypatch.setattr(manager, "request_permission", Mock(return_value=ApprovalChoice.USER))
+    monkeypatch.setattr(manager, "_configuration_path", None)
+    monkeypatch.setattr(manager, "request_permission", Mock(return_value=scope))
 
     result = manager.authorize((file_operation(Action.FILESYSTEM_CREATE, tmp_path / "new.txt"),))
 
@@ -5722,10 +7224,11 @@ def test_host_decision_records_omit_command_and_prompt(tmp_path, asynchronous):
     recorder = Mock()
     manager = PermissionManager(
         tmp_path,
-        configuration=PermissionConfiguration(limits=PolicyLimits(allow_host_processes=True)),
+        configuration=PermissionConfiguration(limits=PolicyLimits()),
         audit_path=audit_path,
         workspace_id="workspace",
         recorder=recorder,
+        allow_direct_host_execution=True,
     )
     manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW, scope=PolicyScope.SESSION)
     secret = "password=synthetic-secret"
@@ -5794,7 +7297,7 @@ def test_authorization_rejection_and_recorder_override_are_atomic(tmp_path):
 def test_authorize_async_awaits_native_approval_and_records_result(tmp_path):
     """Async authorization awaits native input before recording an approval."""
     interaction = ConsoleInteraction(console=Console(file=io.StringIO()), markdown=False)
-    interaction.prompt_async = AsyncMock(return_value=ApprovalChoice.ONCE)
+    interaction.prompt_async = AsyncMock(return_value=ApprovalChoice.SESSION)
     recorder = Mock()
     manager = PermissionManager(tmp_path, interaction=interaction)
     operation_set = (
@@ -5807,7 +7310,7 @@ def test_authorize_async_awaits_native_approval_and_records_result(tmp_path):
     result = asyncio.run(manager.authorize_async(operation_set, recorder=recorder))
 
     assert result.decision is Decision.ALLOW
-    assert result.approval_choice is ApprovalChoice.ONCE
+    assert result.approval_choice is ApprovalChoice.SESSION
     assert result.prompted
     interaction.prompt_async.assert_awaited_once()
     assert interaction.prompt_async.await_args.kwargs["choices"] == {
@@ -5815,6 +7318,7 @@ def test_authorize_async_awaits_native_approval_and_records_result(tmp_path):
         ApprovalChoice.ONCE: "Allow once",
         ApprovalChoice.SESSION: "Allow for this session",
         ApprovalChoice.WORKSPACE: "Allow in this workspace",
+        "details": "Show full scope",
     }
     recorder.record_authorization.assert_called_once_with(result)
 
@@ -6289,7 +7793,7 @@ def test_async_cancelled_stale_approval_does_not_retry_or_record_allow(tmp_path,
 def test_async_authorization_yields_while_a_policy_update_holds_its_lock(tmp_path, policy_waits):
     """Async policy evaluation waits cooperatively for a concurrent sync update."""
     interaction = ConsoleInteraction(console=Console(file=io.StringIO()), markdown=False)
-    interaction.prompt_async = AsyncMock(return_value=ApprovalChoice.ONCE)
+    interaction.prompt_async = AsyncMock(return_value=ApprovalChoice.SESSION)
     manager = PermissionManager(tmp_path, interaction=interaction)
     lock_acquired = Event()
     release_lock = Event()
@@ -7332,6 +8836,7 @@ def test_authorize_async_keeps_fresh_file_changes_one_time_only(tmp_path):
     assert interaction.prompt_async.await_args.kwargs["choices"] == {
         ApprovalChoice.DENY: "Deny",
         ApprovalChoice.ONCE: "Allow once",
+        "details": "Show full scope",
     }
     assert manager.session_rules == ()
 
@@ -7496,7 +9001,7 @@ def test_user_data_and_instruction_changes_require_fresh_one_time_approval(
     assert not manager.session_rules
     assert interaction.prompt.call_count == 2
     assert all(
-        set(call.kwargs["choices"]) == {ApprovalChoice.DENY, ApprovalChoice.ONCE}
+        set(call.kwargs["choices"]) == {ApprovalChoice.DENY, ApprovalChoice.ONCE, "details"}
         for call in interaction.prompt.call_args_list
     )
 
@@ -7530,6 +9035,7 @@ def test_configured_instruction_change_requires_fresh_decision(tmp_path):
     assert set(interaction.prompt.call_args.kwargs["choices"]) == {
         ApprovalChoice.DENY,
         ApprovalChoice.ONCE,
+        "details",
     }
 
 
@@ -7581,6 +9087,7 @@ def test_process_grants_distinguish_argument_boundaries_working_directory_and_sa
     interaction = Mock(spec=Interaction)
     interaction.prompt.return_value = ApprovalChoice.SESSION
     manager = PermissionManager(tmp_path, interaction=interaction)
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ASK)
     approved = operation(
         Action.PROCESS_EXECUTE,
         target=ProcessTarget(
@@ -7676,7 +9183,8 @@ def test_workspace_choice_is_rejected_when_no_workspace_is_available():
     )
 
     assert result.decision is Decision.DENY
-    assert "unavailable" in result.reason
+    assert result.reason == "Rejected by the user."
+    assert ApprovalChoice.WORKSPACE not in interaction.prompt.call_args.kwargs["choices"]
     interaction.prompt.assert_called_once()
 
 
@@ -7823,7 +9331,7 @@ def test_filesystem_boundaries_cannot_be_overridden(tmp_path, path, action, sour
                 argv=("git", "status"), cwd=str(root), boundary=ProcessBoundary.HOST
             ),
             PolicyLimits(),
-            "limit:workspace:allow_host_processes",
+            "boundary:host_execution_disabled",
         ),
     ],
 )
@@ -8245,15 +9753,15 @@ def test_host_processes_require_an_explicit_boundary_opt_in(tmp_path):
     allowed = PermissionManager(
         tmp_path,
         configuration=PermissionConfiguration(
-            limits=PolicyLimits(allow_host_processes=True),
+            limits=PolicyLimits(),
             defaults={Action.PROCESS_EXECUTE: Decision.ALLOW},
         ),
+        allow_direct_host_execution=True,
     )
 
     result = denied.evaluate((operation(Action.PROCESS_EXECUTE, target=target),))
-    assert result.sources == ("limit:workspace:allow_host_processes",)
-    assert "/permissions limit set session host-process allow" in result.reason
-    assert "does not approve" in result.reason
+    assert result.sources == ("boundary:host_execution_disabled",)
+    assert "app.allow_direct_host_execution" in result.reason
     assert (
         allowed.evaluate((operation(Action.PROCESS_EXECUTE, target=target),)).decision
         is Decision.ALLOW
@@ -8278,7 +9786,7 @@ def test_host_limit_in_a_batch_preserves_the_composed_decision(tmp_path, asynchr
 
     assert result.decision is Decision.DENY
     assert result.reason == "1 of 2 planned operation(s) require deny."
-    assert result.sources == ("limit:workspace:allow_host_processes",)
+    assert result.sources == ("boundary:host_execution_disabled",)
 
 
 def test_policy_mutations_persist_defaults_and_rule_lifetimes(tmp_path):
@@ -8306,7 +9814,7 @@ def test_preset_replacement_changes_the_selected_defaults_and_rule_layer(tmp_pat
     """A preset replaces selected-scope defaults and rules while preserving limits and overlays."""
     manager = PermissionManager(tmp_path)
     manager.set_default(Action.FILESYSTEM_DELETE, Decision.DENY)
-    manager.set_limit("allow_host_processes", True)
+    manager.set_limit("deny_local_networks", True)
     manager.add_rule(PermissionRule(id="old-workspace", decision=Decision.DENY))
     manager.add_rule(
         PermissionRule(
@@ -8329,7 +9837,7 @@ def test_preset_replacement_changes_the_selected_defaults_and_rule_layer(tmp_pat
     assert manager.configuration.defaults[Action.FILESYSTEM_CREATE] is Decision.ALLOW
     assert manager.configuration.defaults[Action.FILESYSTEM_REPLACE] is Decision.ALLOW
     assert manager.configuration.defaults[Action.FILESYSTEM_DELETE] is Decision.ASK
-    assert manager.configuration.limits.allow_host_processes is True
+    assert manager.configuration.limits.deny_local_networks is True
     assert [rule.id for rule in manager.session_rules] == ["session-guard"]
     assert (
         manager.explain("write_text_file", Action.FILESYSTEM_CREATE, str(tmp_path / "new")).decision
@@ -8567,17 +10075,17 @@ def test_session_overrides_never_leak_into_later_workspace_saves(tmp_path):
     session_rule = PermissionRule(id="session-only", decision=Decision.DENY)
 
     manager.set_default(Action.FILESYSTEM_DELETE, Decision.ALLOW, scope=PolicyScope.SESSION)
-    manager.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    manager.set_direct_host_execution(True)
     manager.add_rule(session_rule, scope=PolicyScope.SESSION)
     manager.set_default(Action.NETWORK_REQUEST, Decision.DENY)
 
     loaded = PermissionManager(tmp_path)
     assert loaded.configuration.defaults[Action.FILESYSTEM_DELETE] is Decision.ASK
     assert loaded.configuration.defaults[Action.NETWORK_REQUEST] is Decision.DENY
-    assert loaded.configuration.limits.allow_host_processes is False
+    assert loaded.direct_host_execution_enabled is False
     assert loaded.configuration.rules == []
     assert manager.effective_configuration.defaults[Action.FILESYSTEM_DELETE] is Decision.ALLOW
-    assert manager.effective_configuration.limits.allow_host_processes is True
+    assert manager.direct_host_execution_enabled is True
     assert manager.session_rules == (session_rule,)
 
 
@@ -8585,16 +10093,16 @@ def test_session_resets_restore_workspace_inheritance_without_changing_disk(tmp_
     """Per-field and whole-session resets reveal the underlying workspace policy."""
     manager = PermissionManager(tmp_path)
     manager.set_default(Action.PROCESS_EXECUTE, Decision.DENY)
-    manager.set_limit("allow_host_processes", True)
+    manager.set_limit("deny_local_networks", True)
     manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW, scope=PolicyScope.SESSION)
-    manager.set_limit("allow_host_processes", False, scope=PolicyScope.SESSION)
+    manager.set_limit("deny_local_networks", False, scope=PolicyScope.SESSION)
 
     assert manager.reset_default(Action.PROCESS_EXECUTE) is True
     assert manager.reset_default(Action.PROCESS_EXECUTE) is False
-    assert manager.reset_limit("allow_host_processes") is True
-    assert manager.reset_limit("allow_host_processes") is False
+    assert manager.reset_limit("deny_local_networks") is True
+    assert manager.reset_limit("deny_local_networks") is False
     assert manager.effective_configuration.defaults[Action.PROCESS_EXECUTE] is Decision.DENY
-    assert manager.effective_configuration.limits.allow_host_processes is True
+    assert manager.effective_configuration.limits.deny_local_networks is True
 
     manager.add_rule(
         PermissionRule(id="temporary", decision=Decision.ASK),
@@ -8761,8 +10269,11 @@ def test_explain_constructs_every_typed_target_without_prompting(tmp_path):
     """Effective-policy explanation handles absolute paths, URLs, processes, and session state."""
     manager = PermissionManager(
         tmp_path,
-        configuration=PermissionConfiguration(limits=PolicyLimits(allow_host_processes=True)),
+        configuration=PermissionConfiguration(limits=PolicyLimits()),
+        allow_direct_host_execution=True,
     )
+    # Configure automatic process approval to isolate resource-grant behavior.
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
 
     assert (
         manager.explain("read", Action.FILESYSTEM_READ, str(tmp_path / "file.txt")).decision
@@ -8776,7 +10287,7 @@ def test_explain_constructs_every_typed_target_without_prompting(tmp_path):
         manager.explain("fetch", Action.NETWORK_REQUEST, "https://my-host.local/file").decision
         is Decision.ASK
     )
-    assert manager.explain("run", Action.PROCESS_EXECUTE, "git status").decision is Decision.ASK
+    assert manager.explain("run", Action.PROCESS_EXECUTE, "git status").decision is Decision.ALLOW
     assert (
         manager.explain("skills", Action.SESSION_MUTATE, "activate:review").decision is Decision.ASK
     )
@@ -9081,7 +10592,7 @@ def test_error_policy_raises_configuration_errors_and_preserves_active_policy(tm
     manager = PermissionManager(tmp_path)
     manager.set_default(Action.FILESYSTEM_DELETE, Decision.DENY)
     path = tmp_path / ".loop" / "permissions.yaml"
-    path.write_text("version: 3\n", "utf-8")
+    path.write_text("version: 999\n", "utf-8")
 
     with pytest.raises(PermissionConfigurationError) as raised:
         manager.reload()
@@ -9331,7 +10842,7 @@ def test_auto_policy_reports_and_uses_defaults_or_last_known_good(tmp_path, capl
     """Automatic recovery reports startup defaults and retains valid policy on reload."""
     path = tmp_path / ".loop" / "permissions.yaml"
     path.parent.mkdir()
-    path.write_text("version: 3\n", "utf-8")
+    path.write_text("version: 999\n", "utf-8")
 
     manager = PermissionManager(tmp_path, load_policy=PermissionLoadPolicy.AUTO)
 
@@ -9342,7 +10853,7 @@ def test_auto_policy_reports_and_uses_defaults_or_last_known_good(tmp_path, capl
     path.write_text("version: 1\n", "utf-8")
     manager.reload()
     manager.set_default(Action.FILESYSTEM_DELETE, Decision.DENY)
-    path.write_text("version: 3\n", "utf-8")
+    path.write_text("version: 999\n", "utf-8")
     interaction = Mock(spec=Interaction)
     manager.interaction = interaction
 
@@ -9356,7 +10867,7 @@ def test_interactive_policy_retries_a_repaired_file(tmp_path):
     """Interactive recovery rereads a file repaired while the recovery prompt is active."""
     path = tmp_path / ".loop" / "permissions.yaml"
     path.parent.mkdir()
-    path.write_text("version: 3\n", "utf-8")
+    path.write_text("version: 999\n", "utf-8")
     interaction = Mock(spec=Interaction)
 
     def repair(*_args, **_kwargs):
@@ -9382,7 +10893,7 @@ def test_interactive_recovery_does_not_overwrite_a_later_policy_update(tmp_path)
     manager = PermissionManager(tmp_path, interaction=interaction)
     manager.set_default(Action.FILESYSTEM_DELETE, Decision.DENY)
     previous = manager.configuration_path.read_bytes()
-    manager.configuration_path.write_text("version: 3\n", "utf-8")
+    manager.configuration_path.write_text("version: 999\n", "utf-8")
 
     def update_while_prompted(*_args, **_kwargs):
         """Publish a new restrictive policy before the old recovery choice returns."""
@@ -9403,7 +10914,7 @@ def test_interactive_reload_can_retain_the_active_policy(tmp_path):
     interaction = Mock(spec=Interaction)
     manager = PermissionManager(tmp_path, interaction=interaction)
     manager.set_default(Action.FILESYSTEM_DELETE, Decision.DENY)
-    manager.configuration_path.write_text("version: 3\n", "utf-8")
+    manager.configuration_path.write_text("version: 999\n", "utf-8")
     interaction.prompt.return_value = "continue"
 
     assert manager.reload() is PermissionLoadResult.BLOCKED
@@ -9435,7 +10946,7 @@ def test_interactive_loading_requires_an_interaction(tmp_path):
     manager = PermissionManager(tmp_path, interaction=interaction)
     manager.interaction = None
     manager.configuration_path.parent.mkdir(exist_ok=True)
-    manager.configuration_path.write_text("version: 3\n", "utf-8")
+    manager.configuration_path.write_text("version: 999\n", "utf-8")
     with pytest.raises(PermissionConfigurationError):
         manager.reload()
 
@@ -9548,9 +11059,11 @@ def test_process_target_display_resolves_local_paths_to_workspace_virtual_paths(
         tmp_path,
         interaction=interaction,
         configuration=PermissionConfiguration(
-            limits=PolicyLimits(allow_host_processes=True),
+            limits=PolicyLimits(),
         ),
+        allow_direct_host_execution=True,
     )
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ASK)
     target = ProcessTarget(
         argv=("cat", str(readme)),
         cwd=str(sub),
@@ -9577,9 +11090,11 @@ def test_process_target_display_preserves_workspace_relative_argv(tmp_path):
         tmp_path,
         interaction=interaction,
         configuration=PermissionConfiguration(
-            limits=PolicyLimits(allow_host_processes=True),
+            limits=PolicyLimits(),
         ),
+        allow_direct_host_execution=True,
     )
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ASK)
 
     manager.authorize((operation(Action.PROCESS_EXECUTE, target=target),))
 
@@ -9594,9 +11109,11 @@ def test_process_target_display_preserves_argument_boundaries(tmp_path):
         tmp_path,
         interaction=interaction,
         configuration=PermissionConfiguration(
-            limits=PolicyLimits(allow_host_processes=True),
+            limits=PolicyLimits(),
         ),
+        allow_direct_host_execution=True,
     )
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ASK)
     target = ProcessTarget(
         argv=("tool", "a b"),
         cwd=str(tmp_path),
@@ -9616,9 +11133,11 @@ def test_process_target_display_handles_temporary_virtual_paths(tmp_path):
         tmp_path,
         interaction=interaction,
         configuration=PermissionConfiguration(
-            limits=PolicyLimits(allow_host_processes=True),
+            limits=PolicyLimits(),
         ),
+        allow_direct_host_execution=True,
     )
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ASK)
     scratch_file = manager.temporary_directory / "output.log"
     scratch_file.parent.mkdir(exist_ok=True)
     target = ProcessTarget(
@@ -9641,9 +11160,11 @@ def test_process_target_display_preserves_external_temporary_paths(tmp_path):
         tmp_path,
         interaction=interaction,
         configuration=PermissionConfiguration(
-            limits=PolicyLimits(allow_host_processes=True),
+            limits=PolicyLimits(),
         ),
+        allow_direct_host_execution=True,
     )
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ASK)
     external_path = Path("/tmp/verify_review.py")
     target = ProcessTarget(
         argv=(".venv/bin/python", str(external_path)),
@@ -9825,7 +11346,7 @@ def test_policy_reset_failure_prompts_and_stays_blocked(tmp_path, monkeypatch, s
     """Failed reset needs a fresh decision and never clears policy restrictions."""
     path = tmp_path / (".loop/permissions.yaml" if scope == "workspace" else "user.yaml")
     path.parent.mkdir(exist_ok=True)
-    path.write_text("version: 3\n", encoding="utf-8")
+    path.write_text("version: 999\n", encoding="utf-8")
     interaction = Mock(spec=Interaction)
     interaction.prompt.side_effect = ["reset", "continue"]
     if when == "before":
@@ -9852,7 +11373,7 @@ def test_policy_reset_failure_prompts_and_stays_blocked(tmp_path, monkeypatch, s
     assert "synthetic-secret" not in problem.detail
     assert path.with_name(path.name + ".reset-pending").exists() is (when == "after")
     if when == "after":
-        assert next(path.parent.glob(f"{path.name}.*.bak")).read_text() == "version: 3\n"
+        assert next(path.parent.glob(f"{path.name}.*.bak")).read_text() == "version: 999\n"
     with pytest.raises(PermissionNamespaceError):
         manager.require_policy_ready()
 
@@ -9865,7 +11386,7 @@ def test_policy_reset_failure_requires_fresh_retry_or_halt(tmp_path, monkeypatch
 
     path = tmp_path / (".loop/permissions.yaml" if scope == "workspace" else "user.yaml")
     path.parent.mkdir(exist_ok=True)
-    path.write_text("version: 3\n", encoding="utf-8")
+    path.write_text("version: 999\n", encoding="utf-8")
     interaction = Mock(spec=Interaction)
     interaction.prompt.side_effect = ["reset", choice, "exit"]
     monkeypatch.setattr(
@@ -9884,7 +11405,7 @@ def test_policy_reset_failure_requires_fresh_retry_or_halt(tmp_path, monkeypatch
     assert any(
         "Permission policy changed; reload before retrying." in item.detail for item in reports
     )
-    assert path.read_text() == "version: 3\n"
+    assert path.read_text() == "version: 999\n"
 
 
 def test_policy_reset_does_not_convert_egress_transition_failure_into_recovery(
@@ -9895,7 +11416,7 @@ def test_policy_reset_does_not_convert_egress_transition_failure_into_recovery(
     manager = PermissionManager(tmp_path, interaction=interaction)
     path = manager.configuration_path
     path.parent.mkdir(exist_ok=True)
-    path.write_text("version: 3\n", encoding="utf-8")
+    path.write_text("version: 999\n", encoding="utf-8")
     lease = Mock()
     lease.pause.return_value = True
     lease.resume.return_value = True
@@ -10015,7 +11536,7 @@ def test_user_policy_recovery_preserves_newer_revision(tmp_path, monkeypatch):
     path.write_text("version: 2\n", encoding="utf-8")
     interaction = Mock(spec=Interaction)
     manager = PermissionManager(tmp_path, user_configuration_path=path, interaction=interaction)
-    path.write_text("version: 3\n", encoding="utf-8")
+    path.write_text("version: 999\n", encoding="utf-8")
     monkeypatch.setattr(manager, "reset_configuration", Mock(side_effect=OSError(5, "refused")))
     selections = iter(["reset", "continue"])
 
@@ -10065,7 +11586,7 @@ def test_policy_reset_failure_reports_safe_specific_cause(tmp_path, monkeypatch,
     """Reset failures explain trusted or operating-system causes without exception contents."""
     path = tmp_path / ".loop" / "permissions.yaml"
     path.parent.mkdir()
-    path.write_text("version: 3\n", encoding="utf-8")
+    path.write_text("version: 999\n", encoding="utf-8")
     interaction = Mock(spec=Interaction)
     interaction.prompt.side_effect = ["reset", "continue"]
     monkeypatch.setattr(PermissionManager, "reset_configuration", Mock(side_effect=error))
@@ -10233,7 +11754,7 @@ def test_policy_accepts_natural_boolean_strings(tmp_path, quote):
     )
     manager = PermissionManager(tmp_path)
     assert manager.configuration.limits.deny_private_networks is True
-    assert manager.configuration.limits.allow_host_processes is False
+    assert "allow_host_processes" not in PolicyLimits.model_fields
 
 
 def test_policy_accepts_explicit_yaml_11(tmp_path):
@@ -10245,3 +11766,626 @@ def test_policy_accepts_explicit_yaml_11(tmp_path):
         encoding="utf-8",
     )
     assert PermissionManager(tmp_path).configuration.limits.deny_private_networks is True
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("version", [1, 2])
+def test_legacy_host_limit_migration_preserves_backup_without_enabling_gate(
+    tmp_path, enabled, version
+):
+    """Both obsolete eligibility values are discarded, with exact recovery bytes retained."""
+    arguments, _, _ = durable_policy_inputs(tmp_path)
+    manager = PermissionManager(**arguments, bootstrap_pristine_policy=True)
+    manager.close()
+    path = arguments["configuration_path"]
+    payload = load_yaml(path.read_text())
+    payload["version"] = version
+    payload["defaults"].pop("filesystem.execute", None)
+    payload["defaults"].pop("network.local", None)
+    payload["defaults"].pop("network.broad", None)
+    payload["defaults"].pop("network.ingress", None)
+    payload["limits"]["allow_host_processes"] = enabled
+    original = dump_yaml(payload).encode()
+    path.write_bytes(original)
+    migrated = PermissionManager(**arguments)
+    assert not migrated.direct_host_execution_enabled
+    assert migrated.configuration.version == 10
+    assert "allow_host_processes" not in load_yaml(path.read_text())["limits"]
+    backup = path.with_name(f"{path.name}.{payload['namespace_generation']}.schema-v{version}.bak")
+    assert backup.read_bytes() == original
+    assert "allow_host_processes" not in json.dumps(PermissionConfiguration.model_json_schema())
+    migrated.close()
+
+
+def test_legacy_host_grant_remains_dormant_and_gate_changes_invalidate_revision(tmp_path):
+    """Matching digest bytes cannot revive an older grant's approval semantics."""
+    arguments, _, _ = durable_policy_inputs(tmp_path)
+    manager = PermissionManager(
+        **arguments, bootstrap_pristine_policy=True, allow_direct_host_execution=True
+    )
+    rule = manager.trust_host_command("printf host", ApprovalChoice.USER)
+    revision = manager.host_recovery_revision()
+    manager.set_direct_host_execution(True)
+    assert manager.host_recovery_revision() == revision
+    manager.set_direct_host_execution(False)
+    assert manager.host_recovery_revision() is None
+    assert (
+        manager.matching_trusted_host_command_rule("printf host", tmp_path, "request_host_command")
+        is None
+    )
+    manager.close()
+    path = arguments["user_configuration_path"]
+    payload = load_yaml(path.read_text())
+    payload["trusted_host_command_rules"][0]["authorization_version"] = 1
+    path.write_text(dump_yaml(payload))
+    legacy = PermissionManager(**arguments, allow_direct_host_execution=True)
+    assert (
+        legacy.matching_trusted_host_command_rule("printf host", tmp_path, "request_host_command")
+        is None
+    )
+    assert legacy.trusted_host_command_rules()[0].id == rule.id
+    assert legacy.remove_trusted_host_command_rule(rule.id, ApprovalChoice.USER)
+    legacy.close()
+
+
+def test_native_attempt_binds_current_hard_paths_and_cancels_on_tightening(tmp_path):
+    """Trusted reload freezes hard designations and signals active native attempts only on tightening."""
+    policy = tmp_path / "policy.yaml"
+    policy.write_text(dump_yaml(PermissionConfiguration().model_dump(mode="json")))
+    manager = PermissionManager(tmp_path, configuration_path=policy)
+    request = SandboxRequest.create(
+        source="printf ok",
+        cwd=tmp_path,
+        workspace=tmp_path,
+        read_roots=(),
+        write_roots=(tmp_path,),
+        network=False,
+        environment={"PATH": "/usr/bin:/bin"},
+        policy_version="test",
+        deadline=1000,
+        workspace_id="fixture",
+    )
+    revision = manager.egress_policy_revision()
+    cancellation = Event()
+    with manager.sandbox_attempt(request, revision, cancellation) as bound:
+        assert bound is not None
+        assert tmp_path / "secret" not in bound.hard_denied_paths
+        manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW, scope=PolicyScope.SESSION)
+        assert not cancellation.is_set()
+        policy.write_text(
+            dump_yaml(
+                PermissionConfiguration(
+                    limits=PolicyLimits(hard_denied_paths=(str(tmp_path / "secret"),))
+                ).model_dump(mode="json")
+            )
+        )
+        manager.reload()
+        assert cancellation.is_set()
+        assert tmp_path / "secret" not in bound.hard_denied_paths
+    cancellation.clear()
+    current = manager.egress_policy_revision()
+    with manager.sandbox_attempt(request, current, cancellation) as bound:
+        assert tmp_path / "secret" in bound.hard_denied_paths
+        policy.write_text(dump_yaml(PermissionConfiguration().model_dump(mode="json")))
+        manager.reload()
+        assert not cancellation.is_set()
+    with manager.sandbox_attempt(request, revision, Event()) as stale:
+        assert stale is None
+    cancelled = Event()
+    cancelled.set()
+    with manager.sandbox_attempt(request, manager.egress_policy_revision(), cancelled) as stale:
+        assert stale is None
+    manager.close()
+    with manager.sandbox_attempt(request, manager.egress_policy_revision(), Event()) as stale:
+        assert stale is None
+
+
+def test_managed_authority_loss_cancels_bound_native_attempt(tmp_path):
+    """Managed hard paths are frozen and an invalid managed source requests active cleanup."""
+    denied = tmp_path / "designated"
+    store = managed_store(tmp_path, hard_denied_paths=(str(denied),))
+    manager = PermissionManager(tmp_path, managed_policy_store=store)
+    cancellation = Event()
+    with manager.sandbox_attempt(
+        native_request(tmp_path), manager.egress_policy_revision(), cancellation
+    ) as bound:
+        assert denied in bound.hard_denied_paths
+        (store.directory / "managed-policy.json").write_text("invalid")
+        with pytest.raises(OSError, match="managed policy is unavailable"):
+            manager.egress_policy_revision()
+        assert cancellation.is_set()
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("effect", [Decision.ASK, Decision.DENY])
+@pytest.mark.parametrize("kind", ["nested", "exact", "sibling", "other-tool", "process"])
+def test_sandbox_directory_policy_covers_future_descendants(tmp_path, asynchronous, effect, kind):
+    """Native scopes refuse withheld descendants while unrelated typed rules remain independent."""
+    output = tmp_path / "out"
+    output.mkdir()
+    manager = PermissionManager(tmp_path, yolo=True)
+    values = {"decision": effect, "action": Action.FILESYSTEM_CREATE}
+    if kind == "nested":
+        values["resource"] = str(output / "future")
+    elif kind == "exact":
+        values["target"] = FileTarget(path=str(output / "future"))
+    elif kind == "sibling":
+        values["resource"] = str(tmp_path / "sibling")
+    elif kind == "other-tool":
+        values.update(tool="another-tool", tool_exact=True, resource=str(output / "future"))
+    else:
+        values.update(action=None, target=ProcessTarget(argv=("unrelated",), cwd=str(tmp_path)))
+    manager.add_rule(PermissionRule(**values))
+    request = native_request(tmp_path, read_roots=(output,), write_roots=(output,))
+    approved = (
+        asyncio.run(manager.authorize_sandboxed_command_async(request, tool_id="run_command"))
+        if asynchronous
+        else manager.authorize_sandboxed_command(request, tool_id="run_command")
+    )
+    assert approved is (kind not in {"nested", "exact"})
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize(
+    "action", [Action.FILESYSTEM_READ, Action.FILESYSTEM_LIST, Action.FILESYSTEM_EXECUTE]
+)
+def test_sandbox_filesystem_defaults_and_exact_denials_override_automatic_mode(
+    tmp_path, asynchronous, action
+):
+    """Read, list and native-exec restrictions apply to opaque children before admission."""
+    manager = PermissionManager(tmp_path, yolo=True)
+    manager.add_rule(PermissionRule(action=action, decision=Decision.DENY))
+    request = native_request(tmp_path, read_roots=(), write_roots=())
+    approved = (
+        asyncio.run(manager.authorize_sandboxed_command_async(request, tool_id="run_command"))
+        if asynchronous
+        else manager.authorize_sandboxed_command(request, tool_id="run_command")
+    )
+    assert not approved
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_sandbox_admission_refuses_changed_durable_policy_before_inspection(tmp_path, asynchronous):
+    """A changed independent namespace invalidates a native capability snapshot without effects."""
+    arguments, _, _ = durable_policy_inputs(tmp_path)
+    manager = PermissionManager(**arguments, bootstrap_pristine_policy=True)
+    other = PermissionManager(**arguments)
+    other.set_default(Action.FILESYSTEM_READ, Decision.DENY)
+    request = native_request(tmp_path, read_roots=(), write_roots=())
+    try:
+        approved = (
+            asyncio.run(manager.authorize_sandboxed_command_async(request, tool_id="run_command"))
+            if asynchronous
+            else manager.authorize_sandboxed_command(request, tool_id="run_command")
+        )
+        assert not approved
+    finally:
+        other.close()
+        manager.close()
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("decision", list(Decision))
+def test_sandbox_runtime_baseline_obeys_nested_filesystem_policy(tmp_path, asynchronous, decision):
+    """Implicit native runtime reads cannot bypass a withheld ordinary filesystem resource."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    interaction = Mock(spec=Interaction)
+    manager = PermissionManager(workspace, interaction=interaction)
+    # Configure automatic process approval to isolate resource-grant behavior.
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
+    manager.add_rule(
+        PermissionRule(
+            action=Action.FILESYSTEM_READ,
+            decision=decision,
+            resource=str(runtime / "future"),
+        )
+    )
+    request = native_request(workspace, read_roots=(), write_roots=())
+    parameters = {"tool_id": "run_command", "runtime_read_roots": (runtime,)}
+    approved = (
+        asyncio.run(manager.authorize_sandboxed_command_async(request, **parameters))
+        if asynchronous
+        else manager.authorize_sandboxed_command(request, **parameters)
+    )
+    assert approved is (decision is Decision.ALLOW)
+    interaction.prompt.assert_not_called()
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("decision", list(Decision))
+@pytest.mark.parametrize("nested", [False, True])
+def test_sandbox_private_scratch_preserves_explicit_resource_rules(
+    tmp_path, asynchronous, decision, nested
+):
+    """Scratch needs no default ask, but a named restriction or default deny still applies."""
+    manager = PermissionManager(tmp_path)
+    # Configure automatic process approval to isolate resource-grant behavior.
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
+    scratch = manager.temporary_directory
+    if nested:
+        manager.add_rule(
+            PermissionRule(
+                action=Action.FILESYSTEM_CREATE,
+                decision=decision,
+                resource=str(scratch / "withheld"),
+            )
+        )
+    else:
+        manager.set_default(Action.FILESYSTEM_CREATE, decision)
+    request = native_request(
+        tmp_path,
+        read_roots=(),
+        write_roots=(),
+        scratch_root=scratch,
+        environment={"PATH": "/usr/bin:/bin", "TMPDIR": str(scratch)},
+    )
+    approved = (
+        asyncio.run(manager.authorize_sandboxed_command_async(request, tool_id="run_command"))
+        if asynchronous
+        else manager.authorize_sandboxed_command(request, tool_id="run_command")
+    )
+    expected = decision is Decision.ALLOW if nested else decision is not Decision.DENY
+    assert approved is expected
+    manager.close()
+
+
+@pytest.mark.parametrize("scope", ["workspace", "user"])
+@pytest.mark.parametrize("failure", ["invalid", "generation", "missing", "pending", "mode"])
+def test_selected_recovery_defaults_preserve_policy_until_explicit_save(tmp_path, scope, failure):
+    """User-selected defaults preserve original bytes and support a backed-up replacement."""
+    arguments, _, _ = durable_policy_inputs(tmp_path)
+    initial = PermissionManager(**arguments, bootstrap_pristine_policy=True)
+    initial.close()
+    path = arguments["configuration_path" if scope == "workspace" else "user_configuration_path"]
+    if failure == "invalid":
+        path.write_text("rules: [invalid", encoding="utf-8")
+    elif failure == "generation":
+        payload = load_yaml(path.read_text())
+        payload["namespace_generation"] = "0" * 32
+        path.write_text(dump_yaml(payload), encoding="utf-8")
+    elif failure == "mode":
+        path.chmod(0o666)
+    elif failure == "pending":
+        path.with_name(path.name + ".reset-pending").write_bytes(b"interrupted-reset")
+    else:
+        path.unlink()
+    original = path.read_bytes() if path.exists() else None
+    recovered = PermissionManager(**arguments, recovery_defaults={path: "continue"})
+    recovered.require_policy_ready()
+    assert recovered.configuration.defaults[Action.PROCESS_EXECUTE] is Decision.ASK
+    assert not recovered.direct_host_execution_enabled
+    assert (path.read_bytes() if path.exists() else None) == original
+    recovered.save_recovery_defaults(scope)
+    recovered.close()
+    assert path.is_file()
+    assert not path.with_name(path.name + ".reset-pending").exists()
+    if failure == "pending":
+        assert [p.read_bytes() for p in path.parent.glob(path.name + ".reset-pending.*.bak")] == [
+            b"interrupted-reset"
+        ]
+    if original is not None:
+        assert original in [
+            backup.read_bytes() for backup in path.parent.glob(path.name + ".*.bak")
+        ]
+    reloaded = PermissionManager(**arguments)
+    reloaded.require_policy_ready()
+    reloaded.close()
+
+
+def test_version_two_policy_adds_missing_hard_path_field_without_losing_restrictions(tmp_path):
+    """The pre-hard-path schema migrates without rejecting its otherwise complete policy."""
+    arguments, _, _ = durable_policy_inputs(tmp_path)
+    initial = PermissionManager(**arguments, bootstrap_pristine_policy=True)
+    initial.close()
+    path = arguments["configuration_path"]
+    payload = load_yaml(path.read_text())
+    payload["version"] = 2
+    payload["limits"].pop("hard_denied_paths")
+    payload["limits"]["allow_host_processes"] = True
+    payload["limits"]["network_origins"] = []
+    payload["defaults"].pop("filesystem.execute")
+    payload["defaults"].pop("network.local", None)
+    payload["defaults"].pop("network.broad", None)
+    payload["defaults"].pop("network.ingress", None)
+    payload["defaults"]["process.execute"] = "ask"
+    original = dump_yaml(payload).encode()
+    path.write_bytes(original)
+    migrated = PermissionManager(**arguments)
+    migrated.require_policy_ready()
+    assert migrated.configuration.version == 10
+    assert migrated.configuration.limits.hard_denied_paths == ()
+    assert migrated.configuration.limits.network_origins == ()
+    assert migrated.configuration.defaults[Action.PROCESS_EXECUTE] is Decision.ASK
+    assert not migrated.direct_host_execution_enabled
+    assert original in [backup.read_bytes() for backup in path.parent.glob(path.name + ".*.bak")]
+    migrated.close()
+
+
+def test_recovery_defaults_do_not_overwrite_a_later_policy_edit(tmp_path):
+    """Temporary recovery is bound to the bypassed bytes and refuses a stale save."""
+    arguments, _, _ = durable_policy_inputs(tmp_path)
+    initial = PermissionManager(**arguments, bootstrap_pristine_policy=True)
+    initial.close()
+    path = arguments["configuration_path"]
+    path.write_text("broken: [", encoding="utf-8")
+    recovered = PermissionManager(**arguments, recovery_defaults={path: "continue"})
+    path.write_text("# newer policy", encoding="utf-8")
+    with pytest.raises(PermissionNamespaceError, match="changed during temporary recovery"):
+        recovered.save_recovery_defaults("workspace")
+    assert path.read_text() == "# newer policy"
+    recovered.close()
+
+
+@pytest.mark.parametrize("scope", ["invalid", "workspace", "user"])
+def test_recovery_save_requires_a_selected_scope(tmp_path, scope):
+    """Ordinary managers cannot invoke recovery persistence without a prior user selection."""
+    manager = PermissionManager(tmp_path)
+    with pytest.raises(ValueError, match="Recovery scope|No temporary recovery defaults"):
+        manager.save_recovery_defaults(scope)
+    manager.close()
+
+
+def test_recovery_reload_accepts_the_repaired_saved_policy(tmp_path):
+    """Reload ends temporary defaults and restores the user's repaired restrictions."""
+    arguments, _, _ = durable_policy_inputs(tmp_path)
+    initial = PermissionManager(**arguments, bootstrap_pristine_policy=True)
+    initial.close()
+    path = arguments["configuration_path"]
+    original = path.read_bytes()
+    path.write_text("broken: [", encoding="utf-8")
+    manager = PermissionManager(**arguments, recovery_defaults={path: "continue"})
+    path.write_bytes(original)
+    assert manager.reload() is PermissionLoadResult.LOADED
+    manager.require_policy_ready()
+    manager.close()
+
+
+@pytest.mark.parametrize("action", ["reset", "edit"])
+def test_normal_policy_commands_can_save_selected_recovery_defaults(tmp_path, action, monkeypatch):
+    """Existing user commands can replace bypassed policy with an audited, archived save."""
+    arguments, _, _ = durable_policy_inputs(tmp_path)
+    initial = PermissionManager(**arguments, bootstrap_pristine_policy=True)
+    initial.close()
+    path = arguments["configuration_path"]
+    path.write_text("broken: [", encoding="utf-8")
+    audit = Mock()
+    monkeypatch.setattr(manager_module, "telemetry_audit", audit)
+    interaction = Mock(spec=Interaction)
+    manager = PermissionManager(
+        **arguments, recovery_defaults={path: "continue"}, interaction=interaction
+    )
+    audit.assert_any_call("permission.policy_defaults_selected", scope="workspace")
+    assert "original is unchanged" in interaction.warning.call_args.args[0]
+    protected = tmp_path / ".env"
+    protected.write_text("synthetic secret")
+    with pytest.raises(PermissionError, match="protected_path"):
+        manager.open_read_file(protected)
+    if action == "reset":
+        backup = manager.reset_configuration("workspace")
+        assert backup.read_text() == "broken: ["
+    else:
+        manager.set_default(Action.NETWORK_REQUEST, Decision.DENY)
+    manager.require_policy_ready()
+    audit.assert_any_call("permission.policy_recovery_saved", scope="workspace")
+    manager.close()
+    reloaded = PermissionManager(**arguments)
+    reloaded.require_policy_ready()
+    assert reloaded.configuration.defaults[Action.NETWORK_REQUEST] is (
+        Decision.DENY if action == "edit" else Decision.ASK
+    )
+    reloaded.close()
+
+
+def test_recovery_registry_write_failure_remains_recoverable(tmp_path, monkeypatch):
+    """A failed registry publication reports recovery while preserving original policy bytes."""
+    arguments, _, _ = durable_policy_inputs(tmp_path)
+    initial = PermissionManager(**arguments, bootstrap_pristine_policy=True)
+    initial.close()
+    path = arguments["configuration_path"]
+    path.write_text("broken: [", encoding="utf-8")
+    manager = PermissionManager(**arguments, recovery_defaults={path: "continue"})
+    connect = sqlite3.connect
+
+    def refuse_write(database, *args, **kwargs):
+        """Reject only the owned registry's writable connection."""
+        if database == arguments["namespace_catalog_path"]:
+            raise sqlite3.OperationalError("fixture full disk")
+        return connect(database, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(sqlite3, "connect", refuse_write)
+        with pytest.raises(PermissionNamespaceError, match="Retry or use temporary defaults"):
+            manager.save_recovery_defaults("workspace")
+    assert b"broken: [" in [p.read_bytes() for p in path.parent.glob(path.name + ".*.bak")]
+    manager.close()
+    retry = PermissionManager(**arguments, recovery_defaults={path: "continue"})
+    retry.save_recovery_defaults("workspace")
+    retry.require_policy_ready()
+    retry.close()
+
+
+def test_explicit_namespace_initialization_reports_unreadable_backup_directory(
+    tmp_path, monkeypatch
+):
+    """Explicit namespace administration still reports an unreadable backup directory."""
+    arguments, workspace_id, _ = durable_policy_inputs(tmp_path)
+    manager = PermissionManager(**arguments)
+    original = os.scandir
+    path = arguments["configuration_path"]
+
+    def refuse_listing(directory):
+        """Reject only the owned policy directory's listing."""
+        if directory == path.parent:
+            raise PermissionError("fixture listing refused")
+        return original(directory)
+
+    monkeypatch.setattr(os, "scandir", refuse_listing)
+    with pytest.raises(PermissionNamespaceError, match="backup evidence cannot be inspected"):
+        manager.initialize_policy_namespace("workspace", workspace_id, authorized=True)
+    manager.close()
+
+
+def test_new_policy_defaults_are_announced_to_the_user(tmp_path):
+    """First-use policy creation reports each initialized user-owned policy file."""
+    arguments, _, _ = durable_policy_inputs(tmp_path)
+    interaction = Mock(spec=Interaction)
+    manager = PermissionManager(
+        **arguments, bootstrap_pristine_policy=True, interaction=interaction
+    )
+    manager.require_policy_ready()
+    assert interaction.info.call_count == 2
+    assert all(
+        "Created default permission policy" in call.args[0]
+        for call in interaction.info.call_args_list
+    )
+    manager.close()
+
+
+def test_native_network_scopes_enforce_separate_policy_and_hard_limits(tmp_path):
+    """Local and broad decisions remain separate from HTTP egress and respect hard ceilings."""
+    manager = PermissionManager(tmp_path)
+    assert (
+        manager.explain("run_command", Action.NETWORK_LOCAL, "network:local").decision
+        is Decision.ALLOW
+    )
+    assert (
+        manager.explain("run_command", Action.NETWORK_BROAD, "network:broad").decision
+        is Decision.DENY
+    )
+    manager.set_limit("deny_private_networks", False)
+    manager.set_default(Action.NETWORK_REQUEST, Decision.ALLOW)
+    assert (
+        manager.explain("run_command", Action.NETWORK_BROAD, "network:broad").decision
+        is Decision.ASK
+    )
+    manager.add_rule(PermissionRule(decision=Decision.ALLOW))
+    assert (
+        manager.explain("run_command", Action.NETWORK_BROAD, "network:broad").decision
+        is Decision.ASK
+    )
+    assert (
+        manager.explain("fetch", Action.NETWORK_REQUEST, "https://example.test/").decision
+        is Decision.ASK
+    )
+    manager.set_default(Action.NETWORK_LOCAL, Decision.DENY)
+    assert not manager.sandbox_local_network_enabled("run_command")
+    assert manager.sandbox_local_network_enabled()
+    manager.set_default(Action.NETWORK_LOCAL, Decision.ASK)
+    assert manager.sandbox_local_network_enabled("run_command")
+    manager.set_limit("deny_local_networks", True)
+    assert (
+        manager.explain("run_command", Action.NETWORK_LOCAL, "network:local").decision
+        is Decision.DENY
+    )
+    assert not manager.sandbox_local_network_enabled("run_command")
+
+
+@pytest.mark.parametrize("network", [False, True])
+def test_legacy_native_network_approval_requires_broad_scope_review(tmp_path, monkeypatch, network):
+    """Stored ordinary approvals survive while a legacy broad signature requires new consent."""
+    from loop.execution.sandbox import contracts
+
+    interaction = ConsoleInteraction(console=Console(file=io.StringIO()), markdown=False)
+    interaction.prompt = Mock(return_value="workspace")
+    manager = PermissionManager(
+        tmp_path, interaction=interaction, user_configuration_path=tmp_path / "user.yaml"
+    )
+    manager.set_limit("deny_private_networks", False)
+    selected = native_request(tmp_path, "printf approved", network=network)
+    digest = contracts.sha256_digest
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            contracts,
+            "sha256_digest",
+            lambda value: digest(value.replace(", 'separate-broad-network-v1'", "")),
+        )
+        assert manager.authorize_sandboxed_command(selected, tool_id="run_command")
+    manager.close()
+    manager = PermissionManager(
+        tmp_path, interaction=interaction, user_configuration_path=tmp_path / "user.yaml"
+    )
+    interaction.prompt.reset_mock()
+    interaction.prompt.return_value = "deny"
+    try:
+        assert manager.authorize_sandboxed_command(selected, tool_id="run_command") is not network
+        assert interaction.prompt.call_count == int(network)
+    finally:
+        manager.close()
+
+
+def test_ingress_policy_is_distinct_and_never_overrides_local_hard_denial(tmp_path):
+    """Exact ingress has its own default, explicit rules and mandatory local-network ceiling."""
+    manager = PermissionManager(tmp_path)
+    manager.set_default(Action.NETWORK_REQUEST, Decision.ALLOW)
+    manager.add_rule(PermissionRule(decision=Decision.ALLOW))
+    target = "tcp://127.0.0.1:8080"
+    assert manager.explain("run_command", Action.NETWORK_INGRESS, target).decision is Decision.ASK
+    manager.set_default(Action.NETWORK_INGRESS, Decision.ALLOW)
+    assert manager.explain("run_command", Action.NETWORK_INGRESS, target).decision is Decision.ALLOW
+    manager.set_limit("deny_local_networks", True)
+    assert manager.explain("run_command", Action.NETWORK_INGRESS, target).decision is Decision.DENY
+    manager.close()
+
+
+@pytest.mark.parametrize(
+    "resource",
+    [
+        "tcp://0.0.0.0:8080",
+        "tcp://127.0.0.1",
+        "https://127.0.0.1:80",
+        "tcp://user@127.0.0.1:8080",
+        "tcp://127.0.0.1:8080/path",
+        "tcp://127.0.0.1:8080?q",
+        "tcp://127.0.0.1:8080#fragment",
+    ],
+)
+def test_ingress_explanation_refuses_nonexact_resources(tmp_path, resource):
+    """Explanation cannot normalize broader or ambiguous publication syntax into approval."""
+    manager = PermissionManager(tmp_path)
+    with pytest.raises(ValueError, match="Ingress explanation"):
+        manager.explain("run_command", Action.NETWORK_INGRESS, resource)
+    manager.close()
+
+
+def test_ingress_prompt_describes_attempt_and_does_not_offer_remembered_scope(tmp_path):
+    """One publication approval binds the exact attempt, endpoint and bounded authority."""
+    output = io.StringIO()
+    interaction = ConsoleInteraction(console=Console(file=output, width=160), markdown=False)
+    interaction.prompt = Mock(return_value="approve")
+    manager = PermissionManager(tmp_path, interaction=interaction)
+    selected = native_request(tmp_path, "exec service", local_network=True, ingress_port=8123)
+    try:
+        assert manager.authorize_sandboxed_command(selected, tool_id="run_command")
+        prompt = interaction.prompt.call_args
+        rendered = output.getvalue()
+        assert "tcp://127.0.0.1:8123" in rendered and selected.attempt_id in rendered
+        assert "publish this service on host loopback port 8123" in " ".join(rendered.split())
+        assert set(prompt.kwargs["choices"]) == {"deny", "approve", "details"}
+    finally:
+        manager.close()
+
+
+def test_prepared_workspace_scope_respects_existing_write_and_inspection_limits(tmp_path):
+    """Preparing a command grants no file reads or writes beyond the effective policy."""
+    arguments, _, _ = durable_policy_inputs(tmp_path)
+    manager = PermissionManager(**arguments, bootstrap_pristine_policy=True)
+    request = native_request(tmp_path, write_roots=(tmp_path,), read_roots=(), local_network=False)
+    assert manager.sandbox_access_for_review(request, "run_command") == request
+    manager.set_default(Action.FILESYSTEM_REPLACE, Decision.DENY)
+    assert manager.sandbox_access_for_review(request, "run_command") is None
+    assert manager.can_inspect_command_path("run_command", tmp_path, tmp_path, directory=True)
+    assert manager.can_inspect_command_path(
+        "run_command", tmp_path, tmp_path / "file", directory=False
+    )
+    assert not manager.can_inspect_command_path(
+        "run_command", tmp_path.parent, tmp_path, directory=True
+    )
+    assert not manager.can_inspect_command_path(
+        "run_command", tmp_path, tmp_path.parent, directory=True
+    )
+    assert not manager.can_inspect_command_path(
+        "run_command", tmp_path, tmp_path / ".git", directory=True
+    )

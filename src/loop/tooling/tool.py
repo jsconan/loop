@@ -56,7 +56,9 @@ _TOOL_ATTR = "__loop_tool__"
 _LOGGER = logging.getLogger(__name__)
 _TOOL_INVOCATION: ContextVar[object | None] = ContextVar("tool_invocation", default=None)
 
-ToolDefinitionTransform = Callable[[ToolDefinition, ToolRuntimeSettings], ToolDefinition]
+ToolDefinitionTransform = Callable[
+    [ToolDefinition, ToolRuntimeSettings, tuple[str, ...]], ToolDefinition
+]
 ToolWorkerContextTransform = Callable[[ToolContext, ToolContext], ToolContext]
 
 
@@ -494,7 +496,7 @@ class Tool:
             Arguments and native platform capabilities omitted from unsupported model schemas.
             Bare pairs are normalized to named records during registration.
         definition_transform (ToolDefinitionTransform | None): Customize the model-facing
-            definition using current runtime settings, or ``None`` for the declared definition.
+            definition using current runtime settings and requestable sandbox services.
         worker_context_transform (ToolWorkerContextTransform | None): Add tool-owned context to a
             worker copy during asynchronous dispatch, or ``None`` to use the generic context.
     """
@@ -1552,7 +1554,7 @@ def tool[ToolFunction: Callable[..., Any]](
         platform_argument_capabilities (tuple[PlatformArgumentCapability | tuple[str, str], ...]):
             Named records or bare argument and native capability pairs for model exposure.
         definition_transform (ToolDefinitionTransform | None): Customize the model-facing
-            definition using current runtime settings, or ``None`` for the declared definition.
+            definition using current runtime settings and requestable sandbox services.
         worker_context_transform (ToolWorkerContextTransform | None): Add tool-owned context to a
             worker copy during asynchronous dispatch, or ``None`` to use the generic context.
 

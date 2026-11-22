@@ -32,8 +32,44 @@ from loop import (
 from loop.execution.sandbox import SandboxRequest
 from loop.interaction import ConsoleInteraction
 from loop.permissions import PermissionCommands
+from loop.sandbox_catalog import SANDBOX_OPTIONS, sandbox_options
 from loop.utils import ShutdownRequested
 from loop.workspace import Workspace, WorkspaceRepository
+
+
+def test_permissions_manages_paths_in_each_scope(tmp_path, monkeypatch):
+    """The trusted command lists presets and persists exact path decisions."""
+    from loop.permissions import commands
+
+    monkeypatch.setattr(commands, "system_paths", lambda: (tmp_path / "system",))
+    monkeypatch.setattr(commands, "installed_paths", lambda: (tmp_path / "runtime",))
+    interaction = Mock(spec=ConsoleInteraction)
+    permissions = PermissionManager(tmp_path, user_configuration_path=tmp_path / "user.yaml")
+    command = command_manager(permissions, interaction)
+    runtime = tmp_path / "my runtime"
+    runtime.mkdir()
+    path = shlex.quote(str(runtime))
+
+    command.call("permissions", f"path set workspace allow {path}")
+    command.call("permissions", f"path set user deny {path}")
+    command.call("permissions", f"path set session deny {path}")
+    command.call("permissions", "path list")
+    output = interaction.info.call_args.args[0]
+    assert "system read" in output
+    assert "installed read" in output
+    assert f"workspace read {str(runtime)!r}" in output
+    assert f"session deny {str(runtime)!r}" in output
+    assert f"user deny {str(runtime)!r}" in output
+    command.call("permissions", f"path set workspace write {path}")
+    command.call("permissions", f"path set user read-only {path}")
+    command.call("permissions", "path list")
+    assert f"workspace write {str(runtime)!r}" in interaction.info.call_args.args[0]
+    assert f"user read-only {str(runtime)!r}" in interaction.info.call_args.args[0]
+    command.call("permissions", f"path remove user {path}")
+    command.call("permissions", f"path remove user {path}")
+    assert "unchanged" in interaction.info.call_args.args[0]
+    command.call("permissions", "path remove user")
+    interaction.report.assert_called()
 
 
 def test_permissions_sandbox_rules_can_be_listed_and_removed(tmp_path):
@@ -41,6 +77,7 @@ def test_permissions_sandbox_rules_can_be_listed_and_removed(tmp_path):
     interaction = Mock(spec=ConsoleInteraction)
     interaction.prompt.return_value = "session"
     permissions = PermissionManager(tmp_path, interaction=interaction)
+    permissions.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
     command = command_manager(permissions, interaction)
     approved = SandboxRequest.create(
         source="git status",
@@ -64,6 +101,63 @@ def test_permissions_sandbox_rules_can_be_listed_and_removed(tmp_path):
     assert "No matching" in interaction.info.call_args.args[0]
     command.call("permissions", "sandbox unknown")
     interaction.report.assert_called()
+
+
+def test_permissions_controls_ordinary_workspace_write_requests(tmp_path):
+    """The trusted permission command displays, enables and revokes the ordinary write scope."""
+    interaction = Mock(spec=ConsoleInteraction)
+    manager = PermissionManager(tmp_path)
+    command = command_manager(manager, interaction)
+
+    command.call("permissions", "sandbox workspace-write")
+    assert "includes private session scratch" in interaction.info.call_args.args[0]
+    command.call("permissions", "sandbox workspace-write on")
+    assert "includes workspace and private session scratch" in interaction.info.call_args.args[0]
+    command.call("permissions", "show workspace")
+    assert "Ordinary command write request: workspace" in interaction.info.call_args.args[0]
+    command.call("permissions", "sandbox workspace-write off")
+    assert "includes private session scratch" in interaction.info.call_args.args[0]
+    command.call("permissions", "sandbox workspace-write narrow")
+    assert "sandbox workspace-write" in interaction.report.call_args.args[0].detail
+
+
+@pytest.mark.parametrize(
+    ("command_name", "notice"),
+    [
+        ("account-lookup", "directory password fields"),
+        ("process-pools", "access or unlink leftover semaphores"),
+    ],
+)
+def test_permissions_shows_and_changes_macos_host_capability(
+    tmp_path, command_name, notice, monkeypatch
+):
+    """The owner sees the exposure and can explicitly enable and disable one workspace capability."""
+    monkeypatch.setattr("loop.permissions.commands.sandbox_options", lambda: SANDBOX_OPTIONS)
+    workspace = tmp_path / "checkout"
+    workspace.mkdir()
+    catalog = tmp_path / "application" / "workspaces.sqlite"
+    identity = WorkspaceRepository(catalog).initialize(Workspace.discover(workspace)).id
+    manager = PermissionManager(
+        workspace,
+        workspace_id=identity,
+        namespace_catalog_path=catalog,
+        user_namespace_identity=str(catalog.parent),
+        configuration_path=catalog.parent / identity / "permissions.yaml",
+        user_configuration_path=catalog.parent / "permissions.yaml",
+        bootstrap_pristine_policy=True,
+    )
+    interaction = Mock(spec=ConsoleInteraction)
+    commands = command_manager(manager, interaction)
+    for argument, expected in (
+        ("", "opt-in is off"),
+        (" on", "Enabled"),
+        (" off", "opt-in is off"),
+    ):
+        commands.call("permissions", f"sandbox {command_name}{argument}")
+        assert expected in interaction.info.call_args.args[0]
+        assert notice in interaction.info.call_args.args[0]
+    commands.call("permissions", f"sandbox {command_name} invalid")
+    assert command_name in interaction.report.call_args.args[0].detail
 
 
 def test_permissions_host_rules_can_be_listed_and_revoked(tmp_path):
@@ -242,6 +336,7 @@ def test_permissions_sandbox_cli_preserves_other_persisted_scope(tmp_path):
     permissions = PermissionManager(
         tmp_path, user_configuration_path=user_path, interaction=interaction
     )
+    permissions.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
     command = command_manager(permissions, interaction)
     request = SandboxRequest.create(
         source="printf workspace",
@@ -379,6 +474,7 @@ def test_permission_commands_reject_prompting_changes_during_runs(tmp_path):
     for command in (
         "/permissions rule list",
         "/permissions sandbox list",
+        "/permissions sandbox workspace-write off",
         "/permissions host list",
         "/permissions preset list",
     ):
@@ -459,7 +555,7 @@ def test_permissions_command_manages_defaults_limits_and_complete_rule_lifetimes
     manager = command_manager(permissions, interaction)
 
     manager.call("permissions", "default set workspace network.request deny")
-    manager.call("permissions", "limit set workspace host-process allow")
+    manager.call("permissions", "limit set workspace local-network deny")
     manager.call("permissions", "limit set workspace private-network allow")
     manager.call("permissions", "limit add workspace write-root shared")
     manager.call("permissions", "limit add workspace network-origin https://my-host.local")
@@ -473,7 +569,7 @@ def test_permissions_command_manages_defaults_limits_and_complete_rule_lifetimes
 
     loaded = PermissionManager(tmp_path)
     assert loaded.configuration.defaults[Action.NETWORK_REQUEST] is Decision.DENY
-    assert loaded.configuration.limits.allow_host_processes is True
+    assert loaded.configuration.limits.deny_local_networks is True
     assert loaded.configuration.limits.deny_private_networks is False
     assert loaded.configuration.limits.network_origins == ("https://my-host.local",)
     assert loaded.configuration.rules[0].description == "Read docs"
@@ -623,6 +719,10 @@ def test_permissions_reload_can_continue_with_policy_operations_blocked(tmp_path
     assert permissions.evaluate((operation,)).decision is Decision.DENY
     assert asyncio.run(permissions.evaluate_async((operation,))).decision is Decision.DENY
     assert "remain blocked" in interaction.warning.call_args.args[0]
+    assert any(
+        "restart the application to choose temporary defaults" in call.args[0]
+        for call in interaction.warning.call_args_list
+    )
     interaction.prompt.assert_called_once()
 
 
@@ -675,7 +775,7 @@ def test_permissions_reload_reports_invalid_policy_without_replacing_active_poli
     interaction.prompt.return_value = "continue"
     permissions = PermissionManager(tmp_path, interaction=interaction)
     permissions.set_default(Action.FILESYSTEM_DELETE, Decision.DENY)
-    (tmp_path / ".loop" / "permissions.yaml").write_text("version: 3\n", "utf-8")
+    (tmp_path / ".loop" / "permissions.yaml").write_text("version: 999\n", "utf-8")
     manager = command_manager(permissions, interaction)
 
     manager.call("permissions", "reload")
@@ -695,7 +795,7 @@ def test_sync_permissions_command_bridges_recovery_to_legacy_input(tmp_path):
     interaction.prompt.return_value = "continue"
     permissions = PermissionManager(tmp_path, interaction=interaction)
     permissions.set_default(Action.FILESYSTEM_DELETE, Decision.DENY)
-    permissions.configuration_path.write_text("version: 3\n", "utf-8")
+    permissions.configuration_path.write_text("version: 999\n", "utf-8")
     manager = command_manager(permissions, interaction)
 
     manager.call("permissions", "reload")
@@ -712,18 +812,18 @@ def test_permissions_commands_manage_and_display_session_boundaries(tmp_path):
     permissions = PermissionManager(tmp_path)
     manager = command_manager(permissions, interaction)
 
-    manager.call("permissions", "limit set session host-process allow")
+    manager.call("permissions", "limit set session local-network deny")
     manager.call("permissions", "limit add session network-origin https://my-host.local")
     manager.call("permissions", "default set session process.execute allow")
     manager.call("permissions", "show session")
     shown = interaction.info.call_args.args[0]
-    assert "allow_host_processes: True" in shown
+    assert "deny_local_networks: True" in shown
     assert "network_origins: https://my-host.local" in shown
     assert PermissionManager(tmp_path).configuration.limits == permissions.configuration.limits
     manager.call("permissions", "show managed")
     assert "Managed enforcement: unavailable" in interaction.info.call_args.args[0]
 
-    manager.call("permissions", "limit reset session host-process")
+    manager.call("permissions", "limit reset session local-network")
     manager.call("permissions", "default reset session process.execute")
     manager.call("permissions", "default reset session process.execute")
     assert "already inherited" in interaction.warning.call_args.args[0]
@@ -739,14 +839,14 @@ def test_permissions_limit_without_mutation_lists_scoped_values(tmp_path):
     """Bare and explicitly scoped limit inspection distinguish values from inheritance."""
     interaction = Mock(spec=ConsoleInteraction)
     permissions = PermissionManager(tmp_path)
-    permissions.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    permissions.set_limit("deny_local_networks", True, scope=PolicyScope.SESSION)
     manager = command_manager(permissions, interaction)
 
     manager.call("permissions", "limit")
     listed = interaction.info.call_args.args[0]
     assert "Workspace permission limits:" in listed
     assert "Session permission limits:" in listed
-    assert "  host-process: true" in listed
+    assert "  local-network: true" in listed
     assert "  private-network: inherited" in listed
 
     manager.call("permissions", "limit list workspace")
@@ -831,9 +931,9 @@ def test_permissions_preset_commands_preview_and_confirm_scoped_policy_replaceme
     manager = command_manager(permissions, interaction)
 
     manager.call("permissions", "preset list")
-    assert "workspace@1" in interaction.info.call_args.args[0]
+    assert "workspace@2" in interaction.info.call_args.args[0]
     manager.call("permissions", "preset show workspace")
-    assert "Permission preset: workspace@1" in interaction.info.call_args.args[0]
+    assert "Permission preset: workspace@2" in interaction.info.call_args.args[0]
     assert "filesystem.create: allow" in interaction.info.call_args.args[0]
     manager.call("permissions", "preset diff workspace workspace")
     assert "Unchanged: enforcement limits" in interaction.info.call_args.args[0]
@@ -948,12 +1048,12 @@ def test_permissions_command_rejects_every_malformed_branch(tmp_path):
         "rule add workspace invalid tool '*' '*'",
         "rule invalid workspace id",
         "rule remove invalid id",
-        "limit add workspace host-process value",
+        "limit add workspace local-network value",
         "limit invalid workspace read-root workspace",
         "limit set workspace private-network invalid",
         "limit set workspace read-root allow",
         "limit reset workspace invalid",
-        "limit set invalid host-process allow",
+        "limit set invalid local-network deny",
         "preset unknown",
         "preset show missing extra",
         "preset diff invalid workspace",
@@ -1013,6 +1113,7 @@ def test_registered_permissions_grammar_completes_described_policy_domains_and_r
         "default",
         "rule",
         "sandbox",
+        "path",
         "host",
         "limit",
         "preset",
@@ -1026,10 +1127,30 @@ def test_registered_permissions_grammar_completes_described_policy_domains_and_r
         "session",
     }
     assert complete(completer, "/permissions initialize workspace ") == []
-    assert [item.text for item in complete(completer, "/permissions sandbox ")] == [
+    assert [item.text for item in complete(completer, "/permissions sandbox ")] == sorted(
+        (
+            "list",
+            "remove",
+            "workspace-write",
+            *(name.replace("_", "-") for name in sandbox_options()),
+        )
+    )
+    assert {item.text for item in complete(completer, "/permissions sandbox workspace-write ")} == {
+        "on",
+        "off",
+    }
+    assert {item.text for item in complete(completer, "/permissions path ")} == {
         "list",
+        "set",
         "remove",
-    ]
+    }
+    assert {item.text for item in complete(completer, "/permissions path set workspace ")} == {
+        "read",
+        "write",
+        "write-file",
+        "read-only",
+        "deny",
+    }
     assert {item.text for item in complete(completer, "/permissions host ")} == {
         "list",
         "remove",
@@ -1080,7 +1201,7 @@ def test_registered_permissions_grammar_completes_described_policy_domains_and_r
     permissions.add_rule(PermissionRule(id="persistent-rule", decision=Decision.ASK))
     persistent = complete(completer, "/permissions rule remove workspace persistent")
     assert [item.text for item in persistent] == ["persistent-rule"]
-    limits = complete(completer, "/permissions limit set session host-process ")
+    limits = complete(completer, "/permissions limit set session local-network ")
     assert [item.text for item in limits] == ["allow", "deny"]
     assert all(item.display_meta_text for item in limits)
     classifications = complete(completer, "/permissions limit classify workspace ")
@@ -1108,9 +1229,9 @@ def test_registered_permissions_grammar_completes_described_policy_domains_and_r
         "workspace",
     ]
     assert all(item.display_meta_text for item in root_tokens)
-    permissions.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
-    reset_limits = complete(completer, "/permissions limit reset session host")
-    assert [item.text for item in reset_limits] == ["host-process"]
+    permissions.set_limit("deny_local_networks", True, scope=PolicyScope.SESSION)
+    reset_limits = complete(completer, "/permissions limit reset session local")
+    assert [item.text for item in reset_limits] == ["local-network"]
 
 
 def test_permission_initialize_completion_offers_exact_quoted_identity_only_when_idle(tmp_path):

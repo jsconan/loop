@@ -1,5 +1,6 @@
 """Verify Linux request admission, transport and confined execution."""
 
+import base64
 import errno
 import io
 import json
@@ -7,6 +8,7 @@ import os
 import select
 import time
 from contextlib import contextmanager, nullcontext
+from copy import copy
 from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
@@ -25,7 +27,14 @@ _WIRE_REQUEST = json.dumps(
         "schema": 1,
         "request": {
             **dict.fromkeys(
-                set(NATIVE_REQUEST_FIELDS) - {"workspace_executable_identities", "egress_origins"}
+                set(NATIVE_REQUEST_FIELDS)
+                - {
+                    "hardlink_source_identities",
+                    "workspace_executable_identities",
+                    "egress_origins",
+                    "write_files",
+                    "_write_file_identities",
+                }
             ),
             "policy_version": linux_runtime.NATIVE_POLICY_VERSION,
             "workspace": "/tmp",
@@ -235,6 +244,35 @@ def test_wire_negotiation_accepts_real_supported_roundtrips(installation, tmp_pa
     assert SandboxRequest.from_wire(payload) == request
 
 
+@pytest.mark.parametrize("missing", [None, "wire-field", "identities", "feature", "artifact"])
+def test_installed_file_writes_require_authenticated_field_and_feature(installation, missing):
+    """An earlier receiver remains usable without advertising exact file scopes."""
+    record, arguments = installation
+    if missing == "artifact":
+        arguments[-1].pop(linux_runtime._WIRE_ARTIFACT).path.unlink()
+    elif missing:
+        artifact = arguments[-1][linux_runtime._WIRE_ARTIFACT]
+        declaration = {
+            "wire-field": b'    "write_files",\n',
+            "identities": b'    "_write_file_identities",\n',
+            "feature": b'    "sandbox-exact-write-files-v1",\n',
+        }[missing]
+        source = artifact.path.read_bytes().replace(declaration, b"")
+        artifact.path.chmod(0o644)
+        artifact.path.write_bytes(source)
+        artifact.path.chmod(0o444)
+        arguments[-1][linux_runtime._WIRE_ARTIFACT] = linux_host.bind_host_file(artifact.path)
+    publish(installation)
+
+    assert linux_runtime.installed_optional_support(record) == (
+        missing is None,
+        missing != "artifact",
+    )
+    if missing in {"wire-field", "identities", "feature"}:
+        installed = SimpleNamespace(artifacts=arguments[-1])
+        linux_runtime._require_wire_capabilities(installed, _WIRE_REQUEST, None)
+
+
 @pytest.mark.parametrize(
     "case",
     [
@@ -270,9 +308,14 @@ def test_wire_negotiation_accepts_real_supported_roundtrips(installation, tmp_pa
         "undeclared",
         "ambiguous",
         "egress-feature",
+        "ingress-feature",
+        "exact-file-feature",
+        "hardlink-feature",
         "terminal-feature",
         "local-feature",
         "live-output-feature",
+        "hard-policy-feature",
+        "protected-host-feature",
     ],
 )
 def test_wire_negotiation_rejects_unsupported_requests_before_transport(
@@ -284,6 +327,7 @@ def test_wire_negotiation_rejects_unsupported_requests_before_transport(
     source = artifact.path.read_bytes()
     optional_fields = (
         b"NATIVE_REQUEST_OPTIONAL_FIELDS = (\n"
+        b'    "hardlink_source_identities",\n'
         b'    "workspace_executable_identities",\n'
         b'    "egress_origins",\n'
         b'    "stream_output",\n'
@@ -291,6 +335,12 @@ def test_wire_negotiation_rejects_unsupported_requests_before_transport(
         b'    "cleanup_proof",\n'
         b'    "terminal",\n'
         b'    "local_network",\n'
+        b'    "hard_denied_paths",\n'
+        b'    "protected_host_roots",\n'
+        b'    "permission_revision",\n'
+        b'    "ingress_port",\n'
+        b'    "write_files",\n'
+        b'    "_write_file_identities",\n'
         b")"
     )
     assert optional_fields in source
@@ -333,6 +383,9 @@ def test_wire_negotiation_rejects_unsupported_requests_before_transport(
     if case == "terminal-feature":
         envelope["request"]["terminal"] = True
         source = source.replace(b'    "owned-terminal-v1",\n', b"", 1)
+    if case == "protected-host-feature":
+        envelope["request"]["protected_host_roots"] = ["/fixture/data"]
+        source = source.replace(b'    "protected-host-scratch-v1",\n', b"", 1)
     if case == "local-feature":
         envelope["request"]["local_network"] = False
         source = source.replace(b'    "sandbox-local-network-v1",\n', b"", 1)
@@ -401,6 +454,17 @@ def test_wire_negotiation_rejects_unsupported_requests_before_transport(
                 optional_fields,
                 optional_fields.replace(b'    "workspace_executable_identities",\n', b""),
             )
+    if case == "ingress-feature":
+        envelope["request"]["ingress_port"] = 8123
+        source = source.replace(b'    "attempt-ingress-v1",\n', b"")
+    if case == "exact-file-feature":
+        envelope["request"]["write_files"] = ["/tmp/.coverage"]
+        source = source.replace(b'    "sandbox-exact-write-files-v1",\n', b"")
+    if case == "hardlink-feature":
+        envelope["request"]["hardlink_source_identities"] = [{"path": "/home/owner/.cache"}]
+        source = source.replace(b'    "hardlink-sources-v1",\n', b"")
+    if case == "hard-policy-feature":
+        source = source.replace(b'    "native-hard-policy-v1",\n', b"")
     if case == "undeclared":
         source = source.replace(b"NATIVE_RESULT_SCHEMAS = (1,)", b"OLD_RESULT_SCHEMAS = (1,)")
     if case == "ambiguous":
@@ -932,8 +996,10 @@ def execution(installation, monkeypatch):
     for name in ("getuid", "geteuid", "getgid", "getegid"):
         monkeypatch.setattr(linux_runtime.os, name, lambda: 1000)
     request = Mock(
+        ingress_port=None,
         deadline=50,
         runtime_timeout=None,
+        hardlink_source_identities=(),
         terminal=False,
         attempt_id="11111111-1111-4111-8111-111111111111",
         environment=(),
@@ -959,7 +1025,7 @@ def execution(installation, monkeypatch):
     monkeypatch.setattr(
         linux_runtime,
         "namespace_arguments",
-        Mock(return_value=nullcontext((("--unshare-pid",), (77,)))),
+        Mock(return_value=nullcontext((("--unshare-pid",), (77,), request))),
     )
     monkeypatch.setattr(linux_runtime, "runtime_read_roots", Mock(return_value=(Path("/usr"),)))
     monkeypatch.setattr(linux_runtime, "payload_profile", Mock(return_value="payload_profile"))
@@ -1130,6 +1196,38 @@ def test_execute_installed_request_guards_spawn_and_supervision(execution, monke
     assert order == ["guard-enter", "spawn", "supervise", "guard-exit"]
 
 
+@pytest.mark.parametrize("host_sources", [False, True])
+def test_receiver_serializes_the_mounted_view_after_admission(execution, monkeypatch, host_sources):
+    """Only trusted launch uses the restricted view, with the original execution deadline."""
+    original = execution.request
+    mounted = copy(original)
+    mounted.hardlink_source_identities = ("host-only identity",) if host_sources else ()
+    mounted.to_wire = Mock(return_value=b"mounted-view")
+    linux_runtime.namespace_arguments.return_value = nullcontext(
+        (("--unshare-pid",), (77,), mounted)
+    )
+    replace = Mock(return_value=mounted)
+    monkeypatch.setattr(linux_runtime, "replace", replace)
+
+    def launch(*_args, **kwargs):
+        """Read the trusted, anonymous setup input while it is still open."""
+        setup = json.load(kwargs["stdin"])
+        assert base64.b64decode(setup["request"]) == b"mounted-view"
+        return Mock()
+
+    execution.launch.side_effect = launch
+    result = linux_runtime.execute_installed_request(
+        execution.record, b"original-admission", execution.connection
+    )
+    assert result.outcome is SandboxOutcome.COMPLETED
+    SandboxRequest.from_wire.assert_called_once_with(b"original-admission")
+    expected = [{"deadline": original.deadline}]
+    if host_sources:
+        expected.insert(0, {"hardlink_source_identities": ()})
+    assert [call.kwargs for call in replace.call_args_list] == expected
+    assert all(call.args == (mounted,) for call in replace.call_args_list)
+
+
 @pytest.mark.parametrize("prepared_in_time", [False, True])
 def test_receiver_renews_runtime_only_after_preparation(execution, monkeypatch, prepared_in_time):
     """An authenticated receiver rejects slow setup and starts runtime at launch."""
@@ -1191,13 +1289,37 @@ def test_execute_installed_request_binds_and_closes_private_egress_bridge(
 ):
     """Native launch passes only this attempt's bridge FD and checks closure before success."""
     execution.request.egress_origins = ("http://example.com",)
+    execution.request.deadline = 100
+    execution.request.runtime_timeout = 30
+    clock = [10]
+    monkeypatch.setattr(linux_runtime.time, "monotonic", lambda: clock[0])
+
+    def renew(request, *, deadline):
+        """Keep independently visible preparation and execution request snapshots."""
+        updated = copy(request)
+        updated.deadline = deadline
+        return updated
+
+    def launch(*_args, **_kwargs):
+        """Use most of the preparation budget before starting the payload."""
+        clock[0] = 65
+        return Mock()
+
+    def mount(request, *_args, **_kwargs):
+        """Keep the preparation request when no namespace aliases are required."""
+        return nullcontext((("--unshare-pid",), (77,), request))
+
+    monkeypatch.setattr(linux_runtime, "replace", renew)
+    linux_runtime.namespace_arguments.side_effect = mount
+    execution.launch.side_effect = launch
     bridge_host, bridge_child = MagicMock(), MagicMock()
     bridge_child.fileno.return_value = 88
     factory = Mock(return_value=(bridge_host, bridge_child))
     monkeypatch.setattr(linux_runtime.socket, "socketpair", factory)
     broker = Mock()
     broker.close.return_value = confirmed
-    monkeypatch.setattr(linux_runtime, "EgressBroker", Mock(return_value=broker))
+    broker_factory = Mock(return_value=broker)
+    monkeypatch.setattr(linux_runtime, "NetworkBroker", broker_factory)
     result = linux_runtime.execute_installed_request(
         execution.record, b"snapshot", execution.connection
     )
@@ -1208,8 +1330,10 @@ def test_execute_installed_request_binds_and_closes_private_egress_bridge(
     assert 88 in execution.launch.call_args.kwargs["pass_fds"]
     execution.connection.sendall.assert_called_once_with(b"E")
     execution.supervisor.assert_called_once()
+    assert broker_factory.call_args.args[0].deadline == 70
+    assert execution.supervisor.call_args.args[2] == 95
     assert execution.supervisor.call_args.kwargs["mediator"] is broker
-    broker.start_lease.assert_called_once()
+    broker.start_lease.assert_called_once_with(95)
     assert broker.close.call_count >= 1
     if not confirmed:
         assert result.possible_effects
@@ -1722,3 +1846,20 @@ def test_execution_authority_requires_complete_trusted_entry(installation, monke
     else:
         with pytest.raises(ValueError, match="no trusted payload"):
             linux_runtime.execution_authority(record)
+
+
+@pytest.mark.parametrize("stage", ["payload_profile", "compile_payload"])
+def test_policy_preparation_refusal_is_authenticated_without_payload_effects(
+    execution, monkeypatch, stage
+):
+    """Unrepresentable or oversized policy returns a typed refusal before spawning payload code."""
+    monkeypatch.setattr(linux_runtime, stage, Mock(side_effect=ValueError("Policy bound exceeded")))
+    result = linux_runtime.execute_installed_request(
+        execution.record, b"snapshot", execution.connection
+    )
+    assert result.outcome is SandboxOutcome.INVALID
+    assert result.detail == "Policy bound exceeded"
+    assert result.failure_context == "Native sandbox policy preparation was refused."
+    assert not result.possible_effects
+    execution.launch.assert_not_called()
+    execution.supervisor.assert_not_called()

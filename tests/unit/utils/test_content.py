@@ -8,6 +8,7 @@ from uuid import uuid4
 import pytest
 
 from loop import constants
+from loop.utils import content as content_module
 from loop.utils.content import (
     _ContentSpool,
     base64_decode,
@@ -26,6 +27,25 @@ from loop.utils.content import (
     store_content,
     store_text_stream,
 )
+
+
+def test_versioned_path_read_rejects_a_replaced_name(tmp_path, monkeypatch):
+    """A complete descriptor read cannot certify a name rebound to another inode."""
+    source = tmp_path / "source"
+    source.write_text("original", encoding="utf-8")
+    replacement = tmp_path / "replacement"
+    replacement.write_text("changed", encoding="utf-8")
+    read_stream = content_module.read_bounded_text_stream
+
+    def replace_after_read(stream, **kwargs):
+        """Replace the pathname after the bound descriptor's stream has been consumed."""
+        result = read_stream(stream, **kwargs)
+        replacement.replace(source)
+        return result
+
+    monkeypatch.setattr(content_module, "read_bounded_text_stream", replace_after_read)
+    with pytest.raises(ValueError, match="File changed while reading"):
+        read_bounded_text(source, include_version=True)
 
 
 @pytest.mark.parametrize(
@@ -221,6 +241,10 @@ def test_oversized_command_result_keeps_status_and_resumable_streams(
         stream["handle"] = store_content(cached, "synthetic stream")
         stream["next_cursor"] = encode_content_cursor(stream["handle"], len(text))
         stream["continuation"] = "Use read_cached_content with this handle and cursor."
+        stream["next_tool_call"] = {
+            "name": "read_cached_content",
+            "arguments": {"handle": stream["handle"], "cursor": stream["next_cursor"]},
+        }
         stream["captured_bytes"] = len(cached)
         stream["truncated"] = True
     body = {
@@ -254,6 +278,8 @@ def test_oversized_command_result_keeps_status_and_resumable_streams(
             assert (
                 decode_content_cursor(item["next_cursor"], item["handle"]) == item["included_bytes"]
             )
+            assert item["next_tool_call"]["arguments"]["cursor"] == item["next_cursor"]
+            assert item["next_tool_call"]["arguments"]["handle"] == item["handle"]
             assert cached_path(item["handle"])[0].read_text(encoding="utf-8").startswith(text)
     if large_metadata:
         assert all(len(actual[name]["content"]) < len(text) for name in ("stdout", "stderr"))
@@ -564,6 +590,16 @@ def test_content_spool_tail_and_incomplete_capture_metadata(monkeypatch):
     spool.append("12345678")
     result = spool.stream_result(capture_complete=True)
     assert result["tail"] == {"content": "12345678", "start_byte": 0, "end_byte": 8}
+    assert result["next_tool_call"] == {
+        "name": "read_cached_content",
+        "arguments": {
+            "handle": result["handle"],
+            "cursor": result["next_cursor"],
+            "start_line": None,
+            "max_lines": None,
+            "max_bytes": constants.MAX_TOOL_CONTENT_BYTES,
+        },
+    }
     incomplete = spool.stream_result(capture_complete=False)
     assert incomplete["capture_complete"] is False
     assert incomplete["decoding_loss"] == "unknown"
@@ -581,6 +617,7 @@ def test_read_bounded_text_requires_boolean_nul_policy(tmp_path):
     ("ranges", "message"),
     [
         ({"start_byte": 1, "start_line": 1}, "either start_byte or start_line"),
+        ({"start_byte": 1, "start_line": 2}, "either start_byte or start_line"),
         ({"start_byte": -1, "start_line": None}, "start_byte must be non-negative"),
         ({"start_line": 0}, "start_line must be at least 1"),
         ({"max_lines": 0}, "max_lines must be at least 1"),
@@ -632,6 +669,18 @@ def test_bounded_text_prefers_line_mode_when_the_shared_origin_has_a_line_limit(
     assert result["end_line"] == 1
     assert result["next_start_line"] == 2
     assert result["truncation_reason"] == "lines"
+
+
+def test_bounded_text_accepts_byte_zero_as_the_default_for_a_later_line(tmp_path):
+    """A neutral byte offset leaves a selected later line and its continuation intact."""
+    source = tmp_path / "source.txt"
+    source.write_text("first\nsecond\nthird\n", encoding="utf-8")
+
+    result = read_bounded_text(source, start_byte=0, start_line=2, max_lines=1)
+
+    assert result["content"] == "second\n"
+    assert result["start_line"] == 2
+    assert result["next_start_line"] == 3
 
 
 def test_bounded_text_applies_both_ceilings_to_byte_started_reads(tmp_path):

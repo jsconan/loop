@@ -14,6 +14,7 @@ from loop import ConsoleInteraction
 from loop.application import ApplicationPaths
 from loop.application.commands import ApplicationCommands
 from loop.application.runtime import ApplicationRuntime
+from loop.application.verification import VerificationCommands
 from loop.configuration import ApplicationSettings, ConfigurationCommands
 from loop.conversation import ConversationCommands, ConversationRecoveryCommands
 from loop.permissions import PermissionNamespaceError
@@ -92,6 +93,7 @@ def test_create_composes_runtime_from_bound_references(dependencies, assembled):
         ConfigurationCommands,
         ApplicationCommands,
         WorkspaceCommands,
+        VerificationCommands,
     ]
 
     logging_path = dependencies["configure_operational_logging"].call_args.args[0]
@@ -100,6 +102,13 @@ def test_create_composes_runtime_from_bound_references(dependencies, assembled):
     session_path = dependencies["SQLiteSessionStore"].call_args.args[0]
     assert telemetry_path == paths.telemetry
     assert session_path == workspace_paths.sessions
+    assert dependencies["SQLiteSessionStore"].call_args.kwargs["scratch_roots"] == (
+        workspace_paths.scratch_roots
+    )
+    assert (
+        paths.session_scratch
+        in dependencies["PermissionManager"].call_args.kwargs["protected_host_roots"]
+    )
     assert dependencies["PermissionManager"].call_args.kwargs["user_configuration_path"] == (
         paths.user_permissions
     )
@@ -615,7 +624,7 @@ def test_publication_follows_complete_command_registration(dependencies, assembl
         workspace, paths, workspace_paths, settings, Mock(), Mock(), Mock()
     )
 
-    assert [name for name, _value in events] == ["register", "register", "register", "publish"]
+    assert [name for name, _value in events] == ["register"] * 4 + ["publish"]
     runtime.close()
 
 
@@ -1088,3 +1097,85 @@ def test_sync_runtime_keeps_its_native_path_when_a_controller_is_bound():
     runtime.close()
     loop.run.assert_called_once_with()
     controller.run_async.assert_not_called()
+
+
+@pytest.mark.parametrize("choice", ["continue", "reset"])
+@pytest.mark.parametrize("scope", ["workspace", "user"])
+def test_startup_recovery_passes_explicit_defaults_choice(assembled, monkeypatch, choice, scope):
+    """Startup retries with exactly the user-selected policy override and reset intent."""
+    workspace, paths, workspace_paths, settings = assembled
+    path = workspace_paths.permissions if scope == "workspace" else paths.user_permissions
+    interaction = Mock(spec=ConsoleInteraction)
+    interaction.prompt_async = AsyncMock(return_value=choice)
+    runtime = Mock()
+    create = Mock(side_effect=[PermissionNamespaceError(path, "Invalid policy."), runtime])
+    monkeypatch.setattr(ApplicationRuntime, "create", create)
+    result = asyncio.run(
+        ApplicationRuntime.create_interactively_async(
+            workspace, paths, workspace_paths, settings, Mock(), Mock(), interaction
+        )
+    )
+    assert result is runtime
+    assert create.call_args.kwargs["recovery_defaults"] == {path: choice}
+    assert set(interaction.prompt_async.call_args.kwargs["choices"]) == {
+        "retry",
+        "continue",
+        "reset",
+        "exit",
+    }
+
+
+@pytest.mark.parametrize("original_exists", [False, True])
+def test_create_saves_only_explicitly_selected_recovery_reset(
+    dependencies, assembled, original_exists
+):
+    """An explicit reset persists defaults while a temporary user override remains in memory."""
+    workspace, paths, workspace_paths, settings = assembled
+    interaction = Mock()
+    manager = dependencies["PermissionManager"].return_value
+    backup = (
+        workspace_paths.permissions.with_name("permissions.yaml.previous.bak")
+        if original_exists
+        else None
+    )
+    manager.save_recovery_defaults.return_value = backup
+    choices = {
+        workspace_paths.permissions: "reset",
+        paths.user_permissions: "continue",
+    }
+    runtime = ApplicationRuntime.create(
+        workspace,
+        paths,
+        workspace_paths,
+        settings,
+        Mock(),
+        Mock(),
+        interaction,
+        recovery_defaults=choices,
+    )
+    assert dependencies["PermissionManager"].call_args.kwargs["recovery_defaults"] == choices
+    manager.save_recovery_defaults.assert_called_once_with("workspace")
+    expected = f"Saved default permission policy at {workspace_paths.permissions}."
+    if original_exists:
+        expected += f" Original archived at {backup}."
+    interaction.info.assert_called_once_with(expected)
+    runtime.close()
+
+
+def test_create_reports_failed_recovery_save_as_another_recovery_choice(dependencies, assembled):
+    """A failed archive/reset returns to policy recovery instead of an unhandled I/O exit."""
+    workspace, paths, workspace_paths, settings = assembled
+    dependencies["PermissionManager"].return_value.save_recovery_defaults.side_effect = OSError(
+        "fixture full disk"
+    )
+    with pytest.raises(PermissionNamespaceError, match="choose temporary defaults"):
+        ApplicationRuntime.create(
+            workspace,
+            paths,
+            workspace_paths,
+            settings,
+            Mock(),
+            Mock(),
+            Mock(),
+            recovery_defaults={workspace_paths.permissions: "reset"},
+        )

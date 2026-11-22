@@ -8,6 +8,28 @@ from importlib.resources import files
 from pathlib import Path
 
 import loop
+from loop.sandbox_catalog import SANDBOX_OPTIONS
+
+
+def test_native_option_vocabulary_belongs_to_backends():
+    """General policy, execution and model tools consume a backend’s opaque option keys."""
+    source = Path(loop.__file__).parent
+    generic = [
+        *source.joinpath("permissions").rglob("*.py"),
+        source / "execution" / "coordinator.py",
+        source / "execution" / "facade.py",
+        source / "execution" / "sandbox" / "contracts.py",
+        source / "tools" / "system.py",
+        source / "application" / "verification.py",
+    ]
+    for module in generic:
+        code = module.read_text().lower()
+        assert not any(key in code for key in SANDBOX_OPTIONS), module
+    for module in source.joinpath("permissions").rglob("*.py"):
+        code = module.read_text().lower()
+        assert not any(word in code for word in ("sys.platform", "darwin", "seatbelt", "linux")), (
+            module
+        )
 
 
 def test_app_import_avoids_other_platform_sandbox_modules(tmp_path):

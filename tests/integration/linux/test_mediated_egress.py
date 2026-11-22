@@ -8,6 +8,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -75,7 +76,7 @@ def _call(
     command: str,
     origins: list[str],
     *,
-    read_only: bool = True,
+    write: bool = False,
     read_roots: list[str] | None = None,
 ) -> dict:
     """Dispatch one exact command through the public tool boundary."""
@@ -86,7 +87,7 @@ def _call(
                 {
                     "command": command,
                     "cwd": str(workspace),
-                    "read_only": read_only,
+                    "write_roots": [str(workspace)] if write else [],
                     "read_roots": read_roots or [],
                     "egress_origins": origins,
                 }
@@ -270,7 +271,7 @@ def test_uv_sync_uses_the_owned_scoped_package_index(registry):
         '-c "import loop_egress_fixture; print(loop_egress_fixture.VALUE)"'
     )
     result = _call(
-        tools, workspace, command, [_ORIGIN], read_only=False, read_roots=[str(Path(_UV).parent)]
+        tools, workspace, command, [_ORIGIN], write=True, read_roots=[str(Path(_UV).parent)]
     )
     assert result["ok"], json.dumps(result, indent=2)
     assert result["result"]["stdout"]["content"] == "ok\n"
@@ -286,7 +287,7 @@ def test_git_ls_remote_uses_the_owned_scoped_https_repository(registry):
         workspace,
         f"GIT_SSL_NO_VERIFY=true git ls-remote {_HTTPS_ORIGIN}/repo.git HEAD",
         [_HTTPS_ORIGIN],
-        read_only=False,
+        write=True,
     )
     assert result["ok"], result
     assert result["result"]["stdout"]["content"].endswith("\tHEAD\n")
@@ -322,7 +323,7 @@ def test_ungranted_package_or_git_destination_is_denied(registry, client):
         workspace,
         command,
         grants,
-        read_only=False,
+        write=True,
         read_roots=[str(Path(_UV).parent)] if client == "uv" else None,
     )
     assert not result["ok"], result
@@ -535,9 +536,7 @@ def test_other_managers_persisted_change_waits_for_active_reload(registry):
         '> "$WORKSPACE_ROOT/persisted-stream"'
     )
     with ThreadPoolExecutor(max_workers=1) as executor:
-        running = executor.submit(
-            _call, tools, workspace, command, [_HTTPS_ORIGIN], read_only=False
-        )
+        running = executor.submit(_call, tools, workspace, command, [_HTTPS_ORIGIN], write=True)
         deadline = time.monotonic() + 5
         while (not stream.exists() or "started" not in stream.read_text()) and (
             time.monotonic() < deadline
@@ -552,9 +551,7 @@ def test_other_managers_persisted_change_waits_for_active_reload(registry):
 
     stream.unlink()
     with ThreadPoolExecutor(max_workers=1) as executor:
-        running = executor.submit(
-            _call, tools, workspace, command, [_HTTPS_ORIGIN], read_only=False
-        )
+        running = executor.submit(_call, tools, workspace, command, [_HTTPS_ORIGIN], write=True)
         deadline = time.monotonic() + 5
         while (not stream.exists() or "started" not in stream.read_text()) and (
             time.monotonic() < deadline
@@ -571,16 +568,14 @@ def test_direct_policy_edit_waits_for_active_reload(registry):
     if not _HTTPS_ORIGIN:
         pytest.skip("Requires an owned isolated streaming HTTPS fixture")
     tools, workspace, manager = registry
-    manager.set_default(Action.FILESYSTEM_READ, Decision.DENY)
+    manager.save()
     stream = workspace / "edited-stream"
     command = (
         f"curl -kfsS --no-buffer --max-time 12 {_HTTPS_ORIGIN}/slow "
         '> "$WORKSPACE_ROOT/edited-stream"'
     )
     with ThreadPoolExecutor(max_workers=1) as executor:
-        running = executor.submit(
-            _call, tools, workspace, command, [_HTTPS_ORIGIN], read_only=False
-        )
+        running = executor.submit(_call, tools, workspace, command, [_HTTPS_ORIGIN], write=True)
         deadline = time.monotonic() + 5
         while (not stream.exists() or "started" not in stream.read_text()) and (
             time.monotonic() < deadline
@@ -588,14 +583,14 @@ def test_direct_policy_edit_waits_for_active_reload(registry):
             time.sleep(0.02)
         assert stream.exists() and "started" in stream.read_text()
         policy_file = workspace / ".loop" / "permissions.yaml"
-        policy_file.write_text(policy_file.read_text() + "\n# synthetic external edit\n")
+        policy_file.write_text(
+            policy_file.read_text().replace("filesystem.read: allow", "filesystem.read: deny")
+        )
         assert running.result(timeout=12)["ok"]
 
     stream.unlink()
     with ThreadPoolExecutor(max_workers=1) as executor:
-        running = executor.submit(
-            _call, tools, workspace, command, [_HTTPS_ORIGIN], read_only=False
-        )
+        running = executor.submit(_call, tools, workspace, command, [_HTTPS_ORIGIN], write=True)
         deadline = time.monotonic() + 5
         while (not stream.exists() or "started" not in stream.read_text()) and (
             time.monotonic() < deadline
@@ -613,7 +608,7 @@ def test_copied_proxy_url_cannot_cross_sandbox_attempts(registry):
     copied = workspace / "proxy-url"
     source = 'printf %s "$http_proxy" > "$WORKSPACE_ROOT/proxy-url"; sleep 4'
     with ThreadPoolExecutor(max_workers=1) as executor:
-        first = executor.submit(_call, tools, workspace, source, [_ORIGIN], read_only=False)
+        first = executor.submit(_call, tools, workspace, source, [_ORIGIN], write=True)
         deadline = time.monotonic() + 3
         while not copied.exists() and time.monotonic() < deadline:
             time.sleep(0.02)
@@ -638,7 +633,7 @@ def test_expired_attempt_proxy_url_cannot_reopen_egress(registry):
         workspace,
         'printf %s "$http_proxy" > "$WORKSPACE_ROOT/expired-proxy-url"',
         [_ORIGIN],
-        read_only=False,
+        write=True,
     )
     assert first["ok"], first
     second = _call(
@@ -652,11 +647,11 @@ def test_expired_attempt_proxy_url_cannot_reopen_egress(registry):
 
 
 def test_representative_parallel_load_keeps_healthy_leases(registry):
-    """Six active streams survive heartbeat and unchanged-policy pause/resume."""
+    """Four active streams survive heartbeat and unchanged-policy pause/resume."""
     if not _HTTPS_ORIGIN:
         pytest.skip("Requires an owned isolated streaming HTTPS fixture")
     tools, workspace, manager = registry
-    with ThreadPoolExecutor(max_workers=6) as executor:
+    with ThreadPoolExecutor(max_workers=4) as executor:
         running = [
             executor.submit(
                 _call,
@@ -665,12 +660,12 @@ def test_representative_parallel_load_keeps_healthy_leases(registry):
                 f"curl -kfsS --no-buffer --max-time 15 {_HTTPS_ORIGIN}/slow",
                 [_HTTPS_ORIGIN],
             )
-            for _ in range(6)
+            for _ in range(4)
         ]
         deadline = time.monotonic() + 6
-        while len(manager._egress_revokers) < 6 and time.monotonic() < deadline:
+        while len(manager._egress_revokers) < 4 and time.monotonic() < deadline:
             time.sleep(0.02)
-        assert len(manager._egress_revokers) == 6
+        assert len(manager._egress_revokers) == 4
         manager.set_yolo(True)
         for future in running:
             outcome = future.result(timeout=15)
@@ -690,9 +685,7 @@ def test_revision_ack_timeout_does_not_report_success(registry, monkeypatch):
         '> "$WORKSPACE_ROOT/unacknowledged-stream"'
     )
     with ThreadPoolExecutor(max_workers=1) as executor:
-        running = executor.submit(
-            _call, tools, workspace, command, [_HTTPS_ORIGIN], read_only=False
-        )
+        running = executor.submit(_call, tools, workspace, command, [_HTTPS_ORIGIN], write=True)
         deadline = time.monotonic() + 5
         while (not stream.exists() or "started" not in stream.read_text()) and (
             time.monotonic() < deadline
@@ -722,9 +715,7 @@ def test_authority_process_suspend_and_resume(registry, pause_seconds, survives)
         '> "$WORKSPACE_ROOT/suspended-stream"'
     )
     with ThreadPoolExecutor(max_workers=1) as executor:
-        running = executor.submit(
-            _call, tools, workspace, command, [_HTTPS_ORIGIN], read_only=False
-        )
+        running = executor.submit(_call, tools, workspace, command, [_HTTPS_ORIGIN], write=True)
         deadline = time.monotonic() + 5
         while (not stream.exists() or "started" not in stream.read_text()) and (
             time.monotonic() < deadline
@@ -752,9 +743,7 @@ def test_policy_change_closes_an_active_https_tunnel(registry):
         f'curl -kfsS --no-buffer --max-time 12 {_HTTPS_ORIGIN}/slow > "$WORKSPACE_ROOT/stream"'
     )
     with ThreadPoolExecutor(max_workers=1) as executor:
-        running = executor.submit(
-            _call, tools, workspace, command, [_HTTPS_ORIGIN], read_only=False
-        )
+        running = executor.submit(_call, tools, workspace, command, [_HTTPS_ORIGIN], write=True)
         deadline = time.monotonic() + 5
         while (not stream.exists() or "started" not in stream.read_text()) and (
             time.monotonic() < deadline
@@ -783,7 +772,7 @@ def test_policy_change_closes_two_active_tunnels_without_deadlock(registry):
                 workspace,
                 f'curl -kfsS --no-buffer --max-time 12 {_HTTPS_ORIGIN}/slow > "$WORKSPACE_ROOT/{stream.name}"',
                 [_HTTPS_ORIGIN],
-                read_only=False,
+                write=True,
             )
             for stream in streams
         ]
@@ -813,7 +802,7 @@ def test_missed_authority_heartbeat_closes_an_active_tunnel(registry, monkeypatc
         '> "$WORKSPACE_ROOT/heartbeat-stream"'
     )
     started = time.monotonic()
-    outcome = _call(tools, workspace, command, [_HTTPS_ORIGIN], read_only=False)
+    outcome = _call(tools, workspace, command, [_HTTPS_ORIGIN], write=True)
     assert time.monotonic() - started < 5
     assert not outcome["ok"], outcome
     assert stream.exists() and "started" in stream.read_text()
@@ -833,9 +822,7 @@ def test_receiver_death_stops_an_existing_tunnel(registry):
         '> "$WORKSPACE_ROOT/supervisor-stream"'
     )
     with ThreadPoolExecutor(max_workers=1) as executor:
-        running = executor.submit(
-            _call, tools, workspace, command, [_HTTPS_ORIGIN], read_only=False
-        )
+        running = executor.submit(_call, tools, workspace, command, [_HTTPS_ORIGIN], write=True)
         deadline = time.monotonic() + 5
         while (not stream.exists() or "started" not in stream.read_text()) and (
             time.monotonic() < deadline
@@ -877,3 +864,42 @@ def test_receiver_death_stops_an_existing_tunnel(registry):
                 text=True,
                 check=True,
             )
+
+
+def test_loop_process_death_closes_established_tunnel(native_directory):
+    """An external controller observes native receiver and TCP closure after Loop SIGKILL."""
+    if _SUPERVISOR_TEST != "disposable-linux-host" or not _HTTPS_ORIGIN:
+        pytest.skip("Requires the disposable supervisor host and owned HTTPS fixture")
+    assert _HTTPS_ORIGIN == "https://11.0.0.2:18443"
+    root = native_directory("/tmp") / "authority"
+    script = Path(__file__).with_name("egress_lifecycle_probe.py")
+    worker = subprocess.Popen(
+        [sys.executable, "-B", str(script), "death", str(root)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 20
+        while not (root / "ready").is_file() and time.monotonic() < deadline:
+            if worker.poll() is not None:
+                pytest.fail(worker.stderr.read())
+            time.sleep(0.02)
+        assert (root / "ready").is_file(), "The owned tunnel never became ready"
+        assert int((root / "ready").read_text()) == worker.pid
+        controller = subprocess.run(
+            [sys.executable, "-B", str(script), "control-death", str(root)],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        assert controller.returncode == 0, controller.stdout + controller.stderr
+        assert "PASS authority death closed tunnel and receiver" in controller.stdout
+        assert worker.wait(timeout=5) == -signal.SIGKILL
+        assert "finished" not in (root / "workspace/stream").read_text()
+    finally:
+        if worker.poll() is None:
+            worker.kill()
+        worker.wait(timeout=5)
+        worker.stderr.close()

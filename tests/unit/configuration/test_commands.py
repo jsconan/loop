@@ -1905,3 +1905,22 @@ def test_config_reload_reports_reset_failure_before_next_action(tmp_path, monkey
         call.args[0].code == "configuration.reset_failed"
         for call in interaction.report.call_args_list
     )
+
+
+def test_host_setting_warns_and_applies_without_an_in_request_enable_flow(tmp_path):
+    """Trusted configuration explicitly enables the host gate and discloses YOLO's reach."""
+    configuration = ConfigurationManager(tmp_path / "config" / "config.toml")
+    configuration.initialize()
+    configuration.load({})
+    interaction = Mock(spec=ConsoleInteraction)
+    apply = Mock(return_value="applied now")
+    commands = CommandManager(
+        providers=(ConfigurationCommands(configuration, apply),), interaction=interaction
+    )
+    assert commands.handle_user_command("/config set app.allow_direct_host_execution true")
+    assert configuration.effective.app.allow_direct_host_execution
+    assert configuration.source_for("app.allow_direct_host_execution") == "session"
+    assert "YOLO" in interaction.warning.call_args.args[0]
+    assert "unrestricted" in interaction.warning.call_args.args[0]
+    apply.assert_called_once()
+    interaction.prompt.assert_not_called()

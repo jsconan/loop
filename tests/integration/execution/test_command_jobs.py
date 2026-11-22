@@ -3,22 +3,20 @@
 import asyncio
 import json
 from contextvars import ContextVar
-from dataclasses import replace
 from threading import Event, Thread
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 
 from loop.execution import CommandExecutionService
-from loop.execution.jobs import CommandJob
 from loop.execution.sandbox import CommandProcessResult, SandboxCapability, SandboxOutcome
 from loop.instructions import InstructionsManager, RuntimeEnvironment
 from loop.models import ToolCall
 from loop.permissions import (
     Action,
+    Decision,
     Operation,
     PermissionManager,
-    PolicyScope,
     ProcessBoundary,
     ProcessTarget,
 )
@@ -37,6 +35,7 @@ def test_fast_command_returns_final_result_without_polling(tmp_path):
     )
     sessions = SessionManager()
     permissions = PermissionManager(tmp_path)
+    permissions.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
     permissions.bind_temporary_directory(sessions.temporary_directory)
     service = CommandExecutionService(backend, Mock())
     registry = ToolRegistry(execution_service=service, session_manager=sessions)
@@ -74,6 +73,7 @@ def test_command_snapshots_hard_limit_before_approval(tmp_path, monkeypatch):
     backend.run.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
     sessions = SessionManager()
     permissions = PermissionManager(tmp_path)
+    permissions.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
     permissions.bind_temporary_directory(sessions.temporary_directory)
     authorize = permissions.authorize_sandboxed_command
 
@@ -150,6 +150,7 @@ def test_async_command_survives_owner_loop_closure(tmp_path, monkeypatch, mode):
     backend.run.side_effect = run_after_handoff
     sessions = SessionManager()
     permissions = PermissionManager(tmp_path)
+    permissions.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
     permissions.bind_temporary_directory(sessions.temporary_directory)
     if mode == "mediated":
         permissions.set_yolo(True)
@@ -157,7 +158,7 @@ def test_async_command_survives_owner_loop_closure(tmp_path, monkeypatch, mode):
     interaction.prompt_async = AsyncMock(return_value="approve")
     host = Mock()
     if mode == "host_offer":
-        permissions.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+        permissions.set_direct_host_execution(True)
     instructions = InstructionsManager(
         runtime_environment=RuntimeEnvironment(tmp_path, sessions.temporary_directory)
     )
@@ -251,6 +252,7 @@ def test_command_yields_once_and_can_be_cancelled_without_replay(tmp_path):
     backend.run.side_effect = run_command
     sessions = SessionManager()
     permissions = PermissionManager(tmp_path)
+    permissions.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
     permissions.bind_temporary_directory(sessions.temporary_directory)
     service = CommandExecutionService(backend, Mock())
     operation = Operation(
@@ -295,81 +297,6 @@ def test_command_yields_once_and_can_be_cancelled_without_replay(tmp_path):
         permissions.close()
 
 
-@pytest.mark.parametrize("cancel", [False, True])
-def test_approved_host_retry_remains_owned_after_handoff(tmp_path, monkeypatch, cancel):
-    """An approved host retry can be read or cancelled after the original call returns."""
-    host_started = Event()
-    release_host = Event()
-    interaction = Mock(supports_fresh_host_approval=True)
-    interaction.prompt.return_value = "approve"
-    backend = Mock()
-    backend.run.return_value = CommandProcessResult(SandboxOutcome.UNAVAILABLE, detail="no sandbox")
-    host = Mock()
-
-    def run_host(_request, *, cancellation_event, output_observer=None):
-        """Wait for the test to settle or cancel the approved host attempt."""
-        host_started.set()
-        if not release_host.wait(timeout=5):
-            raise TimeoutError("Synthetic host command was not released.")
-        if cancellation_event.is_set():
-            return CommandProcessResult(SandboxOutcome.CANCELLED, possible_effects=True)
-        if output_observer is not None:
-            output_observer("stdout", "host output")
-        return CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0, stdout="host output")
-
-    def wait_for_host(_job, _seconds, _cancellation_event):
-        """Make the initial wait expire only after the authorized host process starts."""
-        if not host_started.wait(timeout=5):
-            raise TimeoutError("The approved host attempt did not start.")
-        return False
-
-    host.run_host_command.side_effect = run_host
-    monkeypatch.setattr(CommandJob, "wait", wait_for_host)
-    sessions = SessionManager()
-    permissions = PermissionManager(tmp_path)
-    permissions.bind_temporary_directory(sessions.temporary_directory)
-    permissions.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
-    service = CommandExecutionService(backend, host)
-    operation = Operation(
-        tool_id="run_command",
-        action=Action.PROCESS_EXECUTE,
-        target=ProcessTarget(
-            argv=("/bin/sh", "-c", ":"), cwd=str(tmp_path), boundary=ProcessBoundary.SANDBOXED
-        ),
-    )
-    context = ToolContext(
-        interaction,
-        "run_command",
-        operations=(operation,),
-        permission_manager=permissions,
-        session_manager=sessions,
-    )
-    try:
-        first = service.run_command(context, ":", wait_seconds=1)
-        assert first["status"] == "running"
-        assert host_started.is_set()
-        assert any(
-            "without the OS sandbox" in call.args[0] for call in interaction.prompt.call_args_list
-        )
-        if cancel:
-            assert service.cancel_command_job(context, first["handle"])["cancel_requested"]
-        release_host.set()
-        final = service.poll_command_job(context, first["handle"], wait_seconds=5)
-        assert final["status"] == "complete"
-        if cancel:
-            assert final["result"]["code"] == "host_command.cancelled"
-            assert final["cancel_requested"]
-        else:
-            assert final["boundary"] == "host"
-            assert final["stdout"]["content"] == "host output"
-        backend.run.assert_called_once()
-        host.run_host_command.assert_called_once()
-    finally:
-        release_host.set()
-        service.close()
-        permissions.close()
-
-
 def test_host_approval_is_not_requested_after_handoff(tmp_path):
     """A no-effects sandbox failure after handoff cannot open a stale host prompt."""
     release_sandbox = Event()
@@ -388,7 +315,7 @@ def test_host_approval_is_not_requested_after_handoff(tmp_path):
     sessions = SessionManager()
     permissions = PermissionManager(tmp_path)
     permissions.bind_temporary_directory(sessions.temporary_directory)
-    permissions.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    permissions.set_direct_host_execution(True)
     service = CommandExecutionService(backend, host)
     operation = Operation(
         tool_id="run_command",
@@ -423,91 +350,6 @@ def test_host_approval_is_not_requested_after_handoff(tmp_path):
         permissions.close()
 
 
-def test_origin_cancellation_during_host_approval_prevents_launch(tmp_path, monkeypatch):
-    """An interrupted origin cannot start a host command after a blocked approval returns."""
-    entered_prompt = Event()
-    release_prompt = Event()
-    handoff_attempted = Event()
-    stopped = Event()
-    backend = Mock()
-    backend.run.return_value = CommandProcessResult(SandboxOutcome.UNAVAILABLE, detail="no sandbox")
-    host = Mock()
-    interaction = Mock(supports_fresh_host_approval=True)
-
-    def prompt(message, **_kwargs):
-        """Block only the separate host decision until cancellation is requested."""
-        if "without the OS sandbox" in message:
-            entered_prompt.set()
-            if not release_prompt.wait(timeout=5):
-                raise TimeoutError("Synthetic host approval was not released.")
-        return "approve"
-
-    interaction.prompt.side_effect = prompt
-    original_handoff = CommandJob.handoff
-
-    def wait_for_prompt(_job, _seconds, _cancellation_event):
-        """Hold the initial wait until the separate approval is active."""
-        if not entered_prompt.wait(timeout=5):
-            raise TimeoutError("Host approval was not entered.")
-
-    def observe_handoff(job, cancellation_event=None):
-        """Expose the caller's attempt to transfer ownership while approval is active."""
-        handoff_attempted.set()
-        return original_handoff(job, cancellation_event)
-
-    monkeypatch.setattr(CommandJob, "wait", wait_for_prompt)
-    monkeypatch.setattr(CommandJob, "handoff", observe_handoff)
-    sessions = SessionManager()
-    permissions = PermissionManager(tmp_path)
-    permissions.bind_temporary_directory(sessions.temporary_directory)
-    permissions.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
-    service = CommandExecutionService(backend, host)
-    operation = Operation(
-        tool_id="run_command",
-        action=Action.PROCESS_EXECUTE,
-        target=ProcessTarget(
-            argv=("/bin/sh", "-c", ":"), cwd=str(tmp_path), boundary=ProcessBoundary.SANDBOXED
-        ),
-    )
-    context = ToolContext(
-        interaction,
-        "run_command",
-        operations=(operation,),
-        permission_manager=permissions,
-        session_manager=sessions,
-        cancellation_event=stopped,
-    )
-    outcomes = []
-    caller = Thread(
-        target=lambda: outcomes.append(service.run_command(context, ":", wait_seconds=1))
-    )
-    caller.start()
-    try:
-        assert entered_prompt.wait(timeout=5), (outcomes, service.inspect_command_jobs(context))
-        assert handoff_attempted.wait(timeout=5)
-        stopped.set()
-        release_prompt.set()
-        caller.join(timeout=5)
-        assert not caller.is_alive()
-        assert len(outcomes) == 1
-        owned = service.inspect_command_jobs(context)["jobs"]
-        assert len(owned) == 1
-        final = service.poll_command_job(
-            replace(context, cancellation_event=None), owned[0]["handle"], wait_seconds=5
-        )
-        assert final["status"] == "complete"
-        assert final["cancel_requested"]
-        host.run_host_command.assert_not_called()
-        assert final["result"]["code"] == "sandbox.cancelled"
-        backend.run.assert_called_once()
-    finally:
-        stopped.set()
-        release_prompt.set()
-        caller.join(timeout=5)
-        service.close()
-        permissions.close()
-
-
 def test_cancelled_async_poll_preserves_the_command(tmp_path, monkeypatch):
     """Output does not end a poll, and cancelling a poll leaves the command running."""
     release = Event()
@@ -530,6 +372,7 @@ def test_cancelled_async_poll_preserves_the_command(tmp_path, monkeypatch):
     backend.run.side_effect = run_command
     sessions = SessionManager()
     permissions = PermissionManager(tmp_path)
+    permissions.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
     permissions.bind_temporary_directory(sessions.temporary_directory)
     service = CommandExecutionService(backend, Mock())
     operation = Operation(

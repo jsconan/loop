@@ -13,6 +13,7 @@ from copy import deepcopy
 from dataclasses import fields, replace
 from datetime import datetime
 from pathlib import Path
+from re import fullmatch
 from threading import Lock, RLock, get_ident
 from typing import Any
 
@@ -142,6 +143,7 @@ class SessionManager:
     _execution_depth: int
     _execution_resources: ExitStack
     _selection_block_depth: int
+    _command_job_depth: int
     _interaction: Interaction
     _temporary_directory: PathHolder | None
     _session: Session
@@ -166,6 +168,7 @@ class SessionManager:
         self._execution_depth = 0
         self._execution_resources = ExitStack()
         self._selection_block_depth = 0
+        self._command_job_depth = 0
         self._interaction = interaction or ConsoleInteraction()
         self._session_store = session_store or MemorySessionStore()
         self._async_blocking_runner = async_blocking_runner
@@ -260,36 +263,72 @@ class SessionManager:
 
     def _bound_directory(self, session_id: str, root: Path, identity: str) -> Path:
         """Validate durable identity or commit an independently created/adopted generation."""
+        binding = self._session_store.working_binding(session_id)
+        existing = binding if binding is not None and not binding.retired else None
+        scratch_roots = self._session_store.scratch_roots
+        legacy = root / identity
+        adopted = binding is None and (legacy.exists() or legacy.is_symlink())
+        if existing is None:
+            if adopted:
+                directory = legacy
+            elif scratch_roots:
+                for candidate in scratch_roots:
+                    try:
+                        ensure_private_directory(candidate)
+                    except (OSError, ValueError):
+                        continue
+                    root = candidate
+                    break
+                else:
+                    raise ValueError(
+                        "Session working storage recovery failed: no private namespace available."
+                    )
+                directory = root / new_uuid().hex / "files"
+            else:
+                directory = root / (identity + "." + str(new_uuid())) / "files"
+        else:
+            generation = Path(existing.generation)
+            if generation.is_absolute():
+                root = generation.parent.parent
+                valid = (
+                    root in scratch_roots
+                    and generation.name == "files"
+                    and fullmatch(r"[0-9a-f]{32}", generation.parent.name)
+                )
+            else:
+                parts = generation.parts
+                valid = parts == (identity,) or (
+                    len(parts) == 2 and parts[0].startswith(identity + ".") and parts[1] == "files"
+                )
+            if not valid:
+                raise ValueError("Session working storage recovery failed: invalid binding.")
+            directory = root / generation
+        if existing is not None and root in scratch_roots:
+            try:
+                ensure_private_directory(root, create=False)
+            except OSError as error:
+                raise ValueError(
+                    "Session working storage recovery failed: namespace unavailable."
+                ) from error
         descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
         try:
-            return self._working_directory(session_id, root, identity, descriptor)
+            return self._working_directory(
+                session_id, directory, (root, descriptor), existing, adopted
+            )
         finally:
             os.close(descriptor)
 
     def _working_directory(
         self,
         session_id: str,
-        root: Path,
-        identity: str,
-        descriptor: int,
+        directory: Path,
+        anchor: tuple[Path, int],
+        binding: WorkingDirectoryBinding | None,
+        adopted: bool,
     ) -> Path:
         """Validate or create storage through an approved namespace descriptor."""
-        binding = self._session_store.working_binding(session_id)
-        anchor = (root, descriptor)
-        if binding is not None and not binding.retired:
-            relative = Path(binding.generation)
-            if (
-                relative.is_absolute()
-                or ".." in relative.parts
-                or relative.parts != (identity,)
-                and not (
-                    len(relative.parts) == 2
-                    and relative.parts[0].startswith(identity + ".")
-                    and relative.parts[1] == "files"
-                )
-            ):
-                raise ValueError("Session working storage recovery failed: invalid binding.")
-            directory = root / relative
+        root, _ = anchor
+        if binding is not None:
             try:
                 if directory.parent != root:
                     ensure_private_directory(directory.parent, create=False, anchor=anchor)
@@ -302,31 +341,27 @@ class SessionManager:
                     "Session working storage recovery failed: root unavailable."
                 ) from error
             return directory
-        legacy = root / identity
-        ordinary_names = False
-        if binding is None and (legacy.exists() or legacy.is_symlink()):
-            ensure_private_directory(legacy, create=False, anchor=anchor)
-            directory = legacy
-        else:
-            parent = root / (identity + "." + str(new_uuid()))
-            ensure_private_directory(parent, anchor=anchor)
-            directory = parent / "files"
-            ensure_private_directory(directory, anchor=anchor)
-            ordinary_names = True
+        if not adopted:
+            ensure_private_directory(directory.parent, anchor=anchor)
+        ensure_private_directory(directory, create=not adopted, anchor=anchor)
         details = directory.stat()
         self._session_store.bind_working_directory(
             session_id,
             WorkingDirectoryBinding(
-                str(directory.relative_to(root)),
+                str(
+                    directory
+                    if root in self._session_store.scratch_roots
+                    else directory.relative_to(root)
+                ),
                 details.st_dev,
                 details.st_ino,
-                ordinary_names=ordinary_names,
+                ordinary_names=not adopted,
             ),
         )
         telemetry_audit(
             "session.working_directory.bound",
             session_id=session_id,
-            ordinary_names=ordinary_names,
+            ordinary_names=not adopted,
         )
         return directory
 
@@ -513,12 +548,31 @@ class SessionManager:
             yield
 
     @contextmanager
+    def command_job_storage(self, session_id: str) -> Generator[None, None, None]:
+        """Pin the job's session and scratch while allowing its harness to start another turn.
+
+        Args:
+            session_id (str): Session captured when reserving the command job.
+
+        Yields:
+            None: Control while the native storage lock and session selection guard are held.
+
+        Raises:
+            ValueError: The selected session or its working storage is invalid.
+            OSError: The working directory cannot be inspected or locked.
+            SessionExecutionConflictError: A different manager or process holds the session.
+        """
+        with self._execution(session_id=session_id, share_owner=True, command_job=True):
+            yield
+
+    @contextmanager
     def _execution(
         self,
         *,
         allow_session_selection: bool = False,
         session_id: str | None = None,
         share_owner: bool = False,
+        command_job: bool = False,
     ) -> Generator[Path | None, None, None]:
         """Admit an execution or retain its resource for the same manager's interaction task."""
         resources = ExitStack()
@@ -533,10 +587,17 @@ class SessionManager:
             owner = _execution_owner(self)
             with _EXECUTION_OWNERS_LOCK:
                 existing = _EXECUTION_OWNERS.get(key)
-                if share_owner and existing is not None and existing[0][0] == id(self):
-                    owner = existing[0]
-                if existing is not None and existing[0] != owner:
-                    raise SessionExecutionConflictError(self._session.id)
+                if existing is not None:
+                    registered, depth = existing
+                    if registered[0] != id(self):
+                        raise SessionExecutionConflictError(self._session.id)
+                    # Detached jobs keep this manager's native lock and generation, but no
+                    # foreground owner. A new turn may claim foreground until it settles.
+                    if allow_session_selection or depth != self._command_job_depth:
+                        if share_owner:
+                            owner = registered
+                        elif registered != owner:
+                            raise SessionExecutionConflictError(self._session.id)
                 depth = existing[1] + 1 if existing is not None else 1
                 # Reserve this session before storage work without blocking other owners.
                 _EXECUTION_OWNERS[key] = (owner, depth)
@@ -561,6 +622,8 @@ class SessionManager:
                         raise SessionExecutionConflictError(self._session.id) from error
                     raise
             self._execution_depth += 1
+            if command_job:
+                self._command_job_depth += 1
             if not allow_session_selection:
                 self._selection_block_depth += 1
             captured = None if allow_session_selection else Path(self.temporary_directory)
@@ -571,6 +634,8 @@ class SessionManager:
             _SESSION_SELECTION.reset(token)
             with self._state_lock:
                 self._execution_depth -= 1
+                if command_job:
+                    self._command_job_depth -= 1
                 if not allow_session_selection:
                     self._selection_block_depth -= 1
                 with _EXECUTION_OWNERS_LOCK:
@@ -1448,6 +1513,7 @@ class SessionManager:
                             artifact.handle,
                             artifact.source,
                             artifact.reloadable,
+                            file_sources=artifact.file_sources,
                         )
             if session.pending_interactions:
                 candidate = deepcopy(session)
@@ -2159,6 +2225,7 @@ class SessionManager:
                 handle=handle,
                 source=metadata["source"],
                 reloadable=metadata["reloadable"],
+                file_sources=metadata.get("file_sources"),
             ),
         )
 

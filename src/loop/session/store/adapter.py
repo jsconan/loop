@@ -10,10 +10,10 @@ from ..session import Session
 
 @dataclass(frozen=True)
 class WorkingDirectoryBinding:
-    """Retain an opaque relative generation and its original filesystem identity.
+    """Retain an opaque working generation and its original filesystem identity.
 
     Args:
-        generation (str): Store-relative working root, never an absolute pathname.
+        generation (str): Relative legacy generation or bound path in the approved scratch root.
         device (int): Original filesystem device.
         inode (int): Original directory inode.
         retired (bool): Whether this generation has been permanently retired.
@@ -51,10 +51,18 @@ class SessionStore(Protocol):
 
     @property
     def temporary_root(self) -> Path:
-        """Return the store-owned root for isolated session working directories.
+        """Return the store-owned root for working locks and legacy directories.
 
         Returns:
             Path: Canonical root whose lifetime matches this store's persistence.
+        """
+
+    @property
+    def scratch_roots(self) -> tuple[Path, ...]:
+        """Return the eligible namespaces for working generations, preferred first.
+
+        Returns:
+            tuple[Path, ...]: Dedicated namespaces or an empty tuple to use the store's own root.
         """
 
     def save(self, session: Session) -> str:

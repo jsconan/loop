@@ -36,6 +36,5 @@ class ResponsePresenter:
         elif isinstance(event, ReasoningCompleted):
             if not self._reasoning_started:
                 self._output.reasoning(event.text)
-        elif isinstance(event, AnswerCompleted):
-            if not self._answer_started:
-                self._output.answer(event.text)
+        elif isinstance(event, AnswerCompleted) and not self._answer_started:
+            self._output.answer(event.text)

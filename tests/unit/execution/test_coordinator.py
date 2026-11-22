@@ -12,7 +12,7 @@ from io import BytesIO, TextIOWrapper
 from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import ANY, Mock
 
 import pytest
 
@@ -31,6 +31,7 @@ from loop.permissions import (
     PolicyScope,
     ProcessBoundary,
     ProcessTarget,
+    SandboxPathAccess,
 )
 from loop.permissions.managed import ManagedPolicyStore
 from loop.telemetry import MemoryTelemetryAdapter, Telemetry, set_telemetry
@@ -69,7 +70,7 @@ def test_managed_host_prohibition_blocks_explicit_request(tmp_path, yolo):
     manager = PermissionManager(
         tmp_path, managed_policy_store=managed_store(tmp_path, forbid_host=True), yolo=yolo
     )
-    manager.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    manager.set_direct_host_execution(True)
     manager.trust_host_command("printf host")
     host = Mock()
     interaction = Mock(spec=Interaction, supports_fresh_host_approval=True)
@@ -98,7 +99,7 @@ def test_managed_human_rule_disables_host_grant_reuse_and_new_grants(tmp_path):
         ),
     )
     manager = PermissionManager(tmp_path, managed_policy_store=store)
-    manager.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    manager.set_direct_host_execution(True)
     manager.trust_host_command("printf host")
     host = Mock()
     host.run_host_command.return_value = "host-result"
@@ -107,10 +108,38 @@ def test_managed_human_rule_disables_host_grant_reuse_and_new_grants(tmp_path):
     service = CommandExecutionCoordinator(Mock(), host, manager, interaction)
     current = trusted_request(tmp_path, manager, "printf host")
     assert service.request_host_command(current, "request_host_command", "Needed") == "host-result"
-    assert set(interaction.prompt.call_args.kwargs["choices"]) == {"deny", "approve"}
+    assert set(interaction.prompt.call_args.kwargs["choices"]) == {"deny", "approve", "details"}
     interaction.prompt.return_value = "deny"
     assert service.request_host_command(current, "request_host_command", "Needed") is None
     assert host.run_host_command.call_count == 1
+
+
+@pytest.mark.parametrize("yolo", [False, True])
+def test_explicit_host_ask_requires_one_time_consent_despite_trusted_grant(tmp_path, yolo):
+    """An explicit host ask requires fresh consent and cannot create a remembered grant."""
+    manager = PermissionManager(tmp_path, yolo=yolo, allow_direct_host_execution=True)
+    grant = manager.trust_host_command("printf host")
+    manager.add_rule(
+        PermissionRule(
+            decision=Decision.ASK, tool="request_host_command", action=Action.PROCESS_EXECUTE
+        ),
+        scope=PolicyScope.SESSION,
+    )
+    host = Mock()
+    host.run_host_command.return_value = "host-result"
+    interaction = Mock(spec=Interaction, supports_fresh_host_approval=True)
+    service = CommandExecutionCoordinator(Mock(), host, manager, interaction)
+    request = trusted_request(tmp_path, manager, "printf host")
+
+    interaction.prompt.return_value = "deny"
+    assert service.request_host_command(request, "request_host_command", "Needed") is None
+    host.run_host_command.assert_not_called()
+    assert set(interaction.prompt.call_args.kwargs["choices"]) == {"deny", "approve", "details"}
+
+    interaction.prompt.return_value = "approve"
+    assert service.request_host_command(request, "request_host_command", "Needed") == "host-result"
+    host.run_host_command.assert_called_once()
+    assert manager.trusted_host_command_rules() == (grant,)
 
 
 def request(tmp_path, **changes):
@@ -162,10 +191,14 @@ def coordinator(
     backend.run.return_value = outcome
     host = Mock()
     host.run_host_command.return_value = "host-result"
-    configuration = PermissionConfiguration(limits=PolicyLimits(allow_host_processes=True))
+    configuration = PermissionConfiguration(limits=PolicyLimits())
     if defaults:
         configuration.defaults.update(defaults)
-    manager = PermissionManager(tmp_path, configuration=configuration)
+    manager = PermissionManager(
+        tmp_path, configuration=configuration, allow_direct_host_execution=True
+    )
+    if not defaults:
+        manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
     return (
         CommandExecutionCoordinator(
             backend, host, manager, None if headless else interaction, auto_approval=auto_approval
@@ -208,7 +241,15 @@ def test_classified_failure_only_offers_host_retry(tmp_path):
 
     attempt = service.run_sandboxed(approved, "run_command")
 
-    backend.run.assert_called_once_with(approved)
+    backend.run.assert_called_once_with(
+        replace(
+            approved,
+            hard_denied_paths=backend.run.call_args.args[0].hard_denied_paths,
+            protected_host_roots=backend.run.call_args.args[0].protected_host_roots,
+            permission_revision=backend.run.call_args.args[0].permission_revision,
+        ),
+        cancellation_event=ANY,
+    )
     host.run_host_command.assert_not_called()
     assert attempt.offer is not None
     assert attempt.offer.warning == (
@@ -239,6 +280,67 @@ def test_sandbox_refuses_final_admission_without_starting_backend(tmp_path, medi
     assert attempt.offer is None
     backend.run.assert_not_called()
     host.run_host_command.assert_not_called()
+
+
+@pytest.mark.parametrize("case", ["approved", "declined", "collision", "hard_denied", "replaced"])
+def test_sandbox_prepares_output_only_for_a_current_approved_attempt(tmp_path, case):
+    """Create the private output before dispatch and preserve refused or occupied paths."""
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    scratch = tmp_path / "scratch"
+    scratch.mkdir(mode=0o700)
+    service, backend, host, interaction = coordinator(
+        checkout,
+        CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0),
+        answer="deny" if case == "declined" else "approve",
+        defaults={Action.PROCESS_EXECUTE: Decision.ASK},
+    )
+    approved = request(
+        checkout,
+        read_roots=(),
+        write_roots=(),
+        scratch_root=scratch,
+        environment={"PATH": "/usr/bin:/bin", "TMPDIR": str(scratch)},
+    )
+    output = approved.output_directory(scratch)
+    if case == "collision":
+        output.write_text("keep")
+    if case == "hard_denied":
+        service._permissions.update_sandbox_paths(
+            ApprovalChoice.SESSION, {str(output): SandboxPathAccess.DENY}
+        )
+
+    def replace_scratch():
+        """Simulate replacement after the first admission identity check."""
+        scratch.rename(scratch.with_name("original"))
+        scratch.mkdir(mode=0o700)
+
+    def consume_output(*_args, **_kwargs):
+        """Observe and use the prepared directory at the native launch boundary."""
+        assert output.is_dir() and output.stat().st_mode & 0o777 == 0o700
+        (output / "report").write_text("result")
+        return CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
+
+    backend.run.side_effect = consume_output
+    attempt = service.run_sandboxed(
+        approved, "run_command", on_admitted=replace_scratch if case == "replaced" else None
+    )
+    interaction.prompt.assert_called_once()
+    host.run_host_command.assert_not_called()
+    if case == "approved":
+        backend.run.assert_called_once()
+        assert attempt.result.outcome is SandboxOutcome.COMPLETED
+        assert (output / "report").read_text() == "result"
+    else:
+        backend.run.assert_not_called()
+        if case == "declined":
+            assert attempt.result is None
+        else:
+            assert attempt.result.outcome is SandboxOutcome.INVALID
+        if case == "collision":
+            assert output.read_text() == "keep"
+        else:
+            assert not output.exists()
 
 
 def test_host_refuses_final_admission_without_starting_process(tmp_path):
@@ -304,7 +406,15 @@ def test_prelaunch_host_offer_displays_executed_source(tmp_path):
 
     assert attempt.offer is not None
     assert 'Executed command: "printf executed"' in attempt.offer.warning
-    backend.run.assert_called_once_with(approved)
+    backend.run.assert_called_once_with(
+        replace(
+            approved,
+            hard_denied_paths=backend.run.call_args.args[0].hard_denied_paths,
+            protected_host_roots=backend.run.call_args.args[0].protected_host_roots,
+            permission_revision=backend.run.call_args.args[0].permission_revision,
+        ),
+        cancellation_event=ANY,
+    )
     host.run_host_command.assert_not_called()
     interaction.prompt.assert_called_once()
 
@@ -327,7 +437,15 @@ def test_possibly_effective_failure_never_offers_host_retry(tmp_path, outcome):
 
     assert attempt.result == failure
     assert attempt.offer is None
-    backend.run.assert_called_once_with(approved)
+    backend.run.assert_called_once_with(
+        replace(
+            approved,
+            hard_denied_paths=backend.run.call_args.args[0].hard_denied_paths,
+            protected_host_roots=backend.run.call_args.args[0].protected_host_roots,
+            permission_revision=backend.run.call_args.args[0].permission_revision,
+        ),
+        cancellation_event=ANY,
+    )
     host.run_host_command.assert_not_called()
     assert all(
         call.args[0] != "Run this exact command without the OS sandbox?"
@@ -399,6 +517,21 @@ def test_sandbox_accepts_large_representable_runtime(tmp_path, monkeypatch):
     assert launched.deadline - launched.runtime_timeout == 160.0
 
 
+def test_coordinator_submits_prepared_scope_for_one_exact_approval(tmp_path):
+    """Broad process permission never admits inferred access without an exact decision."""
+    result = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
+    service, backend, host, interaction = coordinator(
+        tmp_path, result, defaults={Action.PROCESS_EXECUTE: Decision.ALLOW}
+    )
+    interaction.prompt.return_value = "deny"
+    assert (
+        service.run_sandboxed(request(tmp_path), "run_command", prepared_access=True).result is None
+    )
+    interaction.prompt.assert_called_once()
+    backend.run.assert_not_called()
+    host.run_host_command.assert_not_called()
+
+
 def test_sandbox_authorization_receives_model_explanation(tmp_path):
     """The coordinator forwards the explanation into the sandbox permission prompt."""
     outcome = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
@@ -409,7 +542,15 @@ def test_sandbox_authorization_receives_model_explanation(tmp_path):
 
     assert attempt.result == outcome
     assert 'Agent explanation: "Read the toolchain"' in interaction.info.call_args.args[0]
-    backend.run.assert_called_once_with(approved)
+    backend.run.assert_called_once_with(
+        replace(
+            approved,
+            hard_denied_paths=backend.run.call_args.args[0].hard_denied_paths,
+            protected_host_roots=backend.run.call_args.args[0].protected_host_roots,
+            permission_revision=backend.run.call_args.args[0].permission_revision,
+        ),
+        cancellation_event=ANY,
+    )
     host.run_host_command.assert_not_called()
 
 
@@ -477,7 +618,7 @@ def test_session_host_approval_is_reused_and_revocable(tmp_path):
     host = Mock()
     host.run_host_command.return_value = "host-result"
     manager = PermissionManager(tmp_path)
-    manager.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    manager.set_direct_host_execution(True)
     service = CommandExecutionCoordinator(backend, host, manager, interaction)
     first = request(tmp_path)
     offer = service.run_sandboxed(first, "renamed_command").offer
@@ -522,7 +663,7 @@ def test_session_host_approval_requires_matching_runtime_signature(tmp_path, mon
     host = Mock()
     host.run_host_command.return_value = "host-result"
     manager = PermissionManager(tmp_path)
-    manager.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    manager.set_direct_host_execution(True)
     service = CommandExecutionCoordinator(backend, host, manager, interaction)
     first = request(tmp_path)
     second = request(tmp_path)
@@ -622,16 +763,17 @@ def test_explicit_host_request_requires_fresh_exact_approval(tmp_path):
         line for line in warning.splitlines() if line.startswith("Working directory: ")
     )
     assert json.loads(directory_line.removeprefix("Working directory: ")) == str(tmp_path)
-    assert 'Reason: "Need an external service"' in warning
+    assert 'Agent-supplied reason: "Need an external service"' in warning
     assert "may repeat" in warning
     assert interaction.prompt.call_args.kwargs["choices"] == {
         "deny": "Deny",
         "approve": "Approve this one host run",
+        "details": "Show full scope",
     }
 
 
 @pytest.mark.parametrize("headless", [False, True])
-def test_yolo_explicit_host_request_needs_no_gate_or_prompt(tmp_path, headless):
+def test_yolo_explicit_host_request_requires_trusted_gate(tmp_path, headless):
     """An exact host request runs once under YOLO without persisting eligibility or a grant."""
     manager = PermissionManager(tmp_path, yolo=True)
     interaction = None if headless else Mock(spec=Interaction)
@@ -640,12 +782,15 @@ def test_yolo_explicit_host_request_needs_no_gate_or_prompt(tmp_path, headless):
     service = CommandExecutionCoordinator(Mock(), host, manager, interaction, auto_approval=True)
     current = request(tmp_path, source="printf host")
 
+    assert service.request_host_command(current, "request_host_command", "explicit host") is None
+    host.run_host_command.assert_not_called()
+    manager.set_direct_host_execution(True)
     assert (
         service.request_host_command(current, "request_host_command", "explicit host")
         == "host-result"
     )
     host.run_host_command.assert_called_once()
-    assert manager.configuration.limits.allow_host_processes is False
+    assert manager.direct_host_execution_enabled is True
     assert manager.host_command_rules() == ()
     if interaction is not None:
         interaction.prompt.assert_not_called()
@@ -658,7 +803,7 @@ def test_yolo_explicit_host_request_needs_no_gate_or_prompt(tmp_path, headless):
 
 def test_yolo_rejects_implicit_retry_and_revoked_prelaunch_host_request(tmp_path):
     """A failed sandbox attempt cannot become host execution and revocation stops admission."""
-    manager = PermissionManager(tmp_path, yolo=True)
+    manager = PermissionManager(tmp_path, yolo=True, allow_direct_host_execution=True)
     interaction = Mock(spec=Interaction)
     host = Mock()
     backend = Mock()
@@ -697,7 +842,7 @@ def test_yolo_does_not_override_explicit_host_deny(tmp_path):
 def test_explicit_host_request_uses_exact_human_session_grant_headlessly(tmp_path):
     """An exact human grant runs a requested host command without a new interaction."""
     manager = PermissionManager(tmp_path)
-    manager.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    manager.set_direct_host_execution(True)
     grant = manager.trust_host_command("printf host")
     backend = Mock()
     host = Mock()
@@ -753,7 +898,7 @@ def test_explicit_host_prompt_installs_selected_grant_in_same_decision(tmp_path,
         )
         manager.initialize_policy_namespace("workspace", workspace.id, authorized=True)
         manager.initialize_policy_namespace("user", str(catalog.parent), authorized=True)
-    manager.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    manager.set_direct_host_execution(True)
     interaction = Mock(spec=Interaction, supports_fresh_host_approval=True)
     interaction.prompt.return_value = answer
     host = Mock()
@@ -783,7 +928,7 @@ def test_explicit_host_prompt_installs_selected_grant_in_same_decision(tmp_path,
 def test_explicit_host_prompt_refuses_stale_grant_installation(tmp_path, monkeypatch):
     """A grant that cannot commit at the reviewed revision never starts a host process."""
     manager = PermissionManager(tmp_path)
-    manager.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    manager.set_direct_host_execution(True)
     interaction = Mock(spec=Interaction, supports_fresh_host_approval=True)
     interaction.prompt.return_value = "trust_session"
     host = Mock()
@@ -805,7 +950,7 @@ def test_explicit_host_prompt_refuses_stale_grant_installation(tmp_path, monkeyp
 def test_explicit_host_prompt_rechecks_new_grant_before_launch(tmp_path, monkeypatch):
     """A grant lost after installation cannot authorize the pending host launch."""
     manager = PermissionManager(tmp_path)
-    manager.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    manager.set_direct_host_execution(True)
     interaction = Mock(spec=Interaction, supports_fresh_host_approval=True)
     interaction.prompt.return_value = "trust_session"
     host = Mock()
@@ -825,7 +970,7 @@ def test_explicit_host_prompt_rechecks_new_grant_before_launch(tmp_path, monkeyp
 def test_trusted_host_grant_shows_boundary_without_another_prompt(tmp_path):
     """A no-prompt grant still shows unrestricted authority before an interactive launch."""
     manager = PermissionManager(tmp_path)
-    manager.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    manager.set_direct_host_execution(True)
     manager.trust_host_command("printf host")
     host = Mock()
     host.run_host_command.return_value = "host-result"
@@ -846,7 +991,7 @@ def test_trusted_host_grant_shows_boundary_without_another_prompt(tmp_path):
 def test_trusted_host_grant_never_authorizes_a_different_execution_source(tmp_path):
     """A trusted display command cannot launch different shell source headlessly."""
     manager = PermissionManager(tmp_path)
-    manager.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    manager.set_direct_host_execution(True)
     manager.trust_host_command("printf safe")
     host = Mock()
     service = CommandExecutionCoordinator(Mock(), host, manager, None)
@@ -860,7 +1005,7 @@ def test_trusted_host_grant_never_authorizes_a_different_execution_source(tmp_pa
 def test_trusted_host_grant_rejects_changed_execution_environment(tmp_path):
     """A direct request with altered host environment cannot consume a trusted grant."""
     manager = PermissionManager(tmp_path)
-    manager.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    manager.set_direct_host_execution(True)
     manager.trust_host_command("printf safe")
     host = Mock()
     service = CommandExecutionCoordinator(Mock(), host, manager, None)
@@ -883,7 +1028,7 @@ def test_trusted_host_boundary_writes_minimized_durable_audit(tmp_path):
     """No-prompt host approval and execution are durably audited without shell contents."""
     audit_path = tmp_path / "audit.sqlite"
     manager = PermissionManager(tmp_path, audit_path=audit_path, workspace_id="workspace")
-    manager.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    manager.set_direct_host_execution(True)
     grant = manager.trust_host_command("printf synthetic-secret")
     host = Mock()
     host.run_host_command.return_value = CommandProcessResult(
@@ -922,7 +1067,7 @@ def test_trusted_host_boundary_writes_minimized_durable_audit(tmp_path):
 def test_final_host_policy_check_rejects_late_deny(tmp_path, monkeypatch):
     """A policy change after human approval and before launch blocks the host shell."""
     manager = PermissionManager(tmp_path)
-    manager.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    manager.set_direct_host_execution(True)
     interaction = Mock(spec=Interaction, supports_fresh_host_approval=True)
     interaction.prompt.return_value = "approve"
     host = Mock()
@@ -935,7 +1080,7 @@ def test_final_host_policy_check_rejects_late_deny(tmp_path, monkeypatch):
         nonlocal evaluations
         evaluations += 1
         if evaluations == 3:
-            manager.set_limit("allow_host_processes", False, scope=PolicyScope.SESSION)
+            manager.set_direct_host_execution(False)
         return original(operations)
 
     monkeypatch.setattr(manager, "evaluate_with_revision", deny_at_final_check)
@@ -953,9 +1098,10 @@ def test_existing_prelaunch_host_rule_reuses_without_new_interaction(tmp_path):
     host = Mock()
     host.run_host_command.return_value = "host-result"
     interaction = Mock(spec=Interaction, supports_fresh_host_approval=True)
-    interaction.prompt.return_value = "session"
+    interaction.prompt.side_effect = ["session", "session"]
     manager = PermissionManager(tmp_path)
-    manager.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
+    manager.set_direct_host_execution(True)
     human = CommandExecutionCoordinator(backend, host, manager, interaction)
     first = request(tmp_path)
     offer = human.run_sandboxed(first, "run_command").offer
@@ -1013,7 +1159,7 @@ def test_explicit_host_request_requires_reason(tmp_path):
 def test_explicit_host_request_rechecks_policy_after_fresh_approval(tmp_path):
     """A changed host policy during the explicit prompt prevents the launch."""
     manager = PermissionManager(tmp_path)
-    manager.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    manager.set_direct_host_execution(True)
     interaction = Mock(spec=Interaction, supports_fresh_host_approval=True)
     interaction.supports_fresh_host_approval = True
     host = Mock()
@@ -1021,7 +1167,7 @@ def test_explicit_host_request_rechecks_policy_after_fresh_approval(tmp_path):
 
     def revoke(*_args, **_kwargs):
         """Remove host authority while the user reviews the request."""
-        manager.set_limit("allow_host_processes", False, scope=PolicyScope.SESSION)
+        manager.set_direct_host_execution(False)
         return "approve"
 
     interaction.prompt.side_effect = revoke
@@ -1079,7 +1225,8 @@ def test_observed_denial_keeps_exit_without_offering_host(tmp_path):
     host = Mock()
     host.run_host_command.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
     manager = PermissionManager(tmp_path)
-    manager.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW)
+    manager.set_direct_host_execution(True)
     approved = request(tmp_path)
     service = CommandExecutionCoordinator(backend, host, manager, interaction)
 
@@ -1186,7 +1333,7 @@ def test_unrelated_denial_never_offers_host_execution(tmp_path):
     )
     service, _, host, interaction = coordinator(tmp_path, result)
 
-    attempt = service.run_sandboxed(request(tmp_path, read_roots=()), "run_command")
+    attempt = service.run_sandboxed(request(tmp_path, read_roots=(), write_roots=()), "run_command")
 
     assert attempt.result == result
     assert attempt.offer is None
@@ -1250,8 +1397,7 @@ def test_host_retry_respects_default_host_process_limit(tmp_path):
     attempt = service.run_sandboxed(approved, "renamed_command")
     interaction.prompt.reset_mock()
 
-    assert attempt.offer is not None
-    assert service.retry_host_command(attempt.offer, approved) is None
+    assert attempt.offer is None
     interaction.prompt.assert_not_called()
     host.run_host_command.assert_not_called()
 
@@ -1261,7 +1407,7 @@ def test_host_retry_respects_default_host_process_limit(tmp_path):
 def test_host_retry_rechecks_policy_before_and_after_approval(tmp_path, denial, when):
     """A host boundary or exact deny rule cannot be overridden by a retry approval."""
     manager = PermissionManager(tmp_path)
-    manager.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    manager.set_direct_host_execution(True)
     backend = Mock()
     backend.run.return_value = CommandProcessResult(SandboxOutcome.UNAVAILABLE)
     host = Mock()
@@ -1275,7 +1421,7 @@ def test_host_retry_rechecks_policy_before_and_after_approval(tmp_path, denial, 
     def deny_host():
         """Remove host authority without denying the preceding sandbox operation."""
         if denial == "limit":
-            manager.set_limit("allow_host_processes", False, scope=PolicyScope.SESSION)
+            manager.set_direct_host_execution(False)
         else:
             manager.add_rule(
                 PermissionRule(
@@ -1313,7 +1459,7 @@ def test_host_retry_rechecks_policy_before_and_after_approval(tmp_path, denial, 
 def test_host_retry_checks_displayed_and_executed_sources(tmp_path, deny_logical):
     """A host deny for either displayed or executed source prevents launch."""
     manager = PermissionManager(tmp_path)
-    manager.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    manager.set_direct_host_execution(True)
     backend = Mock()
     backend.run.return_value = CommandProcessResult(SandboxOutcome.UNAVAILABLE)
     host = Mock()
@@ -1354,7 +1500,7 @@ def test_host_retry_checks_displayed_and_executed_sources(tmp_path, deny_logical
 def test_explicit_host_ask_requires_a_fresh_decision_despite_session_rule(tmp_path):
     """A new HOST ask rule prevents silent reuse of an existing exact host approval."""
     manager = PermissionManager(tmp_path)
-    manager.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    manager.set_direct_host_execution(True)
     backend = Mock()
     backend.run.return_value = CommandProcessResult(SandboxOutcome.UNAVAILABLE)
     host = Mock()
@@ -1400,7 +1546,7 @@ def test_explicit_host_ask_requires_a_fresh_decision_despite_session_rule(tmp_pa
 def test_host_ask_added_during_approval_invalidates_decision(tmp_path):
     """A newly added HOST ask rule requires a decision after that rule takes effect."""
     manager = PermissionManager(tmp_path)
-    manager.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    manager.set_direct_host_execution(True)
     backend = Mock()
     backend.run.return_value = CommandProcessResult(SandboxOutcome.UNAVAILABLE)
     host = Mock()
@@ -1436,7 +1582,7 @@ def test_host_ask_added_during_approval_invalidates_decision(tmp_path):
 def test_host_retry_rejects_replaced_ask_with_same_rule_id(tmp_path):
     """A replacement host ask cannot reuse consent given for its predecessor."""
     manager = PermissionManager(tmp_path)
-    manager.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    manager.set_direct_host_execution(True)
     backend = Mock()
     backend.run.return_value = CommandProcessResult(SandboxOutcome.UNAVAILABLE)
     host = Mock()
@@ -1471,10 +1617,31 @@ def test_host_retry_rejects_replaced_ask_with_same_rule_id(tmp_path):
     assert not manager.host_command_rules()
 
 
+def test_host_approval_details_keep_the_same_scope_and_require_a_decision(tmp_path):
+    """A details toggle discloses the working directory without allowing host execution."""
+    service, backend, host, interaction = coordinator(
+        tmp_path, CommandProcessResult(SandboxOutcome.UNAVAILABLE)
+    )
+    approved = request(tmp_path)
+    attempt = service.run_sandboxed(approved, "run_command")
+    assert attempt.offer is not None
+    interaction.prompt.side_effect = ["details", "details", "deny"]
+    assert service.retry_host_command(attempt.offer, approved) is None
+    prompts = interaction.prompt.call_args_list[-3:]
+    assert [entry.kwargs["choices"]["details"] for entry in prompts] == [
+        "Show full scope",
+        "Show reduced scope",
+        "Show full scope",
+    ]
+    assert str(approved.cwd) in interaction.info.call_args_list[-2].args[0]
+    backend.run.assert_called_once()
+    host.run_host_command.assert_not_called()
+
+
 def test_explicit_host_ask_offers_only_one_off_approval(tmp_path):
     """An explicit host ask cannot create an ineffective session approval."""
     manager = PermissionManager(tmp_path)
-    manager.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    manager.set_direct_host_execution(True)
     backend = Mock()
     backend.run.return_value = CommandProcessResult(SandboxOutcome.UNAVAILABLE)
     host = Mock()
@@ -1482,7 +1649,6 @@ def test_explicit_host_ask_offers_only_one_off_approval(tmp_path):
     interaction.prompt.return_value = "approve"
     service = CommandExecutionCoordinator(backend, host, manager, interaction)
     approved = request(tmp_path)
-    attempt = service.run_sandboxed(approved, "renamed_command")
     manager.add_rule(
         PermissionRule(
             decision=Decision.ASK,
@@ -1496,12 +1662,13 @@ def test_explicit_host_ask_offers_only_one_off_approval(tmp_path):
         ),
         scope=PolicyScope.SESSION,
     )
+    attempt = service.run_sandboxed(approved, "renamed_command")
     interaction.prompt.reset_mock()
-    interaction.prompt.return_value = "session"
+    interaction.prompt.return_value = "trust_workspace"
 
     assert attempt.offer is not None
     assert service.retry_host_command(attempt.offer, approved) is None
-    assert set(interaction.prompt.call_args.kwargs["choices"]) == {"approve", "deny"}
+    assert set(interaction.prompt.call_args.kwargs["choices"]) == {"approve", "deny", "details"}
     assert not manager.host_command_rules()
     host.run_host_command.assert_not_called()
 
@@ -1509,7 +1676,7 @@ def test_explicit_host_ask_offers_only_one_off_approval(tmp_path):
 def test_host_retry_rechecks_policy_after_final_rule_lookup(tmp_path, monkeypatch):
     """A denial published during the last remembered-rule lookup prevents launch."""
     manager = PermissionManager(tmp_path)
-    manager.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    manager.set_direct_host_execution(True)
     backend = Mock()
     backend.run.return_value = CommandProcessResult(SandboxOutcome.UNAVAILABLE)
     host = Mock()
@@ -1558,7 +1725,7 @@ def test_host_retry_rechecks_policy_after_final_rule_lookup(tmp_path, monkeypatc
 def test_host_retry_rejects_policy_change_during_rule_preparation(tmp_path, monkeypatch):
     """Policy changes before a session host rule is stored cannot authorize launch."""
     manager = PermissionManager(tmp_path)
-    manager.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    manager.set_direct_host_execution(True)
     backend = Mock()
     backend.run.return_value = CommandProcessResult(SandboxOutcome.UNAVAILABLE)
     host = Mock()
@@ -1577,7 +1744,7 @@ def test_host_retry_rejects_policy_change_during_rule_preparation(tmp_path, monk
         signature = original(value)
         if not changed:
             changed = True
-            manager.set_limit("allow_host_processes", False, scope=PolicyScope.SESSION)
+            manager.set_direct_host_execution(False)
         return signature
 
     monkeypatch.setattr(SandboxRequest, "host_command_runtime_signature", revoke_during_signature)
@@ -1592,7 +1759,7 @@ def test_host_retry_rejects_policy_change_during_rule_preparation(tmp_path, monk
 def test_host_ask_added_during_rule_lookup_prevents_silent_reuse(tmp_path, monkeypatch):
     """A new HOST ask rule invalidates a previously matched session approval."""
     manager = PermissionManager(tmp_path)
-    manager.set_limit("allow_host_processes", True, scope=PolicyScope.SESSION)
+    manager.set_direct_host_execution(True)
     backend = Mock()
     backend.run.return_value = CommandProcessResult(SandboxOutcome.UNAVAILABLE)
     host = Mock()
@@ -1662,7 +1829,15 @@ def test_coordinator_passes_run_cancellation_to_both_process_boundaries(tmp_path
         cancellation_event=cancellation_event,
     )
     assert attempt.offer is not None
-    backend.run.assert_called_once_with(approved, cancellation_event=cancellation_event)
+    backend.run.assert_called_once_with(
+        replace(
+            approved,
+            hard_denied_paths=backend.run.call_args.args[0].hard_denied_paths,
+            protected_host_roots=backend.run.call_args.args[0].protected_host_roots,
+            permission_revision=backend.run.call_args.args[0].permission_revision,
+        ),
+        cancellation_event=cancellation_event,
+    )
     assert (
         service.retry_host_command(
             attempt.offer,
@@ -1688,7 +1863,16 @@ def test_coordinator_forwards_terminal_input_to_original_backend(tmp_path):
     attempt = service.run_sandboxed(approved, "run_command", terminal_input=terminal_input)
 
     assert attempt.result is not None and attempt.result.outcome is SandboxOutcome.COMPLETED
-    backend.run.assert_called_once_with(approved, terminal_input=terminal_input)
+    backend.run.assert_called_once_with(
+        replace(
+            approved,
+            hard_denied_paths=backend.run.call_args.args[0].hard_denied_paths,
+            protected_host_roots=backend.run.call_args.args[0].protected_host_roots,
+            permission_revision=backend.run.call_args.args[0].permission_revision,
+        ),
+        terminal_input=terminal_input,
+        cancellation_event=ANY,
+    )
 
 
 def test_coordinator_cancellation_before_sandbox_launch_has_no_effects(tmp_path):
@@ -1842,7 +2026,7 @@ def test_fresh_scratch_requires_a_new_host_decision(tmp_path):
     service, _, host, interaction = coordinator(
         tmp_path,
         CommandProcessResult(SandboxOutcome.DENIED, detail="policy denial"),
-        answer="approve",
+        answer="session",
     )
     with (
         tempfile.TemporaryDirectory(prefix="loop-seatbelt-") as first_directory,
@@ -1856,7 +2040,7 @@ def test_fresh_scratch_requires_a_new_host_decision(tmp_path):
         assert service.retry_host_command(offer, first) is None
         offer = service.run_sandboxed(second, "run_command").offer
         assert service.retry_host_command(offer, second) == "host-result"
-        assert interaction.prompt.call_count == 5
+        assert interaction.prompt.call_count == 4
         assert host.run_host_command.call_count == 2
 
 
@@ -2166,7 +2350,9 @@ def test_host_executor_failure_is_audited_and_not_replayed(tmp_path):
 def test_offer_approval_and_host_execution_have_distinct_sanitized_audit_events(tmp_path):
     """Audit records separate the offer, user decision, and host launch without shell text."""
     service, _, _, _ = coordinator(
-        tmp_path, CommandProcessResult(SandboxOutcome.DENIED, detail="policy denial")
+        tmp_path,
+        CommandProcessResult(SandboxOutcome.DENIED, detail="policy denial"),
+        answer="session",
     )
     approved = request(tmp_path, source="printf private-command")
     adapter = MemoryTelemetryAdapter()
@@ -2181,9 +2367,11 @@ def test_offer_approval_and_host_execution_have_distinct_sanitized_audit_events(
 
     events = [record.event_name for record in adapter.records]
     assert events == [
+        "sandbox.permission_rule_added",
         "sandbox.permission_decided",
         "sandbox.completed",
         "host_command.offered",
+        "host_command.rule_added",
         "host_command.approved",
         "host_command.executed",
     ]
@@ -2397,3 +2585,48 @@ def test_local_host_executor_detects_stuck_reader_and_bounded_cleanup(
     assert result.outcome is SandboxOutcome.TIMED_OUT
     process.stdout.close.assert_not_called()
     process.stderr.close.assert_not_called()
+
+
+@pytest.mark.parametrize("change", ["gate", "path", "cwd"])
+def test_explicit_host_rechecks_authority_after_admission_callback(tmp_path, monkeypatch, change):
+    """Final admission callbacks cannot change eligibility, environment, or cwd and still launch."""
+    manager = PermissionManager(tmp_path, allow_direct_host_execution=True)
+    host = Mock()
+    interaction = Mock(spec=Interaction, supports_fresh_host_approval=True)
+    interaction.prompt.return_value = "approve"
+    service = CommandExecutionCoordinator(Mock(), host, manager, interaction)
+    current = request(tmp_path)
+    offer = service.run_sandboxed(
+        current, "run_command", prelaunch_failure=CommandProcessResult(SandboxOutcome.UNAVAILABLE)
+    ).offer
+    assert offer is not None
+
+    def change_at_admission():
+        """Invalidate an authority immediately before the host executor would run."""
+        if change == "gate":
+            manager.set_direct_host_execution(False)
+        elif change == "path":
+            monkeypatch.setenv("PATH", "/changed")
+        else:
+            tmp_path.rename(tmp_path.with_name(tmp_path.name + "-old"))
+            tmp_path.mkdir()
+
+    assert service.retry_host_command(offer, current, on_admitted=change_at_admission) is None
+    host.run_host_command.assert_not_called()
+    manager.close()
+
+
+def test_sandbox_policy_change_in_final_callback_prevents_backend_launch(tmp_path):
+    """Admission binds hard policy after the callback and rejects its stale approval."""
+    manager = PermissionManager(tmp_path, yolo=True)
+    backend = Mock()
+    service = CommandExecutionCoordinator(backend, Mock(), manager, None)
+
+    def tighten():
+        """Change authority after the earlier revision check."""
+        manager.set_default(Action.PROCESS_EXECUTE, Decision.DENY, scope=PolicyScope.SESSION)
+        return True
+
+    attempt = service.run_sandboxed(request(tmp_path), "run_command", on_admitted=tighten)
+    assert attempt.result.outcome is SandboxOutcome.STALE
+    backend.run.assert_not_called()

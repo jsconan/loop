@@ -4,7 +4,6 @@ import errno
 import json
 import os
 import shutil
-import sys
 from pathlib import Path
 
 import pytest
@@ -33,6 +32,19 @@ def installed_policy(tmp_path: Path) -> tuple[ManagedPolicyStore, Path]:
     return store, directory
 
 
+def test_managed_hard_paths_reject_patterns_at_the_trusted_load_boundary(tmp_path):
+    """An administrator designation cannot silently become an unrepresentable glob rule."""
+    store, directory = installed_policy(tmp_path)
+    (directory / "managed-policy.json").write_text(
+        json.dumps(
+            {"version": 1, "identity": _IDENTITY, "revision": 1, "hard_denied_paths": ["/tmp/*"]}
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ManagedPolicyError, match="hard_denied_paths: value_error"):
+        store.load()
+
+
 def test_managed_policy_accepts_natural_boolean_strings(tmp_path):
     """Recognized boolean strings preserve the configured administrator restrictions."""
     store, directory = installed_policy(tmp_path)
@@ -43,6 +55,15 @@ def test_managed_policy_accepts_natural_boolean_strings(tmp_path):
     loaded = store.load().policy
     assert loaded.forbid_host is True
     assert loaded.deny_local_networks is False
+
+
+def test_managed_option_forbids_only_the_selected_capability(tmp_path):
+    """Each administrator prohibition applies to the named capability."""
+    store, directory = installed_policy(tmp_path)
+    path = directory / "managed-policy.json"
+    policy = {**json.loads(path.read_text()), "forbidden_backend_options": ["account_lookup"]}
+    path.write_text(json.dumps(policy))
+    assert store.load().policy.forbidden_backend_options == ("account_lookup",)
 
 
 def test_absent_installation_is_unmanaged_but_missing_expected_file_is_invalid(tmp_path):
@@ -73,7 +94,7 @@ def test_expectation_survives_policy_directory_disappearance(tmp_path):
 
 def test_unsupported_platform_has_no_managed_source(monkeypatch):
     """An unsupported platform reports managed enforcement unavailable."""
-    monkeypatch.setattr(managed.sys, "platform", "unsupported")
+    monkeypatch.setattr(managed, "managed_directory", lambda: None)
     store = ManagedPolicyStore()
     assert store.directory is None
     assert store.may_be_installed() is False
@@ -85,7 +106,7 @@ def test_default_source_absence_and_presence_are_distinct(tmp_path, monkeypatch)
     directory = tmp_path / "etc" / "loop"
     directory.parent.mkdir()
     directory.parent.chmod(0o755)
-    monkeypatch.setitem(managed._SYSTEM_DIRECTORIES, sys.platform, directory)
+    monkeypatch.setattr(managed, "managed_directory", lambda: directory)
     store = ManagedPolicyStore(trust_anchor=tmp_path, owner_uid=os.getuid())
     assert store.may_be_installed() is False
     assert store.load() is None
@@ -100,7 +121,7 @@ def test_hidden_ancestor_metadata_never_proves_optional_absence(tmp_path, monkey
     directory = tmp_path / "etc" / "loop"
     directory.parent.mkdir()
     directory.parent.chmod(0o755)
-    monkeypatch.setitem(managed._SYSTEM_DIRECTORIES, sys.platform, directory)
+    monkeypatch.setattr(managed, "managed_directory", lambda: directory)
     store = ManagedPolicyStore(trust_anchor=tmp_path, owner_uid=os.getuid())
     original = Path.lstat
 
@@ -123,7 +144,7 @@ def test_hidden_ancestor_metadata_allows_verified_absence(tmp_path, monkeypatch)
     directory = tmp_path / "etc" / "loop"
     directory.parent.mkdir()
     directory.parent.chmod(0o755)
-    monkeypatch.setitem(managed._SYSTEM_DIRECTORIES, sys.platform, directory)
+    monkeypatch.setattr(managed, "managed_directory", lambda: directory)
     store = ManagedPolicyStore(trust_anchor=tmp_path, owner_uid=os.getuid())
     original = Path.lstat
 
@@ -143,7 +164,7 @@ def test_uninspectable_default_source_is_never_treated_as_absent(tmp_path, monke
     directory = tmp_path / "etc" / "loop"
     directory.parent.mkdir()
     directory.parent.chmod(0o755)
-    monkeypatch.setitem(managed._SYSTEM_DIRECTORIES, sys.platform, directory)
+    monkeypatch.setattr(managed, "managed_directory", lambda: directory)
     store = ManagedPolicyStore(trust_anchor=tmp_path, owner_uid=os.getuid())
     original_lstat = Path.lstat
     original_stat = managed.os.stat
@@ -172,7 +193,7 @@ def test_failed_source_metadata_probe_cannot_prove_absence(tmp_path, monkeypatch
     directory = tmp_path / "etc" / "loop"
     directory.parent.mkdir()
     directory.parent.chmod(0o755)
-    monkeypatch.setitem(managed._SYSTEM_DIRECTORIES, sys.platform, directory)
+    monkeypatch.setattr(managed, "managed_directory", lambda: directory)
     store = ManagedPolicyStore(trust_anchor=tmp_path, owner_uid=os.getuid())
     original = Path.lstat
 
@@ -192,7 +213,7 @@ def test_parent_disappearance_before_absence_proof_is_not_optional(tmp_path, mon
     parent.mkdir()
     parent.chmod(0o755)
     directory = parent / "loop"
-    monkeypatch.setitem(managed._SYSTEM_DIRECTORIES, sys.platform, directory)
+    monkeypatch.setattr(managed, "managed_directory", lambda: directory)
     store = ManagedPolicyStore(trust_anchor=tmp_path, owner_uid=os.getuid())
     original = Path.lstat
 
@@ -216,7 +237,7 @@ def test_parent_change_during_absence_proof_is_not_optional(tmp_path, monkeypatc
     parent.mkdir()
     parent.chmod(0o755)
     directory = parent / "loop"
-    monkeypatch.setitem(managed._SYSTEM_DIRECTORIES, sys.platform, directory)
+    monkeypatch.setattr(managed, "managed_directory", lambda: directory)
     store = ManagedPolicyStore(trust_anchor=tmp_path, owner_uid=os.getuid())
     original = managed.os.stat
 
@@ -245,7 +266,7 @@ def test_default_source_rejects_unsafe_ancestor_even_when_both_entries_are_absen
     real.chmod(0o755)
     (tmp_path / "etc").symlink_to(real)
     directory = tmp_path / "etc" / "loop"
-    monkeypatch.setitem(managed._SYSTEM_DIRECTORIES, sys.platform, directory)
+    monkeypatch.setattr(managed, "managed_directory", lambda: directory)
     store = ManagedPolicyStore(trust_anchor=tmp_path, owner_uid=os.getuid())
     assert store.may_be_installed() is True
     with pytest.raises(ManagedPolicyError):
@@ -259,7 +280,7 @@ def test_default_source_rejects_untrusted_absent_parent(tmp_path, monkeypatch, u
     parent.mkdir()
     parent.chmod(0o755)
     directory = parent / "loop"
-    monkeypatch.setitem(managed._SYSTEM_DIRECTORIES, sys.platform, directory)
+    monkeypatch.setattr(managed, "managed_directory", lambda: directory)
     if unsafe == "mode":
         parent.chmod(0o777)
     store = ManagedPolicyStore(

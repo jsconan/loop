@@ -37,7 +37,7 @@ from loop.tooling import (
     ToolPreflightResult,
     ToolStatus,
 )
-from loop.tooling.models import ToolExecutionOutcomeUnknown
+from loop.tooling.models import ToolExecutionInterrupted, ToolExecutionOutcomeUnknown
 from loop.utils import await_value_async
 from tests.scheduling import deliver_callbacks
 
@@ -783,7 +783,7 @@ def test_sync_keyboard_interrupt_retains_only_declared_final_receipt(declared_fi
         make_tool(calculate).execute({"number": 1}, async_runner=runner)
     assert effects == ["committed"]
     if declared_final:
-        assert type(caught.value) is not KeyboardInterrupt
+        assert isinstance(caught.value, ToolExecutionInterrupted)
         assert json.loads(caught.value.output)["result"] == "confirmed"
     else:
         assert not hasattr(caught.value, "output")

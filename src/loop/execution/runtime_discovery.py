@@ -1,4 +1,4 @@
-"""Discover identity-bound workspace runtime candidates for selected tools."""
+"""Discover literal shell and build entry points for executable binding."""
 
 from __future__ import annotations
 
@@ -6,43 +6,210 @@ import os
 import re
 import shlex
 import stat
-import tomllib
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Collection
+from itertools import islice
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from .. import constants
 from ..permissions import CommandInspection, literal_shell_word, shell_tokens
 from ..permissions.protection import is_protected_external_read
-from ..utils import open_selected_file
+from ..utils import open_selected_file, open_selected_parent
 from .sandbox.contracts import resolve_selected_executable
 
 if TYPE_CHECKING:
     from ..permissions import CommandAnalysis
 
-type ExecutableIdentity = tuple[str, Path, Path, int, int]
-
-
-@dataclass(frozen=True)
-class RuntimeCandidate:
-    """Bind a workspace executable and an alternative spelling of the same file.
-
-    Args:
-        identity (ExecutableIdentity): Workspace selection and target device/inode.
-        alias_executable (Path): Metadata spelling that resolves to the same executable.
-    """
-
-    identity: ExecutableIdentity
-    alias_executable: Path
-
-
 _MAX_METADATA_BYTES = 64 * 1024
-_VERSION = re.compile(r"\d+\.\d+(?:\.\d+)?")
-_MINIMUM_VERSION = re.compile(r">=\s*(\d+\.\d+(?:\.\d+)?)")
-_PROJECT_ENVIRONMENT = "UV_PROJECT_ENVIRONMENT="
+_MAX_INSTALLATION_ENTRIES = 1024
 _MAKE_WORD = re.compile(r"[A-Za-z0-9_.-]+")
 _MAKE_CONTROL_ENVIRONMENT = frozenset({"MAKEFLAGS", "GNUMAKEFLAGS", "MFLAGS", "MAKEFILES"})
+
+
+class WorkspaceExecutableLink(NamedTuple):
+    """Bind a workspace executable spelling to its selected file identity.
+
+    Args:
+        name (str): Command spelling selected through PATH or a literal path.
+        spelling (Path): Workspace path used to select the executable.
+        resolved (Path): Canonical selected file.
+        device (int): Device number of the selected file.
+        inode (int): Inode number of the selected file.
+    """
+
+    name: str
+    spelling: Path
+    resolved: Path
+    device: int
+    inode: int
+
+
+def linked_project_installations(
+    workspace: Path,
+    system_roots: tuple[Path, ...],
+    may_list: Callable[[Path], bool],
+) -> dict[Path, list[WorkspaceExecutableLink]]:
+    """Identify external installations referenced by the project’s executable links.
+
+    Args:
+        workspace (Path): Canonical active checkout.
+        system_roots (tuple[Path, ...]): Already visible native system paths.
+        may_list (Callable[[Path], bool]): Current permission to inspect a project directory.
+
+    Returns:
+        dict[Path, list[WorkspaceExecutableLink]]: Candidate bin/lib installations with
+            identity-bound executable spellings. Each new read scope requires review.
+    """
+    installations: dict[Path, list[WorkspaceExecutableLink]] = {}
+    for name in workspace_tool_links(workspace, may_list):
+        try:
+            selected = resolve_selected_executable(name, "", workspace)
+            if selected is None:
+                continue
+            spelling, executable = selected
+            root = executable.parent.parent
+            if (
+                executable.parent.name != "bin"
+                or root.is_relative_to(workspace)
+                or workspace.is_relative_to(root)
+                or Path.home().is_relative_to(root)
+                or any(executable.is_relative_to(system) for system in system_roots)
+                or is_protected_external_read(root)
+                or not (root / "lib").is_dir()
+            ):
+                continue
+            info = executable.stat()
+            if info.st_nlink == 1 and stat.S_ISREG(info.st_mode):
+                link = WorkspaceExecutableLink(name, spelling, executable, info.st_dev, info.st_ino)
+                installations.setdefault(root, []).append(link)
+        except (OSError, RuntimeError, ValueError):
+            continue
+    return installations
+
+
+def workspace_shell_programs(
+    source: str,
+    workspace: Path,
+    cwd: Path,
+    may_read: Callable[[Path], bool],
+) -> tuple[str, ...] | None:
+    """Suggest command names mentioned in a directly selected readable project shell script.
+
+    Suggestions only label possible installed executables for human review. Shell text can
+    mention programs it never runs and it can choose other programs dynamically.
+
+    Args:
+        source (str): Original shell source, used only for discovery.
+        workspace (Path): Canonical checkout root.
+        cwd (Path): Native command working directory.
+        may_read (Callable[[Path], bool]): Current permission to read the proposed script.
+
+    Returns:
+        tuple[str, ...] | None: Suggested names for a selected project script, or None
+            when no readable project script was identified. A changed search environment
+            prevents suggestions based on the inherited PATH.
+    """
+    try:
+        tokens = shell_tokens(workspace_command_source(source, workspace, cwd))
+        inherited_lookup = True
+        while tokens:
+            exporting = tokens[0].raw == "export"
+            start = 1 if exporting else 0
+            end = start
+            while end < len(tokens) and (
+                assignment := re.match(r"([a-zA-Z_][a-zA-Z0-9_]*)=", tokens[end].raw)
+            ):
+                if assignment[1] in {"PATH", "IFS", "ENV", "BASH_ENV"}:
+                    inherited_lookup = False
+                end += 1
+            if exporting:
+                if end == start or end == len(tokens) or tokens[end].raw not in {";", "&&", "\n"}:
+                    return None
+                tokens = tokens[end + 1 :]
+            else:
+                tokens = tokens[end:]
+                break
+        if not tokens or tokens[0].operator or not literal_shell_word(tokens[0].raw):
+            return None
+        selected = tokens[0].value
+        if Path(selected).name in CommandInspection.SHELLS:
+            if len(tokens) < 2 or tokens[1].operator or not literal_shell_word(tokens[1].raw):
+                return None
+            selected = tokens[1].value
+        elif "/" not in selected:
+            return None
+        script = cwd / selected
+        if (
+            not script.is_relative_to(workspace)
+            or ".." in script.parts
+            or is_protected_external_read(script.relative_to(workspace))
+        ):
+            return None
+        body = _read_workspace_file(workspace, script, may_read)
+        if not body or not body.startswith(b"#!"):
+            return None
+        header, _, commands = body.partition(b"\n")
+        words = header[2:].decode().split()
+        if not words or Path(words[-1]).name not in CommandInspection.SHELLS:
+            return None
+        if not inherited_lookup:
+            return ()
+        names = CommandInspection().analyze(commands.decode()).executables
+        return tuple(name for name in names if _MAKE_WORD.fullmatch(name))[
+            : constants.MAX_COMMAND_PATH_COUNT
+        ]
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def workspace_tool_links(workspace: Path, may_list: Callable[[Path], bool]) -> tuple[str, ...]:
+    """Find linked executables in immediate project tool installations without running them.
+
+    Inspect only the conventional bin directory of each immediate project directory.
+    An incomplete or oversized inventory supplies no candidates. A candidate only identifies
+    a tool installation for review and does not authorize reading its contents.
+
+    Args:
+        workspace (Path): Canonical active checkout.
+        may_list (Callable[[Path], bool]): Current permission to inspect a workspace directory.
+
+    Returns:
+        tuple[str, ...]: Absolute executable link spellings in deterministic order.
+    """
+    limit = constants.MAX_COMMAND_PATH_COUNT
+    if not may_list(workspace):
+        return ()
+    links = set()
+    try:
+        with os.scandir(workspace) as children:
+            entries = tuple(islice(children, limit + 1))
+            if len(entries) > limit:
+                return ()
+            directories = [entry.name for entry in entries if entry.is_dir(follow_symlinks=False)]
+        for child in sorted(directories):
+            directory = workspace / child / "bin"
+            if not may_list(directory):
+                continue
+            try:
+                with open_selected_parent(directory) as parent:
+                    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY | os.O_CLOEXEC
+                    descriptor = os.open(directory.name, flags, dir_fd=parent)
+            except (FileNotFoundError, NotADirectoryError, PermissionError):
+                continue
+            try:
+                with os.scandir(descriptor) as entries:
+                    for count, entry in enumerate(entries):
+                        if count >= _MAX_INSTALLATION_ENTRIES:
+                            return ()
+                        if entry.is_symlink():
+                            links.add(str(directory / entry.name))
+                            if len(links) > limit:
+                                return ()
+            finally:
+                os.close(descriptor)
+    except (OSError, RuntimeError):
+        return ()
+    return tuple(sorted(links))
 
 
 def workspace_command_source(source: str, workspace: Path, cwd: Path) -> str:
@@ -87,7 +254,9 @@ def workspace_command_source(source: str, workspace: Path, cwd: Path) -> str:
 
 
 def selected_workspace_executable(
-    source: str, analysis: CommandAnalysis, workspace: Path
+    source: str,
+    analysis: CommandAnalysis,
+    workspace: Path,
 ) -> str | None:
     """Resolve a direct executable using only the bound workspace variable spelling.
 
@@ -184,7 +353,13 @@ def timeout_child_source(source: str) -> str | None:
 
 
 def discover_scratch_shell_source(
-    source: str, scratch: Path, cwd: Path, path_value: str, trusted_shell: Callable[[Path], bool]
+    source: str,
+    scratch: Path,
+    cwd: Path,
+    path_value: str,
+    trusted_shell: Callable[[Path], bool],
+    *,
+    may_read: Callable[[Path], bool],
 ) -> str | None:
     """Read an unambiguously selected session shell script for advisory tool discovery.
 
@@ -194,6 +369,7 @@ def discover_scratch_shell_source(
         cwd (Path): Original command working directory.
         path_value (str): Inherited PATH used to select the shell interpreter.
         trusted_shell (Callable[[Path], bool]): Validate a selected system shell path.
+        may_read (Callable[[Path], bool]): Apply current policy before reading the script.
 
     Returns:
         str | None: Stable bounded UTF-8 script source, or None when selection is ambiguous.
@@ -228,7 +404,7 @@ def discover_scratch_shell_source(
     except (OSError, RuntimeError, ValueError):
         return None
     try:
-        content = _read_workspace_file(scratch, scratch / relative, strict=True)
+        content = _read_workspace_file(scratch, scratch / relative, may_read)
     except PermissionError:
         raise
     except OSError:
@@ -280,7 +456,13 @@ def _makefile_shadowed(cwd: Path) -> bool:
 
 
 def discover_makefile_commands(
-    source: str, workspace: Path, cwd: Path, path_value: str
+    source: str,
+    workspace: Path,
+    cwd: Path,
+    path_value: str,
+    *,
+    may_read: Callable[[Path], bool],
+    environment_names: Collection[str] = (),
 ) -> tuple[str, ...]:
     """Suggest literal recipes from a narrowly recognized system make invocation.
 
@@ -289,11 +471,15 @@ def discover_makefile_commands(
         workspace (Path): Canonical workspace containing the makefile.
         cwd (Path): Canonical directory in which make will run.
         path_value (str): Inherited PATH used to identify the selected make executable.
+        may_read (Callable[[Path], bool]): Apply current policy before reading the recipe.
+        environment_names (Collection[str]): Variables declared in the command environment.
 
     Returns:
         tuple[str, ...]: Literal candidate recipes in prerequisite order; an empty tuple means
             the invocation or makefile cannot be identified safely. Candidates are not authority.
     """
+    if not _MAKE_CONTROL_ENVIRONMENT.isdisjoint(environment_names):
+        return ()
     source = workspace_command_source(source, workspace, cwd)
     if len(source) > 2 * constants.MAX_COMMAND_PATH_LENGTH or "\r" in source:
         return ()
@@ -370,7 +556,7 @@ def discover_makefile_commands(
     makefile = cwd / "Makefile"
     if not _exists(makefile):
         return ()
-    content = _read_workspace_file(workspace, makefile, strict=True)
+    content = _read_workspace_file(workspace, makefile, may_read)
     if content is None:
         return ()
     try:
@@ -444,32 +630,35 @@ def discover_makefile_commands(
     return tuple(commands) if visit(arguments[0]) else ()
 
 
-def _read_workspace_file(workspace: Path, path: Path, *, strict: bool = False) -> bytes | None:
+def _read_workspace_file(
+    workspace: Path,
+    path: Path,
+    may_read: Callable[[Path], bool],
+) -> bytes | None:
     """Read a bounded stable regular workspace file without following path components."""
-    try:
-        before = path.lstat()
-        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
-            return None
-        if before.st_size > _MAX_METADATA_BYTES:
-            return None
-        descriptor = open_selected_file(workspace, path, (before.st_dev, before.st_ino))
-        try:
-            bound = os.fstat(descriptor)
-            content = os.read(descriptor, _MAX_METADATA_BYTES + 1)
-            latest = os.fstat(descriptor)
-            if len(content) > _MAX_METADATA_BYTES or (
-                bound.st_size,
-                bound.st_mtime_ns,
-                bound.st_ctime_ns,
-            ) != (latest.st_size, latest.st_mtime_ns, latest.st_ctime_ns):
-                return None
-            return content
-        finally:
-            os.close(descriptor)
-    except (OSError, ValueError):
-        if strict:
-            raise
+    if not may_read(path):
         return None
+    before = path.lstat()
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+        return None
+    if before.st_size > _MAX_METADATA_BYTES:
+        return None
+    descriptor = open_selected_file(workspace, path, (before.st_dev, before.st_ino))
+    try:
+        bound = os.fstat(descriptor)
+        if not may_read(path):
+            return None
+        content = os.read(descriptor, _MAX_METADATA_BYTES + 1)
+        latest = os.fstat(descriptor)
+        if len(content) > _MAX_METADATA_BYTES or (
+            bound.st_size,
+            bound.st_mtime_ns,
+            bound.st_ctime_ns,
+        ) != (latest.st_size, latest.st_mtime_ns, latest.st_ctime_ns):
+            return None
+        return content
+    finally:
+        os.close(descriptor)
 
 
 def _exists(path: Path) -> bool:
@@ -481,235 +670,3 @@ def _exists(path: Path) -> bool:
         return False
     except OSError:
         return True
-
-
-def _version(value: str) -> tuple[int, ...] | None:
-    """Recognize a literal major/minor or major/minor/patch version."""
-    if _VERSION.fullmatch(value) is None:
-        return None
-    return tuple(int(part) for part in value.split("."))
-
-
-def _environment_values(content: bytes) -> dict[str, str] | None:
-    """Read unambiguous environment metadata as advisory candidate evidence."""
-    values = {}
-    try:
-        for line in content.decode("utf-8").splitlines():
-            key, separator, value = line.partition("=")
-            if separator:
-                key = key.strip()
-                if key in values:
-                    return None
-                values[key] = value.strip()
-    except UnicodeError:
-        return None
-    return values
-
-
-def _environment_version(values: dict[str, str]) -> tuple[int, ...] | None:
-    """Recognize supported managed or standard CPython environment metadata."""
-    if values.get("implementation", "").casefold() == "cpython":
-        return _version(values.get("version_info", ""))
-    if "implementation" not in values and "version_info" not in values and values.get("executable"):
-        return _version(values.get("version", ""))
-    return None
-
-
-def _workspace_interpreter(
-    workspace: Path, spelling: Path, values: dict[str, str]
-) -> RuntimeCandidate | None:
-    """Bind a selected workspace interpreter to its matching metadata spelling."""
-    try:
-        resolved = spelling.resolve(strict=True)
-        details = resolved.stat()
-        home = Path(values.get("home", ""))
-        alias_executable = home / resolved.name
-        if (
-            resolved.is_relative_to(workspace)
-            or not home.is_absolute()
-            or alias_executable.resolve(strict=True) != resolved
-            or not stat.S_ISREG(details.st_mode)
-            or details.st_nlink != 1
-            or not os.access(spelling, os.X_OK)
-        ):
-            return None
-        if "implementation" not in values:
-            executable = Path(values.get("executable", ""))
-            if not executable.is_absolute() or executable.resolve(strict=True) != resolved:
-                return None
-    except (OSError, RuntimeError, ValueError):
-        return None
-    return RuntimeCandidate(
-        (str(spelling), spelling, resolved, details.st_dev, details.st_ino), alias_executable
-    )
-
-
-def _uv_project_runtime(
-    source: str,
-    analysis: CommandAnalysis,
-    workspace: Path,
-    cwd: Path,
-    _path_value: str,
-    identities: tuple[ExecutableIdentity, ...],
-) -> tuple[RuntimeCandidate, ...]:
-    """Identify the default existing environment for an unambiguous project run."""
-    if (
-        cwd != workspace
-        or not analysis.first_executable_initial
-        or not analysis.first_executable_literal
-        or not analysis.first_path_inherited
-        or not any(identity[0] == analysis.executables[0] for identity in identities)
-    ):
-        return ()
-    environment = workspace / ".venv"
-    try:
-        tokens = shell_tokens(source)
-    except ValueError:
-        return ()
-    for token in tokens:
-        if token.operator or not literal_shell_word(token.raw):
-            return ()
-        if token.value == analysis.executables[0]:
-            break
-        name, separator, value = token.value.partition("=")
-        if not separator or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None:
-            return ()
-        if name == _PROJECT_ENVIRONMENT[:-1]:
-            if not value:
-                return ()
-            selected = Path(value)
-            environment = selected if selected.is_absolute() else workspace / selected
-            if ".." in selected.parts or not environment.is_relative_to(workspace):
-                return ()
-        elif name in {"PATH", "VIRTUAL_ENV", "CONDA_PREFIX", "PYTHONHOME"} or (
-            name.startswith("UV_")
-            and name not in {"UV_NO_CACHE", "UV_NO_SYNC", "UV_OFFLINE", "UV_CACHE_DIR"}
-        ):
-            return ()
-    else:
-        return ()
-    arguments = list(analysis.first_executable_arguments)
-    while arguments and arguments[0] in {"--no-cache", "--quiet", "--offline"}:
-        arguments.pop(0)
-    if not arguments or arguments.pop(0) != "run":
-        return ()
-    while arguments and arguments[0] in {"--no-sync", "--quiet", "--offline"}:
-        arguments.pop(0)
-    if arguments and arguments[0] == "--":
-        arguments.pop(0)
-    if not arguments or arguments[0].startswith("-") or "/" in arguments[0]:
-        return ()
-    if arguments[0].endswith(".py") or _exists(workspace / "uv.toml"):
-        return ()
-
-    project = _read_workspace_file(workspace, workspace / "pyproject.toml")
-    config = _read_workspace_file(workspace, environment / "pyvenv.cfg")
-    if project is None or config is None:
-        return ()
-    try:
-        document = tomllib.loads(project.decode("utf-8"))
-        project_table = document["project"]
-        tools = document.get("tool", {})
-        if not isinstance(tools, dict):
-            return ()
-        tool_table = tools.get("uv", {})
-        if not isinstance(project_table, dict) or not isinstance(tool_table, dict):
-            return ()
-        if set(tool_table) - {
-            "package",
-            "exclude-newer",
-            "dev-dependencies",
-            "default-groups",
-            "conflicts",
-        }:
-            return ()
-        values = _environment_values(config)
-        if values is None:
-            return ()
-        version = _environment_version(values)
-        if version is None:
-            return ()
-        required = project_table.get("requires-python")
-        if required is not None:
-            match = _MINIMUM_VERSION.fullmatch(required) if isinstance(required, str) else None
-            minimum = _version(match.group(1)) if match else None
-            if minimum is None or (version + (0, 0, 0))[:3] < (minimum + (0, 0, 0))[:3]:
-                return ()
-        version_file = workspace / ".python-version"
-        if _exists(version_file):
-            contents = _read_workspace_file(workspace, version_file)
-            selected = _version(contents.decode("utf-8").strip()) if contents is not None else None
-            if selected is None or version[: len(selected)] != selected:
-                return ()
-        spelling = environment / "bin/python"
-        candidate = _workspace_interpreter(workspace, spelling, values)
-        if candidate is None:
-            return ()
-    except (KeyError, OSError, RuntimeError, TypeError, UnicodeError, ValueError):
-        return ()
-    return (candidate,)
-
-
-_ADAPTERS = {"uv": _uv_project_runtime}
-
-
-def discover_workspace_interpreters(
-    workspace: Path, identities: tuple[ExecutableIdentity, ...]
-) -> tuple[RuntimeCandidate, ...]:
-    """Suggest runtimes for identity-bound workspace interpreters.
-
-    Args:
-        workspace (Path): Canonical workspace containing selected interpreters.
-        identities (tuple[ExecutableIdentity, ...]): Selected workspace executable identities.
-
-    Returns:
-        tuple[RuntimeCandidate, ...]: Candidates requiring validation and approval.
-    """
-    candidates = []
-    for identity in identities[:128]:
-        _, spelling, _, _, _ = identity
-        if (
-            not spelling.is_relative_to(workspace)
-            or ".." in spelling.parts
-            or spelling.parent.name != "bin"
-        ):
-            continue
-        content = _read_workspace_file(workspace, spelling.parent.parent / "pyvenv.cfg")
-        values = _environment_values(content) if content is not None else None
-        if values is None or _environment_version(values) is None:
-            continue
-        candidate = _workspace_interpreter(workspace, spelling, values)
-        if candidate is not None and candidate.identity[1:] == identity[1:]:
-            candidates.append(RuntimeCandidate(identity, candidate.alias_executable))
-    return tuple(dict.fromkeys(candidates))
-
-
-def discover_workspace_runtimes(
-    source: str,
-    analysis: CommandAnalysis,
-    workspace: Path,
-    cwd: Path,
-    path_value: str,
-    identities: tuple[ExecutableIdentity, ...],
-) -> tuple[RuntimeCandidate, ...]:
-    """Suggest workspace runtime executables selected by a recognized invocation.
-
-    Args:
-        source (str): Original shell source being prepared, never executed for discovery.
-        analysis (CommandAnalysis): Bounded literal command analysis.
-        workspace (Path): Canonical workspace containing candidate environments.
-        cwd (Path): Canonical current directory for the selected command.
-        path_value (str): Inherited PATH, preserved unchanged by discovery.
-        identities (tuple[ExecutableIdentity, ...]): Identity-bound selected executables.
-
-    Returns:
-        tuple[RuntimeCandidate, ...]: Candidates requiring runtime validation and approval.
-    """
-    normalized = workspace_command_source(source, workspace, cwd)
-    if normalized != source:
-        source = normalized
-        analysis = CommandInspection().analyze(source)
-    if not analysis.executables:
-        return ()
-    adapter = _ADAPTERS.get(Path(analysis.executables[0]).name)
-    return adapter(source, analysis, workspace, cwd, path_value, identities) if adapter else ()

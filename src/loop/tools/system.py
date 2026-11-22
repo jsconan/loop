@@ -6,12 +6,15 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from pydantic import BeforeValidator, Field, ValidationInfo
+from pydantic_core import PydanticCustomError
 
 from .. import constants
 from ..errors import Problem
+from ..execution.sandbox.constants import OUTPUT_DIRECTORY_ENVIRONMENT_VARIABLE
 from ..execution.sandbox.contracts import SandboxCapability, normalize_egress_origin
 from ..models import ToolDefinition
 from ..permissions import Action, Operation, OperationPlan, ProcessBoundary, ProcessTarget
+from ..sandbox_catalog import SANDBOX_OPTIONS
 from ..tooling import (
     PlatformArgumentCapability,
     ToolContext,
@@ -37,8 +40,8 @@ def resolve_executable(
         str | list[str],
         Field(
             description=f"One executable name or up to {constants.MAX_COMMAND_PATH_COUNT} "
-            "names to check on the host PATH, "
-            "without running them. Each tool receives its own lookup result and grant reference."
+            "names to check on the host PATH without running them. A default_read result "
+            "is ready to use. An external installation may return a grant_reference."
         ),
     ],
     cwd: Annotated[
@@ -49,7 +52,7 @@ def resolve_executable(
         ),
     ] = ".",
 ) -> dict | Problem:
-    """Check named host executables before requesting sandbox grants."""
+    """Check whether named executables are installed and readable by a sandbox command."""
     try:
         if context.execution_service is None:
             raise ValueError("Executable lookup service is unavailable.")
@@ -73,6 +76,11 @@ def _command_plan(arguments: dict[str, object]) -> OperationPlan:
     if origins is not None:
         if not isinstance(origins, list):
             raise ValueError("Mediated egress origins must be a list.")
+        if origins and arguments.get("network"):
+            raise ValueError(
+                "For exact HTTP(S) destinations, keep egress_origins and set network=false. "
+                "network=true requests general access."
+            )
         normalized["egress_origins"] = list(
             dict.fromkeys(normalize_egress_origin(origin) for origin in origins)
         )
@@ -114,6 +122,18 @@ def _host_command_plan(arguments: dict[str, object]) -> OperationPlan:
     )
 
 
+def _wait_value(value: Any) -> Any:
+    """Accept optional numeric duration spellings while refusing boolean scheduling values."""
+    if value is True or value is False:
+        raise PydanticCustomError("wait_duration", "The command wait must be a nonnegative number.")
+    return normalize_optional_null(value)
+
+
+def _bounded_wait(wait_seconds: float | None, settings: ToolRuntimeSettings) -> float | None:
+    """Honor an earlier return and bound longer requests to the configured per-call wait."""
+    return None if wait_seconds is None else min(wait_seconds, settings.command_max_wait_seconds)
+
+
 def _configure_wait_definition(
     definition: ToolDefinition,
     settings: ToolRuntimeSettings,
@@ -121,10 +141,10 @@ def _configure_wait_definition(
     default_wait_seconds: float,
     default_setting: str,
 ) -> ToolDefinition:
-    """Replace each field description's wait placeholders with active values."""
+    """Advertise the active wait cap and defaults for a nullable duration."""
     wait_schema = definition.parameters["properties"]["wait_seconds"]
     maximum = settings.command_max_wait_seconds
-    wait_schema["maximum"] = maximum
+    wait_schema["anyOf"][0]["maximum"] = maximum
     wait_schema["description"] = wait_schema["description"].format(
         maximum_seconds=maximum,
         maximum_setting="tools.command_max_wait_seconds",
@@ -137,9 +157,19 @@ def _configure_wait_definition(
 
 
 def _run_command_definition(
-    definition: ToolDefinition, settings: ToolRuntimeSettings
+    definition: ToolDefinition, settings: ToolRuntimeSettings, services: tuple[str, ...]
 ) -> ToolDefinition:
-    """Include active initial-wait and whole-command durations in the schema."""
+    """Include active wait durations and only the services this workspace can request."""
+    properties = definition.parameters["properties"]
+    if services:
+        field = properties["runtime_services"]
+        field["anyOf"][0]["items"]["enum"] = list(services)
+        field["description"] += " " + " ".join(
+            f"{name}: {SANDBOX_OPTIONS[name]['label']}." for name in services
+        )
+    else:
+        properties.pop("runtime_services")
+        definition.parameters["required"].remove("runtime_services")
     return _configure_wait_definition(
         definition,
         settings,
@@ -149,7 +179,7 @@ def _run_command_definition(
 
 
 def _poll_command_job_definition(
-    definition: ToolDefinition, settings: ToolRuntimeSettings
+    definition: ToolDefinition, settings: ToolRuntimeSettings, _services: tuple[str, ...]
 ) -> ToolDefinition:
     """Include active poll-wait and whole-command durations in the schema."""
     return _configure_wait_definition(
@@ -182,6 +212,9 @@ def _command_worker_context(context: ToolContext, worker_context: ToolContext) -
             else None
         ),
         audit_host_detached=(permissions.record_host_boundary if permissions is not None else None),
+        host_recovery_detached=(
+            permissions.host_recovery_revision if permissions is not None else None
+        ),
         command_admission=context.command_admission,
         command_authorities=(permissions, instructions),
         command_paths=context.command_paths,
@@ -237,6 +270,9 @@ def request_host_command(
     platform_argument_capabilities=(
         PlatformArgumentCapability("interactive", SandboxCapability.TERMINAL),
         PlatformArgumentCapability("egress_origins", SandboxCapability.MEDIATED_EGRESS),
+        PlatformArgumentCapability("local_ipc", SandboxCapability.LOCAL_IPC),
+        PlatformArgumentCapability("ingress_port", SandboxCapability.INGRESS),
+        PlatformArgumentCapability("write_files", SandboxCapability.WRITE_FILES),
     ),
 )
 def run_command(
@@ -245,10 +281,16 @@ def run_command(
         str,
         Field(
             description="Opaque POSIX shell source to run under the host OS sandbox. "
+            "Use '.' to source a POSIX script. Select an explicit interpreter for other syntax. "
+            "Preserve the exit status when running checks. Use output pagination for long output. "
+            "Appending echo or piping a check into a display command can hide its failing exit "
+            "status. The result already includes the exit code. "
             f'Use "{VirtualPath.TEMPORARY}/..." for session temporary files. '
-            "Configure each tool's output, cache and environment updates as needed for "
-            "read-only workspaces and session scratch. Do not rerun a command that may have "
-            "had effects; inspect or read its existing result instead.",
+            f'"${OUTPUT_DIRECTORY_ENVIRONMENT_VARIABLE}" is the private output directory '
+            "created before launch. "
+            "Preserve the requested wrapper and checks. Use the tool's output settings to put "
+            "generated files and caches there, or request the required write scope. "
+            "Review possible effects and `write_scope.retry` before any authorized retry.",
             min_length=1,
         ),
     ],
@@ -260,13 +302,6 @@ def run_command(
             "defaults to the workspace root. Shell source is passed unchanged."
         ),
     ] = ".",
-    read_only: Annotated[
-        bool,
-        Field(
-            description="Disable workspace writes only when this command and its subprocesses "
-            "need none. Tests and builds often write coverage, caches, or reports."
-        ),
-    ] = False,
     read_roots: Annotated[
         list[str] | None,
         Field(
@@ -282,22 +317,33 @@ def run_command(
         BeforeValidator(normalize_optional_null),
     ] = None,
     write_roots: Annotated[
-        list[str] | None,
+        Literal["scratch"] | Annotated[list[str], Field(json_schema_extra={"minItems": 1})] | None,
         Field(
-            description="Extra existing directories to write inside the sandbox. Each root "
-            "is bound to its current identity, checked against hard limits and protected "
-            "control paths, and shown for scoped approval. "
-            "When no extra write roots are needed, use JSON null (unquoted)."
+            description="Write scope for the command. JSON null (unquoted) lets Loop prepare "
+            "the scope under the workspace policy. Use the string scratch when the workspace "
+            "can stay read-only, or supply a nonempty list of specific output directories. "
+            "Each requested directory is checked against filesystem policy."
+        ),
+        BeforeValidator(normalize_optional_null),
+    ] = None,
+    write_files: Annotated[
+        Annotated[list[str], Field(json_schema_extra={"minItems": 1})] | None,
+        Field(
+            description="Request write access to exact workspace file paths. Give a "
+            "$WORKSPACE_ROOT path or a workspace-relative path. A file can be absent if its "
+            "parent directory already exists. Each path covers one known fixed filename. "
+            "Use private scratch or a dedicated directory in write_roots for outputs with "
+            "generated names, siblings, temporary files or caches. Use JSON null (unquoted) "
+            "for no exact file writes."
         ),
         BeforeValidator(normalize_optional_null),
     ] = None,
     executable_grant: Annotated[
         str | list[str] | None,
         Field(
-            description="Opaque grant_reference values from resolve_executable; each reference "
-            "binds installed-tool read access inside the sandbox. Use a reference when a needed "
-            "installation cannot be selected automatically. When no reference was returned, "
-            "use JSON null (unquoted)."
+            description="For an already readable tool, use JSON null (unquoted). An external "
+            "tool lookup can return a grant_reference. Copy its exact value here only when "
+            "the requested installation needs it."
         ),
         BeforeValidator(normalize_optional_null),
     ] = None,
@@ -309,14 +355,41 @@ def run_command(
             "destination-scoped and can reach private host services."
         ),
     ] = False,
+    runtime_services: Annotated[
+        list[str] | None,
+        Field(
+            description="Request additional runtime services only when the command or its "
+            "dependencies need them. Use JSON null (unquoted) for ordinary execution."
+        ),
+        BeforeValidator(normalize_optional_null),
+    ] = None,
+    ingress_port: Annotated[
+        int | None,
+        Field(
+            description="Publish this attempt on exactly 127.0.0.1:<port> after approval. "
+            "Publication ends with this command or policy revision. "
+            "Cannot combine with general networking, egress_origins or interactive mode. "
+            "When no publication is needed, use JSON null (unquoted).",
+            strict=True,
+            ge=1,
+            le=65535,
+        ),
+        BeforeValidator(normalize_optional_null),
+    ] = None,
+    local_ipc: Annotated[
+        bool,
+        Field(
+            description="Request private local communication for this attempt. Defaults off. "
+            "This does not publish a host port or grant outbound IP access."
+        ),
+    ] = False,
     egress_origins: Annotated[
         list[str] | None,
         Field(
             description="Exact HTTP(S) origins requested through a qualified native mediator. "
+            "Keep network=false for this scope. "
             "Each new connection is checked against hard limits and the approved scope; "
             "unsupported clients fail closed without a host retry. "
-            "The native mediator configures a proxy in the command environment; use a client that "
-            "supports its transport. "
             "Pass a list of origins when needed; otherwise use JSON null (unquoted)."
         ),
         BeforeValidator(normalize_optional_null),
@@ -339,21 +412,21 @@ def run_command(
     ] = None,
     wait_seconds: Annotated[
         float | None,
-        BeforeValidator(normalize_optional_null),
         Field(
             description=(
                 "Wait for up to {maximum_seconds:g} seconds ({maximum_setting}) during the "
                 "initial call. The default is {default_seconds:g} seconds ({default_setting}); "
-                "use JSON null (unquoted) for the default or 0 for an immediate response. The "
-                "whole command has a runtime limit of {runtime_limit_seconds:g} seconds "
-                "({runtime_limit_setting}). If the command remains active, this call returns "
-                "its continuation and available output. Use poll_command_job to wait for "
-                "completion and read_command_output only when more output pages are needed."
+                "use JSON null (unquoted) for the default, including for long commands, or 0 "
+                "for an immediate response after approval. The whole command has a runtime "
+                "limit of {runtime_limit_seconds:g} seconds ({runtime_limit_setting}). "
+                "If the command remains active, poll the returned job handle with "
+                "poll_command_job to continue waiting for the same process. Use "
+                "read_command_output only when more output pages are needed."
             ),
             ge=0,
-            le=constants.MAX_COMMAND_WAIT_SECONDS,
             allow_inf_nan=False,
         ),
+        BeforeValidator(_wait_value),
     ] = None,
     interactive: Annotated[
         bool,
@@ -365,7 +438,8 @@ def run_command(
         ),
     ] = False,
 ) -> dict | Problem:
-    """Run sandboxed shell source with approved host recovery; output may expose physical paths."""
+    """Run sandboxed shell source. Use the default wait for long jobs and poll the returned handle
+    with poll_command_job until completion. Output may expose physical paths."""
     if context.execution_service is None:
         return Problem(
             code="sandbox.unavailable",
@@ -373,20 +447,43 @@ def run_command(
             detail="Native command execution service is unavailable.",
             operation=context.tool_name,
         )
+    if runtime_services:
+        if context.sandbox_output_only:
+            return Problem(
+                code="sandbox.unsupported",
+                title="Saved command scope is fixed",
+                detail="A saved command can use only the runtime services in its saved scope.",
+                operation=context.tool_name,
+            )
+        if any(
+            name not in context.execution_service.backend_options
+            or name not in SANDBOX_OPTIONS
+            or SANDBOX_OPTIONS[name].get("automatic")
+            for name in runtime_services
+        ):
+            return Problem(
+                code="sandbox.unsupported",
+                title="Requested sandbox access unavailable",
+                detail="The active sandbox does not offer the requested runtime service.",
+                operation=context.tool_name,
+            )
     reason_argument = {"reason": reason} if reason is not None else {}
     return context.execution_service.run_command(
         context,
         command,
         cwd,
-        read_only,
         read_roots,
         write_roots,
         executable_grant,
         network,
         git_write,
         egress_origins=egress_origins,
+        local_ipc=local_ipc,
+        backend_options=tuple(runtime_services or context.sandbox_backend_options),
+        ingress_port=ingress_port,
         interactive=interactive,
-        wait_seconds=wait_seconds,
+        wait_seconds=_bounded_wait(wait_seconds, context.settings),
+        write_files=write_files,
         **reason_argument,
     )
 
@@ -413,7 +510,6 @@ def poll_command_job(
     handle: Annotated[str, Field(description="Opaque handle from run_command.", min_length=32)],
     wait_seconds: Annotated[
         float | None,
-        BeforeValidator(normalize_optional_null),
         Field(
             description=(
                 "Wait for command completion or this wait's timeout, up to {maximum_seconds:g} "
@@ -425,16 +521,16 @@ def poll_command_job(
                 "page from each output stream."
             ),
             ge=0,
-            le=constants.MAX_COMMAND_WAIT_SECONDS,
             allow_inf_nan=False,
         ),
+        BeforeValidator(_wait_value),
     ] = None,
     stdout_cursor: Annotated[
         str | None,
         BeforeValidator(normalize_optional_null),
         Field(
             description="Cursor from stdout.next_cursor in a prior run or poll result; "
-            "JSON null (unquoted) starts at the beginning."
+            "JSON null (unquoted) or an empty string starts at the beginning."
         ),
     ] = None,
     stderr_cursor: Annotated[
@@ -442,7 +538,7 @@ def poll_command_job(
         BeforeValidator(normalize_optional_null),
         Field(
             description="Cursor from stderr.next_cursor in a prior run or poll result; "
-            "JSON null (unquoted) starts at the beginning."
+            "JSON null (unquoted) or an empty string starts at the beginning."
         ),
     ] = None,
 ) -> dict | Problem:
@@ -457,9 +553,9 @@ def poll_command_job(
     return context.execution_service.poll_command_job(
         context,
         handle,
-        wait_seconds,
-        stdout_cursor,
-        stderr_cursor,
+        _bounded_wait(wait_seconds, context.settings),
+        stdout_cursor or None,
+        stderr_cursor or None,
     )
 
 
@@ -472,8 +568,8 @@ def read_command_output(
         str | None,
         BeforeValidator(normalize_optional_null),
         Field(
-            description="Opaque continuation cursor, or JSON null (unquoted) for the start of "
-            "the stream."
+            description="Opaque continuation cursor. Use JSON null (unquoted) or an empty string "
+            "for the start of the stream."
         ),
     ] = None,
     max_bytes: Annotated[
@@ -497,7 +593,7 @@ def read_command_output(
         context,
         handle,
         stream,
-        cursor,
+        cursor or None,
         max_bytes,
     )
 

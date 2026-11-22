@@ -8,11 +8,11 @@ from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, Literal, TypeAlias
+from typing import Annotated, Any, Literal, TypeAlias
 
 from jsonschema import FormatChecker, SchemaError
 from jsonschema.validators import validator_for
-from pydantic import BaseModel, Field
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_validator
 from pydantic import ValidationError as PydanticValidationError
 
 type JsonValue = None | bool | int | float | str | list[JsonValue] | dict[str, JsonValue]
@@ -30,6 +30,43 @@ type ContextReferenceKind = Literal["file", "directory"]
 type MessageRole = Literal["user", "assistant"]
 
 _JSON_FENCE = re.compile(r"```(?:json)?[ \t]*\r?\n(.*)\r?\n```", re.IGNORECASE | re.DOTALL)
+
+
+class SandboxOutputPath(BaseModel):
+    """Bind one sandbox environment value to the attempt's private output directory.
+
+    Args:
+        output (str): Relative path beneath the private output directory.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    output: str
+
+    @field_validator("output")
+    @classmethod
+    def _require_relative_path(cls, value: str) -> str:
+        """Keep the configured suffix within the selected output root."""
+        if not value or value.startswith("/") or ".." in value.split("/") or "\x00" in value:
+            raise ValueError(
+                "Sandbox output paths must be relative paths without parent traversal."
+            )
+        return value
+
+
+def _validate_sandbox_environment(
+    value: dict[str, str | SandboxOutputPath],
+) -> dict[str, str | SandboxOutputPath]:
+    """Keep executable discovery's pre-launch search path literal."""
+    path = value.get("PATH")
+    if path is None or isinstance(path, str):
+        return value
+    raise ValueError("Sandbox PATH must be a literal string.")
+
+
+type SandboxEnvironment = Annotated[
+    dict[str, str | SandboxOutputPath], AfterValidator(_validate_sandbox_environment)
+]
 
 
 class AgentRunStopReason(StrEnum):
@@ -576,11 +613,14 @@ class ContentArtifact(BaseModel):
         handle (str): Opaque canonical artifact handle.
         source (str): Human-readable source used to reload reproducible content.
         reloadable (bool): Whether the source can recreate an expired artifact.
+        file_sources (tuple[str, ...] | None): Physical source paths retained outside the model
+            envelope, or None for legacy artifacts without source authority.
     """
 
     handle: str
     source: str
     reloadable: bool
+    file_sources: tuple[str, ...] | None = None
 
 
 class ToolResult(ConversationItemModel):

@@ -11,7 +11,16 @@ from unittest.mock import Mock
 
 import pytest
 
-from loop import PermissionManager, RuntimeEnvironment, Skill, SkillManager, ToolRegistry
+from loop import (
+    Action,
+    Decision,
+    PermissionManager,
+    PolicyScope,
+    RuntimeEnvironment,
+    Skill,
+    SkillManager,
+    ToolRegistry,
+)
 from loop.execution import CommandExecutionService
 from loop.execution.sandbox import (
     CommandProcessResult,
@@ -34,6 +43,8 @@ def require_macos():
     """Skip macOS native cases before any platform-specific fixture starts."""
     if sys.platform != "darwin":
         pytest.skip("macOS native integration requires macOS")
+    if os.environ.get("LOOP_NATIVE_MACOS_TEST") != "owned-volume":
+        pytest.skip("Set LOOP_NATIVE_MACOS_TEST=owned-volume for native macOS qualification")
 
 
 @pytest.fixture(scope="session")
@@ -56,6 +67,14 @@ def macos_local_volume(require_macos):
 
 
 @pytest.fixture(autouse=True)
+def owned_runtime_paths(monkeypatch):
+    """Use declared test runtime paths independent of someone's installed packages."""
+    monkeypatch.setattr(
+        macos_backend.MacOSSeatbeltBackend, "installed_read_roots", staticmethod(lambda: ())
+    )
+
+
+@pytest.fixture
 def local_socket_parent(monkeypatch, native_directory, macos_local_volume):
     """Keep native attempt-local sockets inside one registered disposable volume subtree."""
     safe = native_directory(macos_local_volume.mount, name="t" + secrets.token_hex(4))
@@ -131,6 +150,7 @@ def native_execution_clock(monkeypatch):
     monkeypatch.setattr("loop.execution.facade.time", clock)
     monkeypatch.setattr(selection, "time", clock)
     monkeypatch.setattr("loop.execution.sandbox.macos.backend.time", clock)
+    monkeypatch.setattr("loop.permissions.protection.time", clock)
     monkeypatch.setattr(process_utils, "time", clock)
     return clock
 
@@ -161,7 +181,7 @@ def native_command(backend, native_workspace, native_execution_clock):
 
 @pytest.fixture
 def public_command(backend, native_workspace, native_execution_clock, request):
-    """Compose public dispatch, permissions and native enforcement with a forbidden host retry."""
+    """Compose automatic-process dispatch with native resource checks and a forbidden host retry."""
     host = Mock()
     host.run_host_command.side_effect = AssertionError("unapproved host launch")
     interaction = Mock()
@@ -187,6 +207,7 @@ def public_command(backend, native_workspace, native_execution_clock, request):
         )
         (policy_directory / "permissions.yaml").write_text(payload, encoding="utf-8")
     manager = PermissionManager(native_workspace)
+    manager.set_default(Action.PROCESS_EXECUTE, Decision.ALLOW, scope=PolicyScope.SESSION)
     scratch = manager.temporary_directory
     skill_root = native_workspace.parent / "fixture-skill"
     skill_root.mkdir()

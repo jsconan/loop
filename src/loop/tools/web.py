@@ -2,6 +2,7 @@
 
 import ipaddress
 import logging
+import os
 import socket
 from typing import Annotated
 from urllib.parse import urlsplit
@@ -13,7 +14,7 @@ from pydantic import BeforeValidator, Field, HttpUrl, TypeAdapter
 from .. import constants
 from ..errors import Problem, ProblemException, log_problem
 from ..models import ToolResultPresentation, ToolResultPresentationSpec
-from ..permissions import Action, NetworkTarget, Operation, OperationPlan
+from ..permissions import Action, FileTarget, NetworkTarget, Operation, OperationPlan
 from ..tooling import ToolContext, normalize_optional_null, tool
 from ..utils import (
     BoundedTextContent,
@@ -21,7 +22,9 @@ from ..utils import (
     cached_path,
     decode_content_cursor,
     encode_content_cursor,
+    open_selected_file,
     read_bounded_text,
+    read_bounded_text_stream,
     store_text_stream,
 )
 from .models import CachedContentResult
@@ -139,9 +142,15 @@ def _cached_content_plan(arguments: dict[str, object]) -> OperationPlan:
     """Plan local cached access, a source reload, or one redirected reload hop."""
     if "url" in arguments:
         return _network_plan(arguments)
-    metadata = (
-        None if cached_path(str(arguments["handle"])) else cached_metadata(str(arguments["handle"]))
+    metadata = cached_metadata(str(arguments["handle"]))
+    if metadata is not None and metadata.get("file_sources", ()) is None:
+        raise ValueError("Cached source authority is unknown; read the original source again.")
+    file_operations = tuple(
+        Operation(tool_id="", action=Action.FILESYSTEM_READ, target=FileTarget(path=path))
+        for path in (metadata or {}).get("file_sources", ())
     )
+    if cached_path(str(arguments["handle"])):
+        return OperationPlan(arguments=arguments, operations=file_operations)
     source = metadata["source"] if metadata and metadata["reloadable"] else None
     if source is None:
         return OperationPlan(arguments=arguments)
@@ -262,7 +271,7 @@ def fetch_content(
 
 
 @tool(
-    actions={Action.NETWORK_REQUEST},
+    actions={Action.NETWORK_REQUEST, Action.FILESYSTEM_READ},
     operation_planner=_cached_content_plan,
     result_presentation=ToolResultPresentationSpec(kind=ToolResultPresentation.TEXT),
 )
@@ -311,6 +320,26 @@ def read_cached_content(
     """Read a bounded, resumable portion of cached or explicitly referenced text."""
     try:
         metadata = cached_metadata(handle)
+        if metadata and metadata.get("file_sources"):
+            operations = tuple(
+                Operation(
+                    tool_id=context.tool_name,
+                    action=Action.FILESYSTEM_READ,
+                    target=FileTarget(path=source),
+                )
+                for source in metadata["file_sources"]
+            )
+            if context.permission_manager is None:
+                raise ValueError("Cached file permission authority is unavailable.")
+            context.permission_manager.require_policy_ready()
+            denial = context.permission_manager.check_boundaries(operations)
+            if denial is not None:
+                return Problem(
+                    code="tool.denied",
+                    title="Cached file access denied",
+                    detail=denial.reason,
+                    operation=context.tool_name,
+                )
         resolved = cached_path(handle)
         if resolved is None:
             if metadata is None or not metadata["reloadable"]:
@@ -340,14 +369,27 @@ def read_cached_content(
         start_byte = decode_content_cursor(cursor, handle) if cursor is not None else None
         if start_byte is not None and start_byte > path.stat().st_size:
             raise ValueError("Cached content cursor is beyond the end of the content.")
-        bounded = read_bounded_text(
-            path,
-            start_byte=start_byte,
-            start_line=None if start_byte is not None else start_line,
-            max_lines=max_lines,
-            max_bytes=max_bytes,
-            allow_nul=bool(metadata and metadata.get("allow_nul", False)),
-        )
+        selected = path.lstat()
+        descriptor = open_selected_file(path.parent, path, (selected.st_dev, selected.st_ino))
+        with os.fdopen(descriptor, "rb") as stream:
+            bounded = read_bounded_text_stream(
+                stream,
+                start_byte=start_byte,
+                start_line=None if start_byte is not None else start_line,
+                max_lines=max_lines,
+                max_bytes=max_bytes,
+                allow_nul=bool(metadata and metadata.get("allow_nul", False)),
+            )
+        if metadata and metadata.get("file_sources"):
+            context.permission_manager.require_policy_ready()
+            denial = context.permission_manager.check_boundaries(operations)
+            if denial is not None:
+                return Problem(
+                    code="tool.denied",
+                    title="Cached file access denied",
+                    detail=denial.reason,
+                    operation=context.tool_name,
+                )
         result = _cached_result(handle, source, bounded)
         context.record_cached_read(handle)
         return result

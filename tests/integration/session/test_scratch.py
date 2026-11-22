@@ -18,6 +18,12 @@ from loop import Interaction, SessionExecutionConflictError, SessionManager, SQL
 from loop.utils.path import ensure_private_directory, private_directory_lock
 
 pytestmark = pytest.mark.integration
+_NATIVE_OPT_IN = (
+    sys.platform == "darwin"
+    and os.environ.get("LOOP_NATIVE_MACOS_TEST") == "owned-volume"
+    or sys.platform == "linux"
+    and os.environ.get("LOOP_NATIVE_LINUX_TEST") == "installed"
+)
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="Requires Linux O_PATH directory traversal")
@@ -51,19 +57,22 @@ def test_session_storage_traverses_search_only_ancestors(tmp_path, monkeypatch):
         ancestor.chmod(0o700)
 
 
-def test_saved_working_files_survive_process_exit_and_resume(tmp_path):
+@pytest.mark.parametrize("compact", [False, True])
+def test_saved_working_files_survive_process_exit_and_resume(tmp_path, compact):
     """A resumed session reopens its working files after the creating process has exited."""
-    database = tmp_path / "storage" / "sessions.db"
+    database = tmp_path / "Application Support" / "sessions.db"
     source = """
 import json
 import sys
+from pathlib import Path
 from unittest.mock import Mock
 from loop import Interaction, SessionManager, SQLiteSessionStore
 
 manager = SessionManager(
     interaction=Mock(spec=Interaction),
     session=sys.argv[2] or None,
-    session_store=SQLiteSessionStore(sys.argv[1], workspace_id="workspace"),
+    session_store=SQLiteSessionStore(sys.argv[1], workspace_id="workspace",
+                                    scratch_roots=(Path(sys.argv[3]),) if sys.argv[3] else ()),
     workspace_id="workspace",
 )
 directory = manager.temporary_directory.get()
@@ -80,7 +89,15 @@ print(json.dumps({
     def run(identifier):
         """Launch an isolated application process and collect its public storage result."""
         result = subprocess.run(
-            [sys.executable, "-B", "-c", source, str(database), identifier],
+            [
+                sys.executable,
+                "-B",
+                "-c",
+                source,
+                str(database),
+                identifier,
+                str(tmp_path / "short") if compact else "",
+            ],
             capture_output=True,
             text=True,
             check=True,
@@ -93,6 +110,8 @@ print(json.dumps({
 
     assert created["content"] == "retained"
     assert resumed == created
+    if compact:
+        assert not any(character.isspace() for character in created["directory"])
 
 
 def test_killed_run_remains_recoverable_after_resume(tmp_path):
@@ -136,7 +155,10 @@ with manager.execution():
         owner.communicate(timeout=10)
 
 
-def test_native_ownership_serializes_one_session_and_releases_after_owner_death(tmp_path):
+@pytest.mark.parametrize("owner_method", ["execution", "command_job_storage"])
+def test_native_ownership_serializes_one_session_and_releases_after_owner_death(
+    tmp_path, owner_method
+):
     """Cooperating processes exclude shared-session execution while independent sessions overlap."""
     database = tmp_path / "sessions.db"
     source = """
@@ -148,15 +170,24 @@ try:
         interaction=Mock(spec=Interaction), session=Session(id=sys.argv[2]),
         session_store=SQLiteSessionStore(sys.argv[1], workspace_id="workspace"),
     )
-    with manager.execution():
+    with manager.command_job_storage(manager.session.id) if sys.argv[3] == "job" else manager.execution():
         print(json.dumps({"owned": True, "directory": str(manager.temporary_directory.get())}), flush=True)
-        if sys.argv[3] == "hold":
+        if sys.argv[3] in ("hold", "job"):
             sys.stdin.readline()
 except SessionExecutionConflictError:
     print(json.dumps({"owned": False}), flush=True)
 """
     owner = subprocess.Popen(
-        [sys.executable, "-B", "-u", "-c", source, str(database), "shared", "hold"],
+        [
+            sys.executable,
+            "-B",
+            "-u",
+            "-c",
+            source,
+            str(database),
+            "shared",
+            "job" if owner_method == "command_job_storage" else "hold",
+        ],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -595,7 +626,6 @@ def test_native_commands_file_tools_and_sqlite_survive_independent_resume(
     source = r"""
 import json, os, shlex, sys, tempfile
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import Mock, patch
 from loop import (ApprovalChoice, Interaction, PermissionManager, Session, SessionManager,
                   SQLiteSessionStore, ToolRegistry, constants)
@@ -613,14 +643,6 @@ monitor.denial.return_value = None
 if sys.platform == "linux":
     # Fresh probe scratch must match the installed receiver's native system temporary root.
     tempfile.tempdir = "/tmp"
-elif sys.platform == "darwin":
-    from loop.execution import coordinator, facade
-    from loop.execution.sandbox import selection
-    from loop.execution.sandbox.macos import backend as macos_backend
-    from loop.utils import process
-    clock = SimpleNamespace(monotonic=lambda: 100.0, sleep=lambda _: os.sched_yield(),
-        strftime=lambda _format, _value: '2000-01-01 00:00:00+0000', localtime=lambda: None)
-    coordinator.time = facade.time = selection.time = macos_backend.time = process.time = clock
 with patch("loop.execution.sandbox.macos.backend.SeatbeltDiagnosticService.monitor", return_value=monitor), \
      patch("loop.execution.sandbox.macos.backend._denial_from_log", return_value=None):
     backend = select_sandbox_backend()
@@ -629,7 +651,7 @@ with patch("loop.execution.sandbox.macos.backend.SeatbeltDiagnosticService.monit
         sys.exit(0)
     interaction = Mock(spec=Interaction)
     interaction.prompt.side_effect = lambda message, **kwargs: (
-        "deny" if "without the OS sandbox" in message else ApprovalChoice.ONCE
+        "deny" if "without the OS sandbox" in message else next(key for key, index in kwargs["index"].items() if index == "Y")
         if message == "Proceed?" else "approve")
     manager = SessionManager(interaction=interaction, session=sys.argv[3] or None,
         session_store=SQLiteSessionStore(sys.argv[1], workspace_id="workspace"))
@@ -669,19 +691,17 @@ with patch("loop.execution.sandbox.macos.backend.SeatbeltDiagnosticService.monit
     try:
         if not sys.argv[3]:
             dispatch("run_command", command='printf draft > "$TMPDIR/report.txt"; '
-                + sqlite_command("CREATE TABLE state(value); INSERT INTO state VALUES ('retained SQL');"),
-                read_only=True)
+                + sqlite_command("CREATE TABLE state(value); INSERT INTO state VALUES ('retained SQL');"),)
             visible = instructions.virtual_paths.display(str(manager.temporary_directory.get()))
             script = ('set -eu\ncd "$WORKSPACE_ROOT"\nmkdir "$TMPDIR/.loop"\n'
                       'cat "$TMPDIR/report.txt"\n'
                       '/bin/sh -c \'printf child > "$TMPDIR/.loop/data"\'\n')
             dispatch("write_text_file", path=visible + "/roundtrip.sh", content=script)
-            assert dispatch("run_command", command='/bin/sh "$TMPDIR/roundtrip.sh"',
-                            read_only=True)["stdout"]["content"] == "draft"
+            assert dispatch("run_command", command='/bin/sh "$TMPDIR/roundtrip.sh"',)["stdout"]["content"] == "draft"
             assert dispatch("read_text_file", path=visible + "/.loop/data")["content"] == "child"
             manager.add_user_message("retain working state")
             diagnostics = dispatch("run_command", command='i=0; while [ "$i" -lt 2048 ]; '
-                'do printf "%s\n" "$TMPDIR"; i=$((i+1)); done', read_only=True)
+                'do printf "%s\n" "$TMPDIR"; i=$((i+1)); done',)
             cached = cached_path(diagnostics["stdout"]["handle"])[0].read_text()
             expected = ("/loop-private-scratch" if sys.platform == "linux"
                         else str(manager.temporary_directory.get()))
@@ -693,14 +713,14 @@ with patch("loop.execution.sandbox.macos.backend.SeatbeltDiagnosticService.monit
             dispatch(write_text_file.__name__, path=f"{VirtualPath.WORKSPACE}/{filename}",
                 content="physical workspace")
             printed_path = dispatch(run_command.__name__, command=
-                f'{printer} "%s" "{VirtualPath.WORKSPACE}/{filename}"', read_only=True)["stdout"]["content"]
+                f'{printer} "%s" "{VirtualPath.WORKSPACE}/{filename}"',)["stdout"]["content"]
             assert dispatch(read_text_file.__name__, path=printed_path)["content"] == "physical workspace"
             dispatch(edit_text_file.__name__, path=printed_path, old_content="physical",
                 new_content="verified")
             assert dispatch(read_text_file.__name__, path=printed_path)["content"] == "verified workspace"
             page_command = (f'{printer} "%*s" {prefix_length} ""; '
                             f'{printer} "%s" {shlex.quote(tail)}')
-            page = dispatch(run_command.__name__, command=page_command, read_only=True)["stdout"]
+            page = dispatch(run_command.__name__, command=page_command,)["stdout"]
             assert page["content"] == " " * prefix_length and page["truncated"]
             arguments = {"handle": page["handle"], "cursor": page["next_cursor"], "max_bytes": 1}
             continuation = dispatch(read_cached_content.__name__, **arguments)
@@ -714,7 +734,7 @@ with patch("loop.execution.sandbox.macos.backend.SeatbeltDiagnosticService.monit
             literal = shlex.quote(escaped_stream)
             command = (f'{printer} "%s" {literal}; '
                 f'{printer} "%s" {literal} >&2')
-            dispatch(run_command.__name__, command=command, read_only=True)
+            dispatch(run_command.__name__, command=command,)
             delivered_command = json.loads(manager.messages[-1].output)
             assert delivered_command["ok"] and delivered_command["result"]["exit_code"] == 0
             snapshot = json.loads(cached_path(delivered_command["handle"])[0].read_text())
@@ -778,8 +798,7 @@ with patch("loop.execution.sandbox.macos.backend.SeatbeltDiagnosticService.monit
             dispatch("edit_text_file", path="$TMPDIR/report.txt", old_content="draft",
                 new_content="revised")
         content = dispatch("read_text_file", path="$TMPDIR/report.txt")["content"]
-        state = dispatch("run_command", command=sqlite_command("SELECT value FROM state;", select=True),
-            read_only=True)["stdout"]["content"].strip()
+        state = dispatch("run_command", command=sqlite_command("SELECT value FROM state;", select=True),)["stdout"]["content"].strip()
         persisted = manager.store.load(manager.session.id)
         native = str(manager.temporary_directory.get())
         visible = instructions.virtual_paths.display(native)
@@ -820,6 +839,8 @@ with patch("loop.execution.sandbox.macos.backend.SeatbeltDiagnosticService.monit
         assert result.stderr == ""
         value = json.loads(result.stdout)
         if "unavailable" in value:
+            if _NATIVE_OPT_IN:
+                pytest.fail(value["unavailable"])
             pytest.skip(value["unavailable"])
         return value
 

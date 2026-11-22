@@ -2,7 +2,7 @@
 
 import asyncio
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from ..constants import (
     DEFAULT_COMMAND_INITIAL_WAIT_SECONDS,
@@ -11,7 +11,7 @@ from ..constants import (
     DEFAULT_COMMAND_POLL_WAIT_SECONDS,
     DEFAULT_USER_AGENT,
 )
-from ..models import StrEnum
+from ..models import SandboxEnvironment, StrEnum
 
 
 class ToolStatus(StrEnum):
@@ -143,6 +143,8 @@ class ToolRuntimeSettings:
 
     Args:
         user_agent (str): HTTP user-agent used by web-content tools.
+        sandbox_environment (SandboxEnvironment): Literal values and private output paths.
+        sandbox_path_aliases (tuple[str, ...]): Exact aliases into approved read roots.
         command_job_runtime_limit_seconds (float): Finite total runtime limit beginning at native
             launch.
         command_default_initial_wait_seconds (float): Default wait in the initial command call.
@@ -155,3 +157,5 @@ class ToolRuntimeSettings:
     command_default_initial_wait_seconds: float = DEFAULT_COMMAND_INITIAL_WAIT_SECONDS
     command_default_poll_wait_seconds: float = DEFAULT_COMMAND_POLL_WAIT_SECONDS
     command_max_wait_seconds: float = DEFAULT_COMMAND_MAX_WAIT_SECONDS
+    sandbox_environment: SandboxEnvironment = field(default_factory=dict)
+    sandbox_path_aliases: tuple[str, ...] = ()

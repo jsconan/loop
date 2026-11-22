@@ -438,9 +438,12 @@ def test_schema_diagnostics_resolve_mapping_keys_values_and_list_items():
         ),
         (
             {"kind": "synthetic-secret"},
-            'field "kind" must select one of "file", "network", "process", "session"',
+            'field "kind" must select one of "file", "network", "network_access", "network_ingress", "process", "session"',
         ),
-        ({"path": "/x"}, 'field "kind" must select one of "file", "network", "process", "session"'),
+        (
+            {"path": "/x"},
+            'field "kind" must select one of "file", "network", "network_access", "network_ingress", "process", "session"',
+        ),
     ],
 )
 def test_schema_diagnostics_explain_discriminated_targets(target, expected):
@@ -475,7 +478,7 @@ def test_schema_diagnostics_redact_forged_union_context(kind):
     )
     detail = safe_error_detail(error, PermissionConfiguration)
     assert 'field "kind"' in detail
-    assert '"file", "network", "process", "session"' in detail
+    assert '"file", "network", "network_access", "network_ingress", "process", "session"' in detail
     assert "synthetic-secret" not in detail
 
 

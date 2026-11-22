@@ -64,8 +64,14 @@ class CommandCancellation(threading.Event):
             bool: Whether cancellation has been requested.
         """
         with self._lock:
-            return self._job.is_set() or (
-                not self._handed_off.is_set() and self._origin is not None and self._origin.is_set()
+            return (
+                super().is_set()
+                or self._job.is_set()
+                or (
+                    not self._handed_off.is_set()
+                    and self._origin is not None
+                    and self._origin.is_set()
+                )
             )
 
     def wait(self, timeout: float | None = None) -> bool:

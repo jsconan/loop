@@ -2,16 +2,20 @@ version: 1
 kind: app.permission-preset
 metadata:
   id: unsupervised
-  revision: "1"
+  revision: "2"
   title: Unsupervised
   description: Allow every authority-requiring operation without approval, subject to enforcement limits.
 confirmation_warning: Unsupervised mode allows every authority-requiring operation without approval. Enforcement limits remain active.
 defaults:
   filesystem.list: allow
+  filesystem.execute: allow
   filesystem.read: allow
   filesystem.create: allow
   filesystem.replace: allow
   filesystem.delete: allow
+  network.local: allow
+  network.broad: allow
+  network.ingress: allow
   network.request: allow
   process.execute: allow
   session.mutate: allow

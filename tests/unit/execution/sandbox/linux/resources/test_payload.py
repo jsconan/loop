@@ -28,7 +28,11 @@ def payload(monkeypatch, tmp_path):
     monkeypatch.setattr(
         SandboxRequest,
         "from_wire",
-        Mock(return_value=SimpleNamespace(terminal=False, egress_origins=(), local_network=True)),
+        Mock(
+            return_value=SimpleNamespace(
+                ingress_port=None, terminal=False, egress_origins=(), local_network=True
+            )
+        ),
     )
     record = {
         "path": "/trusted/control",
@@ -75,7 +79,7 @@ def test_payload_enters_bound_setup_and_replaces_private_input(payload):
 def test_payload_attaches_only_its_receiver_owned_terminal(payload, monkeypatch, session_leader):
     """The inherited slave becomes stdin and the process's own controlling terminal."""
     SandboxRequest.from_wire.return_value = SimpleNamespace(
-        terminal=True, egress_origins=(), local_network=True
+        ingress_port=None, terminal=True, egress_origins=(), local_network=True
     )
     module.os.isatty.side_effect = lambda fd: fd in (1, 2)
     module.os.getpid.return_value = 13
@@ -96,7 +100,7 @@ def test_payload_attaches_only_its_receiver_owned_terminal(payload, monkeypatch,
 def test_payload_refuses_missing_receiver_terminal_slave(payload, missing):
     """A missing slave aborts before stdin binding or source execution."""
     SandboxRequest.from_wire.return_value = SimpleNamespace(
-        terminal=True, egress_origins=(), local_network=True
+        ingress_port=None, terminal=True, egress_origins=(), local_network=True
     )
     module.os.isatty.side_effect = lambda fd: fd != missing
     with pytest.raises(ValueError, match="receiver-owned terminal"):
@@ -115,6 +119,7 @@ def test_payload_requires_one_bound_socket_only_for_mediated_attempts(payload, m
         value["egress_fd"] = True if case == "boolean" else 1 if case == "stdio" else 9
     monkeypatch.setattr(module.sys, "stdin", Mock(buffer=io.BytesIO(json.dumps(value).encode())))
     SandboxRequest.from_wire.return_value = SimpleNamespace(
+        ingress_port=None,
         egress_origins=() if case == "unexpected" else ("http://example.com",),
         terminal=False,
         local_network=True,
@@ -142,6 +147,7 @@ def test_payload_requires_filter_exactly_for_local_deny(payload, monkeypatch, ca
         value["local_network_filter"] = "!"
     monkeypatch.setattr(module.sys, "stdin", Mock(buffer=io.BytesIO(json.dumps(value).encode())))
     SandboxRequest.from_wire.return_value = SimpleNamespace(
+        ingress_port=None,
         terminal=False,
         egress_origins=(),
         local_network=case == "unexpected",
@@ -206,3 +212,34 @@ def test_payload_refuses_oversized_or_ambiguous_trusted_input(payload, monkeypat
     SandboxRequest.from_wire.assert_not_called()
     linux_bootstrap.enter_bootstrap.assert_not_called()
     linux_bootstrap.execute_payload.assert_not_called()
+
+
+@pytest.mark.parametrize("case", ["valid", "missing", "unexpected", "malformed"])
+def test_payload_requires_full_descriptor_filter_for_ingress(payload, monkeypatch, case):
+    """The trusted ingress fork cannot leave the payload without descriptor denial."""
+    value = json.loads(module.sys.stdin.buffer.getvalue())
+    ingress = case != "unexpected"
+    if ingress:
+        value["egress_fd"] = 9
+    if case != "missing":
+        value["payload_descriptor_filter"] = (
+            "!" if case == "malformed" else base64.b64encode(b"full-filter").decode()
+        )
+    monkeypatch.setattr(module.sys, "stdin", Mock(buffer=io.BytesIO(json.dumps(value).encode())))
+    SandboxRequest.from_wire.return_value = SimpleNamespace(
+        ingress_port=8123 if ingress else None,
+        terminal=False,
+        egress_origins=(),
+        local_network=True,
+    )
+    module.os.fstat.return_value = SimpleNamespace(st_mode=stat.S_IFSOCK | 0o600)
+    if case == "valid":
+        module.main()
+        assert (
+            linux_bootstrap.execute_payload.call_args.kwargs["payload_descriptor_filter"]
+            == b"full-filter"
+        )
+    else:
+        with pytest.raises((ValueError, binascii.Error)):
+            module.main()
+        linux_bootstrap.execute_payload.assert_not_called()

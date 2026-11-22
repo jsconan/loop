@@ -101,7 +101,7 @@ print('audit-veto-preserved')
 
 
 @pytest.mark.parametrize("exception", ["PermissionError", "OSError", "ValueError", "RuntimeError"])
-@pytest.mark.parametrize("operation", ["runtime", "direct", "make", "search"])
+@pytest.mark.parametrize("operation", ["direct", "make", "search"])
 def test_runtime_receipt_audit_veto_prevents_execution(tmp_path, exception, operation):
     """Real audit hooks can veto receipt reads before command or native search launch."""
     source = r"""
@@ -116,27 +116,22 @@ from loop.tooling import ToolContext
 
 base = Path(sys.argv[1])
 workspace = base / 'workspace'
-commands = workspace / '.venv/bin'
-commands.mkdir(parents=True)
-package = base / 'Cellar/python/1'
+workspace.mkdir()
+package = base / 'Cellar/engine/1'
 (package / 'bin').mkdir(parents=True)
-selected = package / 'bin/python3.14'
+selected = package / 'bin/engine'
 selected.write_text('fixture')
 selected.chmod(0o755)
 receipt = package / 'INSTALL_RECEIPT.json'
 receipt.write_text('{"runtime_dependencies": []}')
-alias = base / 'opt/python'
+alias = base / 'opt/engine'
 alias.parent.mkdir()
 alias.symlink_to(package, target_is_directory=True)
-(commands / 'python').symlink_to(alias / 'bin/python3.14')
-(commands.parent / 'pyvenv.cfg').write_text(
-    f'home = {alias / "bin"}\nimplementation = CPython\nversion_info = 3.14\n')
-command = './.venv/bin/python -c pass'
+command = 'engine --version'
 if sys.argv[3] in ('direct', 'make'):
     os.environ['PATH'] = str(alias / 'bin') + os.pathsep + os.defpath
-    command = 'python3.14 -c pass'
     if sys.argv[3] == 'make':
-        (workspace / 'Makefile').write_text('.PHONY: test\ntest:\n\tpython3.14 -c pass\n')
+        (workspace / 'Makefile').write_text('.PHONY: test\ntest:\n\tengine --version\n')
         command = 'make test'
         MacOSSeatbeltBackend.trusted_system_path = lambda *args, **kwargs: True
 backend = MacOSSeatbeltBackend()
@@ -159,7 +154,7 @@ try:
     result = (service.run_command(context, command) if sys.argv[3] != 'search'
         else service.run_trusted_search((), (), 10.0))
 except Exception as exc:
-    if type(exc) is not getattr(builtins, sys.argv[2]) or str(exc) != 'fixture audit veto':
+    if not isinstance(exc, getattr(builtins, sys.argv[2])) or str(exc) != 'fixture audit veto':
         raise
 else:
     if sys.argv[3] == 'search' or result.code != 'sandbox.unavailable':

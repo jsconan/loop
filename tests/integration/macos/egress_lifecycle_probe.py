@@ -47,7 +47,7 @@ def main() -> None:
     macos_backend.SeatbeltDiagnosticService.monitor = lambda *_args: monitor
     macos_backend._denial_from_log = lambda *_args: None
     backend = select_sandbox_backend()
-    assert SandboxCapability.MEDIATED_EGRESS in backend.capabilities
+    assert SandboxCapability.MEDIATED_EGRESS in backend.requestable_capabilities
     manager = PermissionManager(workspace, yolo=True)
     registry = ToolRegistry(
         [run_command],
@@ -64,6 +64,7 @@ def main() -> None:
         "command": source,
         "cwd": str(workspace),
         "egress_origins": [_ORIGIN],
+        "write_roots": [str(workspace)],
     }
     with ThreadPoolExecutor(max_workers=1) as executor:
         running = executor.submit(

@@ -1014,6 +1014,7 @@ def test_working_storage_rejects_an_unsafe_namespace_parent(tmp_path):
     store = SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="workspace")
     root = store.temporary_root
     root.parent.mkdir(mode=0o755)
+    root.parent.chmod(0o755)
     with pytest.raises(ValueError, match="private real directory"):
         store.working_binding("session")
     assert root.parent.stat().st_mode & 0o777 == 0o755

@@ -1,4 +1,4 @@
-"""Broker attempt-private HTTP proxy connections in the trusted Linux receiver."""
+"""Broker scoped network connections in the trusted Linux receiver."""
 
 from __future__ import annotations
 
@@ -93,13 +93,12 @@ def start_namespace_proxy(descriptor: int) -> int:
         channel.close()
 
 
-class EgressBroker:
+class NetworkBroker:
     """Own checked host transports for one isolated sandbox attempt.
 
     Args:
-        request (SandboxRequest): Original approved origins and command deadline.
+        request (SandboxRequest): Approved network direction, endpoint and command deadline.
         channel (socket.socket): Inherited private Unix handoff endpoint from this attempt.
-        The broker always excludes private addresses; private networking uses another grant.
     """
 
     request: SandboxRequest
@@ -112,14 +111,18 @@ class EgressBroker:
     _last_heartbeat: float
     _revision: int | None
     _lease_started: bool
+    _deadline: float
     _gate_open: bool
     _paused: bool
     _closed: threading.Event
     _uncertain: bool
+    _listener: socket.socket | None
+    _ingress_clients: dict[int, socket.socket]
+    _next_client: int
 
     def __init__(self, request: SandboxRequest, channel: socket.socket) -> None:
-        if not request.egress_origins or request.network:
-            raise ValueError("The broker requires one mediated-only attempt grant.")
+        if (not request.egress_origins and request.ingress_port is None) or request.network:
+            raise ValueError("The broker requires one isolated mediated network grant.")
         self.request = request
         self.channel = channel
         self._lock = threading.Lock()
@@ -129,10 +132,14 @@ class EgressBroker:
         self._last_heartbeat = 0.0
         self._revision = None
         self._lease_started = False
+        self._deadline = request.deadline
         self._gate_open = False
         self._paused = False
         self._closed = threading.Event()
         self._uncertain = False
+        self._listener = None
+        self._ingress_clients = {}
+        self._next_client = 0
         self._reader = threading.Thread(target=self._receive, daemon=True)
         self._reader.start()
 
@@ -155,6 +162,11 @@ class EgressBroker:
             self._last_heartbeat = time.monotonic()
             if not self._gate_open:
                 try:
+                    if self.request.ingress_port is not None:
+                        self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        self._listener.bind(("127.0.0.1", self.request.ingress_port))
+                        self._listener.listen(16)
+                        self._listener.setblocking(False)
                     if self.channel.send(b"G") != 1:
                         return False
                 except OSError:
@@ -162,9 +174,14 @@ class EgressBroker:
                 self._gate_open = True
             return True
 
-    def start_lease(self) -> None:
-        """Start the two-second first-heartbeat deadline only after native spawn."""
+    def start_lease(self, deadline: float) -> None:
+        """Bind the command deadline and start the first-heartbeat budget at native spawn.
+
+        Args:
+            deadline (float): Absolute execution deadline used by the native supervisor.
+        """
         with self._lock:
+            self._deadline = deadline
             self._lease_started = True
             self._last_heartbeat = time.monotonic()
 
@@ -237,7 +254,7 @@ class EgressBroker:
                 and self._gate_open
                 and not self._paused
                 and self._revision is not None
-                and time.monotonic() < self.request.deadline
+                and time.monotonic() < self._deadline
                 and time.monotonic() - self._last_heartbeat < AUTHORITY_SECONDS
             )
 
@@ -252,7 +269,7 @@ class EgressBroker:
                 self._active
                 and self._gate_open
                 and self._revision is not None
-                and time.monotonic() < self.request.deadline
+                and time.monotonic() < self._deadline
                 and time.monotonic() - self._last_heartbeat < AUTHORITY_SECONDS
             )
 
@@ -274,6 +291,8 @@ class EgressBroker:
                 workers = tuple(self._workers)
         if already_closing:
             return self._closed.wait(AUTHORITY_SECONDS) and not self._uncertain
+        if self._listener is not None:
+            self._listener.close()
         for connection in sockets:
             try:
                 connection.shutdown(socket.SHUT_RDWR)
@@ -335,7 +354,7 @@ class EgressBroker:
                 upstream.close()
                 return None
             try:
-                upstream.settimeout(min(1.0, max(0.1, self.request.deadline - time.monotonic())))
+                upstream.settimeout(min(1.0, max(0.1, self._deadline - time.monotonic())))
                 upstream.connect(address)
                 upstream.settimeout(None)
                 if not self.allow_new():
@@ -400,6 +419,9 @@ class EgressBroker:
 
     def _receive(self) -> None:
         """Receive only connected TCP descriptors from the attempt-private bridge."""
+        if self.request.ingress_port is not None:
+            self._receive_ingress()
+            return
         while True:
             with self._lock:
                 if not self._active:
@@ -435,7 +457,6 @@ class EgressBroker:
                 except OSError:
                     pass
                 break
-            worker = None
             try:
                 if (
                     not self.allow_new()
@@ -448,20 +469,61 @@ class EgressBroker:
                     client.close()
                     continue
                 with self._lock:
+                    if not self._active:
+                        break
                     if len(self._workers) >= MAX_CLIENTS:
                         self._sockets.discard(client)
                         client.close()
                         continue
                     worker = threading.Thread(target=self._serve, args=(client,), daemon=True)
+                    # Closure must only see workers that can be joined.
+                    worker.start()
                     self._workers.add(worker)
-                worker.start()
             except (OSError, RuntimeError):
-                with self._lock:
-                    if worker is not None:
-                        self._workers.discard(worker)
                 self.release(client)
                 break
         self.close()
+
+    def _receive_ingress(self) -> None:
+        """Keep host duplicates for revocation and pass only accepted loopback clients."""
+        try:
+            while True:
+                with self._lock:
+                    if not self._active:
+                        return
+                    listener = self._listener
+                sockets = [self.channel, *([listener] if listener is not None else [])]
+                ready, _, _ = select.select(sockets, [], [], POLL_SECONDS)
+                if self.channel in ready:
+                    message = self.channel.recv(6)
+                    if len(message) != 5 or message[:1] != b"D":
+                        return
+                    client = self._ingress_clients.pop(int.from_bytes(message[1:]), None)
+                    if client is None:
+                        return
+                    self.release(client)
+                if listener is not None and listener in ready:
+                    client, _ = listener.accept()
+                    with self._lock:
+                        capacity = len(self._sockets) < MAX_CLIENTS
+                    if not self.allow_new() or not capacity or not self._track(client):
+                        client.close()
+                        continue
+                    self._next_client += 1
+                    identifier = self._next_client.to_bytes(4)
+                    self._ingress_clients[self._next_client] = client
+                    handles = array.array("i", [client.fileno()])
+                    if (
+                        self.channel.sendmsg(
+                            [b"C" + identifier], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, handles)]
+                        )
+                        != 5
+                    ):
+                        return
+        except (OSError, ValueError, OverflowError):
+            return
+        finally:
+            self.close()
 
     def _serve(self, client: socket.socket) -> None:
         """Run one bounded proxy parser and release its client even on failure."""
@@ -480,7 +542,7 @@ class ProxyHandler(BaseHTTPRequestHandler):
     """Forward only visible HTTP requests or an explicitly approved opaque HTTPS tunnel."""
 
     protocol_version = "HTTP/1.1"
-    server: EgressBroker
+    server: NetworkBroker
 
     def log_message(self, format: str, *args: object) -> None:
         """Discard request paths and destination names from routine receiver logs.
