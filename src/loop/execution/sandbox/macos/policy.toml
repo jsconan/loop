@@ -1,0 +1,44 @@
+platform = "darwin"
+managed_directory = "/Library/{app_display_name}"
+system = [
+    "/System/Library",
+    "/usr/bin",
+    "/usr/lib",
+    "/usr/libexec",
+    "/usr/sbin",
+    "/usr/share",
+    "/bin",
+    "/sbin",
+    "/Library/Developer/CommandLineTools",
+    "/dev",
+    "/etc",
+    "/private/etc/apache2/mime.types",
+    "/private/etc/ssl/cert.pem",
+    "/private/etc/ssl/openssl.cnf",
+    "/var/select",
+    "/private/var/select",
+]
+read_only = ["/usr/local/bin", "/usr/local/sbin", "/usr/local/lib"]
+
+# Apply each group only where its package store exists. The other directories
+# contain links or support files used by children and dynamic library loaders.
+[[installed]]
+store = "/opt/homebrew/Cellar"
+paths = [
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+    "/opt/homebrew/lib",
+    "/opt/homebrew/opt",
+    "/opt/homebrew/share",
+]
+
+[[installed]]
+store = "/usr/local/Cellar"
+paths = [
+    "/usr/local/opt",
+    "/usr/local/share",
+]
+
+[options]
+account_lookup = { label = "Look up system users and groups", notice = "The directory service may return account and group metadata and directory password fields. It may contact network directories even with command networking off." }
+process_pools = { label = "Use process pools for parallel work", notice = "Stock process pools share host semaphore capacity and can encounter name collisions. After forced termination, another same-user attempt may access or unlink leftover semaphores. Automatic cleanup cannot safely reclaim those names." }

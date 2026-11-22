@@ -1,0 +1,9 @@
+platform = "linux"
+managed_directory = "/etc/{app_name}"
+system = ["/usr", "/bin", "/sbin", "/lib", "/lib64"]
+
+[options.shared_dependencies]
+automatic = true
+label = "Read-only access to linked project dependencies"
+notice = "File identities are checked in your account's .cache directory. Shared files stay read-only through their project names. The command receives no cache mount."
+hardlink_source = ".cache"
