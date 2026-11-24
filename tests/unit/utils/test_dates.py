@@ -32,13 +32,14 @@ def test_utc_now_returns_timezone_aware_utc_datetime():
     assert timestamp.utcoffset().total_seconds() == 0
 
 
-def test_time_resolver_uses_offset_when_a_trusted_or_host_name_is_invalid(monkeypatch):
-    """An unusable trusted client identifier falls through to the configured or host clock."""
+def test_time_resolver_prefers_a_configured_override_then_detected_time(monkeypatch):
+    """Use a valid override ahead of client detection and fall back to the host offset."""
     instant = datetime(2026, 11, 23, tzinfo=UTC)
     monkeypatch.setenv("TZ", "not-a-zone")
-    configured, name = resolve_local_datetime(instant, client="CST", configured="UTC")
+    configured, name = resolve_local_datetime(instant, client="Asia/Tokyo", configured="UTC")
     assert configured == instant
     assert name == "UTC"
+    assert resolve_local_datetime(instant, client="UTC", configured="unknown") == (instant, "UTC")
     local, name = resolve_local_datetime(instant, client="unknown", configured="unknown")
     assert local.utcoffset() == instant.astimezone().utcoffset()
     assert name is None

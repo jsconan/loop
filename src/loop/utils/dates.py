@@ -74,13 +74,13 @@ def resolve_local_datetime(
     client: str | None = None,
     configured: str | None = None,
 ) -> tuple[datetime, str | None]:
-    """Convert one instant using the explicit, trusted client, user, or host timezone.
+    """Convert one instant using a call selector, configured override, or detected timezone.
 
     Args:
         instant (datetime): Sampled instant, with naive values interpreted as UTC.
         explicit (str | None): Timezone or fixed offset selected for this call.
         client (str | None): IANA timezone received from trusted client context.
-        configured (str | None): Validated user timezone preference.
+        configured (str | None): Validated override that takes precedence over detection.
 
     Returns:
         tuple[datetime, str | None]: Offset-bearing local instant and its IANA name, if known.
@@ -92,7 +92,7 @@ def resolve_local_datetime(
     if explicit is not None:
         zone, name = _selected_timezone(explicit)
         return instant.astimezone(zone), name
-    for name in (client, configured):
+    for name in (configured, client):
         if name is not None:
             try:
                 return instant.astimezone(_named_timezone(name)), name

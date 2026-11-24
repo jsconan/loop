@@ -31,7 +31,7 @@ def test_clock_defaults_and_nullable_schema(monkeypatch, selector, asynchronous)
     )
     registry = ToolRegistry(
         [get_current_datetime],
-        settings=ToolRuntimeSettings(client_timezone="Europe/Luxembourg", timezone="UTC"),
+        settings=ToolRuntimeSettings(client_timezone="Europe/Luxembourg"),
     )
     parameters = registry.definitions()[0].parameters
     assert list(parameters["properties"]) == ["timezone"]
