@@ -1615,24 +1615,10 @@ class ToolRegistry:
             )
         try:
             validated = parse_model_arguments(tool.arguments_model, arguments).model_dump()
-        except (CommandArgumentError, ValidationError) as exc:
-            details = (
-                exc.errors(include_url=False)
-                if isinstance(exc, ValidationError)
-                else [{"type": "argument_binding", "msg": str(exc)}]
-            )
-            return ToolExecutionResult(
-                serialize_tool_problem(
-                    Problem(
-                        code="tool.invalid_arguments",
-                        title="Invalid tool arguments",
-                        detail=f"Invalid arguments for tool '{name}'.",
-                        severity="warning",
-                        operation=name,
-                        metadata={"fields": details},
-                    )
-                )
-            )
+        except CommandArgumentError as exc:
+            return ToolExecutionResult(tool.argument_error(str(exc)))
+        except ValidationError as exc:
+            return ToolExecutionResult(tool.argument_error(exc))
         try:
             command_paths = (
                 instructions_manager.virtual_paths

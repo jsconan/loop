@@ -15,9 +15,11 @@ from functools import partial
 from pathlib import Path
 from threading import Event, Lock, Thread, get_ident
 from types import SimpleNamespace
+from typing import Annotated
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from pydantic import AfterValidator
 from rich.console import Console
 
 from loop import (
@@ -4479,6 +4481,28 @@ def test_call_command_reports_unknown_tools_and_invalid_parameters():
     assert "argument_binding" in registry.command("calculate", ("unknown=1",)).output
     assert "tool.invalid_arguments" in registry.command("calculate", ("not-an-integer",)).output
     assert "tool.planning_failed" in registry.command("invalid_plan", ()).output
+
+
+def test_call_command_can_serialize_validation_errors_with_exception_context():
+    """Command validation preserves field messages without serializing exception objects."""
+
+    def reject(value: str) -> str:
+        """Reject an invalid value with a regular Python exception."""
+        raise ValueError("Use a supported value.")
+
+    @declare_tool
+    def accept(value: Annotated[str, AfterValidator(reject)]) -> str:
+        """Accept one supported value."""
+        return value
+
+    error = json.loads(ToolRegistry([accept]).command("accept", ("invalid",)).output)["problem"]
+
+    assert error["code"] == "tool.invalid_arguments"
+    assert error["detail"] == "Invalid arguments for tool 'accept'."
+    (issue,) = error["metadata"]["fields"]
+    assert issue["loc"] == ["value"]
+    assert "Use a supported value." in issue["msg"]
+    assert "ctx" not in issue
 
 
 def test_call_async_reports_unknown_tools():

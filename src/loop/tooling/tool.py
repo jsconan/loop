@@ -1332,17 +1332,34 @@ class Tool:
         try:
             validated = self.arguments_model.model_validate_json(arguments or "{}")
         except ValidationError as exc:
-            return None, serialize_tool_problem(
-                Problem(
-                    code="tool.invalid_arguments",
-                    title="Invalid tool arguments",
-                    detail=f"Invalid arguments for tool '{self._name_for_error()}'.",
-                    severity="warning",
-                    operation=self._name_for_error(),
-                    metadata={"fields": exc.errors(include_url=False)},
-                )
-            )
+            return None, self.argument_error(exc)
         return validated.model_dump(), None
+
+    def argument_error(self, error: ValidationError | str) -> str:
+        """Serialize an argument rejection for model and user calls.
+
+        Args:
+            error (ValidationError | str): Schema validation error or command binding message.
+
+        Returns:
+            str: Failed tool envelope with JSON-safe validation details.
+        """
+        fields = (
+            error.errors(include_url=False, include_context=False)
+            if isinstance(error, ValidationError)
+            else [{"type": "argument_binding", "msg": error}]
+        )
+        name = self._name_for_error()
+        return serialize_tool_problem(
+            Problem(
+                code="tool.invalid_arguments",
+                title="Invalid tool arguments",
+                detail=f"Invalid arguments for tool '{name}'.",
+                severity="warning",
+                operation=name,
+                metadata={"fields": fields},
+            )
+        )
 
     def plan(self, arguments: dict[str, Any]) -> OperationPlan:
         """Return canonical execution arguments and the complete operation set.
