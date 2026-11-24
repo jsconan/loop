@@ -9,9 +9,11 @@ __all__ = [
     "AgentRunResult",
     "AgentRunStopReason",
     "AgentRunner",
+    "render_environment",
 ]
 
 from .agent import Agent, AgentIdentity, AgentInstructions
+from .context import render_environment
 from .models import (
     AgentRecoveryStatus,
     AgentRunRecoveryRequired,

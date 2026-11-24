@@ -1632,3 +1632,59 @@ def test_unreadable_recovery_configuration_remains_unsaved(tmp_path, monkeypatch
     with pytest.raises(OSError, match="could not be read for recovery"):
         manager.save()
     assert path.read_text() == "# preserve"
+
+
+def test_context_follows_normal_scope_precedence_and_reset_rules(tmp_path):
+    """Workspace files and session edits override user context and reset normally."""
+    user = tmp_path / "user.toml"
+    workspace = tmp_path / "project" / ".loop" / "config.toml"
+    workspace.parent.mkdir(parents=True)
+    user.write_text("[context]\nmode = 'off'\ntimezone = 'UTC'\n", encoding="utf-8")
+    workspace.write_text(
+        "[context]\nmode = 'basic'\nshow_country = true\ncountry = 'nz'\n"
+        "timezone = 'Pacific/Auckland'\n",
+        encoding="utf-8",
+    )
+    manager = ConfigurationManager(user, workspace)
+    loaded = manager.load({}).context
+    assert loaded.mode == "basic" and loaded.show_country and loaded.country == "NZ"
+    assert loaded.show_timezone and not loaded.show_workspace_path
+    assert loaded.timezone == "Pacific/Auckland"
+    assert manager.source_for("context.timezone") == "workspace"
+    assert manager.set(
+        "context.show_workspace_path", True, scope="workspace"
+    ).context.show_workspace_path
+    workspace_contents = workspace.read_bytes()
+    assert manager.set_session("context.timezone", "Asia/Tokyo").context.timezone == "Asia/Tokyo"
+    assert manager.source_for("context.timezone") == "session"
+    assert workspace.read_bytes() == workspace_contents
+    assert manager.reset_session("context.timezone").context.timezone is None
+    assert manager.unset_session("context.timezone").context.timezone == "Pacific/Auckland"
+    assert manager.reset("context.timezone", scope="workspace").context.timezone == "UTC"
+    assert manager.source_for("context.timezone") == "user"
+    assert manager.reset("context.timezone", scope="user").context.timezone is None
+    automatic_settings = user.read_bytes()
+    assert manager.reset("context.timezone", scope="user").context.timezone is None
+    assert user.read_bytes() == automatic_settings
+    with pytest.raises(ValidationError):
+        manager.set("context.show_timezone", None, scope="user")
+    assert manager.reset_all(scope="session").context == ApplicationSettings().context
+    assert manager.unset_all(scope="session").context.country == "NZ"
+
+
+@pytest.mark.parametrize(
+    "key, value",
+    [("timezone", "Unknown/Place"), ("timezone", "CST"), ("country", "Lux"), ("country", "L1")],
+)
+def test_context_invalid_preferences_leave_previous_settings_live(tmp_path, key, value):
+    """A failed context validation leaves both saved and resolved values intact."""
+    path = tmp_path / "config.toml"
+    manager = ConfigurationManager(path)
+    manager.initialize()
+    manager.load({})
+    previous = manager.set("context.timezone", "UTC", scope="user")
+    contents = path.read_bytes()
+    with pytest.raises(ValidationError):
+        manager.set(f"context.{key}", value, scope="user")
+    assert manager.effective == previous
+    assert path.read_bytes() == contents

@@ -644,10 +644,15 @@ class ConfigurationManager:
             defaults = ApplicationSettings().model_dump(mode="python")
             if sections[0] not in defaults or sections[1] not in defaults[sections[0]]:
                 raise ValueError(f"Unknown configuration field '{dotted_path}'.")
-            if not isinstance(table, Mapping):
-                table = tomlkit.table()
-                document[sections[0]] = table
-            table[sections[1]] = value
+            if value is None:
+                _configuration_adapter(*sections).validate_python(value)
+                if isinstance(table, Mapping) and sections[1] in table:
+                    del table[sections[1]]
+            else:
+                if not isinstance(table, Mapping):
+                    table = tomlkit.table()
+                    document[sections[0]] = table
+                table[sections[1]] = value
             try:
                 self._validate_candidate()
                 if before_save is not None:

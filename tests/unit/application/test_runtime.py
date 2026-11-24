@@ -114,6 +114,7 @@ def test_create_composes_runtime_from_bound_references(dependencies, assembled):
     )
     assert dependencies["PermissionManager"].call_args.kwargs["bootstrap_pristine_policy"]
     loop_kwargs = dependencies["Loop"].create_default.call_args.kwargs
+    assert loop_kwargs["context_settings"] == settings.context
     tool_kwargs = dependencies["create_default_tool_registry"].call_args.kwargs
     assert tool_kwargs["settings"].user_agent == settings.web.user_agent
     assert (

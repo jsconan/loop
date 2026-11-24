@@ -361,6 +361,7 @@ class ApplicationRuntime:
                 run_control=session_controller.control if session_controller is not None else None,
                 main_app=main_app,
                 refresh_sandbox_backend=getattr(execution_service, "refresh_backend", None),
+                context_settings=settings.context,
             )
             cls._track_close(loop.command_manager, cleanup_callbacks)
             runtime = cls(

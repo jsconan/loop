@@ -4,6 +4,7 @@ import asyncio
 import logging
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from pathlib import Path
 from threading import get_ident
 from typing import Self
@@ -18,7 +19,7 @@ from .completion import (
     CompletionValue,
     MarkerCompletionAdapter,
 )
-from .configuration import ApplicationSettings
+from .configuration import ApplicationSettings, ContextSettings
 from .control import RunControl
 from .conversation.interaction import ApprovalInteraction
 from .conversation.models import AdmittedConversationInput
@@ -156,6 +157,8 @@ class Loop:
         run_control: RunControl | None = None,
         main_app: bool = False,
         refresh_sandbox_backend: Callable[[], None] | None = None,
+        context_settings: ContextSettings | None = None,
+        client_timezone: str | None = None,
     ) -> Self:
         """Assemble an interactive loop with project defaults.
 
@@ -192,6 +195,8 @@ class Loop:
                 (default) prevents library command dispatch from elevating.
             refresh_sandbox_backend (Callable[[], None] | None): Reselect the command execution
                 backend after approved Linux setup changes, or ``None`` when not composed.
+            context_settings (ContextSettings | None): Effective disclosure and clock preferences.
+            client_timezone (str | None): IANA timezone supplied by a trusted client.
 
         Returns:
             Loop: Fully assembled interactive application.
@@ -283,6 +288,11 @@ class Loop:
             threshold=compaction_threshold,
             instructions_async=lambda: configured_instructions.prepare_async(configured_agent),
         )
+        if client_timezone is not None:
+            configured_tools.settings = replace(
+                configured_tools.settings,
+                client_timezone=client_timezone,
+            )
         configured_runner = AgentRunner(
             configured_agent,
             backend,
@@ -299,6 +309,7 @@ class Loop:
             run_control=run_control,
             prompt_on_recoverable_error=prompt_on_recoverable_error,
             async_blocking_runner=configured_commands.run_blocking_async,
+            context_settings=context_settings,
         )
         providers = (
             SessionCommands(configured_sessions, configured_name_generator),
@@ -417,7 +428,9 @@ class Loop:
         Returns:
             str: Whether the setting was applied now or requires restart.
         """
-        if path == "app.debug":
+        if path.startswith("context."):
+            self._agent_runner.configure_context(settings.context)
+        elif path == "app.debug":
             self._agent_runner.debug = settings.app.debug
         elif path == "app.allow_direct_host_execution":
             self.permission_manager.set_direct_host_execution(

@@ -66,6 +66,14 @@ max_agent_turns = 25
 # Web requests use a browser-like user agent by default.
 # See "Web requests" below to override it.
 
+[context]
+mode = "basic" # "basic" | "off"
+show_timezone = true
+show_country = false
+show_workspace_path = false
+# timezone = "Europe/Luxembourg"
+# country = "LU"
+
 [tools]
 sandbox_environment = {}
 sandbox_path_aliases = []
@@ -145,6 +153,14 @@ When enabled, `request_host_command` requests a separate unrestricted run with t
 YOLO grants each eligible request once and does not save an approval rule. A failed sandbox command never automatically launches a host command. Recovery that could repeat a previous effect or needs a missing choice stays unresolved for an explicit action. Disabling YOLO affects new decisions; a process already running may retain its admitted authority, so stop the active run when immediate withdrawal is needed. An installed [protected administrator policy](permissions.md#optional-administrator-policy) can prohibit YOLO activation, deny operations, require sandbox execution, prohibit host execution, or require a fresh human decision; YOLO cannot override those restrictions. Managed enforcement is unavailable on an unmanaged installation.
 
 While an agent run is active, `conversation.input_mode = "queue"` admits plain text as a follow-up that runs after the current operation settles. Set it to `"steer"` to admit plain text at steering priority and stop the run at its next safe boundary. Explicit `/queue` and `/steer` commands override this setting.
+
+## Environment and time
+
+`[context]` uses the normal user, workspace, and session scopes. Workspace settings override user settings, and session edits apply for the current Loop process. For example, `/config set context.show_country true scope=session` opts into country disclosure for the current process. Basic disclosure supplies the current local date, execution OS and architecture, command shell, and the `$WORKSPACE_ROOT` alias. Set `show_workspace_path` to disclose the resolved tool directory. Set `mode = "off"` to disable automatic disclosure. The clock and runtime path guidance remain available.
+
+`show_timezone` controls the automatic timezone name and numeric offset. The date and on-demand clock use a configured IANA `timezone` override, then the trusted client timezone, then host local time. With `show_country` enabled, Loop uses a configured two-letter `country` override or the explicit region from the process locale. Locale discovery checks `LC_ALL`, `LC_TIME`, and `LANG` in that order. The region reflects locale settings. Loop omits the field when the effective locale supplies no two-letter region. Country disclosure defaults to off.
+
+Effective preferences apply to the clock and model requests as soon as they are loaded or edited. Loop adds the facts to the existing generation instructions for OpenAI and compatible Responses API endpoints. When a server places instructions before conversation input, a change to the facts can lower prompt cache reuse. Saved request history, compaction, and title requests omit the automatic facts.
 
 ## Configure the backend from Python
 

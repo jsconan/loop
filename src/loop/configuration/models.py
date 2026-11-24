@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, SecretStr, model_validator
 from pydantic_core import PydanticCustomError
 
 from .. import constants
@@ -20,6 +20,7 @@ from ..models import (
     SandboxEnvironment,
     StructuredOutputMode,
 )
+from ..utils import validate_timezone
 
 CONFIGURATION_VERSION = 1
 
@@ -154,6 +155,30 @@ class WebSettings(BaseModel):
     )
 
 
+class ContextSettings(BaseModel):
+    """Configure automatic environment disclosure and the clock default.
+
+    Args:
+        mode (Literal["basic", "off"]): Whether to supply automatic environment facts.
+        show_timezone (bool): Include the timezone name when known and the UTC offset.
+        show_country (bool): Include the configured or detected locale country when available.
+        show_workspace_path (bool): Include the resolved tool directory when disclosure is on.
+        timezone (str | None): IANA timezone override, or None to use the client or host timezone.
+        country (str | None): Two-letter country override, or None to use the locale region.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    mode: Literal["basic", "off"] = "basic"
+    show_timezone: bool = True
+    show_country: bool = False
+    show_workspace_path: bool = False
+    timezone: Annotated[str, AfterValidator(validate_timezone)] | None = None
+    country: Annotated[str, Field(pattern=r"^[A-Za-z]{2}$"), AfterValidator(str.upper)] | None = (
+        None
+    )
+
+
 class ToolSettings(BaseModel):
     """Configure built-in tool execution."""
 
@@ -254,6 +279,7 @@ class ApplicationSettings(BaseModel):
     backend: BackendSettings = BackendSettings()
     conversation: ConversationSettings = ConversationSettings()
     app: AppSettings = AppSettings()
+    context: ContextSettings = ContextSettings()
     web: WebSettings = WebSettings()
     tools: ToolSettings = ToolSettings()
     logging: LoggingSettings = LoggingSettings()

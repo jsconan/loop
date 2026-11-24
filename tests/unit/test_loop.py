@@ -67,7 +67,12 @@ from loop import (
 )
 from loop.application import ApplicationPaths
 from loop.application.commands import ApplicationCommands
-from loop.configuration import ApplicationSettings, ConfigurationCommands, ConfigurationManager
+from loop.configuration import (
+    ApplicationSettings,
+    ConfigurationCommands,
+    ConfigurationManager,
+    ContextSettings,
+)
 from loop.conversation import ConversationCommands, ConversationRecoveryCommands
 from loop.conversation.models import (
     AdmittedConversationInput,
@@ -3400,7 +3405,11 @@ def test_loops_share_local_conversation_context(tmp_path):
     second_backend = Mock(default_model="other-model", prepare_context=Mock(side_effect=list))
     second_backend.get_response.return_value = [ResponseCompleted()]
     second = Loop.create_default(
-        backend=second_backend, session=session, working_directory=tmp_path, stream=True
+        backend=second_backend,
+        session=session,
+        working_directory=tmp_path,
+        stream=True,
+        context_settings=ContextSettings(mode="off"),
     )
 
     assert first.session is second.session is session

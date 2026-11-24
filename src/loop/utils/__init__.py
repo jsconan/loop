@@ -100,6 +100,7 @@ __all__ = [
     "utc_offset",
     "validate_content_handle",
     "validate_term",
+    "validate_timezone",
     "validate_timezone_selector",
     "write_text_atomically",
 ]
@@ -141,6 +142,7 @@ from .dates import (
     resolve_local_datetime,
     utc_now,
     utc_offset,
+    validate_timezone,
     validate_timezone_selector,
 )
 from .files import is_binary_file, write_text_atomically

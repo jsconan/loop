@@ -21,6 +21,22 @@ def _named_timezone(name: str) -> tzinfo:
         raise ValueError(_ZONE_ERROR) from error
 
 
+def validate_timezone(name: str) -> str:
+    """Validate an IANA timezone name.
+
+    Args:
+        name (str): IANA identifier, including UTC.
+
+    Returns:
+        str: Validated identifier.
+
+    Raises:
+        ValueError: If the input is ambiguous, invalid, or unavailable.
+    """
+    _named_timezone(name)
+    return name
+
+
 def _selected_timezone(selector: str) -> tuple[tzinfo, str | None]:
     """Resolve a tool selector into an offset or named zone."""
     match = _OFFSET.fullmatch(selector)

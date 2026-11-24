@@ -1924,3 +1924,29 @@ def test_host_setting_warns_and_applies_without_an_in_request_enable_flow(tmp_pa
     assert "unrestricted" in interaction.warning.call_args.args[0]
     apply.assert_called_once()
     interaction.prompt.assert_not_called()
+
+
+@pytest.mark.parametrize("scope", ["user", "workspace", "session"])
+def test_context_commands_respect_explicit_scope(tmp_path, scope):
+    """A selected scope updates and resets the effective clock preference."""
+    configuration = ConfigurationManager(
+        tmp_path / "config.toml", tmp_path / "project" / ".loop" / "config.toml"
+    )
+    configuration.initialize()
+    configuration.load({})
+    interaction = Mock(spec=ConsoleInteraction)
+    interaction.confirm.return_value = True
+    apply = Mock(return_value="applied now")
+    manager = CommandManager(
+        providers=(ConfigurationCommands(configuration, apply),),
+        interaction=interaction,
+    )
+    assert manager.handle_user_command(f"/config set context.timezone Asia/Tokyo scope={scope}")
+    assert configuration.source_for("context.timezone") == scope
+    assert apply.call_args.args[1].context.timezone == "Asia/Tokyo"
+    assert manager.handle_user_command(f"/config reset context.timezone scope={scope}")
+    assert configuration.effective.context.timezone is None
+    interaction.confirm.assert_called_once_with(
+        f"Reset context.timezone for {scope}?", default=False
+    )
+    interaction.prompt.assert_not_called()

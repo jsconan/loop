@@ -7,6 +7,7 @@ import json
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import ExitStack, aclosing, nullcontext
+from dataclasses import replace
 from datetime import datetime
 from functools import partial
 from time import perf_counter, sleep
@@ -20,6 +21,7 @@ from ..backend import (
     BackendRepetitionError,
 )
 from ..compaction import ContextCompaction
+from ..configuration import ContextSettings
 from ..control import RunControl, RunInterrupted, RunStopRequested
 from ..errors import Problem, ProblemException, log_problem
 from ..instructions import InstructionBudgetExceededError, InstructionsManager
@@ -60,6 +62,7 @@ from ..utils import (
     utc_now,
 )
 from .agent import Agent
+from .context import render_environment
 from .models import (
     AgentRecoveryStatus,
     AgentRunRecoveryRequired,
@@ -103,6 +106,7 @@ class AgentRunner:
         async_blocking_runner (Callable[..., Awaitable[Any]] | None): Application-owned bounded
             worker for local synchronous preparation during async runs. Defaults to a shared
             bounded process worker.
+        context_settings (ContextSettings | None): Effective disclosure and clock preferences.
 
     Raises:
         ValueError: If ``max_turns`` is negative.
@@ -117,6 +121,7 @@ class AgentRunner:
     _compaction: ContextCompaction
     _interaction: Interaction
     _working_directory: PathReference
+    _context_settings: ContextSettings
     _stream: bool
     _debug: bool
     _max_turns: int
@@ -144,6 +149,7 @@ class AgentRunner:
         prompt_on_recoverable_error: bool = True,
         run_control: RunControl | None = None,
         async_blocking_runner: Callable[..., Awaitable[Any]] | None = None,
+        context_settings: ContextSettings | None = None,
     ) -> None:
         if max_turns < 0:
             raise ValueError("Agent max turns must be non-negative.")
@@ -164,6 +170,19 @@ class AgentRunner:
         self._interrupted_tools = None
         self._file_observations = None
         self._async_blocking_runner = async_blocking_runner
+        self._context_settings = ContextSettings()
+        if context_settings is not None:
+            self.configure_context(context_settings)
+
+    def configure_context(self, settings: ContextSettings) -> None:
+        """Apply a validated disclosure policy and matching clock default.
+
+        Args:
+            settings (ContextSettings): Validated effective context preferences.
+        """
+        registry = self._agent.tools.registry
+        registry.settings = replace(registry.settings, timezone=settings.timezone)
+        self._context_settings = settings
 
     @property
     def agent(self) -> Agent:
@@ -1496,7 +1515,7 @@ class AgentRunner:
         )
         events = self._backend.get_response(
             input=model_context,
-            instructions=snapshot.content,
+            instructions=self._request_instructions(snapshot.content),
             stream=self._stream,
             model=selected_model,
             hyperparameters=self._agent.hyperparameters,
@@ -1553,7 +1572,7 @@ class AgentRunner:
         )
         events = self._backend.get_response_async(
             input=model_context,
-            instructions=snapshot.content,
+            instructions=self._request_instructions(snapshot.content),
             stream=self._stream,
             model=selected_model,
             hyperparameters=self._agent.hyperparameters,
@@ -1588,6 +1607,24 @@ class AgentRunner:
             ),
         )
         return response
+
+    def _request_instructions(self, instructions: str) -> str:
+        """Append one transient environment block within the existing instruction budget."""
+        clock = self._agent.tools.registry.settings
+        environment = render_environment(
+            self._context_settings,
+            self._working_directory,
+            timezone=clock.timezone,
+            client_timezone=clock.client_timezone,
+        )
+        if environment is None:
+            return instructions
+        combined = f"{instructions}\n\n{environment}"
+        return (
+            combined
+            if len(combined.encode()) <= self._instructions_manager.max_bytes
+            else instructions
+        )
 
     async def _run_blocking_async(
         self,
