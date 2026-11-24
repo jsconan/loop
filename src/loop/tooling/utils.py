@@ -12,6 +12,8 @@ from ..utils import callable_hints, callable_name
 from .context import ToolContext
 from .models import ToolRegistrationError
 
+_CONTEXT_ANNOTATIONS = (ToolContext, ToolContext | None)
+
 
 def normalize_optional_null(value: Any) -> Any:
     """Interpret top-level ``none`` and ``null`` strings case-insensitively as omitted values.
@@ -63,11 +65,11 @@ def get_tool_arguments_model(function: Callable[..., Any], tool_name: str) -> ty
     fields = {}
 
     parameters = list(signature.parameters.values())
-    if parameters and hints.get(parameters[0].name) is ToolContext:
+    if parameters and hints.get(parameters[0].name) in _CONTEXT_ANNOTATIONS:
         parameters = parameters[1:]
 
     for parameter in parameters:
-        if hints.get(parameter.name) is ToolContext:
+        if hints.get(parameter.name) in _CONTEXT_ANNOTATIONS:
             raise ToolRegistrationError(
                 f"Tool '{tool_name}' must declare ToolContext as its first parameter."
             )
@@ -102,13 +104,13 @@ def takes_tool_context(function: Callable[..., Any]) -> bool:
         function (Callable[..., Any]): Function whose first parameter may request a tool context.
 
     Returns:
-        bool: Whether the first parameter is annotated as ``ToolContext``.
+        bool: Whether the first parameter requests a required or optional ``ToolContext``.
     """
     parameters = list(inspect.signature(function).parameters.values())
     if not parameters:
         return False
     hints = callable_hints(function)
-    return hints.get(parameters[0].name) is ToolContext
+    return hints.get(parameters[0].name) in _CONTEXT_ANNOTATIONS
 
 
 def get_tool_schema(schema: dict[str, Any]) -> dict[str, Any]:

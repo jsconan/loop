@@ -78,10 +78,11 @@ def test_get_tool_arguments_model_builds_strict_fields_and_defaults():
         model.model_validate({"value": 1, "unexpected": True})
 
 
-def test_get_tool_arguments_model_omits_typed_tool_context():
+@pytest.mark.parametrize("context_annotation", [ToolContext, ToolContext | None])
+def test_get_tool_arguments_model_omits_typed_tool_context(context_annotation):
     """The runtime tool context is not exposed as a model-supplied argument."""
 
-    def contextual(context: ToolContext, value: int) -> None:
+    def contextual(context: context_annotation, value: int) -> None:
         pass
 
     model = get_tool_arguments_model(contextual, "contextual")
@@ -90,12 +91,15 @@ def test_get_tool_arguments_model_omits_typed_tool_context():
         "value": {"title": "Value", "type": "integer"}
     }
     assert model.model_validate({"value": 2}).model_dump() == {"value": 2}
+    with pytest.raises(ValueError, match="Extra inputs are not permitted"):
+        model.model_validate({"value": 2, "context": None})
 
 
-def test_get_tool_arguments_model_rejects_tool_context_after_first_parameter():
+@pytest.mark.parametrize("context_annotation", [ToolContext, ToolContext | None])
+def test_get_tool_arguments_model_rejects_tool_context_after_first_parameter(context_annotation):
     """Tool context cannot occupy a model-controlled argument position."""
 
-    def misplaced(value: int, context: ToolContext) -> None:
+    def misplaced(value: int, context: context_annotation) -> None:
         pass
 
     with pytest.raises(ToolRegistrationError, match="must declare ToolContext as its first"):
