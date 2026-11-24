@@ -2,6 +2,7 @@
 
 __all__ = [
     "BUILTIN_TOOLS",
+    "CurrentDatetime",
     "activate_skill",
     "cancel_command_job",
     "control_command_terminal",
@@ -48,3 +49,4 @@ from .catalog import (
     search_text,
     write_text_file,
 )
+from .dates import CurrentDatetime

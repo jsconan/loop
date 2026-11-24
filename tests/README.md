@@ -87,6 +87,10 @@ For a lint wrapper that uses Ruff, set `RUFF_CACHE_DIR="$LOOP_OUTPUT_DIR/ruff-ca
 
 Keep test-created private names such as a synthetic `.env` in fresh Loop-owned session scratch. A separately approved external directory still applies the hard private-name denials, including when used as pytest's `--basetemp`. Quote scratch paths so the same command works when both private namespaces contain spaces.
 
+### Clock timezone discovery
+
+`integration/test_timezone.py` checks POSIX timezone discovery against the native offset and covers an unnamed local timezone. It runs on macOS and Linux without privileged setup.
+
 ### Selecting individual tests
 
 Run an individual module or select end-to-end cases:

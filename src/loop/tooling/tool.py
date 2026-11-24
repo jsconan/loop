@@ -1350,11 +1350,12 @@ class Tool:
             else [{"type": "argument_binding", "msg": error}]
         )
         name = self._name_for_error()
+        guidance = " ".join(issue["msg"] for issue in fields if issue["type"].startswith("loop_"))
         return serialize_tool_problem(
             Problem(
                 code="tool.invalid_arguments",
                 title="Invalid tool arguments",
-                detail=f"Invalid arguments for tool '{name}'.",
+                detail=f"Invalid arguments for tool '{name}'. {guidance}".rstrip(),
                 severity="warning",
                 operation=name,
                 metadata={"fields": fields},

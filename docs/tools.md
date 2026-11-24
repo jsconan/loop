@@ -10,7 +10,7 @@ Loop registers these tools for the model by default:
 | `write_text_file`          | Write a UTF-8 file after authorization.                                                             |
 | `edit_text_file`           | Replace exact UTF-8 text with ambiguity checks.                                                     |
 | `delete_path`              | Delete an authorized file, link, or folder tree.                                                    |
-| `get_current_datetime`     | Return the local date and time.                                                                     |
+| `get_current_datetime`     | Return the current local time, UTC instant, and timezone offset.                                    |
 | `fetch_content`            | Fetch authorized HTTP(S) text into a bounded cache.                                                 |
 | `read_cached_content`      | Read cached text by line or cursor.                                                                 |
 | `resolve_executable`       | Check executable availability and identify any additional read access.                                       |
@@ -26,6 +26,14 @@ Loop registers these tools for the model by default:
 `request_host_command` is additionally advertised when the trusted direct-host setting is enabled and host policy permits the tool. It requests a separate unrestricted command with exact approval; it is hidden by default.
 
 Strict model tool schemas require nullable arguments even when unused. Supply JSON `null` (unquoted) for an unused nullable argument. Argument descriptions identify when a value is needed for a particular action or continuation mode. For optional numeric ranges in file reads, cached-content reads, and skill-resource reads, the exact strings `"none"` and `"null"` are also treated as null, regardless of case. The same applies to cached-content cursors and the file-search `include` filter; an omitted filter searches all visible files within the authorized root, while `["None"]` is a literal glob. Terminal dimensions accept the same spelling, as does terminal content for actions other than `write`. File paths, search text, skill names, and terminal input retain their literal meaning. Normal validation, access authorization, and read limits still apply.
+
+## Read the exact time
+
+Call `get_current_datetime` with an IANA timezone such as `Europe/Luxembourg` or `UTC`, or a signed fixed offset such as `+05:45`. Omit `timezone` or pass JSON `null` to use the default. The clock uses the trusted client timezone first, then the user timezone when supplied by the runtime, then host local time. In the CLI, `/call get_current_datetime timezone=Europe/London` selects a zone for that call.
+
+The result contains `datetime`, `utc`, `timezone`, `utc_offset`, and `weekday` for one captured instant. A fixed offset returns `timezone: null` and has no daylight saving rules. A host offset is returned with `timezone: null` when the IANA name is unavailable. Invalid names, shorthand such as `CST`, and malformed offsets produce a structured argument error. Existing stored clock results retain their original value.
+
+The clock accepts timezone identifiers and offsets. For a place name, the agent chooses the corresponding timezone first and asks for the region when the place is ambiguous or spans multiple zones. The clock performs no outbound lookup.
 
 ## Edit files while a model is running
 

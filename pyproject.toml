@@ -25,6 +25,7 @@ dependencies = [
     "rich>=14.1.0,<15",
     "ruamel-yaml>=0.18.16,<0.19",
     "tomlkit>=0.15.1,<1",
+    "tzdata",
 ]
 classifiers = [
     "Programming Language :: Python :: 3.12",

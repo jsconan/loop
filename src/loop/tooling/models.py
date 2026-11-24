@@ -150,6 +150,8 @@ class ToolRuntimeSettings:
         command_default_initial_wait_seconds (float): Default wait in the initial command call.
         command_default_poll_wait_seconds (float): Default wait in a command completion poll.
         command_max_wait_seconds (float): Maximum wait accepted by either command call.
+        timezone (str | None): Effective user timezone for the clock.
+        client_timezone (str | None): Trusted client timezone, when supplied by the runtime.
     """
 
     user_agent: str = DEFAULT_USER_AGENT
@@ -159,3 +161,5 @@ class ToolRuntimeSettings:
     command_max_wait_seconds: float = DEFAULT_COMMAND_MAX_WAIT_SECONDS
     sandbox_environment: SandboxEnvironment = field(default_factory=dict)
     sandbox_path_aliases: tuple[str, ...] = ()
+    timezone: str | None = None
+    client_timezone: str | None = None

@@ -85,6 +85,7 @@ __all__ = [
     "register_cached_metadata",
     "register_shutdown_signals",
     "render_terminal_text",
+    "resolve_local_datetime",
     "ripgrep_path",
     "run_in_worker_async",
     "safe_scalar",
@@ -96,8 +97,10 @@ __all__ = [
     "store_text_stream",
     "supervise_process",
     "utc_now",
+    "utc_offset",
     "validate_content_handle",
     "validate_term",
+    "validate_timezone_selector",
     "write_text_atomically",
 ]
 
@@ -132,7 +135,14 @@ from .content import (
     store_text_stream,
     validate_content_handle,
 )
-from .dates import as_utc, local_now, utc_now
+from .dates import (
+    as_utc,
+    local_now,
+    resolve_local_datetime,
+    utc_now,
+    utc_offset,
+    validate_timezone_selector,
+)
 from .files import is_binary_file, write_text_atomically
 from .generation import GenerationStop, GenerationWatchdog
 from .hashing import matches_digest, payload_digest, sha256_digest
