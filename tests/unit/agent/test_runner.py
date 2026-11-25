@@ -5449,7 +5449,7 @@ def test_runner_checks_cancellation_after_compaction(tmp_path):
     control = RunControl()
     backend = Mock()
     runner = file_runner(tmp_path, backend, run_control=control)
-    runner.compaction.compact_if_needed.side_effect = control.stop
+    runner.compaction.compact_if_needed.side_effect = lambda _occupied, *, window: control.stop()
 
     with pytest.raises(KeyboardInterrupt):
         runner.query()

@@ -1500,6 +1500,7 @@ class SessionManager:
             session.add_compaction(checkpoint)
             if checkpoint.input_tokens_after is not None:
                 session.tokens = checkpoint.input_tokens_after
+                session.usage_boundary = checkpoint.boundary
             session.pending_dispatch = None
         if dispatch is not None and (
             dispatch.position != len(session.messages) or dispatch.window_id != window.id
@@ -1515,6 +1516,7 @@ class SessionManager:
                 active_checkpoint != window.checkpoint_id or previous is not None
             ):
                 session.tokens = 0
+                session.usage_boundary = None
             session.windows.append(window)
         if dispatch is not None:
             session.dispatches.append(dispatch)

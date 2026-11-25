@@ -87,6 +87,7 @@ class Session:
         compactions (list[Compaction]): Durable replacement-context checkpoints.
             Defaults to an empty list.
         tokens (int): Context usage from the latest response or rebuild. Defaults to ``0``.
+        usage_boundary (int | None): Exclusive history index covered by that usage, when known.
         model (str | None): Model identifier in the latest successfully used assignment,
             or ``None`` when unknown. Defaults to ``None``.
         context_window (int | None): Context-window size in the latest successfully used
@@ -111,6 +112,7 @@ class Session:
     messages: list[ConversationItem] = field(default_factory=list)
     compactions: list[Compaction] = field(default_factory=list)
     tokens: int = 0
+    usage_boundary: int | None = None
     model: str | None = None
     context_window: int | None = None
     workspace_id: str | None = None
@@ -233,6 +235,7 @@ class Session:
                     self._add_conversation_event(len(self.messages) - 1)
             if message.usage.total_tokens is not None:
                 self.tokens = message.usage.total_tokens
+                self.usage_boundary = len(self.messages)
             if message.assignment is not None:
                 self.assignment = message.assignment
         else:
@@ -948,6 +951,7 @@ class Session:
                 dispatches=[record.model_dump(mode="json") for record in self.dispatches],
                 pending_dispatch=self.pending_dispatch,
                 tokens=self.tokens,
+                usage_boundary=self.usage_boundary,
                 model=self.model,
                 context_window=self.context_window,
                 workspace_id=self.workspace_id,
@@ -1244,6 +1248,13 @@ class Session:
             ]
             pending_dispatch = payload.get("pending_dispatch")
             tokens = payload["tokens"]
+            usage_boundary = payload.get("usage_boundary")
+            if usage_boundary is not None and (
+                not isinstance(usage_boundary, int)
+                or isinstance(usage_boundary, bool)
+                or not 0 <= usage_boundary <= len(messages)
+            ):
+                raise TypeError("Invalid serialized context usage boundary.")
             model = payload["model"]
             context_window = payload["context_window"]
             workspace_id = payload["workspace_id"]
@@ -1293,6 +1304,7 @@ class Session:
             dispatches=dispatches,
             pending_dispatch=pending_dispatch,
             tokens=tokens,
+            usage_boundary=usage_boundary,
             model=model,
             context_window=context_window,
             workspace_id=workspace_id,

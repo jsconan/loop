@@ -1522,7 +1522,9 @@ class AgentRunner:
         self._checkpoint(steer=True)
         context = self._request_context
         request = context.prepare(recovery)
-        if request.may_compact and self._compaction.compact_if_needed():
+        if request.may_compact and self._compaction.compact_if_needed(
+            context.occupied_tokens(request), window=request.window
+        ):
             request = context.prepare(recovery)
         self._checkpoint(steer=True)
         model_context = request.backend.prepare_context(
@@ -1591,7 +1593,9 @@ class AgentRunner:
         await self._checkpoint_async(steer=True)
         context = self._request_context
         request = await context.prepare_async(recovery)
-        if request.may_compact and await self._compaction.compact_if_needed_async():
+        if request.may_compact and await self._compaction.compact_if_needed_async(
+            context.occupied_tokens(request), window=request.window
+        ):
             request = await context.prepare_async(recovery)
         await self._checkpoint_async(steer=True)
         model_context = request.backend.prepare_context(

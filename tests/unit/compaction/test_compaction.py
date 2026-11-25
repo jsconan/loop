@@ -82,27 +82,27 @@ def test_rejects_invalid_thresholds(tmp_path, threshold):
 
 def test_threshold_accepts_full_capacity(tmp_path):
     """A threshold of one compacts only when context reaches the reported limit."""
-    session = Session(messages=[Message(role="user", content="request")], tokens=99)
+    session = Session(messages=[Message(role="user", content="request")])
     feature, manager, *_ = _feature(tmp_path, session=session, threshold=1)
     manager.context_window = 100
 
-    assert not feature.needed()
-    session.tokens = 100
-    assert feature.needed()
+    assert not feature.needed(99)
+    assert feature.needed(100)
 
 
-def test_threshold_requires_known_capacity_and_usage(tmp_path):
-    """Automatic compaction needs a reported capacity and sufficient observed usage."""
+def test_threshold_counts_projected_input_and_requires_known_capacity(tmp_path):
+    """A projected request can trigger policy before the last observed usage crosses it."""
     session = Session(messages=[Message(role="user", content="hello")], tokens=79)
     feature, manager, *_ = _feature(tmp_path, session=session)
     manager.context_window = 100
     assert feature.threshold == 0.8
     assert feature.can_compact() is True
     assert feature.needed() is False
+    assert feature.needed(80) is True
     session.tokens = 80
     assert feature.needed() is True
     manager.context_window = None
-    assert feature.needed() is False
+    assert feature.needed(100) is False
     feature.threshold = 0.7
     assert feature.threshold == 0.7
     feature.threshold = 1
@@ -123,6 +123,8 @@ def test_skips_no_context_and_empty_middle_needs_no_summary(tmp_path):
     assert checkpoint.coverage.tail == (0,)
     assert feature.compact() is False
     assert feature.can_compact() is False
+    candidate = owner.session.window.model_copy(update={"checkpoint_id": None})
+    assert feature.needed(32768, window=candidate)
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])

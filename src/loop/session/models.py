@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Annotated, Literal, Protocol, TypedDict
+from typing import Annotated, Literal, NotRequired, Protocol, TypedDict
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -577,6 +577,7 @@ class SerializedSession(TypedDict):
     dispatches: list[dict]
     pending_dispatch: str | None
     tokens: int
+    usage_boundary: NotRequired[int | None]
     model: str | None
     context_window: int | None
     workspace_id: str | None

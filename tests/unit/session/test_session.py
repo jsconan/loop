@@ -172,6 +172,7 @@ def test_session_adds_response_items_without_managing_model_assignment():
 
     assert session.messages == [function_call(), answer]
     assert session.tokens == 42
+    assert Session.deserialize(session.serialize()).usage_boundary == 2
     assert session.model == "model-a"
 
 
@@ -1601,6 +1602,8 @@ def test_session_deserialization_identifies_unsupported_item_types():
     [
         "name",
         "tokens",
+        "usage_type",
+        "usage_frontier",
         "model",
         "window",
         "directory",
@@ -1628,6 +1631,10 @@ def test_session_deserialization_rejects_invalid_event_and_snapshot_metadata(mut
         payload["name"] = ""
     elif mutation == "tokens":
         payload["tokens"] = True
+    elif mutation == "usage_type":
+        payload["usage_boundary"] = True
+    elif mutation == "usage_frontier":
+        payload["usage_boundary"] = len(session.messages) + 1
     elif mutation == "model":
         payload["model"] = 42
     elif mutation == "window":

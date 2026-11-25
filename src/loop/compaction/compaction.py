@@ -120,44 +120,68 @@ class ContextCompaction:
             raise ValueError("Compaction threshold must be greater than zero and at most one.")
         self._threshold = threshold
 
-    def can_compact(self) -> bool:
+    def can_compact(self, window: ModelWindow | None = None) -> bool:
         """Check whether canonical history has new context beyond the last checkpoint.
+
+        Args:
+            window (ModelWindow | None): Staged window, or the active window by default.
 
         Returns:
             bool: Whether an automatic rebuild could advance the captured source history.
         """
         session = self._session_manager.session
-        checkpoint = session.checkpoint()
+        checkpoint = session.checkpoint(window)
         return len(session.messages) > (checkpoint.boundary if checkpoint is not None else 0)
 
-    def needed(self) -> bool:
-        """Check the last observed context usage against the automatic threshold.
+    def needed(self, occupied: int | None = None, *, window: ModelWindow | None = None) -> bool:
+        """Check the compaction threshold against the estimated occupied context.
+
+        Args:
+            occupied (int | None): Estimated occupied tokens, or the last observed usage.
+            window (ModelWindow | None): Staged window, or the active window by default.
 
         Returns:
             bool: Whether automatic compaction could make room for the next request.
         """
-        limit = self._context.compaction_capacity(None)
-        return (
-            limit is not None
-            and self._session_manager.tokens >= limit * self._threshold
-            and self.can_compact()
-        )
+        limit = self._context.compaction_capacity(window)
+        if limit is None or not self.can_compact(window):
+            return False
+        tokens = self._session_manager.tokens if occupied is None else occupied
+        return tokens >= limit * self._threshold
 
-    def compact_if_needed(self) -> bool:
-        """Rebuild the session if observed context usage crosses the threshold.
+    def compact_if_needed(
+        self,
+        occupied: int | None = None,
+        *,
+        window: ModelWindow | None = None,
+    ) -> bool:
+        """Rebuild the session if observed or projected context crosses the threshold.
+
+        Args:
+            occupied (int | None): Estimated occupied tokens, or the last observed usage.
+            window (ModelWindow | None): Window whose projected input supplied the estimate.
 
         Returns:
             bool: Whether a checkpoint was committed.
         """
-        return self.needed() and self.compact()
+        return self.needed(occupied, window=window) and self.compact()
 
-    async def compact_if_needed_async(self) -> bool:
+    async def compact_if_needed_async(
+        self,
+        occupied: int | None = None,
+        *,
+        window: ModelWindow | None = None,
+    ) -> bool:
         """Rebuild the session asynchronously after crossing the utilization threshold.
 
+        Args:
+            occupied (int | None): Estimated occupied tokens, or the last observed usage.
+            window (ModelWindow | None): Window whose projected input supplied the estimate.
+
         Returns:
             bool: Whether a checkpoint was committed.
         """
-        return self.needed() and await self.compact_async()
+        return self.needed(occupied, window=window) and await self.compact_async()
 
     def compact(self) -> bool:
         """Capture, build, and atomically commit a fresh model context.

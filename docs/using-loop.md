@@ -76,6 +76,8 @@ Resume restores the session's admitted model choice. A session that followed the
 
 Compaction runs when the active context reaches the configured utilization threshold or you run `/compact` while the session is idle. It rebuilds with current instructions and saved settings eligible for the next window. Loop keeps the opening request and consecutive additions within a token budget, then places the middle checkpoint before up to four complete recent turns and any active turn. Long active turns can be split between completed tool rounds. The current request stays in the retained tail, and the complete transcript remains available for history and recovery. An empty middle needs no summary call. A failed compaction keeps the previous window.
 
+Automatic compaction starts from measured usage when available and estimates newly added input. A model or route switch evaluates the first request against the new model's capacity.
+
 Loop uses the backend's compaction endpoint automatically when its response can be replayed with the required history, retention, and generation headroom. Otherwise it summarizes the eligible history through the normal response endpoint. Each portable summary request budgets space for both the previous summary and the next batch of history. If they exceed that budget together, Loop keeps the previous window. Native checkpoints stay bound to their producing route and model. A continuation archive can contain plaintext saved by a compatible backend.
 
 Older portable summaries migrate to ordinary messages. Older native checkpoints use their recorded route and model where available. Loop replays canonical history when it cannot establish native compatibility.

@@ -20,6 +20,7 @@ from loop.models import (
     ReasoningConfiguration,
     ToolCall,
     ToolResult,
+    Usage,
 )
 from loop.session import Compaction, InstructionSnapshot
 from loop.tools import activate_skill, manage_skills
@@ -556,6 +557,62 @@ def test_backend_switch_replays_locally_without_summarizing_after_a_checkpoint(t
     assert session.tokens == 0
     _turn(loop, "Next request without a usage report")
     other.compact.assert_not_called()
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_first_request_after_switch_uses_target_compaction_capacity(tmp_path, asynchronous):
+    """The first target request can compact with the new route's smaller capacity."""
+    previous = _backend(layout="leading")
+    previous.get_context_window.return_value = 32768
+    loop = Loop.create_default(previous, working_directory=tmp_path, tool_registry=ToolRegistry([]))
+    for index in range(8):
+        _turn(loop, f"Turn {index} about " + "sample " * 600)
+
+    target = _backend(layout="leading", route="smaller-route")
+    target.get_context_window.return_value = 13000
+    target.get_context_window_async.return_value = 13000
+    target.compact.return_value = _portable("Previous decisions")
+    target.compact_async = AsyncMock(return_value=_portable("Previous decisions"))
+
+    async def switch_and_run():
+        """Replace the backend and admit the next request through the async path."""
+        await loop.replace_backend_async(target)
+        await _turn_async(loop, "Next request")
+
+    if asynchronous:
+        asyncio.run(switch_and_run())
+        target.compact_async.assert_awaited_once()
+    else:
+        loop.replace_backend(target)
+        _turn(loop, "Next request")
+        target.compact.assert_called_once()
+
+    assert loop.session.window.route == target.route
+    assert len(loop.session.compactions) == 1
+    assert loop.session.checkpoint().context == _portable("Previous decisions").items
+
+
+def test_compaction_charges_only_new_input_when_usage_is_known(tmp_path):
+    """A small follow-up does not re-estimate a prefix already measured by the model."""
+    backend = _backend(layout="leading")
+    backend.get_context_window.return_value = 32768
+    backend.compact.return_value = _portable("Previous decisions")
+    result = ResponseCompleted(
+        items=(Message(role="assistant", content="Recorded."),),
+        usage=Usage(input_tokens=1100, output_tokens=100, total_tokens=1200),
+    )
+    backend.get_response.side_effect = lambda **kwargs: iter((result,))
+    loop = Loop.create_default(backend, working_directory=tmp_path, tool_registry=ToolRegistry([]))
+    for index in range(8):
+        _turn(loop, f"Turn {index} followed by whitespace" + " " * 4200)
+
+    loop.session.context_window = 13000
+    (tmp_path / "AGENTS.md").write_text("Revised guidance.", encoding="utf-8")
+    _turn(loop, "Small follow-up")
+
+    backend.compact.assert_not_called()
+    assert not loop.session.compactions
+    assert "Revised guidance." in backend.get_response.call_args.kwargs["instructions"]
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])

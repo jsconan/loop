@@ -3,7 +3,7 @@
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 
-from ..backend import Backend, GenerationHyperparameters
+from ..backend import Backend, GenerationHyperparameters, estimate_context
 from ..configuration import ApplicationSettings, ContextSettings
 from ..errors import Problem, ProblemException
 from ..instructions import InstructionsManager, PreparedInstructions
@@ -75,6 +75,19 @@ class AgentRequest:
     backend: Backend
     disclosure: ContextSettings
     snapshot: PreparedInstructions
+
+    @property
+    def projected_tokens(self) -> int:
+        """Estimate the next request's occupied inputs for automatic compaction.
+
+        Returns:
+            int: Estimated model context before generation.
+        """
+        return estimate_context(
+            (item for item in self.input if not isinstance(item, CompactionContextItem)),
+            instructions=self.instructions,
+            tools=self.window.tools,
+        )
 
 
 @dataclass(frozen=True)
@@ -367,7 +380,7 @@ class AgentContext:
             window=window,
             dispatch=dispatch,
             recorded=recorded,
-            may_compact=stored is None and (previous_window is None or target.current is not None),
+            may_compact=stored is None,
             input=context,
             instructions=instructions,
             hyperparameters=hyperparameters,
@@ -483,6 +496,41 @@ class AgentContext:
         ):
             return self._selection.context_window
         return self._sessions.context_window
+
+    def occupied_tokens(self, request: AgentRequest) -> int:
+        """Project additions to the context already measured by the model.
+
+        Args:
+            request (AgentRequest): Prepared logical request to evaluate.
+
+        Returns:
+            int: Estimated occupancy before the next generation.
+        """
+        window = request.window
+        if (
+            request.previous_window not in (None, window.id)
+            or request.previous_checkpoint != window.checkpoint_id
+        ):
+            return request.projected_tokens
+        session = self._sessions.session
+        if request.previous_window is None or session.usage_boundary is None:
+            return max(session.tokens, request.projected_tokens)
+
+        dispatch = request.dispatch
+        additions: list[ModelContextItem] = list(
+            session.messages[session.usage_boundary : dispatch.position]
+        )
+        inline = window.layout != "leading"
+        additions.extend(dispatch.model_items(inline=inline))
+        increase = estimate_context(additions)
+        if dispatch.revision is not None and not inline:
+            previous = self._effective_snapshot(window, session.model_dispatches(window))
+            increase += max(
+                0,
+                estimate_context((), instructions=dispatch.revision.snapshot.content)
+                - estimate_context((), instructions=previous.content),
+            )
+        return session.tokens + increase
 
     def _target_model(self) -> str:
         """Resolve the authorized target for this session."""
