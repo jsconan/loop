@@ -58,6 +58,7 @@ from ..models import (
     CompactionResult,
     ContextReference,
     ConversationItem,
+    DeveloperInput,
     FileInputMode,
     Hyperparameter,
     HyperparameterPolicy,
@@ -66,6 +67,7 @@ from ..models import (
     ModelInfo,
     Reasoning,
     ReasoningCompleted,
+    ReasoningConfiguration,
     ReasoningDelta,
     RepetitionDetection,
     ResponseCompleted,
@@ -1744,6 +1746,8 @@ class OpenAIBackend(Backend):
     def _serialize_item(self, item: ModelContextItem) -> OpenAIInputItemParam:
         """Translate one conversation item into an OpenAI-compatible request item."""
         projected = project_context(item)
+        if isinstance(item, (DeveloperInput, ReasoningConfiguration)):
+            return projected
         item = type(item).model_validate(projected)
         if isinstance(item, CompactionContextItem):
             return self._serialize_compaction_item(item)

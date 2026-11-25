@@ -70,6 +70,7 @@ from loop import (
     ToolResult,
     Usage,
 )
+from loop.models import DeveloperInput, ReasoningConfiguration
 from loop.telemetry import MemoryTelemetryAdapter, Telemetry, set_telemetry
 from loop.telemetry.policy import thaw
 
@@ -4442,3 +4443,52 @@ def test_encoded_attachment_bytes_are_not_rescanned_as_semantic_text():
         "file_data"
     ].partition(",")[2]
     assert b64decode(encoded).decode() == content
+
+
+def test_model_only_updates_reach_the_responses_wire_in_order(monkeypatch):
+    """The SDK sends configuration updates including reset and filters developer text."""
+    from openai import OpenAI as SDKOpenAI
+
+    records = []
+
+    def reply(request):
+        """Capture the actual SDK request and return an empty completed answer."""
+        records.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "id": "resp_recorded",
+                "object": "response",
+                "created_at": 1,
+                "status": "completed",
+                "model": "gpt-6.2",
+                "output": [],
+            },
+        )
+
+    with SDKOpenAI(
+        api_key="LoopFixtureCredential_0123456789abcDEF",
+        http_client=httpx.Client(transport=httpx.MockTransport(reply)),
+    ) as sdk:
+        monkeypatch.setattr("loop.backend.openai.OpenAI", lambda **kwargs: sdk)
+        backend = OpenAIBackend(
+            default_model="gpt-6.2", api_key="LoopFixtureCredential_0123456789abcDEF"
+        )
+        list(
+            backend.get_response(
+                [
+                    DeveloperInput("Credential LoopFixtureCredential_0123456789abcDEF"),
+                    ReasoningConfiguration(None),
+                ],
+                hyperparameters=GenerationHyperparameters(reasoning_effort="low"),
+            )
+        )
+
+    request = records[0]
+    assert request["reasoning"] == {"effort": "low"}
+    assert request["input"][0]["role"] == "developer"
+    assert "LoopFixtureCredential_0123456789abcDEF" not in request["input"][0]["content"]
+    assert request["input"][1] == {
+        "type": "configuration_update",
+        "reasoning": {"effort": None},
+    }

@@ -655,7 +655,31 @@ class CompactionContextItem(BaseModel):
     data: dict[str, Any]
 
 
-type ModelContextItem = ConversationItem | CompactionContextItem
+@dataclass(frozen=True)
+class DeveloperInput:
+    """Carry application-owned instructions independently of canonical conversation history.
+
+    Args:
+        content (str): Model-facing developer message.
+    """
+
+    content: str
+
+
+@dataclass(frozen=True)
+class ReasoningConfiguration:
+    """Carry a provider reasoning update independently of instruction revisions.
+
+    Args:
+        effort (ReasoningEffort | None): Requested effort, or None for the model default.
+    """
+
+    effort: ReasoningEffort | None
+
+
+type ModelContextItem = (
+    ConversationItem | CompactionContextItem | DeveloperInput | ReasoningConfiguration
+)
 
 
 class CompactionResult(BaseModel):

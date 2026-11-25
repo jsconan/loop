@@ -2,9 +2,11 @@
 
 from ..models import (
     CompactionContextItem,
+    DeveloperInput,
     Message,
     ModelContextItem,
     Reasoning,
+    ReasoningConfiguration,
     ToolCall,
     ToolResult,
 )
@@ -25,6 +27,10 @@ def project_context(item: ModelContextItem) -> dict:
     Raises:
         TypeError: If the item has no declared model-visible representation.
     """
+    if isinstance(item, DeveloperInput):
+        return {"role": "developer", "content": item.content}
+    if isinstance(item, ReasoningConfiguration):
+        return {"type": "configuration_update", "reasoning": {"effort": item.effort}}
     if isinstance(item, Message):
         return {
             "role": item.role,
@@ -82,6 +88,8 @@ def project_portable_context(item: ModelContextItem) -> dict | None:
     Raises:
         TypeError: If the item has no declared model-visible representation.
     """
+    if isinstance(item, (DeveloperInput, ReasoningConfiguration)):
+        return None
     if isinstance(item, Reasoning):
         return {"content": item.content, "summary": item.summary}
     if isinstance(item, ToolCall):

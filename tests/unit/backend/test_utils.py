@@ -7,8 +7,10 @@ from loop.models import (
     CompactionContextItem,
     ContentArtifact,
     ContextReference,
+    DeveloperInput,
     Message,
     Reasoning,
+    ReasoningConfiguration,
     ToolCall,
     ToolResult,
 )
@@ -77,3 +79,23 @@ def test_portable_projection_omits_provider_replay_state_but_keeps_semantics():
     assert project_portable_context(
         CompactionContextItem(provider="loop", data={"content": "checkpoint", "opaque": "private"})
     ) == {"provider": "loop", "data": {"content": "checkpoint"}}
+
+
+@pytest.mark.parametrize(
+    ("item", "wire"),
+    [
+        (DeveloperInput("rules"), {"role": "developer", "content": "rules"}),
+        (
+            ReasoningConfiguration("high"),
+            {"type": "configuration_update", "reasoning": {"effort": "high"}},
+        ),
+        (
+            ReasoningConfiguration(None),
+            {"type": "configuration_update", "reasoning": {"effort": None}},
+        ),
+    ],
+)
+def test_request_metadata_has_explicit_wire_shape_and_no_portable_projection(item, wire):
+    """Developer instructions and reasoning changes stay out of portable summaries."""
+    assert project_context(item) == wire
+    assert project_portable_context(item) is None
