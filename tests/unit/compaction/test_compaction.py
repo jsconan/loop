@@ -67,11 +67,21 @@ def compaction_feature(
     return feature, manager, backend, interaction
 
 
-@pytest.mark.parametrize("threshold", [0, 1, -0.1, 1.1])
+@pytest.mark.parametrize("threshold", [0, -0.1, 1.1])
 def test_compaction_rejects_invalid_thresholds(threshold):
-    """Automatic compaction utilization must remain strictly between zero and one."""
-    with pytest.raises(ValueError, match="between zero and one"):
+    """Automatic utilization must be in the same range as configuration."""
+    with pytest.raises(ValueError, match="greater than zero and at most one"):
         compaction_feature(threshold=threshold)
+
+
+def test_compaction_accepts_full_capacity():
+    """A threshold of one waits for usage to reach the reported capacity."""
+    session = Session(messages=[Message(role="user", content="request")], tokens=99)
+    feature, _, _, _ = compaction_feature(session=session, threshold=1)
+
+    assert not feature.needed()
+    session.tokens = 100
+    assert feature.needed()
 
 
 def test_compaction_detects_known_capacity_and_new_history():
@@ -100,8 +110,8 @@ def test_compaction_reconfigures_backend_and_threshold():
     assert feature.backend is replacement
     assert feature.threshold == 0.7
     assert backend is not replacement
-    with pytest.raises(ValueError, match="between zero and one"):
-        feature.threshold = 1
+    feature.threshold = 1
+    assert feature.threshold == 1
 
 
 def test_compaction_declines_absent_or_unneeded_context():

@@ -34,7 +34,7 @@ class ContextCompaction:
             Defaults to ``0.8``.
 
     Raises:
-        ValueError: If ``threshold`` is not strictly between zero and one.
+        ValueError: If ``threshold`` is outside the supported range of (0, 1].
     """
 
     _backend: Backend
@@ -58,8 +58,6 @@ class ContextCompaction:
         threshold: float = constants.DEFAULT_COMPACTION_THRESHOLD,
         instructions_async: Callable[[], Awaitable[PreparedInstructions]] | None = None,
     ) -> None:
-        if not 0 < threshold < 1:
-            raise ValueError("Compaction threshold must be between zero and one.")
         self._backend = backend
         self._session_manager = session_manager
         self._model_selection = model_selection
@@ -67,7 +65,7 @@ class ContextCompaction:
         self._instructions_async = instructions_async
         self._interaction = interaction
         self._working_directory = PathHolder.from_value(working_directory)
-        self._threshold = threshold
+        self.threshold = threshold
 
     @property
     def threshold(self) -> float:
@@ -83,13 +81,13 @@ class ContextCompaction:
         """Set the automatic compaction utilization threshold.
 
         Args:
-            threshold (float): Utilization ratio strictly between zero and one.
+            threshold (float): Utilization ratio greater than zero and at most one.
 
         Raises:
             ValueError: If the threshold is outside the supported range.
         """
-        if not 0 < threshold < 1:
-            raise ValueError("Compaction threshold must be between zero and one.")
+        if not 0 < threshold <= 1:
+            raise ValueError("Compaction threshold must be greater than zero and at most one.")
         self._threshold = threshold
 
     @property

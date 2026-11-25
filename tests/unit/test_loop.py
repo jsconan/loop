@@ -697,11 +697,11 @@ def test_loop_reports_presets_excluded_by_permission_manager(tmp_path, monkeypat
 
 def test_loop_rejects_an_invalid_compaction_threshold(tmp_path):
     """Loop construction validates automatic compaction policy at its composition boundary."""
-    with pytest.raises(ValueError, match="between zero and one"):
+    with pytest.raises(ValueError, match="greater than zero and at most one"):
         Loop.create_default(
             backend=loop_backend(),
             working_directory=tmp_path,
-            compaction_threshold=1,
+            compaction_threshold=1.1,
         )
 
 
