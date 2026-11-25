@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Generator, Iterable
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from threading import RLock
@@ -768,11 +769,17 @@ class InstructionsManager:
                     priority_catalog = preferred
             return build_instructions(priority_catalog, self._recovery_instruction(recovery))
 
-    def activate_skill(self, name: str) -> SkillActivationResponse:
+    def activate_skill(
+        self,
+        name: str,
+        *,
+        persist: Callable[[], None] | None = None,
+    ) -> SkillActivationResponse:
         """Activate a skill for subsequent backend requests.
 
         Args:
             name (str): Exact available skill name.
+            persist (Callable[[], None] | None): Save the provisional activation state.
 
         Returns:
             SkillActivationResponse: Compact activation acknowledgement or structured error. The
@@ -785,10 +792,11 @@ class InstructionsManager:
         """
         with self._lock:
             self._refresh_context()
-            result = self._skill_manager.activate(name)
-            if isinstance(result, SkillOperationError):
-                return result
-            return self._commit_activation(result)
+            with self._persist_activation_change(persist):
+                result = self._skill_manager.activate(name)
+                if isinstance(result, SkillOperationError):
+                    return result
+                return self._commit_activation(result)
 
     async def activate_skill_async(self, name: str) -> SkillActivationResponse:
         """Load skill instructions off-loop and apply activation on the owning task.
@@ -835,22 +843,29 @@ class InstructionsManager:
                     return result
                 return self._commit_activation(result)
 
-    def deactivate_skill(self, name: str) -> SkillDeactivationResponse:
+    def deactivate_skill(
+        self,
+        name: str,
+        *,
+        persist: Callable[[], None] | None = None,
+    ) -> SkillDeactivationResponse:
         """Deactivate a skill and remove it from subsequent backend requests.
 
         Args:
             name (str): Exact available skill name.
+            persist (Callable[[], None] | None): Save the provisional activation state.
 
         Returns:
             SkillDeactivationResponse: Compact deactivation acknowledgement or structured error.
         """
         with self._lock:
             self._refresh_context()
-            result = self._skill_manager.deactivate(name)
-            if not isinstance(result, SkillOperationError) and result["instructions_updated"]:
-                self._context_instructions = self._build_instructions()
-                self._generation += 1
-            return result
+            with self._persist_activation_change(persist):
+                result = self._skill_manager.deactivate(name)
+                if not isinstance(result, SkillOperationError) and result["instructions_updated"]:
+                    self._context_instructions = self._build_instructions()
+                    self._generation += 1
+                return result
 
     async def deactivate_skill_async(self, name: str) -> SkillDeactivationResponse:
         """Refresh skill sources off-loop, then deactivate one skill on the owner.
@@ -876,23 +891,31 @@ class InstructionsManager:
                 self._generation += 1
             return result
 
-    def deactivate_all_skills(self) -> SkillDeactivationAllResult:
+    def deactivate_all_skills(
+        self,
+        *,
+        persist: Callable[[], None] | None = None,
+    ) -> SkillDeactivationAllResult:
         """Deactivate every active skill and rebuild subsequent instructions.
+
+        Args:
+            persist (Callable[[], None] | None): Save the provisional activation state.
 
         Returns:
             SkillDeactivationAllResult: Acknowledgement with the number of deactivated skills.
         """
         with self._lock:
             self._refresh_context()
-            count = self._skill_manager.deactivate_all()
-            if count:
-                self._context_instructions = self._build_instructions()
-                self._generation += 1
-            return SkillDeactivationAllResult(
-                status="deactivated_all",
-                deactivated=count,
-                instructions_updated=bool(count),
-            )
+            with self._persist_activation_change(persist):
+                count = self._skill_manager.deactivate_all()
+                if count:
+                    self._context_instructions = self._build_instructions()
+                    self._generation += 1
+                return SkillDeactivationAllResult(
+                    status="deactivated_all",
+                    deactivated=count,
+                    instructions_updated=bool(count),
+                )
 
     def list_skill_resources(self, name: str) -> SkillResourceListResponse:
         """List resources available to one active skill.
@@ -1084,6 +1107,25 @@ class InstructionsManager:
             raise InstructionBudgetExceededError(
                 "Prepared instructions exceed the configured instruction limit."
             )
+
+    @contextmanager
+    def _persist_activation_change(
+        self,
+        persist: Callable[[], None] | None,
+    ) -> Generator[None, None, None]:
+        """Keep the effective instruction document in sync with a saved skill edit."""
+        if persist is None:
+            yield
+            return
+        instructions, generation = self._context_instructions, self._generation
+        with self._skill_manager.activation_transaction():
+            try:
+                yield
+                if self._generation != generation:
+                    persist()
+            except BaseException:
+                self._context_instructions, self._generation = instructions, generation
+                raise
 
     def _commit_activation(self, result: SkillActivationResult) -> SkillActivationResponse:
         """Commit an activated skill to the aggregate instruction snapshot or roll it back."""

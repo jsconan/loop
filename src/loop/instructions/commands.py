@@ -1,5 +1,6 @@
 """Expose skill discovery and activation as user commands."""
 
+from collections.abc import Callable
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field
@@ -34,10 +35,20 @@ class SkillCommands:
 
     Args:
         instructions_manager (InstructionsManager): Skill lifecycle owner used by the commands.
+        persist (Callable[[], None] | None): Writer for explicit skill state changes.
     """
 
-    def __init__(self, instructions_manager: InstructionsManager) -> None:
+    _instructions_manager: InstructionsManager
+    _persist: Callable[[], None] | None
+
+    def __init__(
+        self,
+        instructions_manager: InstructionsManager,
+        *,
+        persist: Callable[[], None] | None = None,
+    ) -> None:
         self._instructions_manager = instructions_manager
+        self._persist = persist
 
     def get_commands(self) -> tuple[CommandRegistration, ...]:
         """Return skill command registrations.
@@ -149,7 +160,7 @@ class SkillCommands:
     def _activate(self, context: CommandContext, name: str) -> None:
         """Activate one skill and report its state change."""
         try:
-            result = self._instructions_manager.activate_skill(name)
+            result = self._instructions_manager.activate_skill(name, persist=self._persist)
         except (OSError, UnicodeError, ValueError) as exc:
             raise CommandArgumentError(f"Could not load skill '{name}': {exc}") from exc
         if isinstance(result, SkillOperationError):
@@ -162,7 +173,7 @@ class SkillCommands:
     def _deactivate(self, context: CommandContext, name: str) -> None:
         """Deactivate one skill and report its state change."""
         try:
-            result = self._instructions_manager.deactivate_skill(name)
+            result = self._instructions_manager.deactivate_skill(name, persist=self._persist)
         except (OSError, UnicodeError, ValueError) as exc:
             raise CommandArgumentError(f"Could not unload skill '{name}': {exc}") from exc
         if isinstance(result, SkillOperationError):
@@ -175,7 +186,7 @@ class SkillCommands:
     def _deactivate_all(self, context: CommandContext) -> None:
         """Deactivate every skill and report how many changed state."""
         try:
-            result = self._instructions_manager.deactivate_all_skills()
+            result = self._instructions_manager.deactivate_all_skills(persist=self._persist)
         except (OSError, UnicodeError, ValueError) as exc:
             raise CommandArgumentError(f"Could not unload all skills: {exc}") from exc
         if result["instructions_updated"]:

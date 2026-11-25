@@ -3941,6 +3941,38 @@ def test_loop_rejects_a_missing_explicit_working_directory(tmp_path):
     assert loop.working_directory == tmp_path.resolve()
 
 
+def test_slash_skill_edits_commit_to_the_store_and_roll_back_failed_writes(tmp_path, monkeypatch):
+    """Explicit skill edits survive reopen, and a failed edit preserves prior authority."""
+    source = tmp_path / ".agents/skills/demo/SKILL.md"
+    source.parent.mkdir(parents=True)
+    source.write_text("---\nname: demo\ndescription: Demo.\n---\nUse demo.\n", encoding="utf-8")
+    store = SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="workspace")
+    interaction = output_interaction()
+    loop = Loop.create_default(
+        backend=loop_backend(),
+        session_manager=SessionManager(session_store=store),
+        working_directory=tmp_path,
+        interaction=interaction,
+    )
+    skills = [("demo", str(source))]
+    assert loop.command_manager.handle_user_command("/use demo")
+    assert store.load(loop.session.id).active_skills == skills
+    assert not loop.session.dispatches
+    assert loop.command_manager.handle_user_command("/use demo")
+    generation = loop.instructions_manager.generation
+
+    with monkeypatch.context() as override:
+        override.setattr(store, "save", Mock(side_effect=OSError("disk is full")))
+        assert loop.command_manager.handle_user_command("/skills deactivate demo")
+        assert interaction.report.call_args.args[0].code == "session.skill_state_save_failed"
+        assert loop.instructions_manager.active_skill_identities == skills
+        assert loop.instructions_manager.generation == generation
+        assert store.load(loop.session.id).active_skills == skills
+
+    assert loop.command_manager.handle_user_command("/skills deactivate-all")
+    assert store.load(loop.session.id).active_skills == []
+
+
 def test_loop_restores_only_skills_with_the_same_discovered_identity(tmp_path):
     """Session restoration reloads valid active identities and ignores stale locations."""
     (tmp_path / ".git").mkdir()

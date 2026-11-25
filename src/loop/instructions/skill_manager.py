@@ -287,6 +287,25 @@ class SkillManager:
             diagnostics=list(self._diagnostics),
         )
 
+    @contextmanager
+    def activation_transaction(self) -> Generator[None, None, None]:
+        """Restore the previous activations if a caller cannot commit its change.
+
+        Yields:
+            None: Exclusive access to provisional changes to active skills.
+        """
+        with self._lock:
+            previous = (
+                self._activated.copy(),
+                self._activation_tokens.copy(),
+                self._activation_revisions.copy(),
+            )
+            try:
+                yield
+            except BaseException:
+                self._activated, self._activation_tokens, self._activation_revisions = previous
+                raise
+
     def activate(
         self,
         name: str,

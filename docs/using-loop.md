@@ -350,7 +350,7 @@ At startup, the loop discovers `SKILL.md` files under `.agents/skills` from the 
 
 Instruction and skill frontmatter use YAML 1.2 by default, so unquoted values such as `yes` and `on` remain strings.
 
-`/use`, `/skills activate`, and the skill tools share the same activation state. The next model request receives the effective change. Resume restores an activation when the same skill is still discoverable. A `$skill` mention prioritizes its catalog entry for that request without activating it.
+`/use`, `/skills activate`, and the skill tools share the same activation state. Slash commands save successful changes immediately. The next model request receives the effective change. Resume restores an activation when the same skill is still discoverable. A `$skill` mention prioritizes its catalog entry for that request without activating it.
 
 Skill files under `references/`, `scripts/`, and `assets/` remain unloaded until requested through `manage_skills`. Resource paths are confined to the activated skill root. Text resources support line-oriented or byte-oriented continuation and return at most 16 KiB per call. Binary assets are returned as smaller base64 pages so their encoded result remains bounded; resource contents do not become permanent instructions.
 

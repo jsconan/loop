@@ -3594,8 +3594,8 @@ def test_manager_ignores_unregistered_handles_in_tool_output():
     assert manager.messages[0].artifacts == ()
 
 
-def test_manager_updates_instruction_state_without_persisting_an_incomplete_query():
-    """Instruction state remains in memory until the query response completes."""
+def test_manager_persists_explicit_instruction_state_without_a_generation():
+    """Explicit skill changes are saved independently of the generation lifecycle."""
     store = Mock(spec=SessionStore)
     session = Session()
     manager = SessionManager(session=session, session_store=store)
@@ -3605,7 +3605,7 @@ def test_manager_updates_instruction_state_without_persisting_an_incomplete_quer
 
     assert session.instruction_working_directory == "/project"
     assert session.active_skills == [("review", "/skills/review/SKILL.md")]
-    store.save.assert_not_called()
+    store.save.assert_called_once_with(session)
 
 
 def test_manager_adds_a_response_without_reconciling_model_assignment():

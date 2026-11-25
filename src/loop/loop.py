@@ -315,7 +315,13 @@ class Loop:
         providers = (
             SessionCommands(configured_sessions, configured_name_generator),
             PermissionCommands(configured_permissions),
-            SkillCommands(configured_instructions),
+            SkillCommands(
+                configured_instructions,
+                persist=lambda: configured_sessions.update_instruction_state(
+                    str(configured_instructions.working_directory or directory_reference.resolve()),
+                    configured_instructions.active_skill_identities,
+                ),
+            ),
             ToolCommands(configured_tools, configured_instructions),
             ModelCommands(
                 configured_selection, configured_runner.request_context.allow_route_switch

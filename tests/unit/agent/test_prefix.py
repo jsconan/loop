@@ -22,7 +22,7 @@ from loop.models import (
     ToolResult,
 )
 from loop.session import Compaction, InstructionSnapshot
-from loop.tools import activate_skill
+from loop.tools import activate_skill, manage_skills
 from loop.tools.system import poll_command_job, run_command
 from loop.utils import sha256_digest, utc_now
 from tests.backend_doubles import model_backend
@@ -599,6 +599,37 @@ def test_compaction_uses_the_same_route_and_replay_checks_as_generation(tmp_path
     assert sent[0] == Message(role="user", content="Saved user task")
     assert all(isinstance(item, Message) for item in sent)
     assert resumed.session.compactions[-1].route == replacement.route
+
+
+def test_slash_skill_state_persists_before_next_revision(tmp_path):
+    """Activation and deactivation persist as state before model-only replay is updated."""
+    skill = tmp_path / ".agents" / "skills" / "demo"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\nname: demo\ndescription: Demo skill.\n---\nFollow the demo procedure.\n",
+        encoding="utf-8",
+    )
+    backend = _backend()
+    tools = ToolRegistry([activate_skill, manage_skills])
+    loop = Loop.create_default(backend, working_directory=tmp_path, tool_registry=tools)
+    _turn(loop, "Initial turn")
+    assert loop.command_manager.handle_user_command("/use demo")
+    assert Session.deserialize(loop.session.serialize()).active_skills[0][0] == "demo"
+    assert all(record.revision is None for record in loop.session.dispatches)
+    _turn(loop, "Use the skill")
+    assert (
+        "Follow the demo procedure." in backend.get_response.call_args.kwargs["input"][-1].content
+    )
+    assert loop.command_manager.handle_user_command("/skills deactivate demo")
+    assert Session.deserialize(loop.session.serialize()).active_skills == []
+    assert loop.command_manager.handle_user_command("/skills activate demo")
+    assert loop.command_manager.handle_user_command("/skills deactivate-all")
+    assert Session.deserialize(loop.session.serialize()).active_skills == []
+    _turn(loop, "Continue without it")
+    assert (
+        '"deactivate": ["active_skill:'
+        in backend.get_response.call_args.kwargs["input"][-1].content
+    )
 
 
 def test_retries_reuse_the_same_ephemeral_environment_sample(tmp_path, monkeypatch):

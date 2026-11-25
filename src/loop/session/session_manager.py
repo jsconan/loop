@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import shutil
+import sqlite3
 from asyncio import current_task
 from collections.abc import AsyncIterable, Awaitable, Callable, Generator, Iterable
 from contextlib import AbstractContextManager, ExitStack, contextmanager
@@ -2474,13 +2475,30 @@ class SessionManager:
         working_directory: str,
         active_skills: Iterable[tuple[str, str]],
     ) -> None:
-        """Update the instruction state associated with the session.
+        """Persist explicit skill changes before the next model request.
 
         Args:
             working_directory (str): Effective instruction directory.
             active_skills (Iterable[tuple[str, str]]): Active skill names and canonical locations.
+
+        Raises:
+            ProblemException: The session's skill state could not be saved.
         """
-        self._session.update_instruction_state(working_directory, active_skills)
+        identities = tuple(active_skills)
+        try:
+            self._commit(
+                lambda session: session.update_instruction_state(working_directory, identities)
+            )
+        except (OSError, ValueError, sqlite3.Error) as error:
+            raise ProblemException(
+                Problem.from_exception(
+                    error,
+                    code="session.skill_state_save_failed",
+                    title="Could not save skill changes",
+                    detail="The previous skill state is still active. Retry the skill command.",
+                    operation="save_skill_state",
+                )
+            ) from error
 
     def add_response(self, response: Response) -> None:
         """Add a response to the session.
