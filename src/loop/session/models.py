@@ -8,9 +8,10 @@ from pydantic import BaseModel, Field, field_validator
 
 from .. import constants
 from ..instructions.models import CapturedInstruction
-from ..models import AgentRunStopReason, CompactionContextItem, Response, RunMetrics, ToolCall
+from ..models import AgentRunStopReason, CompactionItem, Response, RunMetrics, ToolCall
 from ..permissions import AuthorizationResult
 from ..utils import as_utc
+from .window import CompactionCoverage
 
 SessionNameSource = Literal["initial", "generated", "user"]
 SESSION_NAME_SOURCE_INITIAL: SessionNameSource = "initial"
@@ -59,6 +60,10 @@ class SessionNotFoundError(ValueError):
 
 class SessionWorkspaceMismatchError(ValueError):
     """Report that a session belongs to a different workspace."""
+
+
+class ModelWindowConflictError(ValueError):
+    """Report that the captured session window or checkpoint is no longer active."""
 
 
 class SessionRevisionConflictError(ValueError):
@@ -169,36 +174,28 @@ class Compaction(BaseModel):
         id (str): Stable compaction identifier.
         boundary (int): Exclusive full-history index represented by the checkpoint.
         created_at (datetime): Time at which the checkpoint was created.
-        provider (str): Backend namespace that produced the replacement items.
         model (str): Model used to create the checkpoint.
-        route (str | None): Producing route, absent for unattributed older checkpoints.
-        context (tuple[CompactionContextItem, ...]): Exact replacement context.
+        context (tuple[CompactionItem, ...]): Exact portable or native replacement context.
         instructions (InstructionSnapshot): Instruction state used for compaction.
         input_tokens_before (int | None): Last known context usage before compaction.
-        input_tokens_after (int | None): Context usage reported by compaction.
+        input_tokens_after (int | None): Estimated usage of the rebuilt generation request.
+        coverage (CompactionCoverage | None): Retained references, absent for legacy windows.
     """
 
     id: str
     boundary: int = Field(ge=0)
     created_at: datetime
-    provider: str
     model: str
-    route: str | None = Field(default=None, exclude_if=lambda route: route is None)
-    context: tuple[CompactionContextItem, ...]
+    context: tuple[CompactionItem, ...]
     instructions: InstructionSnapshot
     input_tokens_before: int | None = Field(default=None, ge=0)
     input_tokens_after: int | None = Field(default=None, ge=0)
 
+    coverage: CompactionCoverage | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
+
     _normalize_created_at = field_validator("created_at")(as_utc)
-
-    @property
-    def portable(self) -> bool:
-        """Check whether the stored checkpoint uses the portable summary format.
-
-        Returns:
-            bool: True when the checkpoint can replay independently of a provider route.
-        """
-        return all(item.provider == "loop" for item in self.context)
 
 
 class SessionEventModel(BaseModel):

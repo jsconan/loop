@@ -40,6 +40,7 @@ def test_selection_initializes_from_its_input_or_backend_default():
     explicit = ModelSelection(backend(), explicit_session, selected="explicit")
     assert explicit.selected == "explicit"
     assert explicit.effective == "explicit"
+    assert explicit.context_window == 8192
     assert explicit_session.model == "explicit"
     assert explicit_session.context_window == 8192
 
@@ -61,6 +62,7 @@ def test_selection_restores_last_used_model_without_a_backend_fallback():
     assert session_manager.context_window == 8192
 
     empty = ModelSelection(backend(default_model=None), SessionManager())
+    assert empty.context_window is None
     with pytest.raises(ModelSelectionError, match="No model was selected"):
         _ = empty.effective
 
@@ -75,6 +77,26 @@ def test_selection_normalizes_invalid_context_windows(context_window):
     )
 
     assert session_manager.context_window is None
+
+
+def test_selection_does_not_reuse_capacity_after_a_failed_model_lookup():
+    """A failed lookup leaves the newly selected target's capacity unknown."""
+    active_backend = backend(
+        get_context_window=Mock(
+            side_effect=[
+                8192,
+                BackendConnectionError("lookup failed", provider="test", operation="list_models"),
+            ]
+        )
+    )
+    selection = ModelSelection(active_backend, SessionManager())
+    assert selection.context_window == 8192
+
+    with pytest.raises(BackendConnectionError, match="lookup failed"):
+        selection.restore("other-model")
+
+    assert selection.selected == "other-model"
+    assert selection.context_window is None
 
 
 def test_selection_persists_explicit_intent_and_resolves_model_metadata():

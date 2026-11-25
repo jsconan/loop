@@ -18,7 +18,6 @@ from loop import (
     InputQueuedEvent,
     InputRecalledEvent,
     InputRejectedEvent,
-    InstructionsManager,
     InstructionSnapshot,
     InteractionRequestedEvent,
     InteractionSettledEvent,
@@ -40,6 +39,7 @@ from loop import (
     UnsupportedConversationItemError,
     Usage,
 )
+from loop.instructions import InstructionsManager
 from loop.session import ModelDispatch, ModelWindow, WindowSettings
 from loop.session.models import (
     SESSION_NAME_SOURCE_INITIAL,
@@ -498,9 +498,8 @@ def test_session_recovery_uses_complete_history_after_a_compaction():
             id="checkpoint",
             boundary=1,
             created_at=datetime(2026, 8, 26, tzinfo=UTC),
-            provider="test",
             model="model",
-            context=(CompactionContextItem(provider="test", data={}),),
+            context=(CompactionContextItem(data={}),),
             instructions=InstructionSnapshot(
                 working_directory="/project", content=None, digest="digest"
             ),
@@ -700,7 +699,7 @@ def test_session_externalizes_shipped_v11_inline_references():
     assert reference.next_cursor is not None
     assert reference.media_type == "text/plain"
     assert restored.persistence_snapshot().reference_artifacts[0].content == b"preview"
-    assert json.loads(restored.serialize())["version"] == 17
+    assert json.loads(restored.serialize())["version"] == 18
 
 
 def test_session_migrates_v13_snapshots_without_changing_existing_history():
@@ -723,7 +722,7 @@ def test_session_migrates_v13_snapshots_without_changing_existing_history():
     assert restored.messages == original.messages
     assert restored.messages[-1].output == recorded
     assert "decoding_loss" not in json.loads(restored.messages[-1].output)["result"]["stdout"]
-    assert json.loads(restored.serialize())["version"] == 17
+    assert json.loads(restored.serialize())["version"] == 18
 
 
 def test_session_persistence_snapshot_deduplicates_transient_reference_content():
@@ -855,7 +854,7 @@ def test_session_migrates_v12_snapshots_without_changing_existing_history():
     restored = Session.deserialize(json.dumps(payload))
 
     assert restored.messages == original.messages
-    assert json.loads(restored.serialize())["version"] == 17
+    assert json.loads(restored.serialize())["version"] == 18
 
 
 def test_session_migrates_v14_snapshots_without_changing_existing_history():
@@ -867,7 +866,7 @@ def test_session_migrates_v14_snapshots_without_changing_existing_history():
     restored = Session.deserialize(json.dumps(payload))
 
     assert restored.messages == original.messages
-    assert json.loads(restored.serialize())["version"] == 17
+    assert json.loads(restored.serialize())["version"] == 18
 
 
 @pytest.mark.parametrize("value", ["not-json", "[]", '{"version":99}'])
@@ -1453,18 +1452,15 @@ def test_session_retains_full_history_while_latest_compaction_bounds_model_conte
         id="first",
         boundary=2,
         created_at=datetime(2026, 8, 16, tzinfo=UTC),
-        provider="openai",
         model="model",
-        context=(CompactionContextItem(provider="openai", data={"type": "compaction"}),),
+        context=(CompactionContextItem(data={"type": "compaction"}),),
         instructions=instructions,
     )
     second = first.model_copy(
         update={
             "id": "second",
             "boundary": 3,
-            "context": (
-                CompactionContextItem(provider="openai", data={"type": "compaction", "id": "2"}),
-            ),
+            "context": (CompactionContextItem(data={"type": "compaction", "id": "2"}),),
         }
     )
 
@@ -1485,7 +1481,6 @@ def test_session_retains_full_history_while_latest_compaction_bounds_model_conte
                 id="empty",
                 boundary=0,
                 created_at=datetime(2026, 8, 16, tzinfo=UTC),
-                provider="openai",
                 model="model",
                 context=(),
                 instructions=InstructionSnapshot(
@@ -1499,9 +1494,8 @@ def test_session_retains_full_history_while_latest_compaction_bounds_model_conte
                 id="past-end",
                 boundary=2,
                 created_at=datetime(2026, 8, 16, tzinfo=UTC),
-                provider="openai",
                 model="model",
-                context=(CompactionContextItem(provider="openai", data={}),),
+                context=(CompactionContextItem(data={}),),
                 instructions=InstructionSnapshot(
                     working_directory="/project", content=None, digest="digest"
                 ),
@@ -1525,9 +1519,8 @@ def test_session_rejects_a_checkpoint_that_does_not_advance():
         id="first",
         boundary=1,
         created_at=datetime(2026, 8, 16, tzinfo=UTC),
-        provider="openai",
         model="model",
-        context=(CompactionContextItem(provider="openai", data={}),),
+        context=(CompactionContextItem(data={}),),
         instructions=InstructionSnapshot(working_directory="/project", content=None, digest="d"),
     )
     session.add_compaction(checkpoint)
@@ -1544,9 +1537,8 @@ def test_session_deserialization_validates_compaction_metadata(mutation):
         id="first",
         boundary=1,
         created_at=datetime(2026, 8, 16, tzinfo=UTC),
-        provider="openai",
         model="model",
-        context=(CompactionContextItem(provider="openai", data={}),),
+        context=(CompactionContextItem(data={}),),
         instructions=InstructionSnapshot(working_directory="/project", content=None, digest="d"),
     )
     session.add_compaction(checkpoint)
@@ -1626,9 +1618,8 @@ def test_session_deserialization_rejects_invalid_event_and_snapshot_metadata(mut
         id="checkpoint",
         boundary=1,
         created_at=datetime(2026, 8, 20, tzinfo=UTC),
-        provider="test",
         model="model",
-        context=(CompactionContextItem(provider="test", data={}),),
+        context=(CompactionContextItem(data={}),),
         instructions=InstructionSnapshot(working_directory="/project", content=None, digest="d"),
     )
     session.add_compaction(checkpoint)
@@ -1711,3 +1702,113 @@ def test_schema_16_session_loads_without_establishing_a_model_window():
     restored = Session.deserialize(encoded)
     assert restored.model_context() == session.messages
     assert restored.window is None and restored.dispatches == []
+
+
+@pytest.mark.parametrize(
+    "version, route",
+    [
+        (16, None),
+        (17, "OpenAIBackend:"),
+        (17, "OpenAIBackend:http://localhost:8000/v1:auto"),
+    ],
+)
+def test_committed_checkpoint_formats_preserve_routes_and_wire_items(version, route):
+    """Legacy portable text and native wire state retain their committed meanings."""
+    message = Message(role="user", content="saved history")
+    session = Session(messages=[message, Message(role="assistant", content="saved reply")])
+    portable = Compaction(
+        id="portable",
+        boundary=1,
+        model="model",
+        created_at=datetime.now(UTC),
+        context=(message,),
+        instructions=InstructionSnapshot(working_directory="/project", content=None, digest="d"),
+    )
+    session.add_compaction(portable)
+    session.add_compaction(portable.model_copy(update={"id": "native", "boundary": 2}))
+    if route is not None:
+        session.windows.append(
+            ModelWindow(
+                id="window",
+                route=route,
+                model="model",
+                layout="leading",
+                checkpoint_id="native",
+                settings=WindowSettings(agent_name="Loop"),
+                baseline=InstructionsManager().prepare(Agent("Loop")),
+                tools=(),
+            )
+        )
+    payload = json.loads(session.serialize())
+    payload["version"] = version
+    payload["compactions"][0]["context"] = [
+        {"provider": "loop", "data": {"role": "user", "content": "portable summary"}},
+    ]
+    wire = {"type": "compaction", "encrypted_content": "untouched", "id": "cmp_unchanged"}
+    native = payload["compactions"][1]
+    native["context"] = [{"provider": "openai", "data": wire}]
+    if route is not None:
+        native["route"] = route
+
+    saved = json.dumps(payload)
+    assert Session.requires_migration(saved)
+    restored = Session.deserialize(saved)
+
+    assert restored.windows == session.windows
+    assert [checkpoint.boundary for checkpoint in restored.compactions] == [1, 2]
+    assert restored.compactions[0].context == (Message(role="user", content="portable summary"),)
+    assert restored.checkpoint().context == (
+        CompactionContextItem(data=wire, route=route, model="model" if route else None),
+    )
+
+
+def test_rebuilt_archive_preserves_coverage_and_drops_later_orphan_outputs():
+    """Unpaired outputs never travel across a rebuilt prefix after the captured index."""
+    from loop.session import CompactionCoverage
+
+    first = Message(role="user", content="opening")
+    orphan = ToolResult(call_id="orphan", output="no original call")
+    checkpoint = Compaction(
+        id="rebuilt",
+        created_at=datetime.now(UTC),
+        boundary=1,
+        model="model",
+        context=(),
+        coverage=CompactionCoverage(cut=0, opening=(), tail=(0,)),
+        instructions=InstructionSnapshot(working_directory="/project", content=None, digest=""),
+    )
+    session = Session(
+        messages=[first, orphan],
+        compactions=[checkpoint],
+    )
+    restored = Session.deserialize(session.serialize())
+    assert restored.compactions[0].coverage == checkpoint.coverage
+    assert restored.messages == [first, orphan]
+    assert restored.model_context() == [first]
+
+
+def test_compatible_native_checkpoint_retains_reasoning_and_matching_call_ids():
+    """Native replay keeps the original reasoning and completed tool pair in a retained tail."""
+    from loop.session import CompactionCoverage
+
+    query = Message(role="user", content="original task")
+    reasoning = Reasoning(content="", encrypted_content="provider state")
+    call = ToolCall(call_id="original-call", name="search", arguments="{}", id="original-id")
+    output = ToolResult(call_id=call.call_id, output="complete")
+    item = CompactionContextItem(
+        route="route", model="model", data={"type": "compaction", "encrypted_content": "opaque"}
+    )
+    checkpoint = Compaction(
+        id="native",
+        boundary=4,
+        model="model",
+        created_at=datetime.now(UTC),
+        context=(item,),
+        coverage=CompactionCoverage(cut=1, opening=(0,), tail=(1, 2, 3), preserve_reasoning=True),
+        instructions=InstructionSnapshot(working_directory="/project", content=None, digest=""),
+    )
+    session = Session(messages=[query, reasoning, call, output], compactions=[checkpoint])
+
+    restored = Session.deserialize(session.serialize())
+
+    assert restored.model_context() == [query, item, reasoning, call, output]

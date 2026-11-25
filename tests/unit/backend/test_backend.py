@@ -68,9 +68,11 @@ def test_default_context_preparation_preserves_canonical_items():
     assert prepared[0] is message
 
 
-def test_default_backend_compaction_returns_a_portable_continuation_checkpoint():
+def test_default_backend_compaction_returns_a_portable_continuation_checkpoint(monkeypatch):
     """Backends without native compaction summarize context through their response contract."""
     backend = OpenAIBackend()
+    activity = Mock()
+    monkeypatch.setattr("loop.backend.backend.telemetry_activity", activity)
     backend.get_response = Mock(
         return_value=[
             ResponseCompleted(
@@ -83,24 +85,25 @@ def test_default_backend_compaction_returns_a_portable_continuation_checkpoint()
     result = Backend.compact(
         backend,
         [Message(role="user", content="Do the historical task")],
-        instructions="rules",
         model="model",
     )
 
     assert result.items == (
-        CompactionContextItem(
-            provider="loop",
-            data={"role": "user", "content": "Conversation checkpoint:\nKeep the current task."},
-        ),
+        Message(role="user", content="Conversation checkpoint:\nKeep the current task."),
     )
     assert result.usage.total_tokens == 102
-    assert result.context_tokens == 12
+    activity.assert_called_once_with(
+        "compaction.inference",
+        component="backend",
+        mode="portable",
+        input_tokens=90,
+        output_tokens=12,
+    )
     request = backend.get_response.call_args
     prompt = request.args[0][0]
     assert len(request.args[0]) == 1
     assert "Do not perform or answer any historical request" in prompt.content
     assert prompt.context[0].path == "conversation-history.json"
-    assert '"effective_instructions":"rules"' in prompt.context[0].content
     assert '"content":"Do the historical task"' in prompt.context[0].content
     assert request.kwargs["instructions"].startswith("Perform context compaction only")
 
@@ -111,7 +114,7 @@ def test_default_backend_compaction_requires_a_textual_completion(events):
     backend = OpenAIBackend()
     backend.get_response = Mock(return_value=events)
 
-    assert Backend.compact(backend, [], instructions=None, model="model") is None
+    assert Backend.compact(backend, [], model="model") is None
 
 
 def test_default_backend_async_compaction_uses_the_async_response_contract():
@@ -133,21 +136,16 @@ def test_default_backend_async_compaction_uses_the_async_response_contract():
         Backend.compact_async(
             backend,
             [Message(role="user", content="Do the historical task")],
-            instructions="rules",
             model="model",
         )
     )
 
     assert result.items == (
-        CompactionContextItem(
-            provider="loop",
-            data={"role": "user", "content": "Conversation checkpoint:\nKeep the current task."},
-        ),
+        Message(role="user", content="Conversation checkpoint:\nKeep the current task."),
     )
     request = backend.get_response_async.call_args
     prompt = request.args[0][0]
     assert "Do not perform or answer any historical request" in prompt.content
-    assert '"effective_instructions":"rules"' in prompt.context[0].content
     assert request.kwargs["instructions"].startswith("Perform context compaction only")
     backend.get_response.assert_not_called()
 
@@ -164,7 +162,7 @@ def test_default_backend_async_compaction_requires_a_textual_completion(events):
 
     backend.get_response_async = Mock(return_value=stream())
 
-    assert asyncio.run(Backend.compact_async(backend, [], instructions=None, model="model")) is None
+    assert asyncio.run(Backend.compact_async(backend, [], model="model")) is None
 
 
 def test_default_backend_async_compaction_closes_its_stream_when_cancelled():
@@ -186,9 +184,7 @@ def test_default_backend_async_compaction_closes_its_stream_when_cancelled():
 
     async def cancel_compaction():
         """Cancel compaction after its async response stream is active."""
-        task = asyncio.create_task(
-            Backend.compact_async(backend, [], instructions=None, model="model")
-        )
+        task = asyncio.create_task(Backend.compact_async(backend, [], model="model"))
         try:
             await started.wait()
             task.cancel()
@@ -219,20 +215,32 @@ def test_portable_compaction_does_not_expand_local_attachment_snapshots():
     Backend.compact(
         backend,
         [Message(role="user", content="task", context=(reference,))],
-        instructions="rules",
         model="model",
     )
     history = backend.get_response.call_args.args[0][0].context[0].content
     assert "preview" in history and "private-tail" not in history
 
 
-def test_default_window_capabilities_keep_the_existing_request_representation():
-    """The base contract supports leading instructions and leaves request projection alone."""
-    backend = OpenAIBackend()
+def test_default_window_capabilities_and_complete_request_estimate():
+    """A plain backend uses leading instructions and estimates its semantic checkpoint."""
+    backend = OpenAIBackend(base_url="https://user:pass@example.test/v1/?query=private")
+    assert Backend.endpoint.fget(backend) == "https://example.test/v1"
+    assert Backend.endpoint.fget(OpenAIBackend()) == ""
+    assert Backend.route.fget(backend).endswith(":https://example.test/v1")
     assert Backend.file_input_mode.fget(backend) is None
-    assert Backend.resolve_file_input_mode(backend, "native") == "native"
-    assert Backend.resolve_file_input_mode(backend, None) == backend.file_input_mode
-    assert Backend.instruction_layout(backend, "gpt-6.2") == "leading"
-    assert Backend.supports_reasoning_updates(backend, "gpt-6.2") is False
-    with Backend.file_projection(backend, "text"):
-        assert backend.file_input_mode == "native"
+    assert Backend.resolve_file_input_mode(backend, None) == "text"
+    with Backend.file_projection(backend, "native"):
+        assert backend.file_input_mode == "text"
+    assert Backend.instruction_layout(backend, "model") == "leading"
+    assert Backend.generation_reserve(backend, 4096) == 512
+    assert Backend.supports_reasoning_updates(backend, "model") is False
+    assert Backend.preserves_compacted_reasoning.fget(backend) is False
+    portable = Message(role="user", content="summary")
+    assert Backend.can_replay_checkpoint(backend, [portable], "model")
+    assert not Backend.can_replay_checkpoint(
+        backend, [CompactionContextItem(data={"type": "compaction"})], "model"
+    )
+    kwargs = {"instructions": "guidance", "tools": (), "model": "model"}
+    estimate = Backend.estimate_generation(backend, [portable], **kwargs)
+    assert estimate > len("guidance") // 3
+    assert asyncio.run(Backend.estimate_generation_async(backend, [portable], **kwargs)) == estimate

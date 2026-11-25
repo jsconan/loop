@@ -17,6 +17,12 @@ from openai import (
     APIStatusError,
     APITimeoutError,
 )
+from openai import (
+    AsyncOpenAI as SDKAsyncOpenAI,
+)
+from openai import (
+    OpenAI as SDKOpenAI,
+)
 from openai.types.responses import (
     ResponseCompletedEvent,
     ResponseFailedEvent,
@@ -80,14 +86,6 @@ class Person(BaseModel):
 
     name: str
     age: int
-
-
-class CompactItem(BaseModel):
-    """Provide a serializable SDK compaction output fixture."""
-
-    type: str
-    id: str
-    encrypted_content: str
 
 
 class AsyncModelPage:
@@ -804,12 +802,13 @@ def test_response_requires_an_explicit_or_default_model():
 
 def test_native_compaction_round_trips_exact_provider_items():
     """OpenAI compaction returns durable opaque items that can seed the next request."""
-    item = CompactItem(type="compaction", id="cmp", encrypted_content="opaque")
+    item = {"type": "compaction", "id": "cmp", "encrypted_content": "opaque"}
     sdk = Mock()
-    sdk.responses.compact.return_value = SimpleNamespace(
-        output=[item],
-        usage=SimpleNamespace(input_tokens=90, output_tokens=20, total_tokens=110),
-    )
+    sdk.responses.with_raw_response.compact.return_value.http_response.json.return_value = {
+        "object": "response.compaction",
+        "output": [item],
+        "usage": {"input_tokens": 90, "output_tokens": 20, "total_tokens": 110},
+    }
     sdk.responses.create.return_value = sdk_response(
         output=[], output_text="", usage=None, model="model"
     )
@@ -820,9 +819,7 @@ def test_native_compaction_round_trips_exact_provider_items():
     try:
         with patch("loop.backend.openai.OpenAI", return_value=sdk):
             backend = OpenAIBackend(default_model="model")
-            result = backend.compact(
-                [Message(role="user", content="hello")], instructions="rules", model="model"
-            )
+            result = backend.compact([Message(role="user", content="hello")], model="model")
             list(backend.get_response(result.items, instructions="rules"))
         assert telemetry.close(1)
     finally:
@@ -830,64 +827,63 @@ def test_native_compaction_round_trips_exact_provider_items():
 
     assert result.items == (
         CompactionContextItem(
-            provider="openai",
-            data={"type": "compaction", "id": "cmp", "encrypted_content": "opaque"},
+            route=backend.route,
+            model="model",
+            data=item,
         ),
     )
     assert result.usage.total_tokens == 110  # pylint: disable=no-member
-    assert result.context_tokens == 20
-    compact_request = sdk.responses.compact.call_args.kwargs
-    sdk.responses.compact.assert_called_once()
-    assert thaw(adapter.records[0].payload) == compact_request
+    compact_request = sdk.responses.with_raw_response.compact.call_args.kwargs
+    sdk.responses.with_raw_response.compact.assert_called_once()
+    assert "instructions" not in compact_request
+    assert any(thaw(record.payload) == compact_request for record in adapter.records)
     assert adapter.records[0].payload_sha256 is not None
     assert sdk.responses.create.call_args.kwargs["input"] == [result.items[0].data]
 
 
 def test_native_compaction_async_round_trips_exact_provider_items():
     """Async OpenAI compaction awaits the native endpoint and preserves opaque items."""
-    item = CompactItem(type="compaction", id="cmp", encrypted_content="opaque")
+    item = {"type": "compaction", "id": "cmp", "encrypted_content": "opaque"}
     sdk = Mock()
-    sdk.responses.compact = AsyncMock(
-        return_value=SimpleNamespace(
-            output=[item],
-            usage=SimpleNamespace(input_tokens=90, output_tokens=20, total_tokens=110),
-        )
-    )
+    raw = Mock()
+    raw.http_response.json.return_value = {
+        "object": "response.compaction",
+        "output": [item],
+        "usage": {"input_tokens": 90, "output_tokens": 20, "total_tokens": 110},
+    }
+    sdk.responses.with_raw_response.compact = AsyncMock(return_value=raw)
 
     with patch("loop.backend.openai.AsyncOpenAI", return_value=sdk):
         backend = OpenAIBackend(default_model="model")
         result = asyncio.run(
             backend.compact_async(
                 [Message(role="user", content="hello")],
-                instructions="rules",
                 model="model",
             )
         )
 
     assert result.items == (
         CompactionContextItem(
-            provider="openai",
-            data={"type": "compaction", "id": "cmp", "encrypted_content": "opaque"},
+            route=backend.route,
+            model="model",
+            data=item,
         ),
     )
     assert result.usage.total_tokens == 110
-    assert result.context_tokens == 20
-    sdk.responses.compact.assert_awaited_once()
+    sdk.responses.with_raw_response.compact.assert_awaited_once()
 
 
 def test_native_async_compaction_falls_back_only_for_unsupported_endpoints():
     """Unsupported async native endpoints use the portable async backend path."""
     sdk = Mock()
-    sdk.responses.compact = AsyncMock(
+    sdk.responses.with_raw_response.compact = AsyncMock(
         side_effect=APIStatusError(
             "missing",
             response=httpx.Response(404, request=httpx.Request("POST", "https://example.test")),
-            body=None,
+            body={"code": "route_not_found"},
         )
     )
-    fallback = CompactionResult(
-        items=(CompactionContextItem(provider="loop", data={"role": "user", "content": "sum"}),)
-    )
+    fallback = CompactionResult(items=(Message(role="user", content="sum"),))
 
     with (
         patch("loop.backend.openai.AsyncOpenAI", return_value=sdk),
@@ -899,7 +895,6 @@ def test_native_async_compaction_falls_back_only_for_unsupported_endpoints():
         result = asyncio.run(
             OpenAIBackend(default_model="model").compact_async(
                 [Message(role="user", content="hello")],
-                instructions="rules",
                 model="model",
             )
         )
@@ -916,41 +911,39 @@ def test_native_async_compaction_propagates_operational_api_failures():
         response=httpx.Response(500, request=httpx.Request("POST", "https://example.test")),
         body=None,
     )
-    sdk.responses.compact = AsyncMock(side_effect=error)
+    sdk.responses.with_raw_response.compact = AsyncMock(side_effect=error)
 
     with (
         patch("loop.backend.openai.AsyncOpenAI", return_value=sdk),
         pytest.raises(BackendServerError) as raised,
     ):
-        asyncio.run(
-            OpenAIBackend(default_model="model").compact_async([], instructions=None, model="model")
-        )
+        asyncio.run(OpenAIBackend(default_model="model").compact_async([], model="model"))
 
     assert raised.value.__cause__ is error
     assert raised.value.operation == "compact"
 
 
-def test_native_compaction_falls_back_only_for_unsupported_endpoints():
+@pytest.mark.parametrize("route_error", [{"code": "route_not_found"}, {"detail": "Not Found"}])
+def test_native_compaction_falls_back_only_for_unsupported_endpoints(route_error):
     """Compatible servers without the compact endpoint use portable summarization."""
     sdk = Mock()
-    sdk.responses.compact.side_effect = APIStatusError(
+    sdk.responses.with_raw_response.compact.side_effect = APIStatusError(
         "missing",
         response=httpx.Response(404, request=httpx.Request("POST", "https://example.test")),
-        body=None,
+        body=route_error,
     )
-    fallback = CompactionResult(
-        items=(CompactionContextItem(provider="loop", data={"role": "user", "content": "sum"}),)
-    )
+    fallback = CompactionResult(items=(Message(role="user", content="sum"),))
 
     with (
         patch("loop.backend.openai.OpenAI", return_value=sdk),
         patch("loop.backend.openai.Backend.compact", return_value=fallback) as compact,
     ):
-        result = OpenAIBackend(default_model="model").compact(
-            [Message(role="user", content="hello")], instructions="rules", model="model"
+        result = OpenAIBackend(base_url="http://compatible.test/v1", default_model="model").compact(
+            [Message(role="user", content="hello")], model="model"
         )
 
     assert result is fallback
+    sdk.responses.with_raw_response.compact.assert_called_once()
     compact.assert_called_once()
 
 
@@ -962,13 +955,13 @@ def test_native_compaction_propagates_operational_api_failures():
         response=httpx.Response(500, request=httpx.Request("POST", "https://example.test")),
         body=None,
     )
-    sdk.responses.compact.side_effect = error
+    sdk.responses.with_raw_response.compact.side_effect = error
 
     with (
         patch("loop.backend.openai.OpenAI", return_value=sdk),
         pytest.raises(BackendServerError) as raised,
     ):
-        OpenAIBackend(default_model="model").compact([], instructions=None, model="model")
+        OpenAIBackend(default_model="model").compact([], model="model")
 
     assert raised.value.__cause__ is error
     assert raised.value.operation == "compact"
@@ -983,30 +976,28 @@ def test_portable_compaction_context_serializes_as_a_user_checkpoint():
 
     with patch("loop.backend.openai.OpenAI", return_value=sdk):
         list(
-            OpenAIBackend(default_model="model").get_response(
-                [CompactionContextItem(provider="loop", data={"role": "user", "content": "sum"})]
-            )
+            OpenAIBackend(default_model="model").get_response([Message(role="user", content="sum")])
         )
 
     assert sdk.responses.create.call_args.kwargs["input"] == [{"role": "user", "content": "sum"}]
 
 
-def test_openai_rejects_malformed_portable_compaction_context():
-    """Portable checkpoints validate their role and text before reaching the provider."""
+def test_openai_rejects_compaction_without_provenance():
+    """Unattributed native checkpoints cannot be sent to an endpoint."""
     backend = OpenAIBackend(default_model="model", api_key="test-key")
 
-    with pytest.raises(TypeError, match="Invalid portable compacted context item"):
-        list(backend.get_response([CompactionContextItem(provider="loop", data={})]))
+    with pytest.raises(BackendResponseError, match="incompatible with this model route"):
+        list(backend.get_response([CompactionContextItem(data={})]))
 
 
 def test_openai_rejects_foreign_compaction_context():
     """Provider-specific checkpoints cannot silently cross incompatible backends."""
     backend = OpenAIBackend(default_model="model", api_key="test-key")
 
-    with pytest.raises(TypeError, match="Unsupported compacted context provider"):
+    with pytest.raises(BackendResponseError, match="incompatible with this model route"):
         list(
             backend.get_response(
-                [CompactionContextItem(provider="other", data={"type": "compaction"})]
+                [CompactionContextItem(route="other", model="model", data={"type": "compaction"})]
             )
         )
 
@@ -1022,6 +1013,194 @@ def test_file_input_mode_must_be_supported():
     """File transport rejects modes without defined serialization semantics."""
     with pytest.raises(ValueError, match="None, 'text', or 'native'"):
         OpenAIBackend(file_input_mode="automatic")
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("protocol", ["openai", "vllm_agentic"])
+def test_native_checkpoint_survives_the_sdk_wire_round_trip(monkeypatch, asynchronous, protocol):
+    """SDK transport preserves retained messages, metadata, order, and structured updates."""
+    endpoint = "https://api.openai.com/v1" if protocol == "openai" else "http://agentic.test/v1"
+    model = "gpt-6.2-test" if protocol == "openai" else "served-test"
+    compact_output = [
+        {
+            "id": "msg_retained_text",
+            "type": "message",
+            "role": "user",
+            "content": "Retained user text",
+            "status": "completed",
+            "transport_metadata": {"custom": "preserved"},
+        },
+        {
+            "id": "msg_retained_parts",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "Retained part", "custom": True}],
+        },
+        {"id": "cmp_test", "type": "compaction", "encrypted_content": "summary-or-opaque"},
+    ]
+    recorded = []
+
+    def record(request):
+        """Return a real wire response with the provider's original output mapping."""
+        payload = json.loads(request.content)
+        recorded.append((request.url.path, payload))
+        if request.url.path.endswith("/compact"):
+            return httpx.Response(
+                200,
+                json={
+                    "id": "resp_compact",
+                    "object": "response.compaction",
+                    "created_at": 1,
+                    "output": compact_output,
+                    "usage": {"input_tokens": 90, "output_tokens": 10},
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "id": "resp_live",
+                "object": "response",
+                "created_at": 1,
+                "status": "completed",
+                "model": model,
+                "output": [],
+            },
+        )
+
+    options = {
+        "base_url": None if protocol == "openai" else endpoint,
+        "default_model": model,
+        "api_key": "fixture",
+        "max_retries": 0,
+    }
+    source = [Message(role="user", content="Middle"), ReasoningConfiguration("high")]
+    prefix = [DeveloperInput("Fresh baseline"), Message(role="user", content="Opening")]
+    suffix = [Message(role="user", content="Continue")]
+    if protocol == "openai":
+        suffix.insert(0, ReasoningConfiguration(None))
+    else:
+        prefix = []
+    transport = httpx.MockTransport(record)
+    if asynchronous:
+        sdk = SDKAsyncOpenAI(
+            api_key="fixture", base_url=endpoint, http_client=httpx.AsyncClient(transport=transport)
+        )
+        monkeypatch.setattr("loop.backend.openai.AsyncOpenAI", lambda **kwargs: sdk)
+
+        async def round_trip():
+            """Round-trip provider output using native asynchronous SDK calls."""
+            backend = OpenAIBackend(**options)
+            try:
+                result = await backend.compact_async(source, model=model)
+                events = [
+                    event
+                    async for event in backend.get_response_async(
+                        [*prefix, *result.items, *suffix],
+                        hyperparameters=GenerationHyperparameters(reasoning_effort="low")
+                        if protocol == "openai"
+                        else None,
+                    )
+                ]
+                return result, events
+            finally:
+                await backend.close_async()
+
+        result, events = asyncio.run(round_trip())
+    else:
+        with SDKOpenAI(
+            api_key="fixture", base_url=endpoint, http_client=httpx.Client(transport=transport)
+        ) as sdk:
+            monkeypatch.setattr("loop.backend.openai.OpenAI", lambda **kwargs: sdk)
+            backend = OpenAIBackend(**options)
+            result = backend.compact(source, model=model)
+            events = list(
+                backend.get_response(
+                    [*prefix, *result.items, *suffix],
+                    hyperparameters=GenerationHyperparameters(reasoning_effort="low")
+                    if protocol == "openai"
+                    else None,
+                )
+            )
+    assert isinstance(events[-1], ResponseCompleted)
+    assert [item.data for item in result.items] == compact_output
+    assert all(
+        item.model == model and item.route == OpenAIBackend(**options).route
+        for item in result.items
+    )
+    assert recorded[0] == (
+        "/v1/responses/compact",
+        {"model": model, "input": [{"role": "user", "content": "Middle"}]}
+        | ({"store": False} if protocol == "vllm_agentic" else {}),
+    )
+    outgoing = recorded[1][1]
+    assert outgoing["input"][len(prefix) : len(prefix) + len(compact_output)] == compact_output
+    if protocol == "openai":
+        assert outgoing["store"] is False
+        assert outgoing["reasoning"] == {"effort": "low"}
+        assert outgoing["input"][-2] == {
+            "type": "configuration_update",
+            "reasoning": {"effort": None},
+        }
+
+
+@pytest.mark.parametrize("error_code", ["model_not_found", "file_not_found", None])
+def test_compaction_resource_errors_do_not_masquerade_as_missing_route(error_code):
+    """A missing model or file, and unclassified 404s, retain their normal error path."""
+    sdk = Mock()
+    sdk.responses.with_raw_response.compact.side_effect = APIStatusError(
+        "Resource not found",
+        response=httpx.Response(404, request=httpx.Request("POST", "https://api.openai.com")),
+        body={"code": error_code},
+    )
+    with (
+        patch("loop.backend.openai.OpenAI", return_value=sdk),
+        pytest.raises(BackendNotFoundError) as raised,
+    ):
+        OpenAIBackend(default_model="model").compact([], model="model")
+    assert raised.value.operation == "compact"
+    sdk.responses.create.assert_not_called()
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_gateway_replay_checks_prefix_retention_and_plaintext(asynchronous):
+    """A native gateway checkpoint is eligible only for matching provenance and policy."""
+    endpoint = "http://agentic.test/v1"
+    backend = OpenAIBackend(
+        base_url=endpoint,
+        api_key="strict-fixture-key",
+        default_model="model",
+    )
+    item = CompactionContextItem(
+        route=backend.route,
+        model="model",
+        data={"type": "compaction", "encrypted_content": "safe retained summary"},
+    )
+    unsafe = item.model_copy(
+        update={"data": {"type": "compaction", "encrypted_content": "strict-fixture-key"}}
+    )
+    assert backend.can_replay_checkpoint([item], "model")
+    assert not backend.can_replay_checkpoint([unsafe], "model")
+    assert not backend.can_replay_checkpoint([item], "another-model")
+    assert not backend.can_replay_checkpoint([item], "model", prefix=True)
+    strict = OpenAIBackend(
+        base_url=endpoint,
+        retention_policy="required_false",
+        api_key="strict-fixture-key",
+        default_model="model",
+    )
+    assert not strict.can_replay_checkpoint([item], "model")
+    assert not backend.can_replay_checkpoint([item.model_copy(update={"route": None})], "model")
+    invalid = [Message(role="user", content="Opening"), item]
+    with pytest.raises(BackendResponseError, match="incompatible with this model route"):
+        if asynchronous:
+            asyncio.run(collect_response(backend.get_response_async(invalid)))
+        else:
+            list(backend.get_response(invalid))
+
+
+async def collect_response(events):
+    """Consume the asynchronous response without introducing a mock client."""
+    return [event async for event in events]
 
 
 def test_file_input_mode_defaults_from_the_endpoint_and_allows_overrides():
@@ -2122,7 +2301,6 @@ def test_async_response_uses_default_model():
         store=False,
         model="default",
         input=[{"role": "user", "content": "hi"}],
-        instructions=None,
         stream=False,
         stream_options={"include_usage": True},
         extra_body={
@@ -4457,6 +4635,238 @@ def test_encoded_attachment_bytes_are_not_rescanned_as_semantic_text():
         "file_data"
     ].partition(",")[2]
     assert b64decode(encoded).decode() == content
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("supported", [False, True])
+def test_opaque_checkpoint_headroom_uses_responses_input_count(asynchronous, supported):
+    """Billing and encoded byte length cannot substitute for a measured opaque prompt."""
+    backend = OpenAIBackend(default_model="gpt-6.2-sol", max_output_tokens=900)
+    item = CompactionContextItem(
+        route=backend.route,
+        model="gpt-6.2-sol",
+        data={"type": "compaction", "encrypted_content": "encoded" * 100},
+    )
+    sdk = Mock()
+    if asynchronous:
+        sdk.responses.input_tokens.count = AsyncMock()
+    count = sdk.responses.input_tokens.count
+    if supported:
+        count.return_value = SimpleNamespace(input_tokens=350)
+    else:
+        count.side_effect = APIConnectionError(
+            request=httpx.Request("POST", "https://api.openai.com/v1/responses/input_tokens")
+        )
+    items = [
+        DeveloperInput("Instructions"),
+        Message(role="user", content="Opening"),
+        item,
+        Message(role="user", content="Recent"),
+    ]
+    kwargs = {"instructions": None, "tools": (), "model": "gpt-6.2-sol"}
+    symbol = "AsyncOpenAI" if asynchronous else "OpenAI"
+    with patch(f"loop.backend.openai.{symbol}", return_value=sdk):
+        result = (
+            asyncio.run(backend.estimate_generation_async(items, **kwargs))
+            if asynchronous
+            else backend.estimate_generation(items, **kwargs)
+        )
+    assert backend.generation_reserve(16500) == 900
+    assert result == (350 if supported else None)
+    assert count.call_args.kwargs["input"][2] == item.data
+    assert len(count.call_args.kwargs["input"]) == 4
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize(
+    "output",
+    [
+        "invalid JSON",
+        None,
+        {"object": "unrelated"},
+        {"object": "response.compaction", "output": "invalid block"},
+        {"object": "response.compaction", "output": [{"type": "message"}]},
+        {
+            "object": "response.compaction",
+            "output": [
+                {"type": "compaction", "encrypted_content": "secret-registered-fixture"},
+            ],
+        },
+    ],
+)
+def test_invalid_native_candidate_uses_portable_path(asynchronous, output):
+    """Malformed native replies and policy-changing plaintext fall back without persistence."""
+    sdk = Mock()
+    raw = Mock()
+    if output == "invalid JSON":
+        raw.http_response.json.side_effect = ValueError("Malformed JSON")
+    else:
+        raw.http_response.json.return_value = output
+    fallback = CompactionResult(items=(Message(role="user", content="safe"),))
+    backend = OpenAIBackend(
+        base_url="http://agentic.test/v1",
+        api_key="secret-registered-fixture",
+        default_model="test-model",
+    )
+    method = sdk.responses.with_raw_response.compact
+    if asynchronous:
+        method = AsyncMock()
+        sdk.responses.with_raw_response.compact = method
+    method.return_value = raw
+    parent = AsyncMock(return_value=fallback) if asynchronous else Mock(return_value=fallback)
+    target = "AsyncOpenAI" if asynchronous else "OpenAI"
+    base_method = "compact_async" if asynchronous else "compact"
+    source = [Message(role="user", content="Earlier turn")]
+    with (
+        patch(f"loop.backend.openai.{target}", return_value=sdk),
+        patch(f"loop.backend.openai.Backend.{base_method}", parent),
+    ):
+        result = (
+            asyncio.run(backend.compact_async(source, model="test-model"))
+            if asynchronous
+            else backend.compact(source, model="test-model")
+        )
+    assert result == fallback
+    parent.assert_called_once_with(source, model="test-model")
+
+
+@pytest.mark.parametrize(
+    "file_data, eligible",
+    [
+        (None, False),
+        ("invalid!", False),
+        ("/w==", False),
+        ("Y2xlYW4=", True),
+        ("c2VjcmV0LXJlZ2lzdGVyZWQtZml4dHVyZQ==", False),
+    ],
+)
+def test_gateway_checks_decoded_retained_file_content(file_data, eligible):
+    """A raw protocol block can retain only supported inline files that pass policy."""
+    endpoint = "http://agentic.test/v1"
+    backend = OpenAIBackend(
+        base_url=endpoint,
+        api_key="secret-registered-fixture",
+    )
+    item = CompactionContextItem(
+        route=backend.route,
+        model="test-model",
+        data={
+            "type": "message",
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "notice"},
+                {"type": "input_file", "file_data": file_data},
+            ],
+        },
+    )
+    assert backend.can_replay_checkpoint([item], "test-model") is eligible
+
+
+def test_openai_verified_placement_and_namespace_compatibility(monkeypatch):
+    """Scope inline layouts to the deployment and bind native state to its namespace."""
+    monkeypatch.setenv("OPENAI_PROJECT_ID", "first-project")
+    public = OpenAIBackend()
+    assert public.instruction_layout("gpt-6.2-sol") == "suffix"
+    assert public.instruction_layout("gpt-6-astra") == "inline"
+    assert public.supports_reasoning_updates("gpt-6-astra")
+    assert not public.supports_reasoning_updates("gpt-5.6-sol")
+    assert OpenAIBackend(base_url="http://local.test/v1").instruction_layout("gpt-6.2-sol") == (
+        "leading"
+    )
+    explicit_url = OpenAIBackend(base_url="https://api.openai.com/v1")
+    assert explicit_url.instruction_layout("gpt-6.2-sol") == "leading"
+    assert explicit_url.file_input_mode == "text"
+    assert not explicit_url.supports_reasoning_updates("gpt-6.2-sol")
+    assert public.preserves_compacted_reasoning
+    assert not explicit_url.preserves_compacted_reasoning
+    legacy = CompactionContextItem(data={"type": "reasoning", "encrypted_content": "opaque"})
+    assert not public.can_replay_checkpoint([legacy], "gpt-6.2-sol")
+    monkeypatch.setenv("OPENAI_PROJECT_ID", "second-project")
+    assert OpenAIBackend().route != public.route
+
+
+@pytest.mark.parametrize(
+    "base_url, data, eligible",
+    [
+        (None, {"type": "reasoning", "encrypted_content": "opaque"}, True),
+        (None, {"type": "reasoning", "content": ["malformed part"]}, False),
+        (None, {"type": "message", "role": "developer", "content": "instruction"}, False),
+        ("http://local.test/v1", {"type": "reasoning", "encrypted_content": "opaque"}, False),
+    ],
+)
+def test_bound_native_checkpoint_still_validates_its_wire_shape(base_url, data, eligible):
+    """Matching deployment and model provenance still require a replayable item shape."""
+    backend = OpenAIBackend(base_url=base_url)
+    item = CompactionContextItem(route=backend.route, model="model", data=data)
+    assert backend.can_replay_checkpoint([item], "model") is eligible
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize(
+    "prefix, retention", [(False, "required_false"), (True, "provider_managed")]
+)
+def test_ineligible_custom_compaction_uses_portable_generation(asynchronous, prefix, retention):
+    """Retention and a required opening can rule out native compaction before network I/O."""
+    backend = OpenAIBackend(
+        base_url="http://agentic.test/v1",
+        retention_policy=retention,
+        default_model="model",
+    )
+    portable = Message(role="user", content="summary")
+    source = [Message(role="user", content="input")]
+    expected = CompactionResult(items=(portable,))
+    method = "compact_async" if asynchronous else "compact"
+    fallback = AsyncMock(return_value=expected) if asynchronous else Mock(return_value=expected)
+    with patch(f"loop.backend.openai.Backend.{method}", fallback):
+        operation = getattr(backend, method)(source, model="model", prefix=prefix)
+        result = asyncio.run(operation) if asynchronous else operation
+    assert result == expected
+    options = {"instructions": "rules", "model": "model", "tools": ()}
+    if asynchronous:
+        size = asyncio.run(backend.estimate_generation_async([portable], **options))
+    else:
+        size = backend.estimate_generation([portable], **options)
+    assert size > 0
+    assert not backend.can_replay_checkpoint(
+        [CompactionContextItem(data={"role": "developer", "content": "bad"})],
+        "model",
+    )
+    assert not OpenAIBackend().can_replay_checkpoint(
+        [CompactionContextItem(data={"type": "compaction"})],
+        "model",
+    )
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_opaque_prior_state_requires_canonical_fallback_after_unsupported_route(asynchronous):
+    """An unsupported native endpoint cannot summarize opaque history as portable data."""
+    model = "model"
+    item = CompactionContextItem(
+        route=OpenAIBackend().route,
+        model=model,
+        data={"type": "compaction", "encrypted_content": "opaque"},
+    )
+    sdk = Mock()
+    rejection = APIStatusError(
+        "Unsupported method",
+        response=httpx.Response(405, request=httpx.Request("POST", "https://api.openai.com")),
+        body=None,
+    )
+    if asynchronous:
+        sdk.responses.with_raw_response.compact = AsyncMock(side_effect=rejection)
+    else:
+        sdk.responses.with_raw_response.compact.side_effect = rejection
+    sdk_symbol = "AsyncOpenAI" if asynchronous else "OpenAI"
+    method = "compact_async" if asynchronous else "compact"
+    fallback = AsyncMock() if asynchronous else Mock()
+    with (
+        patch(f"loop.backend.openai.{sdk_symbol}", return_value=sdk),
+        patch(f"loop.backend.openai.Backend.{method}", fallback),
+    ):
+        backend = OpenAIBackend(default_model=model)
+        call_result = getattr(backend, method)([item], model=model)
+        assert (asyncio.run(call_result) if asynchronous else call_result) is None
+    fallback.assert_not_called()
 
 
 def test_model_only_updates_reach_the_responses_wire_in_order(monkeypatch):

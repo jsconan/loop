@@ -10,7 +10,7 @@ from threading import get_ident
 from typing import Self
 
 from . import constants
-from .agent import WINDOW_SETTING_PATHS, Agent, AgentRunner, AgentRunResult
+from .agent import WINDOW_SETTING_PATHS, Agent, AgentContext, AgentRunner, AgentRunResult
 from .backend import Backend, GenerationHyperparameters
 from .commands import CommandManager, CommandsProvider
 from .compaction import CompactionCommands, ContextCompaction
@@ -279,24 +279,30 @@ class Loop:
             async_blocking_runner=configured_commands.run_blocking_async,
         )
         configured_selection.preference = model
-        configured_compaction = ContextCompaction(
-            backend,
-            configured_sessions,
-            configured_selection,
-            lambda: configured_instructions.prepare(configured_agent),
-            configured_interaction,
-            directory_reference,
-            threshold=compaction_threshold,
-            instructions_async=lambda: configured_instructions.prepare_async(configured_agent),
-        )
         if client_timezone is not None:
             configured_tools.settings = replace(
                 configured_tools.settings,
                 client_timezone=client_timezone,
             )
-        configured_runner = AgentRunner(
+        request_context = AgentContext(
             configured_agent,
             backend,
+            configured_instructions,
+            configured_sessions,
+            configured_selection,
+            directory_reference,
+            settings=context_settings
+            or ContextSettings(timezone=configured_agent.tools.registry.settings.timezone),
+        )
+        configured_compaction = ContextCompaction(
+            configured_sessions,
+            request_context,
+            configured_interaction,
+            directory_reference,
+            threshold=compaction_threshold,
+        )
+        configured_runner = AgentRunner(
+            request_context,
             configured_instructions,
             configured_permissions,
             configured_sessions,
@@ -310,7 +316,6 @@ class Loop:
             run_control=run_control,
             prompt_on_recoverable_error=prompt_on_recoverable_error,
             async_blocking_runner=configured_commands.run_blocking_async,
-            context_settings=context_settings,
         )
         providers = (
             SessionCommands(configured_sessions, configured_name_generator),
@@ -542,7 +547,6 @@ class Loop:
         self._backend = backend
         self._agent_runner.backend = backend
         self._model_selection.backend = backend
-        self._compaction.backend = backend
         if self._owns_session_name_generator and isinstance(
             self._session_name_generator, BackendSessionNameGenerator
         ):

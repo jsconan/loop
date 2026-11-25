@@ -3,6 +3,7 @@
 __all__ = [
     "WINDOW_SETTING_PATHS",
     "Agent",
+    "AgentContext",
     "AgentIdentity",
     "AgentInstructions",
     "AgentRecoveryStatus",
@@ -21,5 +22,5 @@ from .models import (
     AgentRunResult,
     AgentRunStopReason,
 )
-from .prefix import WINDOW_SETTING_PATHS
+from .prefix import WINDOW_SETTING_PATHS, AgentContext
 from .runner import AgentRunner

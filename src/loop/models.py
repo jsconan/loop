@@ -645,15 +645,20 @@ ConversationItem: TypeAlias = Message | Reasoning | ToolCall | ToolResult  # noq
 
 
 class CompactionContextItem(BaseModel):
-    """Preserve one provider-specific item used to resume compacted context.
+    """Preserve one native wire item used to resume compacted context.
 
     Args:
-        provider (str): Backend namespace that can interpret the item.
         data (dict[str, Any]): Serialized provider input item.
+        route (str | None): Producing deployment, absent when legacy provenance is ambiguous.
+        model (str | None): Model that produced the item, when known.
     """
 
-    provider: str
     data: dict[str, Any]
+    route: str | None = Field(default=None, exclude_if=lambda value: value is None)
+    model: str | None = Field(default=None, exclude_if=lambda value: value is None)
+
+
+type CompactionItem = Message | CompactionContextItem
 
 
 @dataclass(frozen=True)
@@ -687,15 +692,12 @@ class CompactionResult(BaseModel):
     """Describe replacement context produced by a backend compactor.
 
     Args:
-        items (tuple[CompactionContextItem, ...]): Provider items replacing earlier context.
+        items (tuple[CompactionItem, ...]): Portable text or native replacement context.
         usage (Usage): Token usage reported for the compaction operation.
-        context_tokens (int | None): Tokens in the replacement context, excluding the source
-            context consumed by the compaction request.
     """
 
-    items: tuple[CompactionContextItem, ...]
+    items: tuple[CompactionItem, ...]
     usage: Usage = Field(default_factory=Usage)
-    context_tokens: int | None = Field(default=None, ge=0)
 
 
 class ToolDefinition(BaseModel):

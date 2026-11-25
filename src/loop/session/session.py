@@ -13,7 +13,6 @@ from pydantic import TypeAdapter, ValidationError
 from ..models import (
     AgentRunStopReason,
     ConversationItem,
-    InstructionLayout,
     Message,
     ModelAssignment,
     ModelContextItem,
@@ -64,7 +63,7 @@ from .models import (
 from .naming import initial_session_name, normalize_session_name, validate_session_source
 from .window import ModelDispatch, ModelWindow
 
-_SCHEMA_VERSION = 17
+_SCHEMA_VERSION = 18
 _EVENT_ADAPTER = TypeAdapter(SessionEvent)
 _ITEM_TYPES = {
     "message": Message,
@@ -87,8 +86,7 @@ class Session:
             Defaults to an empty list.
         compactions (list[Compaction]): Durable replacement-context checkpoints.
             Defaults to an empty list.
-        tokens (int): Total tokens in the context after the latest response.
-            Defaults to ``0``.
+        tokens (int): Context usage from the latest response or rebuild. Defaults to ``0``.
         model (str | None): Model identifier in the latest successfully used assignment,
             or ``None`` when unknown. Defaults to ``None``.
         context_window (int | None): Context-window size in the latest successfully used
@@ -149,16 +147,16 @@ class Session:
         if self.events:
             return
         created_at = utc_now()
-        checkpoints = {
-            compaction.boundary: index for index, compaction in enumerate(self.compactions)
-        }
+        checkpoints: dict[int, list[int]] = {}
+        for index, compaction in enumerate(self.compactions):
+            checkpoints.setdefault(compaction.boundary, []).append(index)
         for index in range(len(self.messages) + 1):
-            if index in checkpoints:
+            for checkpoint_index in checkpoints.get(index, ()):
                 self.events.append(
                     CompactionEvent(
                         id=str(new_uuid()),
                         created_at=created_at,
-                        compaction_index=checkpoints[index],
+                        compaction_index=checkpoint_index,
                     )
                 )
             if index < len(self.messages):
@@ -311,11 +309,18 @@ class Session:
         Raises:
             ValueError: If the checkpoint is empty, exceeds history, or moves backward.
         """
-        if not compaction.context:
+        if not compaction.context and compaction.coverage is None:
             raise ValueError("Compaction context cannot be empty.")
         if compaction.boundary > len(self.messages):
             raise ValueError("Compaction boundary exceeds the complete history.")
-        if self.compactions and compaction.boundary <= self.compactions[-1].boundary:
+        if compaction.coverage is not None:
+            compaction.coverage.validate_frontier(compaction.boundary)
+        if self.compactions and (
+            compaction.boundary < self.compactions[-1].boundary
+            or (
+                compaction.coverage is None and compaction.boundary == self.compactions[-1].boundary
+            )
+        ):
             raise ValueError("Compaction boundary must advance beyond the previous checkpoint.")
         self.compactions.append(compaction)
         self.events.append(
@@ -346,34 +351,56 @@ class Session:
         """
         return tuple(record for record in self.dispatches if record.window_id == window.id)
 
-    def generation_context(
+    def model_context(
         self,
         *,
-        window: ModelWindow,
+        window: ModelWindow | None = None,
         dispatch: ModelDispatch | None = None,
     ) -> list[ModelContextItem]:
         """Project bounded context with model-only updates at their original positions.
 
         Args:
-            window (ModelWindow): Candidate window owning generation input.
+            window (ModelWindow | None): Candidate window, or the current committed window.
             dispatch (ModelDispatch | None): Staged, uncommitted logical dispatch to project.
 
         Returns:
             list[ModelContextItem]: Baseline, eligible checkpoint and history, and model updates.
         """
+        window = window or self.window
         checkpoint = self.checkpoint(window)
-        records = list(self.model_dispatches(window))
+        records = list(self.model_dispatches(window)) if window is not None else []
         if dispatch is not None:
             records.append(dispatch)
         context: list[ModelContextItem] = []
-        inline = window.layout != "leading"
+        inline = window is not None and window.layout != "leading"
         if inline:
-            context.append(window.baseline_item())
+            context.append(window.baseline_item(rebuilt=bool(checkpoint and checkpoint.coverage)))
         frontier = checkpoint.boundary if checkpoint is not None else 0
+        suffix = range(frontier, len(self.messages))
+        provider_state_start = window.provider_state_start if window is not None else 0
+        tail = ()
         if checkpoint is not None:
+            coverage = checkpoint.coverage
+            if coverage is not None:
+                context.extend(self.messages[index] for index in coverage.opening)
             context.extend(checkpoint.context)
-        indices = range(frontier, len(self.messages))
-        projected = self._project_history(indices, rebuilt_end=window.provider_state_start)
+            context.extend(
+                record.reasoning
+                for record in records
+                if record.reasoning is not None and record.reasoning_after_checkpoint
+            )
+            if coverage is not None:
+                tail = coverage.tail
+                if not coverage.preserve_reasoning:
+                    provider_state_start = max(provider_state_start, frontier)
+
+        indices = (*tail, *suffix)
+        projected = (
+            self._project_history(indices, rebuilt_end=provider_state_start)
+            if tail or provider_state_start
+            else {index: self.messages[index] for index in indices}
+        )
+        context.extend(projected[index] for index in tail if index in projected)
 
         record_positions: dict[int, list[ModelContextItem]] = {}
         for record in records:
@@ -387,14 +414,15 @@ class Session:
         return context
 
     def checkpoint(self, window: ModelWindow | None = None) -> Compaction | None:
-        """Find the latest checkpoint or the checkpoint pinned by a model window.
+        """Find the replacement context used by the specified or active window.
 
         Args:
-            window (ModelWindow | None): Candidate window owning generation input.
+            window (ModelWindow | None): Candidate window, or the current committed window.
 
         Returns:
-            Compaction | None: Matching checkpoint, when present.
+            Compaction | None: Effective checkpoint, including the latest one in a legacy session.
         """
+        window = window or self.window
         if window is None:
             return self.compactions[-1] if self.compactions else None
         return next(
@@ -402,64 +430,24 @@ class Session:
             None,
         )
 
-    def replay_boundary(
+    def rebuilt_items(
         self,
-        route: str,
-        model: str,
-        layout: InstructionLayout,
-    ) -> tuple[Compaction | None, int]:
-        """Resolve replay eligibility for a target backend and model.
+        indices: Iterable[int],
+        *,
+        provider_state_start: int | None = None,
+    ) -> list[ConversationItem]:
+        """Project retained canonical content for a rebuilt provider prefix.
 
         Args:
-            route (str): Target deployment identifier.
-            model (str): Requested model.
-            layout (InstructionLayout): Target developer instruction placement.
+            indices (Iterable[int]): Ordered canonical item positions.
+            provider_state_start (int | None): Exclude provider state before this history index.
+                None excludes it from all selected items.
 
         Returns:
-            tuple[Compaction | None, int]: Eligible checkpoint and the first history index
-                allowed to keep provider-specific state.
+            list[ConversationItem]: Selected content without incompatible item identifiers.
         """
-        latest = self.checkpoint()
-        checkpoint = latest
-        if (
-            latest is not None
-            and not latest.portable
-            and (latest.route, latest.model) != (route, model)
-        ):
-            checkpoint = None
-        current = self.window
-        if (
-            current is None
-            or (current.route, current.model, current.layout) != (route, model, layout)
-            or (checkpoint is not latest and current.checkpoint_id is not None)
-        ):
-            return checkpoint, len(self.messages)
-        return checkpoint, current.provider_state_start
-
-    def compaction_context(
-        self,
-        route: str,
-        model: str,
-        layout: InstructionLayout,
-    ) -> list[ModelContextItem]:
-        """Project eligible conversation history for the existing compaction operation.
-
-        Args:
-            route (str): Target deployment identifier.
-            model (str): Requested model.
-            layout (InstructionLayout): Target developer instruction placement.
-
-        Returns:
-            list[ModelContextItem]: Eligible checkpoint and canonical history without model
-                instruction revisions, reasoning updates, or transient environment facts.
-        """
-        checkpoint, provider_state_start = self.replay_boundary(route, model, layout)
-        frontier = checkpoint.boundary if checkpoint is not None else 0
-        history = self._project_history(
-            range(frontier, len(self.messages)),
-            rebuilt_end=provider_state_start,
-        )
-        return [*(checkpoint.context if checkpoint else ()), *history.values()]
+        frontier = len(self.messages) if provider_state_start is None else provider_state_start
+        return list(self._project_history(indices, rebuilt_end=frontier).values())
 
     def _project_history(
         self,
@@ -467,9 +455,7 @@ class Session:
         *,
         rebuilt_end: int,
     ) -> dict[int, ConversationItem]:
-        """Pair tool calls and results while dropping state from a previous provider."""
-        if not rebuilt_end:
-            return {index: self.messages[index] for index in indices}
+        """Keep call occurrences paired while removing foreign identifiers from retained history."""
         items = {}
         pending: dict[str, deque[str]] = defaultdict(deque)
         for index in indices:
@@ -491,18 +477,6 @@ class Session:
                     item = item.model_copy(update={"call_id": call_id})
             items[index] = item
         return items
-
-    def model_context(self) -> list[ModelContextItem]:
-        """Return bounded context for the next model request.
-
-        Returns:
-            list[ModelContextItem]: Complete history, or the latest replacement context followed
-                by items added after its boundary.
-        """
-        if not self.compactions:
-            return self.messages
-        checkpoint = self.compactions[-1]
-        return [*checkpoint.context, *self.messages[checkpoint.boundary :]]
 
     def recovery_state(self) -> SessionRecoveryState | None:
         """Return the safest continuation for an interrupted agent run.
@@ -1012,7 +986,7 @@ class Session:
         version = payload.get("version")
         if version == _SCHEMA_VERSION:
             return False
-        if version in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16}:
+        if version in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 17}:
             return True
         raise ValueError(f"Unsupported session version {version}.")
 
@@ -1069,9 +1043,15 @@ class Session:
         """Validate canonical checkpoint and event references."""
         previous_boundary = -1
         for compaction in compactions:
-            if not compaction.context or compaction.boundary > len(messages):
+            if compaction.boundary > len(messages) or (
+                not compaction.context and compaction.coverage is None
+            ):
                 raise TypeError("Invalid serialized compaction.")
-            if compaction.boundary <= previous_boundary:
+            if compaction.coverage is not None:
+                compaction.coverage.validate_frontier(compaction.boundary)
+            if compaction.boundary < previous_boundary or (
+                compaction.coverage is None and compaction.boundary == previous_boundary
+            ):
                 raise TypeError("Invalid serialized compaction order.")
             previous_boundary = compaction.boundary
         for event in events:
@@ -1213,6 +1193,7 @@ class Session:
             )
 
         version = payload.get("version")
+        legacy_compactions = version != _SCHEMA_VERSION
         legacy_reasoning = version in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10}
         if version in {4, 5, 6, 7, 8, 9, 10, 11}:
             try:
@@ -1222,7 +1203,7 @@ class Session:
         if version == 11:
             payload["version"] = _SCHEMA_VERSION
             version = _SCHEMA_VERSION
-        elif version in {12, 13, 14, 16}:
+        elif version in {12, 13, 14, 16, 17}:
             payload = dict(payload)
             payload["version"] = _SCHEMA_VERSION
             version = _SCHEMA_VERSION
@@ -1266,7 +1247,12 @@ class Session:
             model = payload["model"]
             context_window = payload["context_window"]
             workspace_id = payload["workspace_id"]
-            compactions = [Compaction.model_validate(item) for item in payload["compactions"]]
+            compactions = [
+                Compaction.model_validate(
+                    cls._read_legacy_checkpoint(item) if legacy_compactions else item
+                )
+                for item in payload["compactions"]
+            ]
             instruction_working_directory = payload["instruction_working_directory"]
             active_skills = payload["active_skills"]
             events = [_EVENT_ADAPTER.validate_python(item) for item in payload["events"]]
@@ -1314,6 +1300,22 @@ class Session:
             active_skills=[tuple(identity) for identity in active_skills],
             events=events,
         )
+
+    @staticmethod
+    def _read_legacy_checkpoint(checkpoint: dict) -> dict:
+        """Decode the shipped portable wrapper and retain saved native provenance."""
+        items = []
+        route = checkpoint.get("route")
+        for item in checkpoint["context"]:
+            data = item["data"]
+            if item["provider"] == "loop":
+                items.append({"role": data["role"], "content": data["content"]})
+                continue
+            native = {"data": data}
+            if item["provider"] == "openai" and route:
+                native.update(route=route, model=checkpoint["model"])
+            items.append(native)
+        return {**checkpoint, "context": items}
 
     @staticmethod
     def _validate_dispatches(

@@ -1,5 +1,6 @@
 """Prepare the durable agent input window and transient request context."""
 
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 
 from ..backend import Backend, GenerationHyperparameters
@@ -8,6 +9,7 @@ from ..errors import Problem, ProblemException
 from ..instructions import InstructionsManager, PreparedInstructions
 from ..model_selection import ModelSelection
 from ..models import (
+    CompactionContextItem,
     DeveloperInput,
     InstructionLayout,
     ModelContextItem,
@@ -215,6 +217,52 @@ class AgentContext:
             **{name: getattr(effective, name) for name in COMMAND_TIMING_FIELDS},
         )
 
+    def capture(self) -> ModelWindow:
+        """Capture a rebuild with saved settings and freshly loaded instructions.
+
+        Returns:
+            ModelWindow: Rebuild candidate.
+        """
+        target = replace(self._window_target(), settings=self._candidate_settings())
+        snapshot = self._instructions.prepare(self._agent_for(target.settings))
+        return self._new_window(target, snapshot)
+
+    async def capture_async(self) -> ModelWindow:
+        """Capture a rebuild using asynchronous instruction discovery.
+
+        Returns:
+            ModelWindow: Rebuild candidate.
+        """
+        target = replace(self._window_target(), settings=self._candidate_settings())
+        snapshot = await self._instructions.prepare_async(self._agent_for(target.settings))
+        if self.backend is not target.backend or self._target_model() != target.model:
+            self._raise_stale_request()
+        return self._new_window(target, snapshot)
+
+    def check_rebuild(self, window: ModelWindow) -> bool:
+        """Recheck captured instructions, tool safety, and route before publishing a rebuild.
+
+        Args:
+            window (ModelWindow): Candidate whose captured state must remain valid.
+
+        Returns:
+            bool: Whether the candidate can still be published.
+        """
+        snapshot = self._instructions.prepare(self._agent_for(window.settings))
+        return self._rebuild_is_current(window, snapshot)
+
+    async def check_rebuild_async(self, window: ModelWindow) -> bool:
+        """Recheck a captured rebuild with asynchronous instruction discovery.
+
+        Args:
+            window (ModelWindow): Candidate whose captured state must remain valid.
+
+        Returns:
+            bool: Whether the candidate can still be published.
+        """
+        snapshot = await self._instructions.prepare_async(self._agent_for(window.settings))
+        return self._rebuild_is_current(window, snapshot)
+
     def prepare(self, recovery: str | None) -> AgentRequest:
         """Prepare or replay one logical model request.
 
@@ -269,17 +317,9 @@ class AgentContext:
         window = target.current or self._new_window(target, snapshot)
         records = session.model_dispatches(window)
         stored = self._unsettled(session, records)
-        effort = self.agent.hyperparameters.reasoning_effort
         hyperparameters = replace(self.agent.hyperparameters)
-        reasoning = None
-        if target.backend.supports_reasoning_updates(target.model):
-            hyperparameters.reasoning_effort = window.initial_reasoning_effort
-            active_effort = next(
-                (record.reasoning.effort for record in reversed(records) if record.reasoning),
-                window.initial_reasoning_effort,
-            )
-            if effort != active_effort:
-                reasoning = ReasoningConfiguration(effort)
+        effort = hyperparameters.reasoning_effort
+        hyperparameters.reasoning_effort, reasoning = self.reasoning_configuration(window, records)
         revision = None
         if target.current is not None and stored is None:
             revision = InstructionRevision.compare(
@@ -294,6 +334,9 @@ class AgentContext:
                 position=len(session.messages),
                 revision=revision,
                 reasoning=reasoning,
+                reasoning_after_checkpoint=(
+                    reasoning is not None and not records and window.checkpoint_id is not None
+                ),
             )
         )
         recorded = dispatch is stored
@@ -308,12 +351,13 @@ class AgentContext:
             window.leading_instructions(
                 revision.snapshot
                 if revision is not None
-                else self._effective_snapshot(window, records)
+                else self._effective_snapshot(window, records),
+                rebuilt=bool(target.checkpoint and target.checkpoint.coverage),
             ),
             snapshot.suffix if window.layout != "inline" else None,
             sample,
         )
-        context = session.generation_context(window=window, dispatch=None if recorded else dispatch)
+        context = session.model_context(window=window, dispatch=None if recorded else dispatch)
         if window.layout == "inline" and snapshot.suffix:
             context.append(DeveloperInput(snapshot.suffix))
         return AgentRequest(
@@ -333,6 +377,31 @@ class AgentContext:
             disclosure=disclosure,
             snapshot=snapshot,
         )
+
+    def reasoning_configuration(
+        self,
+        window: ModelWindow,
+        records: Sequence[ModelDispatch] = (),
+    ) -> tuple[ReasoningEffort | None, ReasoningConfiguration | None]:
+        """Resolve the generation effort and any update that belongs in the input.
+
+        Args:
+            window (ModelWindow): Model window with the effort pinned at its start.
+            records (Sequence[ModelDispatch]): Prior updates in replay order, empty for a rebuild.
+
+        Returns:
+            tuple[ReasoningEffort | None, ReasoningConfiguration | None]: Top-level effort and
+                the input update needed to apply the live effort, if any.
+        """
+        effort = self.agent.hyperparameters.reasoning_effort
+        if not self.backend.supports_reasoning_updates(window.model):
+            return effort, None
+        active_effort = next(
+            (record.reasoning.effort for record in reversed(records) if record.reasoning),
+            window.initial_reasoning_effort,
+        )
+        update = ReasoningConfiguration(effort) if effort != active_effort else None
+        return window.initial_reasoning_effort, update
 
     def verify(self, request: AgentRequest, *, persisted: bool = False) -> None:
         """Check the replay boundary and the policy that authorizes transmission.
@@ -393,6 +462,28 @@ class AgentContext:
         """
         self._environment_sample = (request.dispatch.id, request.environment_sample)
 
+    def compaction_capacity(self, window: ModelWindow | None) -> int | None:
+        """Return the admitted or newly selected model's context capacity.
+
+        Args:
+            window (ModelWindow | None): Planned request window, or the active window.
+
+        Returns:
+            int | None: Capacity of the model that will receive the rebuilt request.
+        """
+        current = self._sessions.session.window
+        if (
+            window is not None
+            and current is not None
+            and (window.route, window.model)
+            != (
+                current.route,
+                current.model,
+            )
+        ):
+            return self._selection.context_window
+        return self._sessions.context_window
+
     def _target_model(self) -> str:
         """Resolve the authorized target for this session."""
         self._sessions.require_model_route(self.backend.route)
@@ -404,10 +495,32 @@ class AgentContext:
         session = self._sessions.session
         route = self.backend.route
         layout = self.backend.instruction_layout(model)
-        checkpoint, provider_state_start = session.replay_boundary(route, model, layout)
+        latest = session.checkpoint()
+        checkpoint = latest
         current = session.window
+        same_target = current is not None and (current.route, current.model, current.layout) == (
+            route,
+            model,
+            layout,
+        )
+        if checkpoint is not None and (
+            not self.backend.can_replay_checkpoint(
+                checkpoint.context,
+                model,
+                prefix=layout != "leading"
+                or bool(checkpoint.coverage and checkpoint.coverage.opening),
+            )
+            or not same_target
+            and any(isinstance(item, CompactionContextItem) for item in checkpoint.context)
+        ):
+            checkpoint = None
+        provider_state_start = (
+            current.provider_state_start
+            if same_target and checkpoint is latest
+            else len(session.messages)
+        )
         if current is not None and (
-            (current.route, current.model, current.layout) != (route, model, layout)
+            not same_target
             or current.checkpoint_id != (checkpoint.id if checkpoint else None)
             or not self._tools_still_eligible(current)
         ):
@@ -463,6 +576,14 @@ class AgentContext:
             checkpoint_id=target.checkpoint.id if target.checkpoint is not None else None,
             provider_state_start=target.provider_state_start,
             follows_default=not self._selection.selected,
+        )
+
+    def _rebuild_is_current(self, window: ModelWindow, snapshot: PreparedInstructions) -> bool:
+        """Confirm the candidate's route and sources without adopting newer pending preferences."""
+        return (
+            (window.route, window.model) == (self.backend.route, self._target_model())
+            and InstructionRevision.compare(window.baseline, snapshot) is None
+            and self._tools_still_eligible(window)
         )
 
     def _tools_still_eligible(self, window: ModelWindow) -> bool:

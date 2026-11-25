@@ -56,8 +56,9 @@ from loop import (
     edit_text_file,
     read_text_file,
 )
-from loop.agent import Agent, AgentRunner, AgentRunRecoveryRequired, AgentRunResult
+from loop.agent import Agent, AgentContext, AgentRunner, AgentRunRecoveryRequired, AgentRunResult
 from loop.agent import runner as agent_runner_module
+from loop.configuration import ContextSettings
 from loop.conversation.interaction import ApprovalInteraction, MailboxInteraction
 from loop.execution import CommandExecutionService
 from loop.execution import jobs as command_jobs
@@ -177,8 +178,15 @@ def agent_runner(
     compaction.compact_if_needed_async = AsyncMock(return_value=False)
     working_directory = PathHolder(Path.cwd())
     runner = AgentRunner(
-        agent,
-        backend,
+        AgentContext(
+            agent,
+            backend,
+            instructions,
+            session_manager,
+            model_selection,
+            working_directory,
+            settings=ContextSettings(),
+        ),
         instructions,
         Mock(),
         session_manager,
@@ -301,8 +309,15 @@ def file_runner(tmp_path, backend, *, registry=None, sessions=None, run_control=
     selection.synchronize_session_async = AsyncMock()
     working_directory = PathHolder(tmp_path)
     return AgentRunner(
-        agent,
-        model_backend(backend),
+        AgentContext(
+            agent,
+            model_backend(backend),
+            instructions,
+            sessions,
+            selection,
+            working_directory,
+            settings=ContextSettings(),
+        ),
         instructions,
         permissions,
         sessions,
@@ -3513,8 +3528,15 @@ def test_runner_continues_after_max_turns_when_user_affirms():
     selection = Mock()
     working_directory = PathHolder(Path.cwd())
     runner = AgentRunner(
-        agent,
-        backend,
+        AgentContext(
+            agent,
+            backend,
+            instructions,
+            session_manager,
+            selection,
+            working_directory,
+            settings=ContextSettings(),
+        ),
         instructions,
         Mock(),
         session_manager,
@@ -5427,7 +5449,7 @@ def test_runner_checks_cancellation_after_compaction(tmp_path):
     control = RunControl()
     backend = Mock()
     runner = file_runner(tmp_path, backend, run_control=control)
-    runner.compaction.compact_if_needed.side_effect = lambda _snapshot: control.stop()
+    runner.compaction.compact_if_needed.side_effect = control.stop
 
     with pytest.raises(KeyboardInterrupt):
         runner.query()

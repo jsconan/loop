@@ -25,7 +25,6 @@ from loop import (
     BackendConnectionError,
     BackendNotFoundError,
     BackendServerError,
-    CompactionContextItem,
     CompactionResult,
     ConsoleInteraction,
     ContextReference,
@@ -379,7 +378,6 @@ def test_loop_replaces_shared_backend(tmp_path):
     assert loop.backend is replacement
     assert loop.agent_runner.backend is replacement
     assert loop.agent_runner.model_selection.backend is replacement
-    assert loop.agent_runner.compaction.backend is replacement
 
 
 def test_loop_replaces_the_default_session_name_backend(tmp_path):
@@ -3882,25 +3880,29 @@ def test_loop_aligns_injected_session_capacity_with_backend(tmp_path):
     assert session.context_window == 128000
 
 
-def test_query_compacts_above_threshold_and_sends_only_latest_working_context(tmp_path):
-    """Threshold compaction persists full history while replacing the next provider input."""
+def test_query_compacts_above_threshold_and_retains_the_active_request(tmp_path):
+    """The runner uses the rebuilt baseline and canonical retained request for generation."""
     messages = [
-        Message(role="user", content="old question"),
-        Message(role="assistant", content="old answer"),
-        Message(role="user", content="new question"),
+        Message(role="user", content="Opening request"),
+        Message(role="assistant", content="Opening answer"),
+        *(
+            item
+            for index in range(6)
+            for item in (
+                Message(role="user", content=f"Follow-up {index}"),
+                Message(role="assistant", content=f"Answer {index}"),
+            )
+        ),
+        Message(role="user", content="Active request"),
     ]
-    session = Session(messages=messages, tokens=85)
-    compacted = CompactionContextItem(
-        provider="openai",
-        data={"type": "compaction", "encrypted_content": "opaque"},
-    )
+    session = Session(messages=messages, tokens=29000)
+    compacted = Message(role="user", content="Middle summary")
     backend = loop_backend(
-        get_context_window=Mock(return_value=100),
+        get_context_window=Mock(return_value=32768),
         compact=Mock(
             return_value=CompactionResult(
                 items=(compacted,),
                 usage=Usage(input_tokens=85, output_tokens=20, total_tokens=105),
-                context_tokens=20,
             )
         ),
         get_response=Mock(return_value=[ResponseCompleted()]),
@@ -3917,18 +3919,16 @@ def test_query_compacts_above_threshold_and_sends_only_latest_working_context(tm
 
     assert session.messages == messages
     assert len(session.compactions) == 1
-    assert session.compactions[0].boundary == 3
+    assert session.compactions[0].boundary == len(messages)
     assert session.compactions[0].instructions.working_directory == str(tmp_path)
-    assert session.tokens == 20
-    assert session.context_window == 100
+    assert session.tokens > 20
     backend.compact.assert_called_once_with(
-        messages, instructions=loop.instructions, model="default-model"
+        messages[1:6],
+        model="default-model",
+        prefix=True,
     )
-    assert backend.get_response.call_args.kwargs["input"] == [compacted]
-    assert [call.args[0] for call in interaction.info.call_args_list] == [
-        "Compacting session context...",
-        "Compacted session context from 85 to 20 tokens.",
-    ]
+    assert backend.get_response.call_args.kwargs["input"] == [messages[0], compacted, *messages[6:]]
+    assert "estimated" in interaction.info.call_args.args[0]
 
 
 def test_loop_rejects_a_missing_explicit_working_directory(tmp_path):
@@ -4291,6 +4291,7 @@ def test_query_delegates_instruction_state_to_the_session_manager(tmp_path):
     session_manager.model = None
     session_manager.messages = []
     session_manager.model_context = []
+    session_manager.tokens = 0
     session_manager.hydrate_context.side_effect = list
     session_manager.context_window = None
     loop = Loop.create_default(

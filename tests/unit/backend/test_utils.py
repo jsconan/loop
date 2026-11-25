@@ -49,9 +49,9 @@ def test_projection_excludes_local_snapshots_and_artifacts_without_losing_contin
         ]
         == "opaque"
     )
-    assert project_context(CompactionContextItem(provider="loop", data={"content": "checkpoint"}))[
-        "data"
-    ] == {"content": "checkpoint"}
+    assert project_context(CompactionContextItem(data={"content": "checkpoint"}))["data"] == {
+        "content": "checkpoint"
+    }
     with pytest.raises(TypeError, match="Unsupported conversation item"):
         project_context({})
 
@@ -71,14 +71,48 @@ def test_portable_projection_omits_provider_replay_state_but_keeps_semantics():
         "arguments": "{}",
     }
     assert (
-        project_portable_context(
-            CompactionContextItem(provider="openai", data={"type": "compaction", "id": "id"})
-        )
+        project_portable_context(CompactionContextItem(data={"type": "compaction", "id": "id"}))
         is None
     )
-    assert project_portable_context(
-        CompactionContextItem(provider="loop", data={"content": "checkpoint", "opaque": "private"})
-    ) == {"provider": "loop", "data": {"content": "checkpoint"}}
+    portable = Message(role="user", content="checkpoint")
+    assert project_portable_context(portable)["content"] == "checkpoint"
+
+
+def test_portable_context_omits_model_only_updates_and_opaque_binary_attachment():
+    """Portable summaries retain reference metadata without transmitting encoded binary."""
+    from loop.backend import project_portable_context
+    from loop.backend.utils import estimate_context
+    from loop.models import DeveloperInput, ReasoningConfiguration
+
+    ref = ContextReference(
+        kind="file",
+        path="image.png",
+        media_type="image/png",
+        size_bytes=3,
+        included_bytes=3,
+        truncated=False,
+        content=b"\xff\x00\x01",
+    )
+    message = Message(role="user", content="Attachment", context=(ref,))
+    assert project_portable_context(DeveloperInput("State update")) is None
+    assert project_portable_context(ReasoningConfiguration("low")) is None
+    assert project_portable_context(ToolResult(call_id="pair", output="done"))["output"] == "done"
+    assert project_portable_context(message)["context"][0]["content"] is None
+    assert estimate_context([message]) >= 1024
+    reasoning = Reasoning(content="Working", encrypted_content="opaque" * 100)
+    assert estimate_context([reasoning]) == estimate_context([Reasoning(content="Working")])
+    assert (
+        estimate_context(
+            [message.model_copy(update={"context": (ref.model_copy(update={"content": ""}),)})]
+        )
+        >= 1024
+    )
+    assert (
+        estimate_context(
+            [message.model_copy(update={"context": (ref.model_copy(update={"reused": True}),)})]
+        )
+        < 1024
+    )
 
 
 @pytest.mark.parametrize(

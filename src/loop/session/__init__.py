@@ -8,6 +8,7 @@ __all__ = [
     "SESSION_NAME_SOURCE_USER",
     "BackendSessionNameGenerator",
     "Compaction",
+    "CompactionCoverage",
     "CompactionEvent",
     "ConversationItemEvent",
     "GeneratedSessionName",
@@ -25,6 +26,7 @@ __all__ = [
     "MemorySessionStore",
     "ModelDispatch",
     "ModelWindow",
+    "ModelWindowConflictError",
     "PendingToolCall",
     "PermissionEvent",
     "ReferenceArtifact",
@@ -84,6 +86,7 @@ from .models import (
     InstructionSnapshot,
     InteractionRequestedEvent,
     InteractionSettledEvent,
+    ModelWindowConflictError,
     PendingToolCall,
     PermissionEvent,
     ReferenceArtifact,
@@ -123,6 +126,7 @@ from .session_manager import SessionManager
 from .store import MemorySessionStore, SessionStore, SQLiteSessionStore
 from .window import (
     COMMAND_TIMING_FIELDS,
+    CompactionCoverage,
     InstructionRevision,
     ModelDispatch,
     ModelWindow,

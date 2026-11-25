@@ -19,15 +19,12 @@ from threading import Lock, RLock, get_ident
 from typing import Any
 
 from ..errors import Problem, ProblemException, log_problem
-from ..instructions.models import CapturedInstruction
 from ..interaction import ConsoleInteraction, Interaction, InteractionOutput, ResponsePresenter
 from ..models import (
     AgentRunStopReason,
-    CompactionResult,
     ContentArtifact,
     ContextReference,
     ConversationItem,
-    InstructionLayout,
     Message,
     ModelAssignment,
     ModelContextItem,
@@ -78,9 +75,9 @@ from .models import (
     InputQueuedEvent,
     InputRecalledEvent,
     InputRejectedEvent,
-    InstructionSnapshot,
     InteractionRequestedEvent,
     InteractionSettledEvent,
+    ModelWindowConflictError,
     PermissionEvent,
     ResponsePersisted,
     RunCompletedEvent,
@@ -1363,120 +1360,6 @@ class SessionManager:
             raise ValueError("Context window must be positive.")
         self._session.context_window = value
 
-    def add_compaction(
-        self,
-        result: CompactionResult,
-        *,
-        model: str,
-        route: str | None = None,
-        instructions: str | None,
-        working_directory: str,
-        active_skills: Iterable[tuple[str, str]],
-        references: Iterable[CapturedInstruction] = (),
-    ) -> None:
-        """Persist one compaction checkpoint and its exact instruction state.
-
-        Args:
-            result (CompactionResult): Replacement context and reported token usage.
-            model (str): Model used to compact the active context.
-            route (str | None): Identified deployment that produced the checkpoint.
-            instructions (str | None): Complete instructions supplied to the compactor.
-            working_directory (str): Effective instruction-discovery directory.
-            active_skills (Iterable[tuple[str, str]]): Active skill identities.
-            references (Iterable[CapturedInstruction]): Immutable instruction-file provenance.
-
-        Returns:
-            None: The replacement context and instruction state are durably committed.
-
-        Raises:
-            ValueError: If the checkpoint does not advance or has invalid context.
-        """
-        identities = tuple(active_skills)
-        instruction_references = tuple(references)
-        provider = result.items[0].provider if result.items else ""
-        compaction = Compaction(
-            id=str(new_uuid()),
-            boundary=len(self._session.messages),
-            created_at=utc_now(),
-            provider=provider,
-            model=model,
-            route=route,
-            context=result.items,
-            instructions=InstructionSnapshot(
-                working_directory=working_directory,
-                content=instructions,
-                digest=sha256_digest(instructions or ""),
-                active_skills=identities,
-                references=instruction_references,
-            ),
-            input_tokens_before=self._session.tokens,
-            input_tokens_after=result.context_tokens,
-        )
-
-        def apply(session: Session) -> None:
-            session.add_compaction(compaction)
-            if result.context_tokens is not None:
-                session.tokens = result.context_tokens
-            session.update_instruction_state(working_directory, identities)
-
-        self._commit(apply)
-
-    async def add_compaction_async(
-        self,
-        result: CompactionResult,
-        *,
-        model: str,
-        route: str | None = None,
-        instructions: str | None,
-        working_directory: str,
-        active_skills: Iterable[tuple[str, str]],
-        references: Iterable[CapturedInstruction] = (),
-    ) -> None:
-        """Persist one compaction checkpoint through the async session writer.
-
-        Args:
-            result (CompactionResult): Replacement context and reported token usage.
-            model (str): Model used to compact the active context.
-            route (str | None): Identified deployment that produced the checkpoint.
-            instructions (str | None): Complete instructions supplied to the compactor.
-            working_directory (str): Effective instruction-discovery directory.
-            active_skills (Iterable[tuple[str, str]]): Active skill identities.
-            references (Iterable[CapturedInstruction]): Immutable instruction-file provenance.
-
-        Raises:
-            ValueError: If the checkpoint does not advance or has invalid context.
-            asyncio.CancelledError: If the owning task is cancelled after persistence settles.
-        """
-        identities = tuple(active_skills)
-        instruction_references = tuple(references)
-        provider = result.items[0].provider if result.items else ""
-        compaction = Compaction(
-            id=str(new_uuid()),
-            boundary=len(self._session.messages),
-            created_at=utc_now(),
-            provider=provider,
-            model=model,
-            route=route,
-            context=result.items,
-            instructions=InstructionSnapshot(
-                working_directory=working_directory,
-                content=instructions,
-                digest=sha256_digest(instructions or ""),
-                active_skills=identities,
-                references=instruction_references,
-            ),
-            input_tokens_before=self._session.tokens,
-            input_tokens_after=result.context_tokens,
-        )
-
-        def apply(session: Session) -> None:
-            session.add_compaction(compaction)
-            if result.context_tokens is not None:
-                session.tokens = result.context_tokens
-            session.update_instruction_state(working_directory, identities)
-
-        await self._commit_async(apply)
-
     def allow_model_route(self, route: str) -> None:
         """Authorize an explicitly selected route for the active session.
 
@@ -1515,29 +1398,6 @@ class SessionManager:
                     )
                 )
 
-    def compaction_context(
-        self,
-        route: str,
-        model: str,
-        layout: InstructionLayout,
-    ) -> list[ModelContextItem]:
-        """Select authorized canonical compaction input before artifact hydration.
-
-        Args:
-            route (str): Target deployment identifier.
-            model (str): Requested model.
-            layout (InstructionLayout): Target developer instruction placement.
-
-        Returns:
-            list[ModelContextItem]: Eligible conversation items and checkpoint.
-
-        Raises:
-            ProblemException: The target is unauthorized to receive this session.
-        """
-        with self._state_lock:
-            self.require_model_route(route)
-            return self._session.compaction_context(route, model, layout)
-
     def commit_model_window(
         self,
         session_id: str,
@@ -1545,19 +1405,22 @@ class SessionManager:
         previous_checkpoint: str | None,
         window: ModelWindow,
         *,
-        dispatch: ModelDispatch,
+        dispatch: ModelDispatch | None = None,
+        checkpoint: Compaction | None = None,
     ) -> None:
-        """Persist a model dispatch against the captured session and prefix.
+        """Persist a model dispatch or rebuild against the captured session and prefix.
 
         Args:
             session_id (str): Expected active session.
             previous_window (str | None): Expected current window identifier.
             previous_checkpoint (str | None): Expected current checkpoint identifier.
-            window (ModelWindow): Window receiving the dispatch.
-            dispatch (ModelDispatch): Logical dispatch to bind before transport.
+            window (ModelWindow): Window receiving the dispatch or rebuild.
+            dispatch (ModelDispatch | None): Logical dispatch to bind before transport.
+            checkpoint (Compaction | None): Captured replacement context to publish atomically.
 
         Raises:
-            ValueError: The captured model state is stale or inconsistent.
+            ModelWindowConflictError: The captured session, window, or checkpoint changed.
+            ValueError: The captured model state is inconsistent.
         """
         self._commit(
             lambda session: self._apply_model_window(
@@ -1567,6 +1430,7 @@ class SessionManager:
                 previous_checkpoint,
                 window,
                 dispatch,
+                checkpoint,
             )
         )
 
@@ -1577,7 +1441,8 @@ class SessionManager:
         previous_checkpoint: str | None,
         window: ModelWindow,
         *,
-        dispatch: ModelDispatch,
+        dispatch: ModelDispatch | None = None,
+        checkpoint: Compaction | None = None,
     ) -> None:
         """Persist a planned model window through the asynchronous writer.
 
@@ -1585,11 +1450,13 @@ class SessionManager:
             session_id (str): Expected active session.
             previous_window (str | None): Expected current window identifier.
             previous_checkpoint (str | None): Expected current checkpoint identifier.
-            window (ModelWindow): Window receiving the dispatch.
-            dispatch (ModelDispatch): Logical dispatch to bind before transport.
+            window (ModelWindow): Window receiving the dispatch or rebuild.
+            dispatch (ModelDispatch | None): Logical dispatch to bind before transport.
+            checkpoint (Compaction | None): Captured replacement context to publish atomically.
 
         Raises:
-            ValueError: The captured model state is stale or inconsistent.
+            ModelWindowConflictError: The captured session, window, or checkpoint changed.
+            ValueError: The captured model state is inconsistent.
             asyncio.CancelledError: The write was cancelled after persistence settled.
         """
         await self._commit_async(
@@ -1600,6 +1467,7 @@ class SessionManager:
                 previous_checkpoint,
                 window,
                 dispatch,
+                checkpoint,
             )
         )
 
@@ -1610,9 +1478,10 @@ class SessionManager:
         previous_window: str | None,
         previous_checkpoint: str | None,
         window: ModelWindow,
-        dispatch: ModelDispatch,
+        dispatch: ModelDispatch | None,
+        checkpoint: Compaction | None,
     ) -> None:
-        """Validate the captured dispatch before changing canonical state."""
+        """Validate the captured dispatch or rebuild before changing canonical state."""
         previous = session.window
         active_window = previous.id if previous is not None else None
         checkpoint_in_use = session.checkpoint()
@@ -1622,8 +1491,19 @@ class SessionManager:
             previous_window,
             previous_checkpoint,
         ):
-            raise ValueError("The session context changed before its model window was saved.")
-        if dispatch.position != len(session.messages) or dispatch.window_id != window.id:
+            raise ModelWindowConflictError(
+                "The session context changed before its model window was saved."
+            )
+        if checkpoint is not None:
+            if (window.checkpoint_id, window.model) != (checkpoint.id, checkpoint.model):
+                raise ValueError("The checkpoint does not match its new model window.")
+            session.add_compaction(checkpoint)
+            if checkpoint.input_tokens_after is not None:
+                session.tokens = checkpoint.input_tokens_after
+            session.pending_dispatch = None
+        if dispatch is not None and (
+            dispatch.position != len(session.messages) or dispatch.window_id != window.id
+        ):
             raise ValueError("The session history changed before model dispatch.")
         if previous is not None and window.id == previous.id:
             if previous.follows_default != window.follows_default:
@@ -1631,15 +1511,15 @@ class SessionManager:
                     update={"follows_default": window.follows_default},
                 )
         else:
-            if active_checkpoint != window.checkpoint_id or (
-                previous is not None
-                and (previous.route, previous.model) != (window.route, window.model)
+            if checkpoint is None and (
+                active_checkpoint != window.checkpoint_id or previous is not None
             ):
                 session.tokens = 0
             session.windows.append(window)
-        session.dispatches.append(dispatch)
-        session.pending_dispatch = dispatch.id
-        if dispatch.revision is not None:
+        if dispatch is not None:
+            session.dispatches.append(dispatch)
+            session.pending_dispatch = dispatch.id
+        if dispatch is not None and dispatch.revision is not None:
             snapshot = dispatch.revision.snapshot
         elif window.id != active_window:
             snapshot = window.baseline

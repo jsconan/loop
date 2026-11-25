@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+from base64 import b64decode
 from collections.abc import AsyncIterator, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -59,6 +60,7 @@ from ..models import (
     AnswerCompleted,
     AnswerDelta,
     CompactionContextItem,
+    CompactionItem,
     CompactionResult,
     ContextReference,
     ConversationItem,
@@ -119,7 +121,7 @@ from .errors import (
     BackendStatusError,
     BackendTimeoutError,
 )
-from .utils import project_context
+from .utils import estimate_context, project_context
 
 _ReasoningChannel = Literal["content", "summary"]
 
@@ -258,7 +260,7 @@ class OpenAIBackend(Backend):
         self._repetition_min_count = repetition_min_count
         self._hyperparameter_policy = hyperparameter_policy
         if retention_policy is None:
-            retention_policy = "required_false" if base_url is None else "provider_managed"
+            retention_policy = "required_false" if self.base_url is None else "provider_managed"
         self._retention_policy = retention_policy
         self._unsupported_hyperparameters = {}
         self._unsupported_extensions = {}
@@ -344,6 +346,182 @@ class OpenAIBackend(Backend):
         """
         match = _GPT_VERSION.match(model)
         return self.base_url is None and match is not None and int(match[1]) >= 6
+
+    @property
+    def preserves_compacted_reasoning(self) -> bool:
+        """Report the default endpoint's verified reasoning continuation capability.
+
+        Returns:
+            bool: Whether native compaction preserves reasoning in the retained tail.
+        """
+        return self.base_url is None
+
+    def _allows_native_checkpoint(self, prefix: bool) -> bool:
+        """Require a known contract to retain leading items or guarantee no storage."""
+        return self.base_url is None or (
+            not prefix and self._retention_policy == "provider_managed"
+        )
+
+    def can_replay_checkpoint(
+        self,
+        items: Iterable[CompactionItem],
+        model: str,
+        *,
+        prefix: bool = False,
+    ) -> bool:
+        """Validate native protocol, state namespace, model, and policy before replay.
+
+        Args:
+            items (Iterable[CompactionItem]): Complete checkpoint replacement block.
+            model (str): Requested continuation model.
+            prefix (bool): Whether canonical items precede the replacement block.
+
+        Returns:
+            bool: Whether every checkpoint item can be sent without modification.
+        """
+        return all(
+            isinstance(item, Message)
+            or self._allows_native_checkpoint(prefix)
+            and self._can_replay_item(item, model)
+            for item in items
+        )
+
+    def _can_replay_item(self, item: CompactionContextItem, model: str) -> bool:
+        """Check one serialized replacement item without rewriting its contents."""
+        if (item.route, item.model) != (self.route, model):
+            return False
+        data = item.data
+        if not self._valid_native_item(data):
+            return False
+        fields = dict(data)
+        if self.base_url is None:
+            fields.pop("encrypted_content", None)
+        return self._model_input_policy.apply(fields) == fields and self._safe_native_files(data)
+
+    def _valid_native_item(self, data: dict) -> bool:
+        """Accept replayable Responses item shapes on the current deployment."""
+        kind = data.get("type")
+        if kind == "compaction":
+            return isinstance(data.get("encrypted_content"), str) and bool(
+                data["encrypted_content"]
+            )
+        if kind == "message":
+            content = data.get("content")
+            return data.get("role") in ("user", "assistant") and (
+                isinstance(content, str)
+                or isinstance(content, list)
+                and all(isinstance(part, dict) for part in content)
+            )
+        return self.base_url is None and kind in (
+            "reasoning",
+            "function_call",
+            "function_call_output",
+        )
+
+    def _safe_native_files(self, data: dict) -> bool:
+        """Inspect replayable inline text files and reject unknown external file capabilities."""
+        content = data.get("content")
+        if not isinstance(content, list):
+            return True
+        for item in content:
+            if not isinstance(item, dict):
+                return False
+            if item.get("type") != "input_file":
+                continue
+            encoded = item.get("file_data")
+            if not isinstance(encoded, str):
+                return False
+            try:
+                decoded = b64decode(encoded.split(",", 1)[-1], validate=True).decode()
+            except (ValueError, UnicodeError):
+                return False
+            if self._model_input_policy.apply(decoded) != decoded:
+                return False
+        return True
+
+    def generation_reserve(self, capacity: int) -> int:
+        """Use the configured output budget when estimating rebuilt request headroom.
+
+        Args:
+            capacity (int): Context capacity of the selected model.
+
+        Returns:
+            int: Capacity reserved for generation.
+        """
+        return self._max_output_tokens or super().generation_reserve(capacity)
+
+    def estimate_generation(
+        self,
+        items: list[ModelContextItem],
+        *,
+        instructions: str | None,
+        tools: tuple[ToolDefinition, ...],
+        model: str,
+    ) -> int | None:
+        """Count native replacement context or estimate projected semantic context.
+
+        Args:
+            items (list[ModelContextItem]): Model input to measure.
+            instructions (str | None): Separate instruction field when supported.
+            tools (tuple[ToolDefinition, ...]): Ordered function definitions.
+            model (str): Selected model.
+
+        Returns:
+            int | None: Estimated context, or None if an opaque block cannot be measured.
+        """
+        if not any(isinstance(item, CompactionContextItem) for item in items):
+            return estimate_context(items, instructions=instructions, tools=tools)
+        try:
+            response = self._get_client().responses.input_tokens.count(
+                **self._count_request(items, instructions, tools, model)
+            )
+        except OpenAIError:
+            return None
+        return response.input_tokens
+
+    async def estimate_generation_async(
+        self,
+        items: list[ModelContextItem],
+        *,
+        instructions: str | None,
+        tools: tuple[ToolDefinition, ...],
+        model: str,
+    ) -> int | None:
+        """Measure rebuilt context using the asynchronous Responses token counter.
+
+        Args:
+            items (list[ModelContextItem]): Model input to measure.
+            instructions (str | None): Separate instruction field when supported.
+            tools (tuple[ToolDefinition, ...]): Ordered function definitions.
+            model (str): Selected model.
+
+        Returns:
+            int | None: Estimated context, or None if an opaque block cannot be measured.
+        """
+        if not any(isinstance(item, CompactionContextItem) for item in items):
+            return estimate_context(items, instructions=instructions, tools=tools)
+        try:
+            response = await self._get_async_client().responses.input_tokens.count(
+                **self._count_request(items, instructions, tools, model)
+            )
+        except OpenAIError:
+            return None
+        return response.input_tokens
+
+    def _count_request(
+        self,
+        items: list[ModelContextItem],
+        instructions: str | None,
+        tools: tuple[ToolDefinition, ...],
+        model: str,
+    ) -> dict[str, object]:
+        """Prepare the same token-bearing fields used in the next generation request."""
+        return self._prepared_request(
+            model=model,
+            input=self._serialize_input(items, model),
+            tools=self._serialize_tools(tools),
+            **({"instructions": instructions} if instructions else {}),
+        )
 
     def _validate_attributes(self) -> None:
         """Validate the backend attributes after initialization."""
@@ -685,7 +863,9 @@ class OpenAIBackend(Backend):
         return prepared
 
     def _hyperparameter_request_parameters(
-        self, model: str, hyperparameters: GenerationHyperparameters | None
+        self,
+        model: str,
+        hyperparameters: GenerationHyperparameters | None,
     ) -> dict[str, object]:
         """Return request hyperparameters supported by the selected model."""
         unsupported = self._unsupported_hyperparameters.get(model, set())
@@ -721,7 +901,9 @@ class OpenAIBackend(Backend):
         )
 
     def _discover_hyperparameters(
-        self, model: str, hyperparameters: GenerationHyperparameters | None
+        self,
+        model: str,
+        hyperparameters: GenerationHyperparameters | None,
     ) -> None:
         """Discover and cache explicitly declared model hyperparameter support."""
         requested = self._requested_hyperparameters(hyperparameters)
@@ -750,7 +932,9 @@ class OpenAIBackend(Backend):
             )
 
     async def _discover_hyperparameters_async(
-        self, model: str, hyperparameters: GenerationHyperparameters | None
+        self,
+        model: str,
+        hyperparameters: GenerationHyperparameters | None,
     ) -> None:
         """Asynchronously discover and cache explicitly declared hyperparameter support."""
         requested = self._requested_hyperparameters(hyperparameters)
@@ -1076,15 +1260,15 @@ class OpenAIBackend(Backend):
     ) -> Iterator[ResponseEvent]:
         """Yield response events while provider errors remain available for recovery."""
         selected_model = self._select_model(model)
+        serialized_input = self._serialize_input(input, selected_model)
         self._discover_hyperparameters(selected_model, hyperparameters)
         request_instructions = self._structured_output_instructions(instructions, output_format)
         serialized_tools = self._serialize_tools(tools)
-        serialized_input = self._serialize_input(input)
         if output_format is None:
             request = {
                 "model": selected_model,
                 "input": serialized_input,
-                "instructions": request_instructions,
+                **({"instructions": request_instructions} if request_instructions else {}),
                 "stream": stream,
                 "stream_options": {"include_usage": True},
                 "tools": serialized_tools,
@@ -1265,15 +1449,15 @@ class OpenAIBackend(Backend):
     ) -> AsyncIterator[ResponseEvent]:
         """Asynchronously yield events while provider errors remain available for recovery."""
         selected_model = self._select_model(model)
+        serialized_input = self._serialize_input(input, selected_model)
         await self._discover_hyperparameters_async(selected_model, hyperparameters)
         request_instructions = self._structured_output_instructions(instructions, output_format)
         serialized_tools = self._serialize_tools(tools)
-        serialized_input = self._serialize_input(input)
         if output_format is None:
             request = {
                 "model": selected_model,
                 "input": serialized_input,
-                "instructions": request_instructions,
+                **({"instructions": request_instructions} if request_instructions else {}),
                 "stream": stream,
                 "stream_options": {"include_usage": True},
                 "tools": serialized_tools,
@@ -1556,25 +1740,40 @@ class OpenAIBackend(Backend):
         self,
         input: Iterable[ModelContextItem],  # pylint: disable=redefined-builtin
         *,
-        instructions: str | None,
         model: str,
+        native: bool = True,
+        prefix: bool = False,
     ) -> CompactionResult | None:
-        """Compact active context through the OpenAI Responses API.
+        """Compact eligible history using native stateless compaction or a portable summary.
 
         Args:
-            input (Iterable[ModelContextItem]): Active context to replace.
-            instructions (str | None): Current instructions to preserve during compaction.
+            input (Iterable[ModelContextItem]): Eligible middle history.
             model (str): Model selected for the operation.
+            native (bool): Permit native compaction when available.
+            prefix (bool): Whether replay places existing conversation before the replacement.
 
         Returns:
-            CompactionResult | None: Exact provider replacement items and reported usage, or
-                ``None`` when portable fallback does not produce a summary.
+            CompactionResult | None: Replacement context and separate inference usage.
 
         Raises:
-            BackendError: If native and portable compaction fail operationally.
+            BackendError: If compaction fails operationally.
         """
+        context = self._compaction_input(input)
         try:
-            return self._compact(input, instructions=instructions, model=model)
+            if native and self._allows_native_checkpoint(prefix):
+                try:
+                    request = self._compact_request(context, model)
+                    raw = self._get_client().responses.with_raw_response.compact(**request)
+                    if result := self._native_compaction_result(raw.http_response, model):
+                        return result
+                except APIStatusError as error:
+                    if not self._can_fallback_compact(error):
+                        raise
+            # Native continuation state has no complete portable interpretation. The
+            # window owner can retry with the canonical source history for that block.
+            if any(isinstance(item, CompactionContextItem) for item in context):
+                return None
+            return super().compact(context, model=model)
         except OpenAIError as error:
             raise self._translated_error(error, "compact") from error
 
@@ -1582,98 +1781,120 @@ class OpenAIBackend(Backend):
         self,
         input: Iterable[ModelContextItem],  # pylint: disable=redefined-builtin
         *,
-        instructions: str | None,
         model: str,
+        native: bool = True,
+        prefix: bool = False,
     ) -> CompactionResult | None:
-        """Asynchronously compact active context through the Responses API.
+        """Compact eligible history through the asynchronous Responses API.
 
         Args:
-            input (Iterable[ModelContextItem]): Active context to replace.
-            instructions (str | None): Current instructions to preserve during compaction.
+            input (Iterable[ModelContextItem]): Eligible middle history.
             model (str): Model selected for the operation.
+            native (bool): Permit native compaction when available.
+            prefix (bool): Whether replay places existing conversation before the replacement.
 
         Returns:
-            CompactionResult | None: Exact provider replacement items and reported usage, or
-                ``None`` when portable fallback does not produce a summary.
+            CompactionResult | None: Replacement context and separate inference usage.
 
         Raises:
-            BackendError: If native and portable compaction fail operationally.
-            ValueError: If the backend rejects the selected model.
+            BackendError: If compaction fails operationally.
         """
+        context = self._compaction_input(input)
         try:
-            return await self._compact_async(input, instructions=instructions, model=model)
+            if native and self._allows_native_checkpoint(prefix):
+                try:
+                    request = self._compact_request(context, model)
+                    raw = await self._get_async_client().responses.with_raw_response.compact(
+                        **request
+                    )
+                    if result := self._native_compaction_result(raw.http_response, model):
+                        return result
+                except APIStatusError as error:
+                    if not self._can_fallback_compact(error):
+                        raise
+            # Native continuation state has no complete portable interpretation. The
+            # window owner can retry with the canonical source history for that block.
+            if any(isinstance(item, CompactionContextItem) for item in context):
+                return None
+            return await super().compact_async(context, model=model)
         except OpenAIError as error:
             raise self._translated_error(error, "compact") from error
 
-    def _compact(
-        self,
-        input: Iterable[ModelContextItem],  # pylint: disable=redefined-builtin
-        *,
-        instructions: str | None,
-        model: str,
-    ) -> CompactionResult | None:
-        """Compact context while retaining provider errors for endpoint fallback."""
-        active_context = list(input)
-        try:
-            request = self._prepared_request(
-                model=model,
-                input=self._serialize_input(active_context),
-                instructions=instructions,
-            )
-            response = self._get_client().responses.compact(**request)
-            self._trace_provider_value("gen_ai.response", response)
-        except APIStatusError as error:
-            if error.status_code not in (404, 405, 501):
-                raise
-            return super().compact(
-                active_context,
-                instructions=instructions,
-                model=model,
-            )
-        return self._native_compaction_result(response)
+    @staticmethod
+    def _compaction_input(items: Iterable[ModelContextItem]) -> list[ModelContextItem]:
+        """Exclude model-only instruction and reasoning updates from standalone compaction."""
+        return [
+            item for item in items if not isinstance(item, (DeveloperInput, ReasoningConfiguration))
+        ]
 
-    async def _compact_async(
-        self,
-        input: Iterable[ModelContextItem],  # pylint: disable=redefined-builtin
-        *,
-        instructions: str | None,
-        model: str,
-    ) -> CompactionResult | None:
-        """Compact context asynchronously while preserving unsupported-endpoint fallback."""
-        active_context = list(input)
-        try:
-            request = self._prepared_request(
-                model=model,
-                input=self._serialize_input(active_context),
-                instructions=instructions,
-            )
-            response = await self._get_async_client().responses.compact(**request)
-            self._trace_provider_value("gen_ai.response", response)
-        except APIStatusError as error:
-            if error.status_code not in (404, 405, 501):
-                raise
-            return await super().compact_async(
-                active_context,
-                instructions=instructions,
-                model=model,
-            )
-        return self._native_compaction_result(response)
-
-    @classmethod
-    def _native_compaction_result(cls, response: object) -> CompactionResult:
-        """Convert a native compact response into durable opaque provider items."""
-        usage = cls._usage(response)
-        return CompactionResult(
-            items=tuple(
-                CompactionContextItem(
-                    provider="openai",
-                    data=item.model_dump(mode="json", exclude_none=True),
-                )
-                for item in response.output
-            ),
-            usage=usage,
-            context_tokens=usage.output_tokens,
+    def _compact_request(self, items: list[ModelContextItem], model: str) -> dict[str, object]:
+        """Build policy-prepared, direct input for standalone Responses compaction."""
+        custom = self.base_url is not None
+        request = self._prepared_request(
+            model=model,
+            input=self._serialize_input(items, model),
+            **({"store": False} if custom else {}),
         )
+        if custom:
+            request["extra_body"] = {"store": request.pop("store")}
+        return request
+
+    @staticmethod
+    def _can_fallback_compact(error: APIStatusError) -> bool:
+        """Identify an unsupported route or item without masking unrelated provider failures."""
+        if error.status_code in (405, 501):
+            return True
+        if error.status_code == 404:
+            return error.body == {"detail": "Not Found"} or error.code in {
+                "route_not_found",
+                "endpoint_not_found",
+                "unsupported_endpoint",
+            }
+        return error.status_code in (400, 422) and error.code in {
+            "invalid_encrypted_content",
+            "unsupported_input_item",
+            "unsupported_attachment",
+            "unsupported_endpoint",
+            "unsupported_store",
+        }
+
+    def _native_compaction_result(
+        self,
+        raw_response: httpx.Response,
+        model: str,
+    ) -> CompactionResult | None:
+        """Validate the raw SDK wire response and carry forward its exact replacement block."""
+        try:
+            response = raw_response.json()
+        except ValueError:
+            return None
+        self._trace_provider_value("gen_ai.response", response)
+        if not isinstance(response, dict) or response.get("object") != "response.compaction":
+            return None
+        output = response.get("output")
+        if not isinstance(output, list) or any(not isinstance(item, dict) for item in output):
+            return None
+        if sum(item.get("type") == "compaction" for item in output) != 1:
+            return None
+        items = tuple(
+            CompactionContextItem(
+                route=self.route,
+                model=model,
+                data=item,
+            )
+            for item in output
+        )
+        usage = self._usage(response)
+        telemetry_activity(
+            "compaction.inference",
+            component="backend",
+            mode="native",
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
+        )
+        if not self.can_replay_checkpoint(items, model):
+            return None
+        return CompactionResult(items=items, usage=usage)
 
     def prepare_context(self, context: Iterable[ModelContextItem]) -> list[ModelContextItem]:
         """Apply input policy to file-bearing context without changing source identities.
@@ -1763,12 +1984,23 @@ class OpenAIBackend(Backend):
         return json.dumps(payload, ensure_ascii=False) if marked else output
 
     def _serialize_input(  # pylint: disable=redefined-builtin
-        self, input: str | Iterable[ModelContextItem]
+        self,
+        input: str | Iterable[ModelContextItem],
+        model: str,
     ) -> str | list[OpenAIInputItemParam]:
         """Translate conversation items into OpenAI-compatible request items."""
         if isinstance(input, str):
             return input
-        return [self._serialize_item(item) for item in self.prepare_context(input)]
+        context = self.prepare_context(input)
+        checkpoint = [item for item in context if isinstance(item, CompactionContextItem)]
+        has_prefix = bool(checkpoint) and not isinstance(context[0], CompactionContextItem)
+        if not self.can_replay_checkpoint(checkpoint, model, prefix=has_prefix):
+            raise BackendResponseError(
+                "The saved checkpoint is incompatible with this model route.",
+                provider="openai",
+                operation="prepare_context",
+            )
+        return [self._serialize_item(item) for item in context]
 
     def _attachment_message(self, reference: ContextReference) -> dict[str, Any]:
         """Translate one file snapshot into a backend-compatible content part."""
@@ -1840,7 +2072,7 @@ class OpenAIBackend(Backend):
             return projected
         item = type(item).model_validate(projected)
         if isinstance(item, CompactionContextItem):
-            return self._serialize_compaction_item(item)
+            return item.data
         if isinstance(item, Message):
             return self._serialize_message_item(item)
         if isinstance(item, Reasoning):
@@ -1995,19 +2227,6 @@ class OpenAIBackend(Backend):
             call_id=item.call_id,
             output=item.output,
         )
-
-    @staticmethod
-    def _serialize_compaction_item(item: CompactionContextItem) -> OpenAIInputItemParam:
-        """Translate one native or portable compaction checkpoint item."""
-        if item.provider == "loop":
-            role = item.data.get("role")
-            content = item.data.get("content")
-            if role not in ("user", "assistant") or not isinstance(content, str):
-                raise TypeError("Invalid portable compacted context item.")
-            return OpenAIMessageParam(role=role, content=content)
-        if item.provider != "openai":
-            raise TypeError(f"Unsupported compacted context provider: {item.provider!r}.")
-        return item.data
 
     @staticmethod
     def _serialize_tools(
@@ -2509,12 +2728,16 @@ class OpenAIBackend(Backend):
     @staticmethod
     def _usage(response: object) -> Usage:
         """Translate non-negative token counts from an OpenAI response."""
-        usage = getattr(response, "usage", None)
-        input_details = getattr(usage, "input_tokens_details", None)
-        output_details = getattr(usage, "output_tokens_details", None)
+
+        def value_of(obj: object, field: str) -> object:
+            return obj.get(field) if isinstance(obj, Mapping) else getattr(obj, field, None)
+
+        usage = value_of(response, "usage")
+        input_details = value_of(usage, "input_tokens_details")
+        output_details = value_of(usage, "output_tokens_details")
 
         def token_count(obj: object, field: str) -> int | None:
-            value = getattr(obj, field, None)
+            value = value_of(obj, field)
             return value if isinstance(value, int) and value >= 0 else None
 
         return Usage(

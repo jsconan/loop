@@ -2,32 +2,71 @@
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .. import constants
-from ..backend import Backend
-from ..instructions import PreparedInstructions
+from ..backend import Backend, estimate_context
 from ..interaction import Interaction
-from ..model_selection import ModelSelection
-from ..models import CompactionResult
-from ..session import SessionManager
+from ..models import (
+    CompactionContextItem,
+    CompactionItem,
+    CompactionResult,
+    ConversationItem,
+    ModelContextItem,
+)
+from ..session import (
+    Compaction,
+    InstructionSnapshot,
+    ModelWindow,
+    ModelWindowConflictError,
+    SessionManager,
+)
 from ..telemetry import telemetry_activity, telemetry_error
-from ..utils import PathHolder, PathReference, run_in_worker_async
+from ..utils import PathHolder, PathReference, new_uuid, utc_now
+from .planning import CompactionLimitError, RetainedContext, portable_batches
+
+if TYPE_CHECKING:
+    from ..agent import AgentContext
+
+_UNDECLARED_CAPACITY = 32_768
+_SUMMARY_RESERVE = 1024
+
+
+@dataclass(frozen=True)
+class _Attempt:
+    """Capture a rebuild candidate and the session boundaries it may replace."""
+
+    session_id: str
+    previous_window: str | None
+    previous_checkpoint: str | None
+    backend: Backend
+    window: ModelWindow
+    retained: RetainedContext
+    opening: list[ModelContextItem]
+    tail: list[ModelContextItem]
+    native_tail: list[ModelContextItem] | None
+    middle: list[ConversationItem]
+    previous_items: tuple[CompactionItem, ...]
+    previous_context_tokens: int | None
+    uncovered: list[ConversationItem]
+    available: int
+    summary_budget: int
+    native: bool
+
+    @property
+    def has_prefix(self) -> bool:
+        """Check whether rebuilt input puts canonical items before the checkpoint."""
+        return bool(self.opening) or self.window.layout != "leading"
 
 
 class ContextCompaction:
     """Compact active model context according to a configurable utilization policy.
 
     Args:
-        backend (Backend): Backend used to produce replacement context.
         session_manager (SessionManager): Active session context and checkpoint persistence.
-        model_selection (ModelSelection): Active model and context-window selection.
-        instructions (Callable[[], PreparedInstructions]): Provider that prepares exact
-            model-ready instructions for an explicit agent.
-        instructions_async (Callable[[], Awaitable[PreparedInstructions]] | None): Native async
-            provider used by ``compact_async``. If omitted, the synchronous provider runs through
-            bounded worker admission.
+        context (AgentContext): Owner of the candidate model window and its backend.
         interaction (Interaction): Service used to report compaction progress and outcomes.
         working_directory (str | Path | PathReference): Current working-directory reference.
         threshold (float): Context-window utilization that triggers automatic compaction.
@@ -37,32 +76,23 @@ class ContextCompaction:
         ValueError: If ``threshold`` is outside the supported range of (0, 1].
     """
 
-    _backend: Backend
     _session_manager: SessionManager
-    _model_selection: ModelSelection
-    _instructions: Callable[[], PreparedInstructions]
-    _instructions_async: Callable[[], Awaitable[PreparedInstructions]] | None
+    _context: AgentContext
     _interaction: Interaction
     _working_directory: PathReference
     _threshold: float
 
     def __init__(
         self,
-        backend: Backend,
         session_manager: SessionManager,
-        model_selection: ModelSelection,
-        instructions: Callable[[], PreparedInstructions],
+        context: AgentContext,
         interaction: Interaction,
         working_directory: str | Path | PathReference,
         *,
         threshold: float = constants.DEFAULT_COMPACTION_THRESHOLD,
-        instructions_async: Callable[[], Awaitable[PreparedInstructions]] | None = None,
     ) -> None:
-        self._backend = backend
         self._session_manager = session_manager
-        self._model_selection = model_selection
-        self._instructions = instructions
-        self._instructions_async = instructions_async
+        self._context = context
         self._interaction = interaction
         self._working_directory = PathHolder.from_value(working_directory)
         self.threshold = threshold
@@ -90,290 +120,423 @@ class ContextCompaction:
             raise ValueError("Compaction threshold must be greater than zero and at most one.")
         self._threshold = threshold
 
-    @property
-    def backend(self) -> Backend:
-        """Return the backend used for context compaction.
-
-        Returns:
-            Backend: Active compaction backend.
-        """
-        return self._backend
-
-    @backend.setter
-    def backend(self, backend: Backend) -> None:
-        """Replace the backend used for future compaction.
-
-        Args:
-            backend (Backend): Fully configured replacement backend.
-        """
-        self._backend = backend
-
     def can_compact(self) -> bool:
-        """Return whether complete history advanced beyond the latest checkpoint.
+        """Check whether canonical history has new context beyond the last checkpoint.
 
         Returns:
-            bool: ``True`` when at least one uncompacted history item exists.
+            bool: Whether an automatic rebuild could advance the captured source history.
         """
         session = self._session_manager.session
-        boundary = session.compactions[-1].boundary if session.compactions else 0
-        return boundary < len(session.messages)
+        checkpoint = session.checkpoint()
+        return len(session.messages) > (checkpoint.boundary if checkpoint is not None else 0)
 
     def needed(self) -> bool:
-        """Return whether current usage reached the automatic compaction threshold.
+        """Check the last observed context usage against the automatic threshold.
 
         Returns:
-            bool: ``True`` when capacity is known, usage reached the threshold, and new history
-                can be compacted.
+            bool: Whether automatic compaction could make room for the next request.
         """
-        context_window = self._session_manager.context_window
+        limit = self._context.compaction_capacity(None)
         return (
-            context_window is not None
-            and self._session_manager.tokens >= context_window * self._threshold
+            limit is not None
+            and self._session_manager.tokens >= limit * self._threshold
             and self.can_compact()
         )
 
-    def compact_if_needed(self, instructions: PreparedInstructions | None = None) -> bool:
-        """Compact the active context when its utilization policy is satisfied.
-
-        Args:
-            instructions (PreparedInstructions | None): Exact instructions prepared for the
-                surrounding model turn, or ``None`` to request a fresh explicit snapshot.
+    def compact_if_needed(self) -> bool:
+        """Rebuild the session if observed context usage crosses the threshold.
 
         Returns:
-            bool: ``True`` when a new checkpoint was persisted, otherwise ``False``.
-
-        Raises:
-            ValueError: If compaction is required but no effective model is configured.
+            bool: Whether a checkpoint was committed.
         """
-        return self.compact(instructions=instructions) if self.needed() else False
+        return self.needed() and self.compact()
 
-    async def compact_if_needed_async(
-        self,
-        instructions: PreparedInstructions | None = None,
-    ) -> bool:
-        """Compact asynchronously when the active context reaches its utilization threshold.
-
-        Args:
-            instructions (PreparedInstructions | None): Exact instructions prepared for the
-                surrounding model turn, or ``None`` to request a fresh explicit snapshot.
+    async def compact_if_needed_async(self) -> bool:
+        """Rebuild the session asynchronously after crossing the utilization threshold.
 
         Returns:
-            bool: ``True`` when a new checkpoint was persisted, otherwise ``False``.
-
-        Raises:
-            BackendError: If the provider request or response fails.
-            ValueError: If compaction is required but no effective model is configured.
-            RuntimeError: Bounded worker admission is full or unavailable when no async provider
-                was configured.
-            asyncio.CancelledError: The task is cancelled after instruction preparation settles.
+            bool: Whether a checkpoint was committed.
         """
-        if not self.needed():
-            return False
-        return await self.compact_async(instructions=instructions)
+        return self.needed() and await self.compact_async()
 
-    def compact(
-        self,
-        *,
-        force: bool = True,
-        instructions: PreparedInstructions | None = None,
-    ) -> bool:
-        """Compact the active context and persist its replacement checkpoint.
-
-        Args:
-            force (bool): Whether to compact regardless of the utilization threshold. Defaults to
-                ``True`` for explicit calls.
-            instructions (PreparedInstructions | None): Exact prepared instructions to preserve,
-                or ``None`` to request a fresh explicit snapshot.
+    def compact(self) -> bool:
+        """Capture, build, and atomically commit a fresh model context.
 
         Returns:
-            bool: ``True`` when a new checkpoint was persisted, otherwise ``False``.
-
-        Raises:
-            ValueError: If no effective model is configured.
-            ProblemException: If the target route cannot use the active session.
+            bool: Whether an eligible rebuilt context was committed.
         """
-        if not self._can_start(force):
-            return False
-
-        snapshot = instructions or self._instructions()
-        model = self._model_selection.effective
-        backend = self._backend
-        route = backend.route
-        context = self._session_manager.compaction_context(
-            route, model, backend.instruction_layout(model)
-        )
-        self._report_start(model)
+        window = self._context.capture()
         try:
-            result = backend.compact(
-                self._session_manager.hydrate_context(context),
-                instructions=snapshot.content,
-                model=model,
-            )
+            attempt = self._start(window)
+            if attempt is None:
+                return False
+            with attempt.backend.file_projection(window.settings.file_input_mode):
+                result = self._summarize(attempt)
+                if result is None or (attempt.middle and not result.items):
+                    return self._empty_result()
+                tokens = self._estimate(attempt, result)
+                if not self._fits(attempt, tokens) and self._native_result(result):
+                    result = self._portable(attempt)
+                    tokens = self._estimate(attempt, result) if result is not None else None
         except NotImplementedError:
             return self._unsupported()
-        return self._finish(result, snapshot, model, route)
+        except CompactionLimitError as error:
+            self._interaction.warning(str(error))
+            return False
+        if not self._fits(attempt, tokens):
+            return self._unfit()
+        if not self._context.check_rebuild(window) or self._context.backend is not attempt.backend:
+            return self._stale()
+        checkpoint = self._checkpoint(attempt, result, tokens)
+        try:
+            self._session_manager.commit_model_window(
+                attempt.session_id,
+                attempt.previous_window,
+                attempt.previous_checkpoint,
+                attempt.window,
+                checkpoint=checkpoint,
+            )
+        except ModelWindowConflictError:
+            return self._stale()
+        self._context.apply_window(attempt.window)
+        self._report_completion(checkpoint)
+        return True
 
-    async def compact_async(
-        self,
-        *,
-        force: bool = True,
-        instructions: PreparedInstructions | None = None,
-    ) -> bool:
-        """Asynchronously compact the active context and persist its replacement checkpoint.
-
-        Args:
-            force (bool): Whether to compact regardless of the utilization threshold. Defaults to
-                ``True`` for explicit calls.
-            instructions (PreparedInstructions | None): Exact prepared instructions to preserve,
-                or ``None`` to request a fresh explicit snapshot.
+    async def compact_async(self) -> bool:
+        """Capture and commit a rebuilt context using asynchronous provider operations.
 
         Returns:
-            bool: ``True`` when a new checkpoint was persisted, otherwise ``False``.
+            bool: Whether an eligible rebuilt context was committed.
 
         Raises:
-            BackendError: If the provider request or response fails.
-            ValueError: If no effective model is configured.
-            ProblemException: If the target route cannot use the active session.
-            RuntimeError: Bounded worker admission is full or unavailable when no async provider
-                was configured.
-            asyncio.CancelledError: If backend compaction or session persistence is cancelled.
+            asyncio.CancelledError: Rebuild or checkpoint persistence was cancelled.
         """
-        if not self._can_start(force):
-            return False
-
-        if instructions is not None:
-            snapshot = instructions
-        elif self._instructions_async is not None:
-            snapshot = await self._instructions_async()
-        else:
-            snapshot = await run_in_worker_async(self._instructions)
-        model = self._model_selection.effective
-        backend = self._backend
-        route = backend.route
-        context = self._session_manager.compaction_context(
-            route, model, backend.instruction_layout(model)
-        )
-        self._report_start(model)
+        window = await self._context.capture_async()
         try:
-            result = await backend.compact_async(
-                self._session_manager.hydrate_context(context),
-                instructions=snapshot.content,
-                model=model,
-            )
+            attempt = self._start(window)
+            if attempt is None:
+                return False
+            with attempt.backend.file_projection(window.settings.file_input_mode):
+                result = await self._summarize_async(attempt)
+                if result is None or (attempt.middle and not result.items):
+                    return self._empty_result()
+                tokens = await self._estimate_async(attempt, result)
+                if not self._fits(attempt, tokens) and self._native_result(result):
+                    result = await self._portable_async(attempt)
+                    tokens = (
+                        await self._estimate_async(attempt, result) if result is not None else None
+                    )
         except NotImplementedError:
             return self._unsupported()
-        return await self._finish_async(result, snapshot, model, route)
-
-    def _can_start(self, force: bool) -> bool:
-        """Return whether compaction should proceed, reporting an explicit empty request."""
-        if not self.can_compact():
-            if force:
-                self._interaction.warning("There is no new session context to compact.")
+        except CompactionLimitError as error:
+            self._interaction.warning(str(error))
             return False
-        return force or self.needed()
+        if not self._fits(attempt, tokens):
+            return self._unfit()
+        if (
+            not await self._context.check_rebuild_async(window)
+            or self._context.backend is not attempt.backend
+        ):
+            return self._stale()
+        checkpoint = self._checkpoint(attempt, result, tokens)
+        try:
+            await self._session_manager.commit_model_window_async(
+                attempt.session_id,
+                attempt.previous_window,
+                attempt.previous_checkpoint,
+                attempt.window,
+                checkpoint=checkpoint,
+            )
+        except ModelWindowConflictError:
+            return self._stale()
+        self._context.apply_window(attempt.window)
+        self._report_completion(checkpoint)
+        return True
 
-    def _report_start(self, model: str) -> None:
-        """Report one compaction start for its authorized model."""
+    def _start(self, window: ModelWindow) -> _Attempt | None:
+        """Freeze the source frontier, projected suffix, and eligible earlier checkpoint."""
+        manager = self._session_manager
+        backend = self._context.backend
+        session = manager.session
+        previous = session.checkpoint()
+        current = session.window
+        if (current is None and not session.messages) or (
+            not self.can_compact()
+            and current is not None
+            and window.checkpoint_id == current.checkpoint_id
+            and (window.route, window.model, window.settings, window.baseline.digest, window.tools)
+            == (
+                current.route,
+                current.model,
+                current.settings,
+                current.baseline.digest,
+                current.tools,
+            )
+        ):
+            self._interaction.warning("There is no new session context to compact.")
+            return None
+        checkpoint_id = window.checkpoint_id
+        window = window.model_copy(update={"checkpoint_id": str(new_uuid())})
+        limit = self._context.compaction_capacity(window)
+        capacity = limit or _UNDECLARED_CAPACITY
+        available = capacity - backend.generation_reserve(capacity)
+        baseline = [window.baseline_item(rebuilt=True)] if window.layout != "leading" else []
+        overhead = estimate_context(
+            baseline, instructions=window.leading_instructions(rebuilt=True), tools=window.tools
+        )
+        retain_budget = available - overhead
+        if retain_budget < 0:
+            raise CompactionLimitError("Instructions and tools exceed the available context limit.")
+        retained = RetainedContext.select(
+            session, retain_budget - min(_SUMMARY_RESERVE, retain_budget // 4)
+        )
+        middle = list(retained.middle)
+        previous_items = ()
+        previous_context_tokens = None
+        uncovered = middle
+        opening = [session.messages[index] for index in retained.coverage.opening]
+        prefix = bool(opening) or window.layout != "leading"
+        if previous is not None and previous.id == checkpoint_id and previous.coverage is not None:
+            earlier = RetainedContext(previous.boundary, previous.coverage).middle
+            if tuple(middle[: len(earlier)]) == earlier and backend.can_replay_checkpoint(
+                previous.context, window.model, prefix=prefix
+            ):
+                previous_items = previous.context
+                previous_context_tokens = previous.input_tokens_after
+                uncovered = middle[len(earlier) :]
         self._interaction.info("Compacting session context...")
-        telemetry_activity(
-            "compaction.started",
-            severity="info",
-            component="compaction",
-            model=model,
+        telemetry_activity("compaction.started", component="compaction", model=window.model)
+        return _Attempt(
+            session_id=session.id,
+            previous_window=current.id if current is not None else None,
+            previous_checkpoint=previous.id if previous is not None else None,
+            backend=backend,
+            window=window,
+            retained=retained,
+            opening=opening,
+            tail=session.rebuilt_items(retained.coverage.tail),
+            native_tail=(
+                session.rebuilt_items(
+                    retained.coverage.tail, provider_state_start=window.provider_state_start
+                )
+                if backend.preserves_compacted_reasoning
+                else None
+            ),
+            middle=session.rebuilt_items(middle),
+            previous_items=previous_items,
+            previous_context_tokens=previous_context_tokens,
+            uncovered=session.rebuilt_items(
+                uncovered,
+                provider_state_start=window.provider_state_start
+                if window.layout != "leading"
+                else None,
+            ),
+            available=available,
+            summary_budget=max(1, available - min(_SUMMARY_RESERVE, available // 4)),
+            native=limit is not None,
         )
+
+    def _summarize(self, attempt: _Attempt) -> CompactionResult | None:
+        """Summarize only the middle and retain an eligible prior compacted range."""
+        if not attempt.middle or (attempt.previous_items and not attempt.uncovered):
+            return CompactionResult(items=attempt.previous_items)
+        middle = self._summary_input(attempt)
+        if middle is None:
+            return self._portable(attempt)
+        hydrated = self._session_manager.hydrate_context(middle)
+        result = attempt.backend.compact(
+            hydrated, model=attempt.window.model, prefix=attempt.has_prefix
+        )
+        if result is None and attempt.previous_items:
+            return self._portable(attempt)
+        return result
+
+    async def _summarize_async(self, attempt: _Attempt) -> CompactionResult | None:
+        """Summarize the captured middle via async hydration and provider APIs."""
+        if not attempt.middle or (attempt.previous_items and not attempt.uncovered):
+            return CompactionResult(items=attempt.previous_items)
+        middle = self._summary_input(attempt)
+        if middle is None:
+            return await self._portable_async(attempt)
+        hydrated = await self._session_manager.hydrate_context_async(middle)
+        result = await attempt.backend.compact_async(
+            hydrated, model=attempt.window.model, prefix=attempt.has_prefix
+        )
+        if result is None and attempt.previous_items:
+            return await self._portable_async(attempt)
+        return result
+
+    @staticmethod
+    def _summary_input(attempt: _Attempt) -> list[ModelContextItem] | None:
+        """Budget a reusable native block by the previous rebuilt request's measured cost."""
+        if not attempt.native:
+            return None
+        middle = [*attempt.previous_items, *attempt.uncovered]
+        if any(isinstance(item, CompactionContextItem) for item in attempt.previous_items):
+            prior = attempt.previous_context_tokens or attempt.summary_budget
+            tokens = prior + estimate_context(attempt.uncovered)
+        else:
+            tokens = estimate_context(middle)
+        return middle if tokens <= attempt.summary_budget else None
+
+    def _portable(self, attempt: _Attempt) -> CompactionResult | None:
+        """Build bounded summaries from canonical history without native state."""
+        result = CompactionResult(items=())
+        for batch in portable_batches(attempt.middle, attempt.summary_budget // 2):
+            context = self._portable_input(result.items, batch, attempt.summary_budget)
+            model_input = self._session_manager.hydrate_context(context)
+            result = attempt.backend.compact(model_input, model=attempt.window.model, native=False)
+            if result is None or not result.items:
+                return None
+        return result
+
+    async def _portable_async(self, attempt: _Attempt) -> CompactionResult | None:
+        """Build bounded portable summaries with asynchronous I/O."""
+        result = CompactionResult(items=())
+        for batch in portable_batches(attempt.middle, attempt.summary_budget // 2):
+            context = self._portable_input(result.items, batch, attempt.summary_budget)
+            model_input = await self._session_manager.hydrate_context_async(context)
+            result = await attempt.backend.compact_async(
+                model_input, model=attempt.window.model, native=False
+            )
+            if result is None or not result.items:
+                return None
+        return result
+
+    @staticmethod
+    def _portable_input(
+        summary: tuple[CompactionItem, ...],
+        batch: list[ConversationItem],
+        budget: int,
+    ) -> list[ModelContextItem]:
+        """Enforce the request budget for the prior summary and its next batch together."""
+        items = [*summary, *batch]
+        if estimate_context(items) > budget:
+            raise CompactionLimitError("The portable checkpoint exceeds the summary limit.")
+        return items
+
+    def _estimate(self, attempt: _Attempt, result: CompactionResult) -> int | None:
+        """Measure the entire rebuilt generation context."""
+        if not attempt.backend.can_replay_checkpoint(
+            result.items,
+            attempt.window.model,
+            prefix=attempt.has_prefix,
+        ):
+            return None
+        context = self._session_manager.hydrate_context(self._rebuilt_items(attempt, result))
+        return attempt.backend.estimate_generation(
+            context,
+            instructions=attempt.window.leading_instructions(rebuilt=True),
+            tools=attempt.window.tools,
+            model=attempt.window.model,
+        )
+
+    async def _estimate_async(self, attempt: _Attempt, result: CompactionResult) -> int | None:
+        """Measure the entire rebuilt generation context asynchronously."""
+        if not attempt.backend.can_replay_checkpoint(
+            result.items,
+            attempt.window.model,
+            prefix=attempt.has_prefix,
+        ):
+            return None
+        context = await self._session_manager.hydrate_context_async(
+            self._rebuilt_items(attempt, result)
+        )
+        return await attempt.backend.estimate_generation_async(
+            context,
+            instructions=attempt.window.leading_instructions(rebuilt=True),
+            tools=attempt.window.tools,
+            model=attempt.window.model,
+        )
+
+    def _rebuilt_items(self, attempt: _Attempt, result: CompactionResult) -> list[ModelContextItem]:
+        """Build the complete context order used to establish generation headroom."""
+        window = attempt.window
+        baseline = [window.baseline_item(rebuilt=True)] if window.layout != "leading" else []
+        tail = (
+            attempt.native_tail
+            if attempt.native_tail is not None and self._native_result(result)
+            else attempt.tail
+        )
+        _, update = self._context.reasoning_configuration(window)
+        reasoning = [update] if update is not None else []
+        return [*baseline, *attempt.opening, *result.items, *reasoning, *tail]
+
+    @staticmethod
+    def _fits(attempt: _Attempt, tokens: int | None) -> bool:
+        """Accept only a measured or bounded request with room for generation."""
+        return tokens is not None and tokens <= attempt.available
+
+    @staticmethod
+    def _native_result(result: CompactionResult) -> bool:
+        """Check whether the candidate may require canonical portable fallback."""
+        return any(isinstance(item, CompactionContextItem) for item in result.items)
+
+    def _checkpoint(self, attempt: _Attempt, result: CompactionResult, tokens: int) -> Compaction:
+        """Record captured coverage and a refreshed baseline in one window transition."""
+        snapshot = attempt.window.baseline
+        return Compaction(
+            id=attempt.window.checkpoint_id,
+            boundary=attempt.retained.end,
+            created_at=utc_now(),
+            model=attempt.window.model,
+            context=result.items,
+            coverage=attempt.retained.coverage.model_copy(
+                update={
+                    "preserve_reasoning": bool(
+                        attempt.native_tail is not None and self._native_result(result)
+                    )
+                }
+            ),
+            instructions=InstructionSnapshot(
+                working_directory=str(snapshot.working_directory or self._working_directory),
+                content=snapshot.content,
+                digest=snapshot.digest,
+                active_skills=snapshot.active_skills,
+                references=tuple(
+                    section.reference
+                    for section in snapshot.sections
+                    if section.reference is not None
+                ),
+            ),
+            input_tokens_before=self._session_manager.tokens,
+            input_tokens_after=tokens,
+        )
+
+    def _report_completion(self, checkpoint: Compaction) -> None:
+        """Report generation-context size separately from backend inference usage."""
+        telemetry_activity(
+            "compaction.completed",
+            component="compaction",
+            input_tokens_before=checkpoint.input_tokens_before,
+            input_tokens_after=checkpoint.input_tokens_after,
+        )
+        self._interaction.info(
+            f"Compacted session context to an estimated {checkpoint.input_tokens_after:,} tokens."
+        )
+
+    def _empty_result(self) -> bool:
+        """Report an empty result without replacing the previous checkpoint."""
+        telemetry_error(
+            "compaction.failed", error_type="compaction.empty_result", component="compaction"
+        )
+        self._interaction.warning("The selected backend did not produce compacted context.")
+        return False
 
     def _unsupported(self) -> bool:
-        """Report that the backend does not implement compaction."""
-        telemetry_activity(
-            "compaction.unsupported",
-            severity="warning",
-            component="compaction",
-        )
+        """Report a backend that provides neither native nor portable compaction."""
+        telemetry_activity("compaction.unsupported", severity="warning", component="compaction")
         self._interaction.warning("The selected backend does not support context compaction.")
         return False
 
-    def _finish(
-        self,
-        result: CompactionResult | None,
-        snapshot: PreparedInstructions,
-        model: str,
-        route: str,
-    ) -> bool:
-        """Persist a complete compacted context and report its observed token change."""
-        if result is None or not result.items:
-            telemetry_error(
-                "compaction.failed",
-                error_type="compaction.empty_result",
-                component="compaction",
-            )
-            self._interaction.warning("The selected backend did not produce compacted context.")
-            return False
+    def _unfit(self) -> bool:
+        """Keep the current window when the rebuilt request cannot fit."""
+        self._interaction.warning("The rebuilt request would exceed the available context limit.")
+        return False
 
-        working_directory = str(snapshot.working_directory or self._working_directory)
-        previous_tokens = self._session_manager.tokens
-        self._session_manager.add_compaction(
-            result,
-            model=model,
-            route=route,
-            instructions=snapshot.content,
-            working_directory=working_directory,
-            active_skills=list(snapshot.active_skills),
-            references=tuple(
-                section.reference for section in snapshot.sections if section.reference is not None
-            ),
+    def _stale(self) -> bool:
+        """Keep the current window when the rebuild lost its captured state."""
+        self._interaction.warning(
+            "The session or its instruction sources changed during compaction."
         )
-        self._report_completion(previous_tokens)
-        return True
-
-    async def _finish_async(
-        self,
-        result: CompactionResult | None,
-        snapshot: PreparedInstructions,
-        model: str,
-        route: str,
-    ) -> bool:
-        """Persist compacted context asynchronously and report its observed token change."""
-        if result is None or not result.items:
-            return self._empty_result()
-
-        previous_tokens = self._session_manager.tokens
-        await self._session_manager.add_compaction_async(
-            result,
-            model=model,
-            route=route,
-            instructions=snapshot.content,
-            working_directory=str(snapshot.working_directory or self._working_directory),
-            active_skills=list(snapshot.active_skills),
-            references=tuple(
-                section.reference for section in snapshot.sections if section.reference is not None
-            ),
-        )
-        self._report_completion(previous_tokens)
-        return True
-
-    def _report_completion(self, previous_tokens: int) -> None:
-        """Report one persisted compaction and its token change."""
-        current_tokens = self._session_manager.tokens
-        telemetry_activity(
-            "compaction.completed",
-            severity="info",
-            component="compaction",
-            input_tokens_before=previous_tokens,
-            input_tokens_after=current_tokens,
-        )
-        if current_tokens != previous_tokens:
-            self._interaction.info(
-                f"Compacted session context from {previous_tokens:,} to {current_tokens:,} tokens."
-            )
-        else:
-            self._interaction.info("Compacted session context.")
-
-    def _empty_result(self) -> bool:
-        """Report a compaction result that has no replacement context."""
-        telemetry_error(
-            "compaction.failed",
-            error_type="compaction.empty_result",
-            component="compaction",
-        )
-        self._interaction.warning("The selected backend did not produce compacted context.")
         return False

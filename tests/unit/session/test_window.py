@@ -6,7 +6,7 @@ import pytest
 from pydantic import ValidationError
 
 from loop.instructions import InstructionSection, PreparedInstructions
-from loop.session import InstructionRevision, ModelWindow, WindowSettings
+from loop.session import CompactionCoverage, InstructionRevision, ModelWindow, WindowSettings
 from loop.utils import sha256_digest
 
 
@@ -68,3 +68,22 @@ def test_revision_detects_reordering_without_replacing_identical_sections():
     assert '"replace": []' in revision.content
     assert f'"order": ["{second.identity}", "{first.identity}"]' in revision.content
     assert "/project" not in revision.content
+
+
+@pytest.mark.parametrize(
+    "opening, cut, tail, end",
+    [
+        ((1, 0), 2, (2, 3), 4),
+        ((0,), 2, (3, 2), 4),
+        ((0,), 2, (0, 2, 3), 4),
+        ((0,), 2, (2, 3, 4), 4),
+        ((2,), 2, (3,), 4),
+        ((0,), 2, (3,), 4),
+        ((), 5, (), 4),
+    ],
+)
+def test_retained_indices_are_unique_ordered_and_within_frontier(opening, cut, tail, end):
+    """Reject invalid retained references before durable or visible replay."""
+    coverage = CompactionCoverage(opening=opening, cut=cut, tail=tail)
+    with pytest.raises(ValueError, match="Invalid retained compaction ranges"):
+        coverage.validate_frontier(end)

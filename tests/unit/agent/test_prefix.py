@@ -44,12 +44,9 @@ def _backend(layout="suffix", route="test-route", model="model"):
     return backend
 
 
-def _portable(text, *, tokens=None):
-    """Build a portable checkpoint with the existing backend compaction result."""
-    return CompactionResult(
-        items=(CompactionContextItem(provider="loop", data={"role": "user", "content": text}),),
-        context_tokens=tokens,
-    )
+def _portable(text):
+    """Build a portable checkpoint with the backend's compaction result."""
+    return CompactionResult(items=(Message(role="user", content=text),))
 
 
 def _turn(loop, text):
@@ -145,7 +142,7 @@ def test_instruction_edits_and_removal_append_in_replay_order(tmp_path):
     updated = backend.get_response.call_args.kwargs["input"]
     assert '"deactivate": ["agents:' in updated[-1].content
     restored = Session.deserialize(loop.session.serialize())
-    assert restored.generation_context(window=restored.window)[:-1] == updated
+    assert restored.model_context(window=restored.window)[:-1] == updated
 
 
 def test_uncertain_dispatch_reuses_committed_positions_after_reopen(tmp_path):
@@ -188,16 +185,17 @@ def test_live_effort_change_preserves_the_admitted_retry(tmp_path, monkeypatch, 
     source.write_text("Initial rules.", encoding="utf-8")
     backend = _backend()
     backend.supports_reasoning_updates = lambda model: True
-    backend.get_context_window.return_value = 100
-    backend.compact.return_value = _portable("Older conversation.", tokens=10)
+    backend.get_context_window.return_value = 32768
+    backend.compact.return_value = _portable("Older conversation.")
     loop = Loop.create_default(
         backend,
         working_directory=tmp_path,
         context_settings=ContextSettings(timezone="UTC"),
         reasoning_effort="low",
     )
-    _turn(loop, "First")
-    loop.session.tokens = 40
+    for index in range(7):
+        _turn(loop, f"Earlier request {index}")
+    loop.session.tokens = 10_000
     source.write_text("Admitted rules.", encoding="utf-8")
     runner = loop.agent_runner
     runner.session_manager.add_user_message("Interrupted request")
@@ -428,7 +426,7 @@ def test_saved_name_file_and_four_timings_wait_for_rebuild(tmp_path):
     assert after.settings.command_max_wait_seconds == 4
     assert resumed.configuration_status("app.agent_name") is None
     assert resumed.tool_registry.settings.command_max_wait_seconds == 4
-    next_backend.compact.assert_called_once()
+    next_backend.compact.assert_not_called()
     latest = next_backend.get_response.call_args.kwargs
     assert "Pending identity" in latest["instructions"]
     assert latest["tools"] != first["tools"]
@@ -454,7 +452,12 @@ def test_live_reasoning_replays_updates_and_restores_effort_after_rebuild(tmp_pa
     reasoning = [item for item in request["input"] if isinstance(item, ReasoningConfiguration)]
     assert reasoning == [ReasoningConfiguration("high"), ReasoningConfiguration(None)]
     backend.compact.return_value = _portable("Old history")
+    backend.estimate_generation = Mock(return_value=1000)
     assert loop.agent_runner.compaction.compact()
+    measured = backend.estimate_generation.call_args.args[0]
+    assert [item for item in measured if isinstance(item, ReasoningConfiguration)] == [
+        ReasoningConfiguration(None)
+    ]
     _turn(loop, "After compaction")
     request = backend.get_response.call_args.kwargs
     reasoning = [item for item in request["input"] if isinstance(item, ReasoningConfiguration)]
@@ -512,22 +515,30 @@ def test_backend_switch_replays_locally_without_summarizing_after_a_checkpoint(t
     _turn(loop, "Initial request")
     session = loop.session
     owner = loop.agent_runner.session_manager
-    result = (
-        CompactionResult(
-            items=(
-                CompactionContextItem(
-                    provider="openai",
-                    data={"type": "compaction", "encrypted_content": "private provider state"},
-                ),
-            ),
-            context_tokens=30_000,
+    item = (
+        CompactionContextItem(
+            route=previous.route,
+            model="model",
+            data={"type": "compaction", "encrypted_content": "private provider state"},
         )
         if native
-        else _portable("Portable checkpoint", tokens=30_000)
+        else Message(role="user", content="Portable checkpoint")
     )
-    previous.compact.return_value = result
-    assert loop.agent_runner.compaction.compact()
-    checkpoint = session.compactions[-1]
+    checkpoint = Compaction(
+        id="saved-checkpoint",
+        model="model",
+        created_at=utc_now(),
+        boundary=len(session.messages),
+        context=(item,),
+        input_tokens_after=30_000,
+        instructions=InstructionSnapshot(
+            working_directory=str(tmp_path),
+            content=None,
+            digest=sha256_digest(""),
+        ),
+    )
+    window = session.window.model_copy(update={"id": "compacted", "checkpoint_id": checkpoint.id})
+    owner.commit_model_window(session.id, session.window.id, None, window, checkpoint=checkpoint)
     owner.add_message(Reasoning(content="", encrypted_content="recent opaque reasoning"))
     other = _backend(route="next-route")
     other.get_context_window.return_value = 32768
@@ -536,19 +547,12 @@ def test_backend_switch_replays_locally_without_summarizing_after_a_checkpoint(t
     _turn(loop, "Continue")
 
     sent = other.get_response.call_args.kwargs["input"]
-    assert not any(isinstance(entry, Reasoning) for entry in sent)
-    if native:
-        assert sent[1].content == "Initial request"
-        assert not any(isinstance(entry, CompactionContextItem) for entry in sent)
-    else:
-        assert sent[1].data["content"] == "Portable checkpoint"
+    assert not any(isinstance(entry, (CompactionContextItem, Reasoning)) for entry in sent)
+    assert sent[1].content == ("Initial request" if native else "Portable checkpoint")
     assert session.compactions == [checkpoint]
     restored = Session.deserialize(session.serialize())
     assert restored.window.checkpoint_id == (None if native else checkpoint.id)
-    assert not any(
-        isinstance(entry, Reasoning)
-        for entry in restored.generation_context(window=restored.window)
-    )
+    assert not any(isinstance(entry, Reasoning) for entry in restored.model_context())
     assert session.tokens == 0
     _turn(loop, "Next request without a usage report")
     other.compact.assert_not_called()
@@ -558,9 +562,16 @@ def test_backend_switch_replays_locally_without_summarizing_after_a_checkpoint(t
 def test_compaction_uses_the_same_route_and_replay_checks_as_generation(tmp_path, asynchronous):
     """History reaches a replacement route only after authorization and portable projection."""
     origin = _backend()
+    origin.get_context_window.return_value = 32768
     loop = Loop.create_default(origin, working_directory=tmp_path)
     _turn(loop, "Saved user task")
-    checkpoint = CompactionContextItem(provider="openai", data={"type": "compaction"})
+    for index in range(6):
+        _turn(loop, f"Saved turn {index}")
+    checkpoint = CompactionContextItem(
+        route=origin.route,
+        model="model",
+        data={"type": "compaction", "encrypted_content": "opaque checkpoint"},
+    )
     origin.compact.return_value = CompactionResult(items=(checkpoint,))
     assert loop.agent_runner.compaction.compact()
     _turn(loop, "Continue on the same route")
@@ -596,9 +607,10 @@ def test_compaction_uses_the_same_route_and_replay_checks_as_generation(tmp_path
         resumed.apply_runtime_settings("app.model", settings)
     assert compact()
     sent = transport.call_args.args[0]
-    assert sent[0] == Message(role="user", content="Saved user task")
+    assert sent[0] == Message(role="assistant", content="Recorded.")
     assert all(isinstance(item, Message) for item in sent)
-    assert resumed.session.compactions[-1].route == replacement.route
+    assert resumed.session.compactions[-1].context == _portable("Portable summary").items
+    assert resumed.session.window.route == replacement.route
 
 
 def test_slash_skill_state_persists_before_next_revision(tmp_path):
@@ -733,8 +745,11 @@ def test_async_dispatch_rechecks_disclosure_after_persisting(tmp_path, monkeypat
     asyncio.run(scenario())
 
 
-def test_async_instruction_discovery_rejects_a_superseded_model_target(tmp_path, monkeypatch):
-    """Instructions prepared for a previous model cannot seed the selected window."""
+@pytest.mark.parametrize("compaction", [False, True], ids=["generation", "compaction"])
+def test_async_instruction_discovery_rejects_a_superseded_model_target(
+    tmp_path, monkeypatch, compaction
+):
+    """An asynchronous discovery result for a previous model cannot seed a window."""
 
     async def scenario():
         """Select another model while collecting the previous target's instructions."""
@@ -752,8 +767,12 @@ def test_async_instruction_discovery_rejects_a_superseded_model_target(tmp_path,
 
         monkeypatch.setattr(loop.instructions_manager, "prepare_async", prepare_then_switch)
         with pytest.raises(ProblemException, match="request changed before dispatch"):
-            await loop.agent_runner.query_async()
+            if compaction:
+                await loop.agent_runner.compaction.compact_async()
+            else:
+                await loop.agent_runner.query_async()
         backend.get_response_async.assert_not_called()
+        backend.compact_async.assert_not_called()
         assert not loop.session.dispatches
 
     asyncio.run(scenario())
@@ -817,13 +836,12 @@ def test_compatible_legacy_checkpoint_gets_a_fresh_baseline(tmp_path):
     """A portable legacy checkpoint remains eligible at its original frontier."""
     older = Message(role="user", content="previous task")
     later = Message(role="user", content="next task")
-    item = _portable("Summary").items[0]
+    item = Message(role="user", content="Summary")
     checkpoint = Compaction(
         id="old",
         created_at=utc_now(),
         boundary=1,
         model="model",
-        provider="loop",
         context=(item,),
         instructions=InstructionSnapshot(
             working_directory=str(tmp_path),
@@ -837,6 +855,7 @@ def test_compatible_legacy_checkpoint_gets_a_fresh_baseline(tmp_path):
     loop.agent_runner.query()
     request = backend.get_response.call_args.kwargs["input"]
     assert isinstance(request[0], DeveloperInput)
+    assert "Opening messages and checkpoints" not in request[0].content
     assert request[1:] == [item, later]
     assert loop.session.window.checkpoint_id == "old"
     assert loop.session.messages == [older, later]

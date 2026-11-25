@@ -25,6 +25,12 @@ COMMAND_TIMING_FIELDS = (
 )
 
 
+_HISTORY_GUIDANCE = (
+    "Opening messages and checkpoints from a rebuilt window are historical context. "
+    "Continue the latest actual user request or the tool round already in progress."
+)
+
+
 class WindowSettings(BaseModel):
     """Keep non-secret settings that affect a context window's prefix.
 
@@ -127,33 +133,46 @@ class ModelWindow(BaseModel):
             raise ValueError("Invalid model-window instruction baseline.")
         return self
 
-    def baseline_item(self) -> DeveloperInput:
+    def baseline_item(self, *, rebuilt: bool = False) -> DeveloperInput:
         """Render the initial developer item and the rules for applying later revisions.
+
+        Args:
+            rebuilt (bool): Include guidance for retained opening and checkpoint history.
 
         Returns:
             DeveloperInput: Initial instruction sections with stable labels.
         """
         sections = [(part.identity, part.render()) for part in self.baseline.sections]
         content = json.dumps(sections, ensure_ascii=False)
+        history = _HISTORY_GUIDANCE if rebuilt else ""
         return DeveloperInput(
             "The following ordered instruction sections apply in order of precedence. "
             "An instruction revision replaces the listed sections, removes deactivated "
             "sections, and supplies their new order. Obsolete sections no longer apply. "
-            f"\n<instruction_baseline>\n{content}\n</instruction_baseline>"
+            f"{history}\n<instruction_baseline>\n{content}\n</instruction_baseline>"
         )
 
-    def leading_instructions(self, snapshot: PreparedInstructions | None = None) -> str | None:
+    def leading_instructions(
+        self,
+        snapshot: PreparedInstructions | None = None,
+        *,
+        rebuilt: bool = False,
+    ) -> str | None:
         """Return the legacy leading document when that route requires it.
 
         Args:
             snapshot (PreparedInstructions | None): Effective revision, or the initial baseline.
+            rebuilt (bool): Include guidance for retained opening and checkpoint history.
 
         Returns:
             str | None: Effective instructions for a leading route, otherwise None.
         """
         if self.layout != "leading":
             return None
-        return (snapshot or self.baseline).content
+        content = (snapshot or self.baseline).content
+        if not rebuilt:
+            return content
+        return f"{content}\n\n{_HISTORY_GUIDANCE}"
 
 
 class InstructionRevision(BaseModel):
@@ -210,6 +229,7 @@ class ModelDispatch(BaseModel):
         position (int): Exclusive canonical index after which the updates first apply.
         revision (InstructionRevision | None): Committed instruction change.
         reasoning (ReasoningConfiguration | None): Committed provider configuration update.
+        reasoning_after_checkpoint (bool): Position a restored effort before the retained tail.
     """
 
     model_config = ConfigDict(frozen=True, extra="forbid")
@@ -219,6 +239,7 @@ class ModelDispatch(BaseModel):
     position: int = Field(ge=0)
     revision: InstructionRevision | None = None
     reasoning: ReasoningConfiguration | None = None
+    reasoning_after_checkpoint: bool = False
 
     def model_items(self, *, inline: bool) -> Iterable[DeveloperInput | ReasoningConfiguration]:
         """Yield updates to replay at the original dispatch boundary.
@@ -231,5 +252,44 @@ class ModelDispatch(BaseModel):
         """
         if inline and self.revision is not None:
             yield DeveloperInput(self.revision.content)
-        if self.reasoning is not None:
+        if self.reasoning is not None and not self.reasoning_after_checkpoint:
             yield self.reasoning
+
+
+class CompactionCoverage(BaseModel):
+    """Record retained references and middle coverage for a rebuilt context.
+
+    Args:
+        cut (int): Exclusive end of the summarized middle, omitting retained references.
+        opening (tuple[int, ...]): Canonical indices replayed ahead of the checkpoint.
+        tail (tuple[int, ...]): Canonical indices replayed after the checkpoint.
+        preserve_reasoning (bool): Retain compatible provider reasoning in the tail.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    cut: int = Field(ge=0)
+    opening: tuple[int, ...]
+    tail: tuple[int, ...]
+    preserve_reasoning: bool = False
+
+    def validate_frontier(self, source_end: int) -> None:
+        """Verify retained indices against the exclusive source-history end.
+
+        Args:
+            source_end (int): Captured canonical replay frontier.
+
+        Raises:
+            ValueError: A range overlaps, is unordered, or includes uncaptured history.
+        """
+        retained = (*self.opening, *self.tail)
+        if (
+            not 0 <= self.cut <= source_end
+            or tuple(sorted(set(self.opening))) != self.opening
+            or tuple(sorted(set(self.tail))) != self.tail
+            or len(set(retained)) != len(retained)
+            or any(index < 0 or index >= source_end for index in retained)
+            or any(index >= self.cut for index in self.opening)
+            or any(index not in self.tail for index in range(self.cut, source_end))
+        ):
+            raise ValueError("Invalid retained compaction ranges.")

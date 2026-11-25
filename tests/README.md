@@ -91,6 +91,8 @@ Keep test-created private names such as a synthetic `.env` in fresh Loop-owned s
 
 `unit/agent/test_context.py` checks sync and async request disclosure, timezone precedence, optional country detection, and the instruction budget using a recording backend. The configuration suites check the scope precedence of context overrides. `integration/test_timezone.py` checks POSIX timezone discovery against the native offset and covers an unnamed local timezone. It runs on macOS and Linux without privileged setup.
 
+The compaction suites cover retained history, checkpoint validation, and portable fallback. The backend tests use the actual OpenAI SDK transport with synthetic provider responses.
+
 ### Selecting individual tests
 
 Run an individual module or select end-to-end cases:

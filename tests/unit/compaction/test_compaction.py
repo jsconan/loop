@@ -1,380 +1,539 @@
-"""Tests for active conversation context compaction."""
+"""Exercise captured compaction ranges, fallback, and atomic context publication."""
 
 import asyncio
-from threading import get_ident
-from types import SimpleNamespace
+from dataclasses import replace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from loop import (
-    Agent,
-    Backend,
-    CompactionContextItem,
-    CompactionResult,
-    InstructionsManager,
-    Interaction,
-    Message,
-    ModelSelection,
-    Session,
-    SessionManager,
-    Usage,
-)
+from loop import Agent, Message, ModelSelection, Session, SessionManager
+from loop.agent import AgentContext
 from loop.compaction import ContextCompaction
-from loop.telemetry import MemoryTelemetryAdapter, Telemetry, set_telemetry
+from loop.configuration import ContextSettings
+from loop.instructions import InstructionsManager
+from loop.interaction import Interaction
+from loop.models import CompactionContextItem, CompactionResult, DeveloperInput, Usage
+from loop.session import ModelWindow, WindowSettings
 from loop.utils import PathHolder
+from tests.backend_doubles import model_backend
 
 
-def prepared_instructions():
-    """Build a provider of instructions for one reusable test agent definition."""
-    instructions = InstructionsManager()
-    agent = Agent("Assistant")
-    return lambda: instructions.prepare(agent)
+def _history(turns=7):
+    """Build unmistakable complete turns with an unfinished current request."""
+    return [
+        Message(role="user", content="opening"),
+        Message(role="user", content="opening addition"),
+        Message(role="assistant", content="first answer"),
+        *(
+            item
+            for turn in range(1, turns)
+            for item in (
+                Message(role="user", content=f"request {turn}"),
+                Message(role="assistant", content=f"answer {turn}"),
+            )
+        ),
+        Message(role="user", content="active request"),
+    ]
 
 
-def compaction_feature(
-    *,
-    session: Session | None = None,
-    compact: Mock | None = None,
-    threshold: float = 0.8,
-    instruction_provider=None,
-    instructions_async=None,
-):
-    """Build context compaction with isolated collaborators."""
-    manager = SessionManager(session=session)
-    backend = Mock(
-        spec=Backend,
-        compact=compact or Mock(),
-        default_model="model",
-        route="test-route",
-        instruction_layout=lambda model: "leading",
-        get_context_window=Mock(return_value=100),
+def _result(*, native=False):
+    """Produce a replacement block with billing distinct from generation context."""
+    item = (
+        CompactionContextItem(data={"type": "compaction", "encrypted_content": "opaque"})
+        if native
+        else Message(role="user", content="Middle summary")
     )
-    selection = ModelSelection(backend, manager)
+    return CompactionResult(
+        items=(item,), usage=Usage(input_tokens=100, output_tokens=10, total_tokens=110)
+    )
+
+
+def _feature(tmp_path, *, session=None, threshold=0.8):
+    """Compose a compactor around an isolated session and backend transport."""
+    owner = SessionManager(session=session)
+    backend = model_backend(
+        get_context_window=Mock(return_value=32768),
+        get_context_window_async=AsyncMock(return_value=32768),
+        instruction_layout=lambda model: "inline",
+    )
+    selection = ModelSelection(backend, owner)
     interaction = Mock(spec=Interaction)
-    instructions = InstructionsManager(project_instructions="instructions")
+    instructions = InstructionsManager(project_instructions="project guidance")
     agent = Agent("Assistant")
-    feature = ContextCompaction(
+    context = AgentContext(
+        agent,
         backend,
-        manager,
+        instructions,
+        owner,
         selection,
-        instruction_provider or (lambda: instructions.prepare(agent)),
-        interaction,
-        PathHolder("/project"),
-        threshold=threshold,
-        instructions_async=instructions_async,
+        PathHolder(tmp_path),
+        settings=ContextSettings(),
     )
-    return feature, manager, backend, interaction
+    feature = ContextCompaction(owner, context, interaction, tmp_path, threshold=threshold)
+    return feature, owner, backend, interaction, instructions, agent, context
 
 
 @pytest.mark.parametrize("threshold", [0, -0.1, 1.1])
-def test_compaction_rejects_invalid_thresholds(threshold):
+def test_rejects_invalid_thresholds(tmp_path, threshold):
     """Automatic utilization must be in the same range as configuration."""
     with pytest.raises(ValueError, match="greater than zero and at most one"):
-        compaction_feature(threshold=threshold)
+        _feature(tmp_path, threshold=threshold)
 
 
-def test_compaction_accepts_full_capacity():
-    """A threshold of one waits for usage to reach the reported capacity."""
+def test_threshold_accepts_full_capacity(tmp_path):
+    """A threshold of one compacts only when context reaches the reported limit."""
     session = Session(messages=[Message(role="user", content="request")], tokens=99)
-    feature, _, _, _ = compaction_feature(session=session, threshold=1)
+    feature, manager, *_ = _feature(tmp_path, session=session, threshold=1)
+    manager.context_window = 100
 
     assert not feature.needed()
     session.tokens = 100
     assert feature.needed()
 
 
-def test_compaction_detects_known_capacity_and_new_history():
-    """Automatic policy requires known capacity, sufficient usage, and uncompacted history."""
+def test_threshold_requires_known_capacity_and_usage(tmp_path):
+    """Automatic compaction needs a reported capacity and sufficient observed usage."""
     session = Session(messages=[Message(role="user", content="hello")], tokens=79)
-    feature, manager, backend, _ = compaction_feature(session=session)
-
+    feature, manager, *_ = _feature(tmp_path, session=session)
+    manager.context_window = 100
     assert feature.threshold == 0.8
     assert feature.can_compact() is True
     assert feature.needed() is False
     session.tokens = 80
     assert feature.needed() is True
-    manager.session.context_window = None
-    backend.get_context_window.return_value = None
+    manager.context_window = None
     assert feature.needed() is False
-
-
-def test_compaction_reconfigures_backend_and_threshold():
-    """Future compaction reads an owner-updated threshold and replacement backend."""
-    feature, _, backend, _ = compaction_feature(threshold=0.8)
-    replacement = Mock()
-
-    feature.backend = replacement
     feature.threshold = 0.7
-
-    assert feature.backend is replacement
     assert feature.threshold == 0.7
-    assert backend is not replacement
     feature.threshold = 1
     assert feature.threshold == 1
 
 
-def test_compaction_declines_absent_or_unneeded_context():
-    """Explicit and automatic requests avoid backend work when their policy is not satisfied."""
-    feature, _, backend, interaction = compaction_feature()
-
+def test_skips_no_context_and_empty_middle_needs_no_summary(tmp_path):
+    """Explicit rebuild can install instructions for an entirely retained window."""
+    feature, owner, backend, interaction, *_ = _feature(tmp_path)
     assert feature.compact() is False
     interaction.warning.assert_called_once_with("There is no new session context to compact.")
-    assert feature.compact(force=False) is False
-    backend.compact.assert_not_called()
-
-    session = Session(messages=[Message(role="user", content="hello")], tokens=79)
-    feature, _, backend, interaction = compaction_feature(session=session)
-    assert feature.compact(force=False) is False
+    owner.add_user_message("Only the active request")
     assert feature.compact_if_needed() is False
-    interaction.warning.assert_not_called()
-    backend.compact.assert_not_called()
-
-
-@pytest.mark.parametrize("unsupported", ["error", "empty", "no_items"])
-def test_compaction_reports_backend_that_cannot_produce_context(unsupported):
-    """Unsupported and unusable backend results leave active context unchanged."""
-    result = CompactionResult(items=()) if unsupported == "no_items" else None
-    compact = Mock(
-        side_effect=NotImplementedError if unsupported == "error" else None,
-        return_value=result,
-    )
-    session = Session(messages=[Message(role="user", content="hello")], tokens=80)
-    feature, _, _, interaction = compaction_feature(session=session, compact=compact)
-    telemetry = Telemetry(MemoryTelemetryAdapter(), flush_seconds=0.01)
-    if unsupported != "no_items":
-        set_telemetry(telemetry)
-
-    try:
-        assert feature.compact_if_needed() is False
-    finally:
-        telemetry.close(1)
-        set_telemetry(None)
-    assert session.compactions == []
-    assert interaction.warning.call_args.args[0].startswith("The selected backend")
-    if unsupported == "error":
-        unobserved, _, _, _ = compaction_feature(
-            session=Session(messages=[Message(role="user", content="hello")], tokens=80),
-            compact=Mock(side_effect=NotImplementedError),
-        )
-        assert unobserved.compact_if_needed() is False
-
-
-def test_compaction_persists_replacement_context_and_reports_usage():
-    """Successful compaction snapshots state and replaces model context without losing history."""
-    message = Message(role="user", content="hello")
-    item = CompactionContextItem(provider="openai", data={"type": "compaction"})
-    compact = Mock(
-        return_value=CompactionResult(
-            items=(item,),
-            usage=Usage(total_tokens=100),
-            context_tokens=20,
-        )
-    )
-    session = Session(messages=[message], tokens=80)
-    feature, manager, backend, interaction = compaction_feature(
-        session=session,
-        compact=compact,
-    )
-    telemetry = Telemetry(MemoryTelemetryAdapter(), flush_seconds=0.01)
-    set_telemetry(telemetry)
-
-    try:
-        assert feature.compact_if_needed() is True
-    finally:
-        telemetry.close(1)
-        set_telemetry(None)
-
-    assert session.messages == [message]
-    assert manager.model_context == [item]
-    assert session.tokens == 20
-    assert session.compactions[0].route == "test-route"
-    assert session.compactions[0].instructions.working_directory == "/project"
-    assert session.compactions[0].instructions.content.endswith("instructions")
-    assert "<agent_instructions" in session.compactions[0].instructions.content
-    backend.compact.assert_called_once_with(
-        [message],
-        instructions=session.compactions[0].instructions.content,
-        model="model",
-    )
-    interaction.info.assert_any_call("Compacted session context from 80 to 20 tokens.")
-
-
-def test_async_compaction_persists_replacement_context_after_backend_completion():
-    """Async compaction commits the owner state only after a complete backend result."""
-    result = CompactionResult(
-        items=(
-            CompactionContextItem(
-                provider="loop",
-                data={"role": "user", "content": "checkpoint"},
-            ),
-        ),
-        context_tokens=20,
-    )
-    session = Session(messages=[Message(role="user", content="hello")], tokens=80)
-    feature, manager, backend, interaction = compaction_feature(session=session)
-    previous_context = manager.model_context
-    backend.compact_async = AsyncMock(return_value=result)
-
-    applied = asyncio.run(feature.compact_if_needed_async())
-
-    assert applied is True
-    backend.compact_async.assert_awaited_once()
-    assert backend.compact_async.call_args.args[0] == previous_context
-    assert backend.compact_async.call_args.kwargs["instructions"]
-    assert backend.compact_async.call_args.kwargs["model"] == "model"
-    assert len(session.compactions) == 1
-    interaction.info.assert_any_call("Compacting session context...")
-
-
-def test_async_compaction_runs_legacy_instruction_provider_on_a_worker():
-    """The compatibility provider is isolated from the event-loop thread."""
-    session = Session(messages=[Message(role="user", content="hello")], tokens=80)
-    worker_threads = []
-    snapshot = prepared_instructions()()
-
-    def provide_instructions():
-        """Return the captured instruction snapshot and record provider ownership."""
-        worker_threads.append(get_ident())
-        return snapshot
-
-    feature, _, backend, _ = compaction_feature(
-        session=session,
-        instruction_provider=provide_instructions,
-    )
-    backend.compact_async = AsyncMock(return_value=CompactionResult(items=()))
-    owner_thread = get_ident()
-
-    asyncio.run(feature.compact_async())
-
-    assert worker_threads and worker_threads[0] != owner_thread
-
-
-def test_async_compaction_awaits_a_native_instruction_provider():
-    """A configured async instruction provider is awaited directly by compaction."""
-    session = Session(messages=[Message(role="user", content="hello")], tokens=80)
-    snapshot = prepared_instructions()()
-    instructions_async = AsyncMock(return_value=snapshot)
-    feature, _, backend, _ = compaction_feature(
-        session=session,
-        instructions_async=instructions_async,
-    )
-    backend.compact_async = AsyncMock(return_value=CompactionResult(items=()))
-
-    asyncio.run(feature.compact_async())
-
-    instructions_async.assert_awaited_once_with()
-
-
-def test_async_compaction_uses_the_explicit_prepared_snapshot():
-    """An explicit instruction snapshot bypasses both provider paths."""
-    session = Session(messages=[Message(role="user", content="hello")], tokens=80)
-    feature, _, backend, _ = compaction_feature(session=session)
-    backend.compact_async = AsyncMock(return_value=CompactionResult(items=()))
-    snapshot = prepared_instructions()()
-
-    asyncio.run(feature.compact_async(instructions=snapshot))
-
-    backend.compact_async.assert_awaited_once()
-    assert backend.compact_async.call_args.kwargs["instructions"] == snapshot.content
-
-
-def test_async_compaction_skips_absent_or_unneeded_context():
-    """Async compaction honors empty-history and utilization boundaries before backend work."""
-    feature, _, backend, interaction = compaction_feature()
-
-    assert asyncio.run(feature.compact_async()) is False
-    assert asyncio.run(feature.compact_async(force=False)) is False
-    assert asyncio.run(feature.compact_if_needed_async()) is False
-    interaction.warning.assert_called_once_with("There is no new session context to compact.")
-    backend.compact_async.assert_not_awaited()
-
-    session = Session(messages=[Message(role="user", content="hello")], tokens=79)
-    feature, _, backend, interaction = compaction_feature(session=session)
-    assert asyncio.run(feature.compact_async(force=False)) is False
-    assert asyncio.run(feature.compact_if_needed_async()) is False
-    interaction.warning.assert_not_called()
-    backend.compact_async.assert_not_awaited()
-
-
-def test_async_compaction_cancellation_does_not_commit_partial_context():
-    """Cancellation during model compaction leaves the active session history unchanged."""
-    session = Session(messages=[Message(role="user", content="hello")], tokens=80)
-    feature, _, backend, _ = compaction_feature(session=session)
-    started = asyncio.Event()
-
-    async def compact(*args, **kwargs):
-        """Pause after compaction starts so the test can cancel the operation."""
-        started.set()
-        await asyncio.Event().wait()
-
-    backend.compact_async = AsyncMock(side_effect=compact)
-
-    async def cancel_compaction():
-        """Cancel the backend request at a deterministic suspension point."""
-        task = asyncio.create_task(feature.compact_if_needed_async())
-        try:
-            await started.wait()
-            task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
-        finally:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-
-    asyncio.run(cancel_compaction())
-
-    assert session.compactions == []
-    assert session.messages == [Message(role="user", content="hello")]
-
-
-@pytest.mark.parametrize("unsupported", ["error", "empty", "no_items"])
-def test_async_compaction_reports_unavailable_backend_results(unsupported):
-    """Async compaction leaves history intact when the backend cannot produce a checkpoint."""
-    result = CompactionResult(items=()) if unsupported == "no_items" else None
-    compact = AsyncMock(
-        side_effect=NotImplementedError if unsupported == "error" else None,
-        return_value=result,
-    )
-    session = Session(messages=[Message(role="user", content="hello")], tokens=80)
-    feature, _, backend, interaction = compaction_feature(session=session)
-    backend.compact_async = compact
-
-    assert asyncio.run(feature.compact_if_needed_async()) is False
-
-    assert session.compactions == []
-    assert interaction.warning.call_args.args[0].startswith("The selected backend")
-
-
-def test_compaction_reports_success_without_remeasured_usage():
-    """Compaction confirms a checkpoint when the backend cannot report replacement usage."""
-    item = CompactionContextItem(provider="openai", data={"type": "compaction"})
-    session = Session(messages=[Message(role="user", content="hello")], tokens=20)
-    feature, _, _, interaction = compaction_feature(
-        session=session,
-        compact=Mock(return_value=CompactionResult(items=(item,))),
-    )
-
     assert feature.compact() is True
-    interaction.info.assert_any_call("Compacted session context.")
+    backend.compact.assert_not_called()
+    checkpoint = owner.session.compactions[-1]
+    assert checkpoint.context == ()
+    assert checkpoint.coverage.tail == (0,)
+    assert feature.compact() is False
+    assert feature.can_compact() is False
 
 
-def test_compaction_requires_an_effective_model():
-    """Compaction rejects configured sessions that cannot resolve an effective model."""
-    manager = SessionManager(session=Session(messages=[Message(role="user", content="hello")]))
-    backend = SimpleNamespace(
-        compact=Mock(),
-        default_model=None,
-        get_context_window=Mock(return_value=None),
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("outcome", ["unsupported", "empty"])
+def test_empty_or_unsupported_middle_result_keeps_previous_window(tmp_path, asynchronous, outcome):
+    """An unusable nonempty summary attempt leaves the source history and window eligible."""
+    feature, owner, backend, interaction, *_ = _feature(
+        tmp_path, session=Session(messages=_history(), tokens=29000)
     )
-    feature = ContextCompaction(
-        backend,
-        manager,
-        ModelSelection(backend, manager),
-        prepared_instructions(),
-        Mock(spec=Interaction),
-        PathHolder("/project"),
-    )
+    method = backend.compact_async if asynchronous else backend.compact
+    if outcome == "unsupported":
+        method.side_effect = NotImplementedError
+    else:
+        method.return_value = None
+    if asynchronous:
+        completed = asyncio.run(feature.compact_if_needed_async())
+    else:
+        completed = feature.compact_if_needed()
+    assert completed is False
+    assert owner.session.window is None
+    assert not owner.session.compactions
+    assert owner.tokens == 29000
+    problem = interaction.warning.call_args.args[0]
+    assert (
+        "does not support context compaction"
+        if outcome == "unsupported"
+        else "did not produce compacted context"
+    ) in problem
 
-    with pytest.raises(ValueError, match="No model was selected"):
-        feature.compact()
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_retains_opening_and_recent_turns_around_middle(tmp_path, asynchronous):
+    """The checkpoint replaces only the captured middle and estimates the whole generation."""
+    messages = _history()
+    feature, owner, backend, interaction, *_ = _feature(
+        tmp_path, session=Session(messages=messages, tokens=29000)
+    )
+    method = backend.compact_async if asynchronous else backend.compact
+    method.return_value = _result()
+    if asynchronous:
+        assert asyncio.run(feature.compact_if_needed_async())
+    else:
+        assert feature.compact_if_needed()
+    submitted = method.call_args.args[0]
+    assert [item.content for item in submitted] == [
+        "first answer",
+        "request 1",
+        "answer 1",
+        "request 2",
+        "answer 2",
+    ]
+    assert method.call_args.kwargs == {
+        "model": "default-model",
+        "prefix": True,
+    }
+    checkpoint = owner.session.compactions[-1]
+    assert checkpoint.boundary == len(messages)
+    assert checkpoint.coverage.opening == (0, 1)
+    assert checkpoint.coverage.tail == tuple(range(7, len(messages)))
+    assert checkpoint.input_tokens_before == 29000
+    assert checkpoint.input_tokens_after == owner.tokens > 10
+    reconstructed = owner.session.model_context()
+    assert isinstance(reconstructed[0], DeveloperInput)
+    assert "project guidance" in reconstructed[0].content
+    assert reconstructed[1:3] == messages[:2]
+    assert reconstructed[3] == _result().items[0]
+    assert reconstructed[4:] == messages[7:]
+    assert owner.messages == messages
+    assert "estimated" in interaction.info.call_args.args[0]
+
+
+def test_native_headroom_failure_uses_only_canonical_middle_for_portable_fallback(tmp_path):
+    """An unmeasurable opaque block never becomes durable continuation data."""
+    feature, owner, backend, *_ = _feature(
+        tmp_path, session=Session(messages=_history(), tokens=30000)
+    )
+    backend.compact.side_effect = [_result(native=True), _result()]
+    backend.estimate_generation = Mock(side_effect=[None, 1200])
+    assert feature.compact()
+    assert backend.compact.call_count == 2
+    assert backend.compact.call_args.kwargs["native"] is False
+    assert all(isinstance(item, Message) for item in backend.compact.call_args.args[0])
+    assert owner.session.compactions[-1].context == _result().items
+    assert owner.tokens == 1200
+
+
+def test_unfit_portable_candidate_keeps_original_context(tmp_path):
+    """An oversized rebuilt request does not replace a usable prior prefix."""
+    feature, owner, backend, interaction, *_ = _feature(
+        tmp_path, session=Session(messages=_history(), tokens=29000)
+    )
+    backend.compact.return_value = _result()
+    backend.estimate_generation = Mock(return_value=40000)
+    assert feature.compact() is False
+    assert not owner.session.compactions
+    assert "exceed the available context limit" in interaction.warning.call_args.args[0]
+
+
+def test_appended_input_replays_once_after_captured_frontier(tmp_path):
+    """A turn admitted while the provider summarizes is outside the checkpoint coverage."""
+    messages = _history()
+    feature, owner, backend, *_ = _feature(
+        tmp_path, session=Session(messages=messages, tokens=29000)
+    )
+    captured_end = len(messages)
+
+    async def complete(*args, **kwargs):
+        """Admit a new user item before the provider returns its summary."""
+        await owner.add_user_message_async("while compacting")
+        return _result()
+
+    backend.compact_async.side_effect = complete
+    assert asyncio.run(feature.compact_async())
+    assert owner.session.compactions[-1].boundary == captured_end
+    texts = [item.content for item in owner.model_context if isinstance(item, Message)]
+    assert texts.count("while compacting") == 1
+    assert texts[-2:] == ["active request", "while compacting"]
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_compaction_discards_a_result_when_the_active_session_was_replaced(tmp_path, asynchronous):
+    """A stale rebuild leaves the prior checkpoint and the replacement session intact."""
+    feature, owner, backend, interaction, *_ = _feature(
+        tmp_path, session=Session(messages=_history())
+    )
+    backend.compact.return_value = _result()
+    assert feature.compact()
+    original = owner.session
+    checkpoint = original.checkpoint()
+    owner.add_message(Message(role="assistant", content="finish earlier request"))
+    owner.add_user_message("another request")
+    replacement = Session(messages=[Message(role="user", content="Different conversation")])
+
+    def provider_result(*args, **kwargs):
+        """Replace the active snapshot before publishing the provider's result."""
+        owner.load_session(replacement)
+        return _result()
+
+    if asynchronous:
+        backend.compact_async = AsyncMock(side_effect=provider_result)
+        assert not asyncio.run(feature.compact_async())
+    else:
+        backend.compact.side_effect = provider_result
+        assert not feature.compact()
+
+    assert original.compactions == [checkpoint]
+    assert owner.session is replacement and not replacement.compactions
+    assert "changed during compaction" in interaction.warning.call_args.args[0]
+
+
+def test_async_cancellation_keeps_checkpoint_and_effective_window(tmp_path):
+    """Cancelling before provider completion leaves the committed prefix in place."""
+    feature, owner, backend, *_ = _feature(
+        tmp_path, session=Session(messages=_history(), tokens=29000)
+    )
+    backend.compact.return_value = _result()
+    assert feature.compact()
+    window = owner.session.window
+    checkpoint = owner.session.compactions[-1]
+    owner.add_message(Message(role="assistant", content="The active answer"))
+    owner.add_user_message("a new active request")
+
+    async def cancel_attempt():
+        """Cancel the task after the provider has received the captured plan."""
+        started = asyncio.Event()
+
+        async def wait_for_cancellation(*args, **kwargs):
+            """Leave provider completion pending until cancelled."""
+            started.set()
+            await asyncio.Event().wait()
+
+        backend.compact_async.side_effect = wait_for_cancellation
+        attempt = asyncio.create_task(feature.compact_async())
+        await started.wait()
+        attempt.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await attempt
+
+    asyncio.run(cancel_attempt())
+    assert owner.session.window == window
+    assert owner.session.compactions == [checkpoint]
+
+
+def test_bound_candidate_changes_are_atomic_with_validation(tmp_path):
+    """A stale instruction candidate never adopts its pending settings."""
+    feature, owner, backend, interaction, instructions, agent, context = _feature(tmp_path)
+    owner.add_user_message("opening")
+    assert feature.compact()
+    original = owner.session.window
+    candidate = ModelWindow(
+        id="candidate",
+        route=backend.route,
+        model="default-model",
+        layout="inline",
+        settings=WindowSettings(agent_name="Updated"),
+        baseline=instructions.prepare(replace(agent, identity="Updated")),
+        tools=(),
+    )
+    context.capture = Mock(return_value=candidate)
+    context.capture_async = AsyncMock(return_value=candidate)
+    context.check_rebuild = Mock(return_value=False)
+    context.apply_window = Mock()
+    assert not feature.compact()
+    assert owner.session.window == original
+    context.apply_window.assert_not_called()
+    assert "changed during compaction" in interaction.warning.call_args.args[0]
+    context.check_rebuild_async = AsyncMock(return_value=True)
+    assert asyncio.run(feature.compact_async())
+    assert owner.session.window.settings.agent_name == "Updated"
+    assert owner.session.compactions[0].boundary == owner.session.compactions[1].boundary
+    context.apply_window.assert_called_once_with(owner.session.window)
+
+
+def test_async_portable_rebuild_resumes_from_canonical_middle_when_native_count_is_unavailable(
+    tmp_path,
+):
+    """Async fallback estimates the portable rebuild before publishing the same capture."""
+    feature, owner, backend, *_ = _feature(
+        tmp_path, session=Session(messages=_history(), tokens=30000)
+    )
+    backend.compact_async.side_effect = [_result(native=True), _result()]
+    backend.estimate_generation_async = AsyncMock(side_effect=[None, 1200])
+    assert asyncio.run(feature.compact_async())
+    assert backend.compact_async.await_count == 2
+    assert backend.compact_async.call_args.kwargs["native"] is False
+    assert owner.session.compactions[-1].context == _result().items
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_lower_capacity_abandons_unfit_pending_prefix(tmp_path, asynchronous):
+    """An oversized instruction and tool prefix fails before any inference."""
+    feature, owner, backend, interaction, *_ = _feature(
+        tmp_path, session=Session(messages=_history(), tokens=30000)
+    )
+    owner.context_window = 16
+    if asynchronous:
+        assert not asyncio.run(feature.compact_async())
+    else:
+        assert not feature.compact()
+    interaction.warning.assert_called_once_with(
+        "Instructions and tools exceed the available context limit."
+    )
+    assert not owner.session.compactions
+    backend.compact.assert_not_called()
+    backend.compact_async.assert_not_called()
+
+
+def test_repeated_compaction_reuses_eligible_coverage_once(tmp_path):
+    """A later middle includes the previous checkpoint and each newly uncovered item once."""
+    feature, owner, backend, *_ = _feature(
+        tmp_path, session=Session(messages=_history(), tokens=30000)
+    )
+    backend.compact.return_value = _result()
+    assert feature.compact()
+    old = owner.session.compactions[-1]
+    owner.add_message(Message(role="assistant", content="finish active"))
+    owner.add_user_message("new active")
+    assert feature.compact()
+    input_items = backend.compact.call_args.args[0]
+    assert input_items[0] == old.context[0]
+    assert [item.content for item in input_items[1:]] == ["request 3", "answer 3"]
+    assert owner.session.compactions[-1].boundary > old.boundary
+
+
+def test_async_compaction_declines_to_pin_empty_fresh_history(tmp_path):
+    """Manual compaction before any input leaves the agent window unpinned."""
+    feature, owner, backend, *_ = _feature(tmp_path)
+    assert not asyncio.run(feature.compact_async())
+    assert owner.session.window is None
+    backend.compact_async.assert_not_called()
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("empty", [False, True])
+def test_portable_summary_without_reported_capacity(tmp_path, asynchronous, empty):
+    """Without a reported capacity, compaction uses a bounded, nonempty portable summary."""
+    feature, owner, backend, *_ = _feature(tmp_path, session=Session(messages=_history()))
+    owner.context_window = None
+    method = backend.compact_async if asynchronous else backend.compact
+    method.return_value = CompactionResult(items=()) if empty else _result()
+    if asynchronous:
+        outcome = asyncio.run(feature.compact_async())
+    else:
+        outcome = feature.compact()
+    assert outcome is not empty
+    assert method.call_args.kwargs["native"] is False
+    assert bool(owner.session.compactions) is not empty
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_portable_batches_stop_before_reusing_an_oversized_summary(tmp_path, asynchronous):
+    """A provider summary must fit alongside the next batch before Loop sends it."""
+    history = [
+        Message(role="user", content="first request"),
+        Message(role="assistant", content="x" * 33000),
+        Message(role="user", content="another historical request"),
+        Message(role="assistant", content="y" * 33000),
+        *_history(),
+    ]
+    feature, owner, backend, interaction, *_ = _feature(tmp_path, session=Session(messages=history))
+    owner.context_window = None
+    method = backend.compact_async if asynchronous else backend.compact
+    method.return_value = CompactionResult(items=(Message(role="user", content="z" * 90000),))
+
+    outcome = asyncio.run(feature.compact_async()) if asynchronous else feature.compact()
+
+    assert outcome is False
+    assert method.call_count == 1
+    interaction.warning.assert_called_once_with(
+        "The portable checkpoint exceeds the summary limit."
+    )
+    assert not owner.session.compactions
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_ineligible_native_output_is_replaced_once_with_portable_context(tmp_path, asynchronous):
+    """Replay compatibility is checked before estimating or writing a native candidate."""
+    feature, owner, backend, *_ = _feature(tmp_path, session=Session(messages=_history()))
+    backend.can_replay_checkpoint = Mock(side_effect=[False, True])
+    method = backend.compact_async if asynchronous else backend.compact
+    method.side_effect = [_result(native=True), _result()]
+    if asynchronous:
+        assert asyncio.run(feature.compact_async())
+    else:
+        assert feature.compact()
+    assert owner.session.compactions[-1].context == _result().items
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_repeated_native_compaction_uses_measured_cost_instead_of_wire_size(tmp_path, asynchronous):
+    """Opaque bytes do not disqualify a measured checkpoint from a repeated rebuild."""
+    feature, owner, backend, *_ = _feature(tmp_path, session=Session(messages=_history()))
+    native = CompactionContextItem(
+        data={"type": "compaction", "encrypted_content": "opaque" * 32000}
+    )
+    backend.compact.return_value = CompactionResult(items=(native,))
+    backend.estimate_generation = Mock(return_value=1000)
+    assert feature.compact()
+    owner.add_message(Message(role="assistant", content="finish earlier request"))
+    owner.add_user_message("another request")
+    method = backend.compact_async if asynchronous else backend.compact
+    method.return_value = _result()
+
+    if asynchronous:
+        assert asyncio.run(feature.compact_async())
+    else:
+        assert feature.compact()
+
+    assert method.call_args.args[0][0] == native
+    assert method.call_args.kwargs.get("native", True)
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_rejected_prior_checkpoint_restarts_summarization_from_canonical_history(
+    tmp_path,
+    asynchronous,
+):
+    """An opaque continuation error must not silently lose its covered canonical content."""
+    feature, owner, backend, *_ = _feature(tmp_path, session=Session(messages=_history()))
+    backend.compact.return_value = _result()
+    assert feature.compact()
+    owner.add_message(Message(role="assistant", content="finish earlier request"))
+    owner.add_user_message("another request")
+    method = backend.compact_async if asynchronous else backend.compact
+    method.side_effect = [None, _result()]
+    if asynchronous:
+        assert asyncio.run(feature.compact_async())
+    else:
+        assert feature.compact()
+    canonical = method.call_args.args[0]
+    assert all(isinstance(item, Message) for item in canonical)
+    assert canonical[0].content == "first answer"
+
+
+def test_async_unfit_or_stale_attempt_never_commits(tmp_path):
+    """Headroom and captured instruction checks both precede async persistence."""
+    feature, owner, backend, interaction, instructions, agent, context = _feature(
+        tmp_path, session=Session(messages=_history())
+    )
+    backend.compact_async.return_value = _result()
+    backend.estimate_generation_async = AsyncMock(side_effect=[99999, 1024])
+    assert not asyncio.run(feature.compact_async())
+    assert "context limit" in interaction.warning.call_args.args[0]
+    candidate = ModelWindow(
+        id="candidate",
+        route=backend.route,
+        model="default-model",
+        layout="inline",
+        settings=WindowSettings(agent_name="Assistant"),
+        baseline=instructions.prepare(agent),
+        tools=(),
+    )
+    context.capture_async = AsyncMock(return_value=candidate)
+    context.check_rebuild_async = AsyncMock(return_value=False)
+    assert not asyncio.run(feature.compact_async())
+    assert "changed during compaction" in interaction.warning.call_args.args[0]
+    assert not owner.session.compactions
+
+
+@pytest.mark.parametrize("eligible_before_planning", [False, True])
+def test_ineligible_earlier_coverage_is_not_used_to_compact_again(
+    tmp_path, eligible_before_planning
+):
+    """Previously stored provider blocks are optional when the active route cannot replay them."""
+    feature, owner, backend, *_ = _feature(tmp_path, session=Session(messages=_history()))
+    backend.compact.return_value = _result()
+    assert feature.compact()
+    owner.add_message(Message(role="assistant", content="finish earlier request"))
+    owner.add_user_message("another request")
+    backend.can_replay_checkpoint = Mock(
+        side_effect=[True, False, True] if eligible_before_planning else [False, True]
+    )
+    assert feature.compact()
+    assert all(isinstance(item, Message) for item in backend.compact.call_args.args[0])

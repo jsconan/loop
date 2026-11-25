@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import aclosing, closing, nullcontext
 from dataclasses import replace
 from datetime import UTC, datetime
+from pathlib import Path
 from threading import Barrier, Event, get_ident
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock, call, patch
@@ -26,7 +27,6 @@ from loop import (
     BackendResponseError,
     Compaction,
     CompactionContextItem,
-    CompactionResult,
     ConsoleInteraction,
     ContentArtifact,
     ContextReference,
@@ -60,7 +60,7 @@ from loop import (
     Usage,
 )
 from loop.constants import MAX_TOOL_RESULT_BYTES
-from loop.instructions import CapturedInstruction
+from loop.instructions import CapturedInstruction, PreparedInstructions
 from loop.interaction import Interaction, InteractionOutput
 from loop.session import (
     BackendSessionNameGenerator,
@@ -84,6 +84,7 @@ from loop.utils import (
     ensure_private_directory,
     sha256_digest,
     store_content,
+    utc_now,
 )
 from tests.scheduling import deliver_callbacks
 
@@ -519,18 +520,16 @@ def test_manager_replays_visible_session_items_in_durable_order():
             id="first",
             boundary=0,
             created_at=datetime(2026, 8, 16, tzinfo=UTC),
-            provider="test",
             model="model",
-            context=(CompactionContextItem(provider="test", data={}),),
+            context=(CompactionContextItem(data={}),),
             instructions=instructions,
         ),
         Compaction(
             id="second",
             boundary=3,
             created_at=datetime(2026, 8, 16, tzinfo=UTC),
-            provider="test",
             model="model",
-            context=(CompactionContextItem(provider="test", data={}),),
+            context=(CompactionContextItem(data={}),),
             instructions=instructions,
             input_tokens_before=12_345,
             input_tokens_after=678,
@@ -2253,31 +2252,65 @@ def test_load_session_revokes_in_memory_interactions_without_store_write():
     assert manager.session.events[-1].outcome == "revoked"
 
 
+def _model_window_candidate(
+    *, content=None, working_directory="/project", skills=(), references=(), tokens=None
+):
+    """Build a captured baseline and matching replacement context for session writes."""
+    item = Message(role="user", content="summary")
+    baseline = PreparedInstructions(
+        content=content or "",
+        generation=0,
+        working_directory=Path(working_directory),
+        active_skills=skills,
+        sections=(),
+        digest=sha256_digest(content or ""),
+    )
+    window = ModelWindow(
+        id="new-window",
+        route="test",
+        model="model",
+        layout="leading",
+        settings=WindowSettings(agent_name="Loop"),
+        baseline=baseline,
+        tools=(),
+        checkpoint_id="captured-checkpoint",
+    )
+    checkpoint = Compaction(
+        id="captured-checkpoint",
+        boundary=1,
+        created_at=utc_now(),
+        model="model",
+        context=(item,),
+        instructions=InstructionSnapshot(
+            working_directory=working_directory,
+            content=content,
+            digest=baseline.digest,
+            active_skills=skills,
+            references=references,
+        ),
+        input_tokens_before=90,
+        input_tokens_after=tokens,
+    )
+    return window, checkpoint
+
+
 def test_async_compaction_without_token_estimate_preserves_session_usage():
-    """Compaction checkpoints persist instruction state when no token estimate is returned."""
+    """The async writer persists the checkpoint and preserves existing usage if absent."""
     session = Session(messages=[Message(role="user", content="question")], tokens=48)
     store = MemorySessionStore()
     manager = SessionManager(session=session, session_store=store)
-    result = CompactionResult(
-        items=(CompactionContextItem(provider="loop", data={"content": "summary"}),),
-        context_tokens=None,
-    )
+    skills = (("guide", "/project/.agents/skills/guide"),)
+    window, checkpoint = _model_window_candidate(skills=skills)
 
     asyncio.run(
-        manager.add_compaction_async(
-            result,
-            model="model-a",
-            instructions=None,
-            working_directory="/project",
-            active_skills=(("guide", "/project/.agents/skills/guide"),),
-        )
+        manager.commit_model_window_async(session.id, None, None, window, checkpoint=checkpoint)
     )
 
     stored = store.load(session.id)
     assert stored.tokens == 48
-    assert len(stored.compactions) == 1
-    assert stored.compactions[0].context == result.items
-    assert stored.active_skills == [("guide", "/project/.agents/skills/guide")]
+    assert stored.window == window
+    assert stored.compactions == [checkpoint]
+    assert stored.active_skills == list(skills)
 
 
 def test_async_tool_result_bounds_large_output_without_a_matching_call():
@@ -3651,73 +3684,38 @@ def test_manager_exposes_context_metadata_and_validates_window_selection():
         manager.context_window = 0
 
 
-def test_manager_persists_compaction_with_instruction_and_skill_snapshot():
-    """Compaction atomically records replacement context and exact instruction state."""
+def test_manager_persists_checkpoint_and_window_together():
+    """Replacement context, exact instructions, provenance and usage share one write."""
     store = Mock(spec=SessionStore)
     session = Session(messages=[Message(role="user", content="hello")], tokens=90)
     manager = SessionManager(session=session, session_store=store)
-    result = CompactionResult(
-        items=(
-            CompactionContextItem(
-                provider="openai",
-                data={"type": "compaction", "encrypted_content": "opaque"},
-            ),
-        ),
-        usage=Usage(input_tokens=90, output_tokens=20, total_tokens=110),
-        context_tokens=20,
-    )
     reference = CapturedInstruction.capture(
         "/project/AGENTS.md",
         "project rules",
         workspace_id="workspace-id",
         workspace_root="/project",
     )
-
-    manager.add_compaction(
-        result,
-        model="model",
-        instructions="project rules",
-        working_directory="/project",
-        active_skills=iter([("review", "/skills/review/SKILL.md")]),
+    window, checkpoint = _model_window_candidate(
+        content="project rules",
+        tokens=20,
         references=(reference,),
+        skills=(("review", "/skills/review/SKILL.md"),),
     )
 
-    checkpoint = session.compactions[0]
-    assert manager.model_context == [*checkpoint.context]
-    assert checkpoint.boundary == 1
-    assert checkpoint.instructions.content == "project rules"
-    assert checkpoint.instructions.active_skills == (("review", "/skills/review/SKILL.md"),)
-    assert checkpoint.instructions.references == (reference,)
-    assert Session.deserialize(session.serialize()).compactions[0].instructions.references == (
-        reference,
-    )
-    assert checkpoint.input_tokens_before == 90
-    assert checkpoint.input_tokens_after == 20
+    manager.commit_model_window(session.id, None, None, window, checkpoint=checkpoint)
+
+    assert manager.model_context == list(checkpoint.context)
+    assert session.window == window
+    assert session.compactions == [checkpoint]
     assert session.tokens == 20
+    restored = Session.deserialize(session.serialize())
+    assert restored.compactions[0].instructions.references == (reference,)
+    assert restored.active_skills == [("review", "/skills/review/SKILL.md")]
     store.save.assert_called_once_with(session)
 
 
-def test_manager_preserves_usage_when_compaction_omits_token_counts():
-    """A compactor without usage metadata does not erase the latest known context usage."""
-    session = Session(messages=[Message(role="user", content="hello")], tokens=90)
-    manager = SessionManager(session=session)
-
-    manager.add_compaction(
-        CompactionResult(
-            items=(CompactionContextItem(provider="openai", data={"type": "compaction"}),)
-        ),
-        model="model",
-        instructions=None,
-        working_directory="/project",
-        active_skills=(),
-    )
-
-    assert session.tokens == 90
-    assert session.compactions[0].input_tokens_after is None
-
-
 def test_manager_rolls_back_compaction_when_persistence_fails():
-    """A failed checkpoint write restores all prior in-memory session state."""
+    """A failed checkpoint write restores all prior in-memory model state."""
     store = Mock(spec=SessionStore)
     store.save.side_effect = OSError("disk full")
     session = Session(
@@ -3727,24 +3725,37 @@ def test_manager_rolls_back_compaction_when_persistence_fails():
         active_skills=[("old", "/skills/old/SKILL.md")],
     )
     manager = SessionManager(session=session, session_store=store)
-
+    window, checkpoint = _model_window_candidate(
+        content="new rules",
+        working_directory="/new",
+        tokens=20,
+        skills=(("new", "/skills/new/SKILL.md"),),
+    )
     with pytest.raises(OSError, match="disk full"):
-        manager.add_compaction(
-            CompactionResult(
-                items=(CompactionContextItem(provider="openai", data={"type": "compaction"}),),
-                usage=Usage(total_tokens=110),
-                context_tokens=20,
-            ),
-            model="model",
-            instructions="new rules",
-            working_directory="/new",
-            active_skills=(("new", "/skills/new/SKILL.md"),),
-        )
-
+        manager.commit_model_window(session.id, None, None, window, checkpoint=checkpoint)
     assert session.compactions == []
+    assert session.window is None
     assert session.tokens == 90
     assert session.instruction_working_directory == "/old"
     assert session.active_skills == [("old", "/skills/old/SKILL.md")]
+
+
+def test_model_window_writer_refuses_stale_captures():
+    """A different owner, checkpoint or conversation frontier cannot publish a dispatch."""
+    manager = SessionManager()
+    manager.add_user_message("active")
+    session = manager.session
+    window, checkpoint = _model_window_candidate()
+    with pytest.raises(ValueError, match="session context changed"):
+        manager.commit_model_window("stale-owner", None, None, window)
+    with pytest.raises(ValueError, match="checkpoint does not match"):
+        manager.commit_model_window(
+            session.id, None, None, window, checkpoint=checkpoint.model_copy(update={"model": "x"})
+        )
+    dispatch = ModelDispatch(id="dispatch", window_id=window.id, position=0)
+    with pytest.raises(ValueError, match="session history changed"):
+        manager.commit_model_window(session.id, None, None, window, dispatch=dispatch)
+    assert session.window is None and not session.dispatches
 
 
 @pytest.mark.parametrize("method", ["add_message", "add_messages"])

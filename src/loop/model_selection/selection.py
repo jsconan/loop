@@ -47,6 +47,7 @@ class ModelSelection:
     _async_blocking_runner: Callable[..., Awaitable[Any]] | None
     _available_models: list[ModelInfo] | None
     _available_models_expires_at: float
+    _resolved_assignment: tuple[Backend, ModelAssignment] | None
     preference: str | None
 
     def __init__(
@@ -65,6 +66,7 @@ class ModelSelection:
         self._async_blocking_runner = async_blocking_runner
         self._available_models = None
         self._available_models_expires_at = 0.0
+        self._resolved_assignment = None
         if self._selected is not None or backend.default_model is not None:
             self.synchronize_session()
 
@@ -88,7 +90,7 @@ class ModelSelection:
 
     @backend.setter
     def backend(self, backend: Backend) -> None:
-        """Replace the model backend and discard its cached catalog.
+        """Replace the model backend and discard its cached metadata.
 
         Args:
             backend (Backend): Fully configured replacement backend.
@@ -96,6 +98,7 @@ class ModelSelection:
         self._backend = backend
         self._available_models = None
         self._available_models_expires_at = 0.0
+        self._resolved_assignment = None
 
     @property
     def effective(self) -> str:
@@ -123,6 +126,20 @@ class ModelSelection:
             ModelSelectionError: If neither this selection nor the backend provides a model.
         """
         return self.resolve_assignment(self._backend, self.effective)
+
+    @property
+    def context_window(self) -> int | None:
+        """Return the already resolved capacity of the selected target.
+
+        Returns:
+            int | None: Capacity for the current backend and requested model, if known.
+        """
+        resolved = self._resolved_assignment
+        if resolved is not None and resolved[0] is self._backend:
+            assignment = resolved[1]
+            if assignment.model == (self._selected or self._backend.default_model):
+                return assignment.context_window
+        return None
 
     @classmethod
     def resolve_assignment(cls, backend: Backend, model: str) -> ModelAssignment:
@@ -306,7 +323,9 @@ class ModelSelection:
         Raises:
             ModelSelectionError: If neither the selection nor backend defines a model.
         """
-        self._session_manager.refresh_model_context(self._backend.route, self.assignment)
+        assignment = self.assignment
+        self._resolved_assignment = (self._backend, assignment)
+        self._session_manager.refresh_model_context(self._backend.route, assignment)
 
     async def synchronize_session_async(self) -> None:
         """Synchronize the active session using native asynchronous model metadata.
@@ -321,6 +340,7 @@ class ModelSelection:
         """
         backend = self._backend
         assignment = await self.resolve_assignment_async(backend, self.effective)
+        self._resolved_assignment = (backend, assignment)
         self._session_manager.refresh_model_context(backend.route, assignment)
 
     def select_fallback(self, interaction: Interaction) -> bool:

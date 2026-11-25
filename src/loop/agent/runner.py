@@ -20,7 +20,6 @@ from ..backend import (
     BackendRepetitionError,
 )
 from ..compaction import ContextCompaction
-from ..configuration import ContextSettings
 from ..control import RunControl, RunInterrupted, RunStopRequested
 from ..errors import Problem, ProblemException, log_problem
 from ..instructions import InstructionBudgetExceededError, InstructionsManager
@@ -86,8 +85,7 @@ class AgentRunner:
     """Run a configured agent against one conversation session.
 
     Args:
-        agent (Agent): Reusable agent definition to execute.
-        backend (Backend): Backend used to produce model responses.
+        request_context (AgentContext): Owner of the next model request and its window.
         instructions_manager (InstructionsManager): Contextual instruction aggregation service.
         permission_manager (PermissionManager): Host policy authorizing tool effects.
         session_manager (SessionManager): Manager owning conversation history and persistence.
@@ -106,7 +104,6 @@ class AgentRunner:
         async_blocking_runner (Callable[..., Awaitable[Any]] | None): Application-owned bounded
             worker for local synchronous preparation during async runs. Defaults to a shared
             bounded process worker.
-        context_settings (ContextSettings | None): Effective disclosure and clock preferences.
 
     Raises:
         ValueError: If ``max_turns`` is negative.
@@ -132,8 +129,7 @@ class AgentRunner:
 
     def __init__(
         self,
-        agent: Agent,
-        backend: Backend,
+        request_context: AgentContext,
         instructions_manager: InstructionsManager,
         permission_manager: PermissionManager,
         session_manager: SessionManager,
@@ -148,7 +144,6 @@ class AgentRunner:
         prompt_on_recoverable_error: bool = True,
         run_control: RunControl | None = None,
         async_blocking_runner: Callable[..., Awaitable[Any]] | None = None,
-        context_settings: ContextSettings | None = None,
     ) -> None:
         if max_turns < 0:
             raise ValueError("Agent max turns must be non-negative.")
@@ -168,17 +163,7 @@ class AgentRunner:
         self._file_observations = None
         self._response_target = None
         self._async_blocking_runner = async_blocking_runner
-        self._request_context = AgentContext(
-            agent,
-            backend,
-            instructions_manager,
-            session_manager,
-            model_selection,
-            working_directory,
-            settings=(
-                context_settings or ContextSettings(timezone=agent.tools.registry.settings.timezone)
-            ),
-        )
+        self._request_context = request_context
         self._request_context.apply_window(session_manager.session.window)
 
     @property
@@ -1537,7 +1522,7 @@ class AgentRunner:
         self._checkpoint(steer=True)
         context = self._request_context
         request = context.prepare(recovery)
-        if request.may_compact and self._compaction.compact_if_needed(request.snapshot):
+        if request.may_compact and self._compaction.compact_if_needed():
             request = context.prepare(recovery)
         self._checkpoint(steer=True)
         model_context = request.backend.prepare_context(
@@ -1606,7 +1591,7 @@ class AgentRunner:
         await self._checkpoint_async(steer=True)
         context = self._request_context
         request = await context.prepare_async(recovery)
-        if request.may_compact and await self._compaction.compact_if_needed_async(request.snapshot):
+        if request.may_compact and await self._compaction.compact_if_needed_async():
             request = await context.prepare_async(recovery)
         await self._checkpoint_async(steer=True)
         model_context = request.backend.prepare_context(
