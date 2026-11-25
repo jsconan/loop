@@ -46,6 +46,8 @@ def compaction_feature(
         spec=Backend,
         compact=compact or Mock(),
         default_model="model",
+        route="test-route",
+        instruction_layout=lambda model: "leading",
         get_context_window=Mock(return_value=100),
     )
     selection = ModelSelection(backend, manager)
@@ -176,6 +178,7 @@ def test_compaction_persists_replacement_context_and_reports_usage():
     assert session.messages == [message]
     assert manager.model_context == [item]
     assert session.tokens == 20
+    assert session.compactions[0].route == "test-route"
     assert session.compactions[0].instructions.working_directory == "/project"
     assert session.compactions[0].instructions.content.endswith("instructions")
     assert "<agent_instructions" in session.compactions[0].instructions.content

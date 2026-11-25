@@ -17,7 +17,7 @@ from re import fullmatch
 from threading import Lock, RLock, get_ident
 from typing import Any
 
-from ..errors import Problem, log_problem
+from ..errors import Problem, ProblemException, log_problem
 from ..instructions.models import CapturedInstruction
 from ..interaction import ConsoleInteraction, Interaction, InteractionOutput, ResponsePresenter
 from ..models import (
@@ -26,6 +26,7 @@ from ..models import (
     ContentArtifact,
     ContextReference,
     ConversationItem,
+    InstructionLayout,
     Message,
     ModelAssignment,
     ModelContextItem,
@@ -94,9 +95,10 @@ from .models import (
     ToolExecutionCompletedEvent,
     ToolExecutionStartedEvent,
 )
-from .naming import initial_session_name
+from .naming import BackendSessionNameGenerator, initial_session_name
 from .session import Session
 from .store import MemorySessionStore, SessionStore, WorkingDirectoryBinding
+from .window import ModelDispatch, ModelWindow
 
 type ExecutionKey = tuple[tuple[str, str | int], str]
 type ExecutionOwner = tuple[int, int, int | None]
@@ -152,6 +154,7 @@ class SessionManager:
     _async_blocking_runner: Callable[..., Awaitable[Any]] | None
     _response_persisted_observers: list[tuple[object, Callable[[ResponsePersisted], None]]]
     _response_persisted_observers_lock: Lock
+    _allowed_model_route: tuple[str, str] | None
     _persistence_lock: Lock
     _commit_lock: Lock
     _async_commit_lock: asyncio.Lock
@@ -174,6 +177,7 @@ class SessionManager:
         self._async_blocking_runner = async_blocking_runner
         self._response_persisted_observers = []
         self._response_persisted_observers_lock = Lock()
+        self._allowed_model_route = None
         self._persistence_lock = Lock()
         self._commit_lock = Lock()
         self._async_commit_lock = asyncio.Lock()
@@ -795,6 +799,19 @@ class SessionManager:
         """
         self._session.assignment = value
 
+    def refresh_model_context(self, route: str, target: ModelAssignment | None) -> None:
+        """Refresh context capacity and retain the saved provider assignment.
+
+        Args:
+            route (str): Deployment serving the selected model.
+            target (ModelAssignment | None): Selected model and known capacity, when available.
+        """
+        window = self._session.window
+        if window is None:
+            self.assignment = target
+        elif target is not None and (route, target.model) == (window.route, window.model):
+            self._session.context_window = target.context_window
+
     @property
     def model_context(self) -> list[ModelContextItem]:
         """Return hydrated context bounded by the latest compaction checkpoint.
@@ -807,7 +824,7 @@ class SessionManager:
             ValueError: If referenced content is missing, corrupt, or inconsistent with its
                 occurrence metadata.
         """
-        return self._hydrate_model_context(self._session.model_context(), self._session_store)
+        return self.hydrate_context(self._session.model_context())
 
     async def model_context_async(self) -> list[ModelContextItem]:
         """Return hydrated context after loading immutable references in a bounded worker.
@@ -821,9 +838,42 @@ class SessionManager:
                 occurrence metadata.
             asyncio.CancelledError: If reference loading is cancelled after it settles.
         """
-        context = deepcopy(self._session.model_context())
+        return await self.hydrate_context_async(self._session.model_context())
+
+    def hydrate_context(self, context: list[ModelContextItem]) -> list[ModelContextItem]:
+        """Verify and hydrate attachments in a planned provider context.
+
+        Args:
+            context (list[ModelContextItem]): Staged canonical and model-only items.
+
+        Returns:
+            list[ModelContextItem]: Context with its immutable payloads materialized.
+
+        Raises:
+            ValueError: A referenced payload is missing or disagrees with its identity.
+        """
+        return self._hydrate_model_context(context, self._session_store)
+
+    async def hydrate_context_async(
+        self,
+        context: list[ModelContextItem],
+    ) -> list[ModelContextItem]:
+        """Verify and hydrate planned context in a bounded worker.
+
+        Args:
+            context (list[ModelContextItem]): Staged canonical and model-only items.
+
+        Returns:
+            list[ModelContextItem]: Detached context with verified payloads.
+
+        Raises:
+            ValueError: A referenced payload is missing or disagrees with its identity.
+            asyncio.CancelledError: Attachment verification was cancelled.
+        """
         return await self._run_blocking_async(
-            self._hydrate_model_context, context, self._session_store
+            self._hydrate_model_context,
+            deepcopy(context),
+            self._session_store,
         )
 
     @staticmethod
@@ -1264,19 +1314,19 @@ class SessionManager:
 
     @property
     def model(self) -> str | None:
-        """Return the model explicitly selected for requests.
+        """Return the model recorded for the active session.
 
         Returns:
-            str | None: The selected model, or ``None`` when the backend default is used.
+            str | None: Recorded model, or ``None`` when unknown.
         """
         return self._session.model
 
     @model.setter
     def model(self, value: str | None) -> None:
-        """Set the model explicitly selected for requests.
+        """Set the model recorded for the active session.
 
         Args:
-            value (str | None): The model to use, or ``None`` to use the backend default.
+            value (str | None): Model to retain, or ``None`` to clear it.
         """
         self._session.model = value
 
@@ -1317,6 +1367,7 @@ class SessionManager:
         result: CompactionResult,
         *,
         model: str,
+        route: str | None = None,
         instructions: str | None,
         working_directory: str,
         active_skills: Iterable[tuple[str, str]],
@@ -1327,6 +1378,7 @@ class SessionManager:
         Args:
             result (CompactionResult): Replacement context and reported token usage.
             model (str): Model used to compact the active context.
+            route (str | None): Identified deployment that produced the checkpoint.
             instructions (str | None): Complete instructions supplied to the compactor.
             working_directory (str): Effective instruction-discovery directory.
             active_skills (Iterable[tuple[str, str]]): Active skill identities.
@@ -1347,6 +1399,7 @@ class SessionManager:
             created_at=utc_now(),
             provider=provider,
             model=model,
+            route=route,
             context=result.items,
             instructions=InstructionSnapshot(
                 working_directory=working_directory,
@@ -1372,6 +1425,7 @@ class SessionManager:
         result: CompactionResult,
         *,
         model: str,
+        route: str | None = None,
         instructions: str | None,
         working_directory: str,
         active_skills: Iterable[tuple[str, str]],
@@ -1382,6 +1436,7 @@ class SessionManager:
         Args:
             result (CompactionResult): Replacement context and reported token usage.
             model (str): Model used to compact the active context.
+            route (str | None): Identified deployment that produced the checkpoint.
             instructions (str | None): Complete instructions supplied to the compactor.
             working_directory (str): Effective instruction-discovery directory.
             active_skills (Iterable[tuple[str, str]]): Active skill identities.
@@ -1400,6 +1455,7 @@ class SessionManager:
             created_at=utc_now(),
             provider=provider,
             model=model,
+            route=route,
             context=result.items,
             instructions=InstructionSnapshot(
                 working_directory=working_directory,
@@ -1419,6 +1475,178 @@ class SessionManager:
             session.update_instruction_state(working_directory, identities)
 
         await self._commit_async(apply)
+
+    def allow_model_route(self, route: str) -> None:
+        """Authorize an explicitly selected route for the active session.
+
+        Args:
+            route (str): Deployment selected by the user.
+        """
+        with self._state_lock:
+            self._allowed_model_route = (self._session.id, route)
+
+    def require_model_route(self, route: str) -> None:
+        """Check the active session's authorization before exposing its history.
+
+        Args:
+            route (str): Deployment about to receive session history.
+
+        Raises:
+            ProblemException: The saved deployment is unavailable and the user has
+                not authorized this route for the active session.
+        """
+        with self._state_lock:
+            session = self._session
+            if (
+                session.window is not None
+                and session.window.route != route
+                and self._allowed_model_route != (session.id, route)
+            ):
+                raise ProblemException(
+                    Problem(
+                        code="agent.route_unavailable",
+                        title="Could not continue the session",
+                        detail=(
+                            "The saved model route is unavailable. Select a model or configure "
+                            "an explicit provider switch before continuing this session."
+                        ),
+                        operation="prepare_model_context",
+                    )
+                )
+
+    def compaction_context(
+        self,
+        route: str,
+        model: str,
+        layout: InstructionLayout,
+    ) -> list[ModelContextItem]:
+        """Select authorized canonical compaction input before artifact hydration.
+
+        Args:
+            route (str): Target deployment identifier.
+            model (str): Requested model.
+            layout (InstructionLayout): Target developer instruction placement.
+
+        Returns:
+            list[ModelContextItem]: Eligible conversation items and checkpoint.
+
+        Raises:
+            ProblemException: The target is unauthorized to receive this session.
+        """
+        with self._state_lock:
+            self.require_model_route(route)
+            return self._session.compaction_context(route, model, layout)
+
+    def commit_model_window(
+        self,
+        session_id: str,
+        previous_window: str | None,
+        previous_checkpoint: str | None,
+        window: ModelWindow,
+        *,
+        dispatch: ModelDispatch,
+    ) -> None:
+        """Persist a model dispatch against the captured session and prefix.
+
+        Args:
+            session_id (str): Expected active session.
+            previous_window (str | None): Expected current window identifier.
+            previous_checkpoint (str | None): Expected current checkpoint identifier.
+            window (ModelWindow): Window receiving the dispatch.
+            dispatch (ModelDispatch): Logical dispatch to bind before transport.
+
+        Raises:
+            ValueError: The captured model state is stale or inconsistent.
+        """
+        self._commit(
+            lambda session: self._apply_model_window(
+                session,
+                session_id,
+                previous_window,
+                previous_checkpoint,
+                window,
+                dispatch,
+            )
+        )
+
+    async def commit_model_window_async(
+        self,
+        session_id: str,
+        previous_window: str | None,
+        previous_checkpoint: str | None,
+        window: ModelWindow,
+        *,
+        dispatch: ModelDispatch,
+    ) -> None:
+        """Persist a planned model window through the asynchronous writer.
+
+        Args:
+            session_id (str): Expected active session.
+            previous_window (str | None): Expected current window identifier.
+            previous_checkpoint (str | None): Expected current checkpoint identifier.
+            window (ModelWindow): Window receiving the dispatch.
+            dispatch (ModelDispatch): Logical dispatch to bind before transport.
+
+        Raises:
+            ValueError: The captured model state is stale or inconsistent.
+            asyncio.CancelledError: The write was cancelled after persistence settled.
+        """
+        await self._commit_async(
+            lambda session: self._apply_model_window(
+                session,
+                session_id,
+                previous_window,
+                previous_checkpoint,
+                window,
+                dispatch,
+            )
+        )
+
+    @staticmethod
+    def _apply_model_window(
+        session: Session,
+        session_id: str,
+        previous_window: str | None,
+        previous_checkpoint: str | None,
+        window: ModelWindow,
+        dispatch: ModelDispatch,
+    ) -> None:
+        """Validate the captured dispatch before changing canonical state."""
+        previous = session.window
+        active_window = previous.id if previous is not None else None
+        checkpoint_in_use = session.checkpoint()
+        active_checkpoint = checkpoint_in_use.id if checkpoint_in_use is not None else None
+        if (session.id, active_window, active_checkpoint) != (
+            session_id,
+            previous_window,
+            previous_checkpoint,
+        ):
+            raise ValueError("The session context changed before its model window was saved.")
+        if dispatch.position != len(session.messages) or dispatch.window_id != window.id:
+            raise ValueError("The session history changed before model dispatch.")
+        if previous is not None and window.id == previous.id:
+            if previous.follows_default != window.follows_default:
+                session.windows[-1] = previous.model_copy(
+                    update={"follows_default": window.follows_default},
+                )
+        else:
+            if active_checkpoint != window.checkpoint_id or (
+                previous is not None
+                and (previous.route, previous.model) != (window.route, window.model)
+            ):
+                session.tokens = 0
+            session.windows.append(window)
+        session.dispatches.append(dispatch)
+        session.pending_dispatch = dispatch.id
+        if dispatch.revision is not None:
+            snapshot = dispatch.revision.snapshot
+        elif window.id != active_window:
+            snapshot = window.baseline
+        else:
+            return
+        if snapshot.working_directory is not None:
+            session.instruction_working_directory = str(snapshot.working_directory)
+        session.active_skills = list(snapshot.active_skills)
 
     def load_session(self, session: Session | str) -> None:
         """Load a session from the store.
@@ -1563,15 +1791,15 @@ class SessionManager:
     def new_session(self) -> None:
         """Replace the idle session and select its isolated working directory when bound.
 
+        The new session starts without a model assignment.
+
         Raises:
             SessionExecutionConflictError: If this manager is currently executing a session.
             ValueError: Bound working storage is aliased, not private, or owned by another user.
             OSError: The working directory cannot be created or inspected.
         """
         with self._state_lock:
-            self._select_session(
-                Session(model=self._session.model, workspace_id=self._workspace_id)
-            )
+            self._select_session(Session(workspace_id=self._workspace_id))
 
     def rename_session(self, name: str) -> None:
         """Assign and persist a user-controlled name to the active session.
@@ -1624,7 +1852,8 @@ class SessionManager:
             if context is None:
                 self._interaction.info("No completed exchange found to generate a session name.")
                 return
-            if not self._is_current_name_context(
+            if not self._can_generate_session_name(
+                generator,
                 context,
                 require_initial_name=require_initial_name,
             ):
@@ -1689,7 +1918,8 @@ class SessionManager:
             if context is None:
                 self._interaction.info("No completed exchange found to generate a session name.")
                 return
-            if not self._is_current_name_context(
+            if not self._can_generate_session_name(
+                generator,
                 context,
                 require_initial_name=require_initial_name,
             ):
@@ -1777,16 +2007,26 @@ class SessionManager:
             model=session.model,
         )
 
-    def _is_current_name_context(
+    def _can_generate_session_name(
         self,
+        generator: SessionNameGenerator,
         context: SessionNameContext,
         *,
         require_initial_name: bool,
     ) -> bool:
-        """Return whether a captured request still matches the active session and name state."""
-        return self._session.id == context.session_id and (
-            not require_initial_name or self._session.has_initial_name()
-        )
+        """Check that this exchange still belongs to the session and can reach its backend."""
+        try:
+            with self._state_lock:
+                if self._session.id != context.session_id or (
+                    require_initial_name and not self._session.has_initial_name()
+                ):
+                    return False
+                if isinstance(generator, BackendSessionNameGenerator):
+                    self.require_model_route(generator.backend.route)
+        except ProblemException as error:
+            self._interaction.report(error.problem)
+            return False
+        return True
 
     @staticmethod
     def _rename_generated_session(

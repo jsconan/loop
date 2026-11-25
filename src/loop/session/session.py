@@ -1,6 +1,7 @@
 """Define the session persistence contract."""
 
 import json
+from collections import defaultdict, deque
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -12,6 +13,7 @@ from pydantic import TypeAdapter, ValidationError
 from ..models import (
     AgentRunStopReason,
     ConversationItem,
+    InstructionLayout,
     Message,
     ModelAssignment,
     ModelContextItem,
@@ -60,8 +62,9 @@ from .models import (
     UnsupportedConversationItemError,
 )
 from .naming import initial_session_name, normalize_session_name, validate_session_source
+from .window import ModelDispatch, ModelWindow
 
-_SCHEMA_VERSION = 16
+_SCHEMA_VERSION = 17
 _EVENT_ADAPTER = TypeAdapter(SessionEvent)
 _ITEM_TYPES = {
     "message": Message,
@@ -98,6 +101,9 @@ class Session:
             Defaults to an empty list.
         events (list[SessionEvent]): Ordered durable replay and observability events.
             Defaults to an empty list.
+        windows (list[ModelWindow]): Immutable baseline and settings for each model window.
+        dispatches (list[ModelDispatch]): Committed model-only updates in dispatch order.
+        pending_dispatch (str | None): Unsettled logical request, if any.
         revision (int): Store-managed persisted snapshot revision. New sessions start at zero.
     """
 
@@ -113,6 +119,9 @@ class Session:
     instruction_working_directory: str | None = None
     active_skills: list[tuple[str, str]] = field(default_factory=list)
     events: list[SessionEvent] = field(default_factory=list)
+    windows: list[ModelWindow] = field(default_factory=list)
+    dispatches: list[ModelDispatch] = field(default_factory=list)
+    pending_dispatch: str | None = None
     revision: int = field(default=0, compare=False, repr=False)
 
     @property
@@ -209,7 +218,7 @@ class Session:
         self.name_source = source
 
     def add_message(self, message: ConversationItem | Response) -> None:
-        """Add one message to the conversation history.
+        """Record a conversation item or completed response with its model metadata.
 
         Args:
             message (ConversationItem | Response): Conversation item to add.
@@ -219,12 +228,15 @@ class Session:
         """
         if isinstance(message, Response):
             validated = [self._get_message(item) for item in message.items]
+            self.pending_dispatch = None
             for item in validated:
                 self.messages.append(item)
                 if not isinstance(item, ToolCall):
                     self._add_conversation_event(len(self.messages) - 1)
             if message.usage.total_tokens is not None:
                 self.tokens = message.usage.total_tokens
+            if message.assignment is not None:
+                self.assignment = message.assignment
         else:
             self.add_messages((message,))
 
@@ -313,6 +325,172 @@ class Session:
                 compaction_index=len(self.compactions) - 1,
             )
         )
+
+    @property
+    def window(self) -> ModelWindow | None:
+        """Return the committed model window.
+
+        Returns:
+            ModelWindow | None: Current baseline and prefix settings, when established.
+        """
+        return self.windows[-1] if self.windows else None
+
+    def model_dispatches(self, window: ModelWindow) -> tuple[ModelDispatch, ...]:
+        """Return committed dispatches that belong to a window.
+
+        Args:
+            window (ModelWindow): Window whose dispatches should replay.
+
+        Returns:
+            tuple[ModelDispatch, ...]: Ordered matching records.
+        """
+        return tuple(record for record in self.dispatches if record.window_id == window.id)
+
+    def generation_context(
+        self,
+        *,
+        window: ModelWindow,
+        dispatch: ModelDispatch | None = None,
+    ) -> list[ModelContextItem]:
+        """Project bounded context with model-only updates at their original positions.
+
+        Args:
+            window (ModelWindow): Candidate window owning generation input.
+            dispatch (ModelDispatch | None): Staged, uncommitted logical dispatch to project.
+
+        Returns:
+            list[ModelContextItem]: Baseline, eligible checkpoint and history, and model updates.
+        """
+        checkpoint = self.checkpoint(window)
+        records = list(self.model_dispatches(window))
+        if dispatch is not None:
+            records.append(dispatch)
+        context: list[ModelContextItem] = []
+        inline = window.layout != "leading"
+        if inline:
+            context.append(window.baseline_item())
+        frontier = checkpoint.boundary if checkpoint is not None else 0
+        if checkpoint is not None:
+            context.extend(checkpoint.context)
+        indices = range(frontier, len(self.messages))
+        projected = self._project_history(indices, rebuilt_end=window.provider_state_start)
+
+        record_positions: dict[int, list[ModelContextItem]] = {}
+        for record in records:
+            items = record_positions.setdefault(record.position, [])
+            items.extend(record.model_items(inline=inline))
+        for index in range(frontier, len(self.messages)):
+            context.extend(record_positions.get(index, ()))
+            if index in projected:
+                context.append(projected[index])
+        context.extend(record_positions.get(len(self.messages), ()))
+        return context
+
+    def checkpoint(self, window: ModelWindow | None = None) -> Compaction | None:
+        """Find the latest checkpoint or the checkpoint pinned by a model window.
+
+        Args:
+            window (ModelWindow | None): Candidate window owning generation input.
+
+        Returns:
+            Compaction | None: Matching checkpoint, when present.
+        """
+        if window is None:
+            return self.compactions[-1] if self.compactions else None
+        return next(
+            (item for item in reversed(self.compactions) if item.id == window.checkpoint_id),
+            None,
+        )
+
+    def replay_boundary(
+        self,
+        route: str,
+        model: str,
+        layout: InstructionLayout,
+    ) -> tuple[Compaction | None, int]:
+        """Resolve replay eligibility for a target backend and model.
+
+        Args:
+            route (str): Target deployment identifier.
+            model (str): Requested model.
+            layout (InstructionLayout): Target developer instruction placement.
+
+        Returns:
+            tuple[Compaction | None, int]: Eligible checkpoint and the first history index
+                allowed to keep provider-specific state.
+        """
+        latest = self.checkpoint()
+        checkpoint = latest
+        if (
+            latest is not None
+            and not latest.portable
+            and (latest.route, latest.model) != (route, model)
+        ):
+            checkpoint = None
+        current = self.window
+        if (
+            current is None
+            or (current.route, current.model, current.layout) != (route, model, layout)
+            or (checkpoint is not latest and current.checkpoint_id is not None)
+        ):
+            return checkpoint, len(self.messages)
+        return checkpoint, current.provider_state_start
+
+    def compaction_context(
+        self,
+        route: str,
+        model: str,
+        layout: InstructionLayout,
+    ) -> list[ModelContextItem]:
+        """Project eligible conversation history for the existing compaction operation.
+
+        Args:
+            route (str): Target deployment identifier.
+            model (str): Requested model.
+            layout (InstructionLayout): Target developer instruction placement.
+
+        Returns:
+            list[ModelContextItem]: Eligible checkpoint and canonical history without model
+                instruction revisions, reasoning updates, or transient environment facts.
+        """
+        checkpoint, provider_state_start = self.replay_boundary(route, model, layout)
+        frontier = checkpoint.boundary if checkpoint is not None else 0
+        history = self._project_history(
+            range(frontier, len(self.messages)),
+            rebuilt_end=provider_state_start,
+        )
+        return [*(checkpoint.context if checkpoint else ()), *history.values()]
+
+    def _project_history(
+        self,
+        indices: Iterable[int],
+        *,
+        rebuilt_end: int,
+    ) -> dict[int, ConversationItem]:
+        """Pair tool calls and results while dropping state from a previous provider."""
+        if not rebuilt_end:
+            return {index: self.messages[index] for index in indices}
+        items = {}
+        pending: dict[str, deque[str]] = defaultdict(deque)
+        for index in indices:
+            item = self.messages[index]
+            portable = index < rebuilt_end
+            if isinstance(item, Reasoning) and portable:
+                continue
+            if isinstance(item, ToolCall):
+                call_id = item.call_id
+                if portable:
+                    item = item.model_copy(update={"id": None, "call_id": f"call_loop_{index}"})
+                pending[call_id].append(item.call_id)
+            elif isinstance(item, ToolResult):
+                matches = pending.get(item.call_id)
+                if not matches:
+                    continue
+                call_id = matches.popleft()
+                if call_id != item.call_id:
+                    item = item.model_copy(update={"call_id": call_id})
+            items[index] = item
+        return items
 
     def model_context(self) -> list[ModelContextItem]:
         """Return bounded context for the next model request.
@@ -792,6 +970,9 @@ class Session:
                 name_source=self.name_source,
                 messages=messages,
                 compactions=[compaction.model_dump(mode="json") for compaction in self.compactions],
+                windows=[window.model_dump(mode="json") for window in self.windows],
+                dispatches=[record.model_dump(mode="json") for record in self.dispatches],
+                pending_dispatch=self.pending_dispatch,
                 tokens=self.tokens,
                 model=self.model,
                 context_window=self.context_window,
@@ -831,7 +1012,7 @@ class Session:
         version = payload.get("version")
         if version == _SCHEMA_VERSION:
             return False
-        if version in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14}:
+        if version in {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16}:
             return True
         raise ValueError(f"Unsupported session version {version}.")
 
@@ -1041,7 +1222,7 @@ class Session:
         if version == 11:
             payload["version"] = _SCHEMA_VERSION
             version = _SCHEMA_VERSION
-        elif version in {12, 13, 14}:
+        elif version in {12, 13, 14, 16}:
             payload = dict(payload)
             payload["version"] = _SCHEMA_VERSION
             version = _SCHEMA_VERSION
@@ -1076,6 +1257,11 @@ class Session:
                     data.update(content="", summary=data.get("content", ""))
                 messages.append(model.model_validate(data))
 
+            windows = [ModelWindow.model_validate(item) for item in payload.get("windows", [])]
+            dispatches = [
+                ModelDispatch.model_validate(item) for item in payload.get("dispatches", [])
+            ]
+            pending_dispatch = payload.get("pending_dispatch")
             tokens = payload["tokens"]
             model = payload["model"]
             context_window = payload["context_window"]
@@ -1100,6 +1286,13 @@ class Session:
             )
             cls._validate_reference_metadata(messages)
             cls._validate_timeline(messages, compactions, events, session_id)
+            cls._validate_dispatches(
+                windows,
+                dispatches,
+                compactions,
+                pending_dispatch,
+                len(messages),
+            )
 
         except (KeyError, TypeError, ValidationError) as error:
             raise ValueError("Invalid serialized session.") from error
@@ -1110,6 +1303,9 @@ class Session:
             name_source=name_source,
             messages=messages,
             compactions=compactions,
+            windows=windows,
+            dispatches=dispatches,
+            pending_dispatch=pending_dispatch,
             tokens=tokens,
             model=model,
             context_window=context_window,
@@ -1118,6 +1314,39 @@ class Session:
             active_skills=[tuple(identity) for identity in active_skills],
             events=events,
         )
+
+    @staticmethod
+    def _validate_dispatches(
+        windows: list[ModelWindow],
+        dispatches: list[ModelDispatch],
+        compactions: list[Compaction],
+        pending: str | None,
+        message_count: int,
+    ) -> None:
+        """Validate that durable model-only entries refer to captured windows and positions."""
+        checkpoints = {checkpoint.id: checkpoint.boundary for checkpoint in compactions}
+        frontiers = {}
+        for window in windows:
+            if (
+                window.id in frontiers
+                or window.provider_state_start > message_count
+                or (window.checkpoint_id is not None and window.checkpoint_id not in checkpoints)
+            ):
+                raise TypeError("Invalid serialized model window.")
+            frontiers[window.id] = checkpoints.get(window.checkpoint_id, 0)
+        record_ids = set()
+        last = 0
+        for record in dispatches:
+            if (
+                record.id in record_ids
+                or record.window_id not in frontiers
+                or not max(last, frontiers[record.window_id]) <= record.position <= message_count
+            ):
+                raise TypeError("Invalid serialized model dispatch.")
+            last = record.position
+            record_ids.add(record.id)
+        if pending is not None and (not dispatches or pending != dispatches[-1].id):
+            raise TypeError("Invalid pending model dispatch.")
 
     @staticmethod
     def _validate_reference_metadata(

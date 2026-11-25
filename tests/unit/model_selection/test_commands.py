@@ -5,6 +5,8 @@ from threading import get_ident
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
+import pytest
+
 from loop import (
     AsyncInteractionInput,
     BackendAuthenticationError,
@@ -41,7 +43,8 @@ def test_model_commands_list_show_and_select_available_models():
     ]
     selection.available.return_value = models
     selection.available_async.return_value = models
-    provider = ModelCommands(selection)
+    on_select = Mock()
+    provider = ModelCommands(selection, on_select)
     manager = CommandManager(interaction=interaction)
     manager.register_provider(provider)
 
@@ -60,6 +63,7 @@ def test_model_commands_list_show_and_select_available_models():
     )
     assert interaction.info.call_args_list[0].args[0] == "Using the backend default model."
     selection.select_async.assert_awaited_once_with("model-b")
+    on_select.assert_called_once_with()
     assert manager.commands[-1].completion.provider == "models"
     completion = provider.get_completion_providers()[0]
     assert [(value.value, value.description) for value in completion.provider()] == [
@@ -158,6 +162,7 @@ def test_async_dispatch_reports_model_preference_write_failure():
     selection = ModelSelection(
         SimpleNamespace(
             default_model="model-a",
+            route="model-test",
             get_context_window=Mock(return_value=2048),
             get_context_window_async=AsyncMock(return_value=2048),
             get_models=Mock(return_value=[ModelInfo(id="model-a")]),
@@ -215,14 +220,17 @@ def test_check_command_gently_reports_an_unreachable_backend():
     selection.select_fallback_async.assert_not_awaited()
 
 
-def test_check_command_offers_existing_fallback_for_a_missing_model():
-    """The check command delegates absent model recovery to the established fallback flow."""
+@pytest.mark.parametrize("has_callback", [False, True])
+def test_check_command_offers_existing_fallback_for_a_missing_model(has_callback):
+    """The model check reports an explicitly accepted fallback to the request owner."""
     interaction = Mock(spec=Interaction)
     selection = model_selection_mock()
     selection.available_async.return_value = [ModelInfo(id="replacement")]
     selection.effective = "missing"
+    selection.select_fallback_async.return_value = True
     manager = CommandManager(interaction=interaction)
-    manager.register_provider(ModelCommands(selection))
+    on_select = Mock() if has_callback else None
+    manager.register_provider(ModelCommands(selection, on_select))
 
     manager.call("check")
 
@@ -231,6 +239,8 @@ def test_check_command_offers_existing_fallback_for_a_missing_model():
     )
     fallback_interaction = selection.select_fallback_async.await_args.args[0]
     assert isinstance(fallback_interaction, AsyncInteractionInput)
+    if on_select is not None:
+        on_select.assert_called_once_with()
 
 
 def test_check_command_reports_fallback_preference_write_failure():

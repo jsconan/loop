@@ -17,38 +17,45 @@ def render_environment(
     settings: ContextSettings,
     working_directory: PathReference,
     *,
-    timezone: str | None,
     client_timezone: str | None,
+    include_time: bool,
 ) -> str | None:
     """Render the allowlisted environment for one generation request.
 
     Args:
         settings (ContextSettings): Validated policy for the optional fields.
         working_directory (PathReference): Directory used by the active tool runtime.
-        timezone (str | None): Effective configured timezone shared with the clock.
         client_timezone (str | None): Trusted client timezone shared with the clock.
+        include_time (bool): Include calendar and timezone facts in a verified request suffix.
 
     Returns:
-        str | None: Escaped environment block from one instant, or None when disabled.
+        str | None: Escaped environment facts, including one clock sample when supported.
     """
     if settings.mode == "off":
         return None
-    local, zone = resolve_local_datetime(utc_now(), client=client_timezone, configured=timezone)
+    fields: dict[str, str | None] = {}
+    if include_time:
+        local, zone = resolve_local_datetime(
+            utc_now(),
+            client=client_timezone,
+            configured=settings.timezone,
+        )
+        fields["current_date"] = local.date().isoformat()
+        if settings.show_timezone:
+            fields["timezone"] = zone
+            fields["utc_offset"] = utc_offset(local)
     workspace_path = None
     if settings.show_workspace_path:
         with suppress(OSError, RuntimeError):
             workspace_path = str(working_directory.resolve())
-    fields = {
-        "current_date": local.date().isoformat(),
-        "timezone": zone if settings.show_timezone else None,
-        "utc_offset": utc_offset(local) if settings.show_timezone else None,
-        "operating_system": system(),
-        "architecture": machine(),
-        "shell": constants.SHELL_COMMAND_PATH,
-        "workspace": VirtualPath.WORKSPACE,
-        "workspace_path": workspace_path,
-        "country": (settings.country or _locale_country()) if settings.show_country else None,
-    }
+    fields.update(
+        operating_system=system(),
+        architecture=machine(),
+        shell=constants.SHELL_COMMAND_PATH,
+        workspace=VirtualPath.WORKSPACE,
+        workspace_path=workspace_path,
+        country=(settings.country or _locale_country()) if settings.show_country else None,
+    )
     lines = ["<environment_context>"]
     lines.extend(f"{name}: {_escape_fact(value)}" for name, value in fields.items() if value)
     lines.append("</environment_context>")

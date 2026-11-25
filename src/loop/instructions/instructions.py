@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from dataclasses import replace
-from functools import partial
-from html import escape
 from pathlib import Path
 from threading import RLock
 from typing import TYPE_CHECKING, Self
@@ -24,7 +22,6 @@ from .models import (
     ManagedSkillListResult,
     PreparedInstructions,
     RuntimeEnvironment,
-    Skill,
     SkillActivationResponse,
     SkillActivationResult,
     SkillDeactivationAllResult,
@@ -70,6 +67,7 @@ class InstructionsManager:
     _runtime_environment: RuntimeEnvironment | None
     _skill_manager: SkillManager
     _max_bytes: int
+    _agent_bytes: int
     _working_directory: Path | None
     _dirty: bool
     _generation: int
@@ -104,6 +102,7 @@ class InstructionsManager:
         self._runtime_environment = runtime_environment
         self._skill_manager = skill_manager or SkillManager()
         self._max_bytes = max_bytes
+        self._agent_bytes = 0
         self._working_directory = (
             Path(working_directory).resolve() if working_directory is not None else None
         )
@@ -228,6 +227,32 @@ class InstructionsManager:
         """
         return self._max_bytes
 
+    def bind_agent_budget(
+        self,
+        agent: Agent,
+        *,
+        pinned: PreparedInstructions | None = None,
+    ) -> None:
+        """Reserve the effective agent sections when validating skill and source changes.
+
+        Args:
+            agent (Agent): Agent providing the initial intrinsic instructions.
+            pinned (PreparedInstructions | None): Committed baseline for the active window.
+        """
+        with self._lock:
+            prefix = (
+                build_instructions(agent.identity.render(), agent.render())
+                if pinned is None
+                else build_instructions(
+                    *(
+                        section.content
+                        for section in pinned.sections
+                        if section.kind in {"agent_identity", "agent_instructions"}
+                    )
+                )
+            )
+            self._agent_bytes = self._encoded_size(prefix or "")
+
     def set_runtime_environment(self, environment: RuntimeEnvironment | None) -> None:
         """Replace application-owned runtime context atomically.
 
@@ -298,19 +323,7 @@ class InstructionsManager:
         """
         with self._lock:
             self._refresh_context()
-            available = {skill.name for skill in self._skill_manager.skills}
-            priorities = tuple(dict.fromkeys(name for name in names if name in available))
-            if priorities == self._skill_catalog_priorities:
-                return self._encoded_size(self._build_instructions(agent)) <= self._max_bytes
-            previous = self._skill_catalog_priorities
-            self._skill_catalog_priorities = priorities
-            instructions = self._build_instructions(agent)
-            if self._encoded_size(instructions) > self._max_bytes:
-                self._skill_catalog_priorities = previous
-                return False
-            self._context_instructions = self._build_instructions()
-            self._generation += 1
-            return True
+            return self._apply_catalog_priorities(names, agent)
 
     async def set_skill_catalog_priorities_async(
         self,
@@ -336,19 +349,25 @@ class InstructionsManager:
         """
         await self._refresh_context_async()
         with self._lock:
-            available = {skill.name for skill in self._skill_manager.skills}
-            priorities = tuple(dict.fromkeys(name for name in names if name in available))
-            if priorities == self._skill_catalog_priorities:
-                return self._encoded_size(self._build_instructions(agent)) <= self._max_bytes
-            previous = self._skill_catalog_priorities
-            self._skill_catalog_priorities = priorities
-            instructions = self._build_instructions(agent)
-            if self._encoded_size(instructions) > self._max_bytes:
-                self._skill_catalog_priorities = previous
-                return False
-            self._context_instructions = self._build_instructions()
+            return self._apply_catalog_priorities(names, agent)
+
+    def _apply_catalog_priorities(self, names: Iterable[str], agent: Agent | None) -> bool:
+        """Validate transient presentation against the same effective instruction budget."""
+        available = {skill.name for skill in self._skill_manager.skills}
+        priorities = tuple(dict.fromkeys(name for name in names if name in available))
+        previous = self._skill_catalog_priorities
+        self._skill_catalog_priorities = priorities
+        content = (
+            self._snapshot(agent, None, None).content_with_suffix
+            if agent is not None
+            else build_instructions(self._context_instructions, self.request_suffix()) or ""
+        )
+        if self._encoded_size(content) > self._max_bytes:
+            self._skill_catalog_priorities = previous
+            return False
+        if previous != priorities:
             self._generation += 1
-            return True
+        return True
 
     @property
     def virtual_paths(self) -> VirtualPath:
@@ -509,12 +528,19 @@ class InstructionsManager:
                 self._dirty = True
                 self._refresh_revision += 1
 
-    def prepare(self, agent: Agent, *, recovery: str | None = None) -> PreparedInstructions:
+    def prepare(
+        self,
+        agent: Agent,
+        *,
+        recovery: str | None = None,
+        pinned: PreparedInstructions | None = None,
+    ) -> PreparedInstructions:
         """Prepare an immutable request snapshot for an explicit agent.
 
         Args:
             agent (Agent): Agent whose intrinsic identity and instructions start the document.
             recovery (str | None): Named transient recovery section for this request.
+            pinned (PreparedInstructions | None): Existing baseline supplying pinned agent sections.
 
         Returns:
             PreparedInstructions: Prepared document and exact provenance for one request.
@@ -540,8 +566,8 @@ class InstructionsManager:
                 self._refresh_changes,
             )
             self._refresh_context()
-            instructions = self._build_instructions(agent, recovery)
-            if self._encoded_size(instructions) > self._max_bytes:
+            snapshot = self._snapshot(agent, recovery, pinned)
+            if self._encoded_size(snapshot.content_with_suffix) > self._max_bytes:
                 (
                     self._project_instructions,
                     self._runtime_environment,
@@ -558,19 +584,21 @@ class InstructionsManager:
                 raise InstructionBudgetExceededError(
                     "Prepared instructions exceed the configured instruction limit."
                 )
-            return self._snapshot(agent, instructions, recovery)
+            return snapshot
 
     async def prepare_async(
         self,
         agent: Agent,
         *,
         recovery: str | None = None,
+        pinned: PreparedInstructions | None = None,
     ) -> PreparedInstructions:
         """Prepare an immutable request snapshot without reading files on the event loop.
 
         Args:
             agent (Agent): Agent whose intrinsic identity and instructions start the document.
             recovery (str | None): Named transient recovery section for this request.
+            pinned (PreparedInstructions | None): Existing baseline supplying pinned agent sections.
 
         Returns:
             PreparedInstructions: Prepared document and exact provenance for one request.
@@ -585,39 +613,7 @@ class InstructionsManager:
         """
         await self._refresh_context_async()
         with self._lock:
-            instructions = self._build_instructions(agent, recovery)
-            if self._encoded_size(instructions) > self._max_bytes:
-                raise InstructionBudgetExceededError(
-                    "Prepared instructions exceed the configured instruction limit."
-                )
-            generation = self._generation
-            working_directory = self._working_directory
-            active_skills = tuple(self._skill_manager.active_identities)
-            section_state = (
-                self._project_sources,
-                self._project_instructions,
-                self._runtime_environment,
-                self._skill_manager.catalog(preferred_names=self._skill_catalog_priorities),
-                self._skill_manager.activated_instructions,
-                self._workspace_id,
-                self._workspace_root,
-            )
-        sections = await run_in_worker_async(
-            partial(
-                self._instruction_sections_from_state,
-                agent,
-                recovery,
-                *section_state,
-            )
-        )
-        return PreparedInstructions(
-            content=instructions,
-            generation=generation,
-            working_directory=working_directory,
-            active_skills=active_skills,
-            sections=sections,
-            digest=sha256_digest(instructions),
-        )
+            return self.snapshot(agent, recovery=recovery, pinned=pinned)
 
     def _refresh_context(self) -> bool:
         """Refresh stale contextual sources without requiring an agent binding."""
@@ -699,42 +695,78 @@ class InstructionsManager:
         """
         return await self._refresh_context_async()
 
-    def snapshot(self, agent: Agent) -> PreparedInstructions:
+    def snapshot(
+        self,
+        agent: Agent,
+        *,
+        recovery: str | None = None,
+        pinned: PreparedInstructions | None = None,
+    ) -> PreparedInstructions:
         """Return an immutable snapshot for an explicit agent.
 
         Args:
             agent (Agent): Agent whose intrinsic identity and instructions start the document.
+            recovery (str | None): Named transient recovery guidance.
+            pinned (PreparedInstructions | None): Existing baseline supplying agent sections.
 
         Returns:
-            PreparedInstructions: Current document and provenance.
+            PreparedInstructions: Current document and exact provenance.
 
         Raises:
             InstructionBudgetExceededError: If the composed document exceeds the configured
                 instruction limit.
         """
         with self._lock:
-            instructions = self._build_instructions(agent)
-            if self._encoded_size(instructions) > self._max_bytes:
+            snapshot = self._snapshot(agent, recovery, pinned)
+            if self._encoded_size(snapshot.content_with_suffix) > self._max_bytes:
                 raise InstructionBudgetExceededError(
                     "Prepared instructions exceed the configured instruction limit."
                 )
-            return self._snapshot(agent, instructions)
+            return snapshot
 
     def _snapshot(
         self,
         agent: Agent,
-        instructions: str,
-        recovery: str | None = None,
+        recovery: str | None,
+        pinned: PreparedInstructions | None,
     ) -> PreparedInstructions:
-        """Capture immutable provenance for an already composed agent document."""
+        """Render one canonical document and separately capture transient presentation."""
+        sections = self._instruction_sections(agent)
+        if pinned is not None:
+            agent_kinds = {"agent_identity", "agent_instructions"}
+            sections = (
+                *(part for part in pinned.sections if part.kind in agent_kinds),
+                *(part for part in sections if part.kind not in agent_kinds),
+            )
+        content = self._render_sections(sections)
         return PreparedInstructions(
-            content=instructions,
+            content=content,
             generation=self._generation,
             working_directory=self._working_directory,
             active_skills=tuple(self._skill_manager.active_identities),
-            sections=self._instruction_sections(agent, recovery),
-            digest=sha256_digest(instructions),
+            sections=sections,
+            digest=sha256_digest(content),
+            suffix=self.request_suffix(recovery),
         )
+
+    def request_suffix(self, recovery: str | None = None) -> str | None:
+        """Render request-scoped skill presentation and recovery outside the baseline.
+
+        Args:
+            recovery (str | None): Named transient recovery guidance.
+
+        Returns:
+            str | None: Request-local instructions, if any.
+        """
+        with self._lock:
+            priority_catalog = None
+            if self._skill_catalog_priorities:
+                preferred = self._skill_manager.catalog(
+                    preferred_names=self._skill_catalog_priorities
+                )
+                if preferred != self._skill_manager.catalog():
+                    priority_catalog = preferred
+            return build_instructions(priority_catalog, self._recovery_instruction(recovery))
 
     def activate_skill(self, name: str) -> SkillActivationResponse:
         """Activate a skill for subsequent backend requests.
@@ -966,7 +998,6 @@ class InstructionsManager:
         """Publish a detached refresh candidate after rechecking its owner revision."""
         previous_target = self._signature[0] if self._signature else None
         previous_instructions = self._context_instructions
-        project_instructions = loaded.content
         refresh_changes = self._describe_refresh(working_directory, loaded, signature)
         if not self._skill_discovery_enabled:
             return self._refresh_static(
@@ -985,23 +1016,24 @@ class InstructionsManager:
             diagnostics = self._load_diagnostics(loaded)
 
             for skill in skill_manager.activated_skills:
-                instructions = self._compose(
-                    None, project_instructions, skill_manager, self._runtime_environment
+                instructions = self._render_sections(
+                    self._instruction_sections(loaded=loaded, skills=skill_manager)
                 )
-                if self._encoded_size(instructions) > self._max_bytes:
+                if self._with_agent_size(instructions) > self._max_bytes:
                     skill_manager.deactivate(skill.name)
                     diagnostics.append(
                         f"Deactivated '{skill.name}' during refresh: instruction budget exceeded."
                     )
 
-            instructions = self._compose(
-                None, project_instructions, skill_manager, self._runtime_environment
+            instructions = self._render_sections(
+                self._instruction_sections(loaded=loaded, skills=skill_manager)
             )
 
+            self._check_bound_budget(instructions)
             changed = (
                 previous_target != str(working_directory) or previous_instructions != instructions
             )
-            self._project_instructions = project_instructions
+            self._project_instructions = loaded.content
             self._project_sources = loaded.sources
             self._skill_manager = skill_manager
             self._context_instructions = instructions
@@ -1023,9 +1055,8 @@ class InstructionsManager:
         previous_instructions: str | None,
     ) -> bool:
         """Install refreshed project content while preserving an injected skill manager."""
-        instructions = self._compose(
-            None, loaded.content, self._skill_manager, self._runtime_environment
-        )
+        instructions = self._render_sections(self._instruction_sections(loaded=loaded))
+        self._check_bound_budget(instructions)
         changed = previous_target != str(working_directory) or previous_instructions != instructions
         self._project_instructions = loaded.content
         self._project_sources = loaded.sources
@@ -1038,23 +1069,26 @@ class InstructionsManager:
             self._generation += 1
         return changed
 
-    def _build_instructions(self, agent: Agent | None = None, recovery: str | None = None) -> str:
-        """Render the current instruction sources."""
-        return (
-            self._compose(
-                agent,
-                self._project_instructions,
-                self._skill_manager,
-                self._runtime_environment,
-                recovery,
+    def _build_instructions(self) -> str:
+        """Render the current canonical contextual sources."""
+        return self._render_sections(self._instruction_sections())
+
+    def _with_agent_size(self, instructions: str) -> int:
+        """Include the pinned agent prefix and its separator in contextual size."""
+        separator = 2 if self._agent_bytes and instructions else 0
+        return self._agent_bytes + self._encoded_size(instructions) + separator
+
+    def _check_bound_budget(self, instructions: str) -> None:
+        """Refuse to publish sources that exceed a bound agent's instruction budget."""
+        if self._agent_bytes and self._with_agent_size(instructions) > self._max_bytes:
+            raise InstructionBudgetExceededError(
+                "Prepared instructions exceed the configured instruction limit."
             )
-            or ""
-        )
 
     def _commit_activation(self, result: SkillActivationResult) -> SkillActivationResponse:
         """Commit an activated skill to the aggregate instruction snapshot or roll it back."""
         instructions = self._build_instructions()
-        size = self._encoded_size(instructions)
+        size = self._with_agent_size(instructions)
         if size > self._max_bytes:
             if result["instructions_updated"]:
                 self._skill_manager.deactivate(result["name"])
@@ -1073,139 +1107,69 @@ class InstructionsManager:
     def _instruction_sections(
         self,
         agent: Agent | None = None,
-        recovery: str | None = None,
+        *,
+        loaded: LoadedAgentInstructions | None = None,
+        skills: SkillManager | None = None,
     ) -> tuple[InstructionSection, ...]:
-        """Return typed provenance for every currently composed section."""
-        return self._instruction_sections_from_state(
-            agent,
-            recovery,
-            self._project_sources,
-            self._project_instructions,
-            self._runtime_environment,
-            self._skill_manager.catalog(preferred_names=self._skill_catalog_priorities),
-            self._skill_manager.activated_instructions,
-            self._workspace_id,
-            self._workspace_root,
-        )
-
-    @staticmethod
-    def _instruction_sections_from_state(
-        agent: Agent | None,
-        recovery: str | None,
-        project_sources: tuple[AgentInstructionsSource, ...],
-        project_instructions: str | None,
-        runtime_environment: RuntimeEnvironment | None,
-        skill_catalog: str,
-        activated_instructions: tuple[tuple[Skill, str], ...],
-        workspace_id: str | None,
-        workspace_root: Path | None,
-    ) -> tuple[InstructionSection, ...]:
-        """Build provenance sections from detached state and capture source paths."""
+        """Capture the ordered, canonical sources from current or candidate state."""
+        project_sources = self._project_sources if loaded is None else loaded.sources
+        project_content = self._project_instructions if loaded is None else loaded.content
+        skills = self._skill_manager if skills is None else skills
         sections = []
         if agent is not None:
             sections.extend(
                 (
                     InstructionSection("agent_identity", agent.identity.render(), "agent"),
                     InstructionSection(
-                        "agent_instructions",
-                        agent.render(),
-                        agent.instructions.source,
+                        "agent_instructions", agent.render(), agent.instructions.source
                     ),
                 )
             )
         sections.extend(
-            InstructionSection(
-                "agents",
-                source.content,
-                str(source.path),
-                InstructionsManager._reference(
-                    source.path,
-                    source.content,
-                    workspace_id=workspace_id,
-                    workspace_root=workspace_root,
-                ),
-            )
+            self._file_section("agents", source.path, source.content)
             for source in project_sources
             if source.content
         )
-        if recovery == "repetition":
+        if project_content and not project_sources:
+            sections.append(InstructionSection("agents", project_content, "injected"))
+        if self._runtime_environment is not None:
             sections.append(
                 InstructionSection(
-                    "recovery",
-                    InstructionsManager._recovery_instruction(recovery),
-                    "repetition",
+                    "runtime_environment", self._runtime_environment.render(), "runtime"
                 )
             )
-        if project_instructions and not project_sources:
-            sections.append(InstructionSection("agents", project_instructions, "injected"))
-        if runtime_environment is not None:
-            sections.append(
-                InstructionSection(
-                    "runtime_environment",
-                    runtime_environment.render(),
-                    "runtime",
-                )
-            )
-        if skill_catalog:
-            sections.append(InstructionSection("skill_catalog", skill_catalog, "skill_discovery"))
+        if catalog := skills.catalog():
+            sections.append(InstructionSection("skill_catalog", catalog, "skill_discovery"))
         sections.extend(
-            InstructionSection(
-                "active_skill",
-                instructions,
-                str(skill.location),
-                InstructionsManager._reference(
-                    skill.location,
-                    instructions,
-                    workspace_id=workspace_id,
-                    workspace_root=workspace_root,
-                ),
-            )
-            for skill, instructions in activated_instructions
+            self._file_section("active_skill", skill.location, content, name=skill.name)
+            for skill, content in skills.activated_instructions
         )
         return tuple(sections)
 
-    @staticmethod
-    def _reference(
-        path: Path,
-        content: str,
-        *,
-        workspace_id: str | None,
-        workspace_root: Path | None,
-    ) -> CapturedInstruction:
-        """Capture file provenance using the manager's durable workspace context."""
-        return CapturedInstruction.capture(
+    def _file_section(
+        self, kind: str, path: Path, content: str, *, name: str | None = None
+    ) -> InstructionSection:
+        """Capture content with its already resolved source and workspace-relative provenance."""
+        relative = None
+        if self._workspace_root is not None and path.is_relative_to(self._workspace_root):
+            relative = path.relative_to(self._workspace_root).as_posix()
+        reference = CapturedInstruction(
+            self._workspace_id if relative is not None else None,
+            relative if self._workspace_id is not None else None,
             path,
+            sha256_digest(content),
             content,
-            workspace_id=workspace_id,
-            workspace_root=workspace_root,
         )
+        return InstructionSection(kind, content, str(path), reference, name=name)
 
-    def _compose(
-        self,
-        agent: Agent | None,
-        project_instructions: str | None,
-        skill_manager: SkillManager,
-        runtime_environment: RuntimeEnvironment | None = None,
-        recovery: str | None = None,
-    ) -> str:
-        """Render an instruction document from candidate sources."""
-        entries = []
-        for skill, instructions in skill_manager.activated_instructions:
-            entries.append(f'<skill name="{escape(skill.name)}">\n{instructions}\n</skill>')
-        active = (
-            "<active_skills>\n" + "\n".join(entries) + "\n</active_skills>" if entries else None
-        )
-        sources = []
-        if agent is not None:
-            sources.extend((agent.identity.render(), agent.render()))
-        return build_instructions(
-            *sources,
-            project_instructions,
-            runtime_environment.render() if runtime_environment is not None else None,
-            skill_manager.catalog(preferred_names=self._skill_catalog_priorities),
-            active,
-            self._recovery_instruction(recovery),
-        )
+    @staticmethod
+    def _render_sections(sections: tuple[InstructionSection, ...]) -> str:
+        """Render the leading document from the same sections used to compare revisions."""
+        active = [section.render() for section in sections if section.kind == "active_skill"]
+        body = [section.content for section in sections if section.kind != "active_skill"]
+        if active:
+            body.append("<active_skills>\n" + "\n".join(active) + "\n</active_skills>")
+        return build_instructions(*body) or ""
 
     @staticmethod
     def _recovery_instruction(recovery: str | None) -> str | None:

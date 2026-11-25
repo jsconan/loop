@@ -160,7 +160,7 @@ class ContextSettings(BaseModel):
 
     Args:
         mode (Literal["basic", "off"]): Whether to supply automatic environment facts.
-        show_timezone (bool): Include the timezone name when known and the UTC offset.
+        show_timezone (bool): Include the timezone name and offset in the environment suffix.
         show_country (bool): Include the configured or detected locale country when available.
         show_workspace_path (bool): Include the resolved tool directory when disclosure is on.
         timezone (str | None): IANA timezone override, or None to use the client or host timezone.

@@ -5,7 +5,6 @@ import json
 import os
 from io import StringIO
 from threading import Event, get_ident
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -39,6 +38,7 @@ from loop.configuration import ConfigurationCommands, ConfigurationManager
 from loop.conversation import ConversationCommands
 from loop.conversation.interaction import ApprovalInteraction
 from loop.session import LocalSessionNameGenerator
+from tests.backend_doubles import model_backend
 
 pytestmark = pytest.mark.integration
 
@@ -57,9 +57,7 @@ def test_recovery_error_safely_renders_untrusted_fifo_name(tmp_path, async_mode)
     )
     source.confirm = Mock(return_value=True)
     source.confirm_async = AsyncMock(return_value=True)
-    backend = Mock()
-    backend.default_model = "fixture"
-    backend.prepare_context.side_effect = list
+    backend = model_backend(default_model="fixture")
     sessions = SessionManager()
     sessions.add_user_message("Synthetic delete request")
     sessions.begin_run()
@@ -108,7 +106,7 @@ def test_async_loop_commands_can_reserve_the_native_terminal(tmp_path):
         permissions = PermissionManager(tmp_path)
         interaction = ApprovalInteraction(controller.interaction, permissions)
         loop = Loop.create_default(
-            SimpleNamespace(default_model="fixture", get_context_window=lambda _model: None),
+            model_backend(default_model="fixture", get_context_window=lambda _model: None),
             interaction=interaction,
             permission_manager=permissions,
             run_control=controller.control,
@@ -205,7 +203,7 @@ def test_async_loop_dispatches_model_commands_without_blocking_the_ui(tmp_path):
         source.table = observed_table
         source.info = observed_info
         loop = Loop.create_default(
-            SimpleNamespace(
+            model_backend(
                 default_model="fixture",
                 get_context_window=lambda _model: None,
                 get_models=get_models,
@@ -284,7 +282,7 @@ def test_async_model_check_can_select_a_fallback_without_stopping_the_loop(tmp_p
         source.prompt_async = observed_prompt_async
         source.info = observed_info
         loop = Loop.create_default(
-            SimpleNamespace(
+            model_backend(
                 default_model=None,
                 get_context_window=lambda _model: 4096,
                 get_models=lambda: [ModelInfo(id="replacement"), ModelInfo(id="other")],
@@ -378,7 +376,7 @@ def test_native_input_queues_and_controls_active_model_execution(tmp_path, mode)
                 ]
 
             source.info, source.run_metrics = info, run_metrics
-            backend = SimpleNamespace(
+            backend = model_backend(
                 default_model="local",
                 get_context_window=lambda _model: None,
                 prepare_context=list,
@@ -495,7 +493,7 @@ def test_native_recalled_message_can_be_replaced_by_export_command(tmp_path):
                 ]
 
             source.info, source.run_metrics = info, metrics
-            backend = SimpleNamespace(
+            backend = model_backend(
                 default_model="local",
                 get_context_window=lambda _model: None,
                 prepare_context=list,

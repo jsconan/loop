@@ -43,6 +43,7 @@ def test_session_commands_list_resume_rename_and_reset_sessions():
     manager.call("sessions")
     listed = interaction.table.call_args.args[0]
     manager.call("resume", first_id)
+    assert sessions.session.model == "served-model"
     manager.call("rename", '"Renamed topic"')
     manager.call("new")
 
@@ -54,8 +55,7 @@ def test_session_commands_list_resume_rename_and_reset_sessions():
     assert [session.name for session in listed] == ["First topic", "Second topic"]
     interaction.user.assert_called_once_with("Prior question")
     assert store.load(first_id).name == "Renamed topic"
-    # Model is preserved across new session, but other state is reset
-    assert sessions.session.model == "served-model"
+    assert sessions.session.model is None
     assert sessions.session.messages == []
     assert sessions.session.tokens == 0
     assert manager.commands[-1].completion.provider == "sessions"
@@ -76,6 +76,7 @@ def test_sessions_namespace_matches_shortcuts_and_renames_stored_sessions():
     manager.call("sessions")
     manager.call("sessions", f'rename {stored_id} "Renamed stored"')
     manager.call("sessions", f"resume {stored_id}")
+    assert sessions.session.model == "resumed-model"
     manager.call("sessions", "new")
 
     assert interaction.table.call_args.kwargs["columns"] == (
@@ -85,7 +86,7 @@ def test_sessions_namespace_matches_shortcuts_and_renames_stored_sessions():
     )
     assert store.load(stored_id).name == "Renamed stored"
     assert active_id != sessions.session.id
-    assert sessions.session.model == "resumed-model"
+    assert sessions.session.model is None
     commands = {command.name: command for command in manager.commands}
     assert "session" in commands
     assert "sessions" in commands
@@ -252,7 +253,7 @@ def test_session_command_and_sessions_show_display_current_operational_state():
     assert {row["field"]: row["value"] for row in shown[2].args[0]} == {
         "ID": sessions.session.id,
         "Name": "Untitled",
-        "Model": "served-model",
+        "Model": "Backend default",
         "Context": "0 tokens (capacity unknown)",
         "Conversation items": 0,
         "Compactions": 0,

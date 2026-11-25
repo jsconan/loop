@@ -1,6 +1,7 @@
 """Expose active model selection through user commands."""
 
 import logging
+from collections.abc import Callable
 from types import SimpleNamespace
 from typing import Annotated
 
@@ -21,12 +22,19 @@ class ModelCommands:
 
     Args:
         model_selection (ModelSelection): Active conversation model selection to inspect or change.
+        on_select (Callable[[], None] | None): Notify the request owner of an explicit selection.
     """
 
     _model_selection: ModelSelection
+    _on_select: Callable[[], None] | None
 
-    def __init__(self, model_selection: ModelSelection) -> None:
+    def __init__(
+        self,
+        model_selection: ModelSelection,
+        on_select: Callable[[], None] | None = None,
+    ) -> None:
         self._model_selection = model_selection
+        self._on_select = on_select
 
     def get_commands(self) -> tuple[CommandRegistration, ...]:
         """Return model discovery and selection command registrations.
@@ -160,6 +168,8 @@ class ModelCommands:
         except (BackendError, OSError) as error:
             self._report_selection_failure(context, error)
             return
+        if self._on_select is not None:
+            self._on_select()
         context.interaction.info(f"Using model: {name}")
 
     def _available(self) -> list[ModelInfo]:
@@ -169,9 +179,12 @@ class ModelCommands:
     async def _select_fallback_async(self, context: CommandContext) -> None:
         """Select a replacement model and report expected persistence failures."""
         try:
-            await self._model_selection.select_fallback_async(context.interaction)
+            selected = await self._model_selection.select_fallback_async(context.interaction)
         except (BackendError, OSError) as error:
             self._report_selection_failure(context, error)
+        else:
+            if selected and self._on_select is not None:
+                self._on_select()
 
     @classmethod
     def _report_selection_failure(

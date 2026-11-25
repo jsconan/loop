@@ -171,6 +171,7 @@ class Compaction(BaseModel):
         created_at (datetime): Time at which the checkpoint was created.
         provider (str): Backend namespace that produced the replacement items.
         model (str): Model used to create the checkpoint.
+        route (str | None): Producing route, absent for unattributed older checkpoints.
         context (tuple[CompactionContextItem, ...]): Exact replacement context.
         instructions (InstructionSnapshot): Instruction state used for compaction.
         input_tokens_before (int | None): Last known context usage before compaction.
@@ -182,12 +183,22 @@ class Compaction(BaseModel):
     created_at: datetime
     provider: str
     model: str
+    route: str | None = Field(default=None, exclude_if=lambda route: route is None)
     context: tuple[CompactionContextItem, ...]
     instructions: InstructionSnapshot
     input_tokens_before: int | None = Field(default=None, ge=0)
     input_tokens_after: int | None = Field(default=None, ge=0)
 
     _normalize_created_at = field_validator("created_at")(as_utc)
+
+    @property
+    def portable(self) -> bool:
+        """Check whether the stored checkpoint uses the portable summary format.
+
+        Returns:
+            bool: True when the checkpoint can replay independently of a provider route.
+        """
+        return all(item.provider == "loop" for item in self.context)
 
 
 class SessionEventModel(BaseModel):
@@ -565,6 +576,9 @@ class SerializedSession(TypedDict):
     name_source: SessionNameSource | None
     messages: list[SerializedMessage]
     compactions: list[dict]
+    windows: list[dict]
+    dispatches: list[dict]
+    pending_dispatch: str | None
     tokens: int
     model: str | None
     context_window: int | None

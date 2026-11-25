@@ -1180,3 +1180,30 @@ def test_create_reports_failed_recovery_save_as_another_recovery_choice(dependen
             Mock(),
             recovery_defaults={workspace_paths.permissions: "reset"},
         )
+
+
+def test_mixed_reload_refreshes_the_client_and_defers_the_file_projection(dependencies):
+    """Client refresh uses saved options while the request owner keeps the file mode pending."""
+    active_loop = Mock()
+    active_loop.apply_runtime_settings.return_value = "pending until the next rebuild"
+    runtime = ApplicationRuntime(active_loop, Mock(), 2.0)
+    saved = ApplicationSettings.model_validate(
+        {
+            "backend": {"file_input_mode": "native", "request_timeout_seconds": 3},
+        }
+    )
+    statuses = runtime.apply_configuration_changes(
+        ("backend.file_input_mode", "backend.request_timeout_seconds"),
+        saved,
+    )
+    assert statuses == {
+        "backend.file_input_mode": "pending until the next rebuild",
+        "backend.request_timeout_seconds": "applied now",
+    }
+    backend = dependencies["OpenAIBackend"].call_args.kwargs
+    assert backend["file_input_mode"] == "native"
+    assert backend["request_timeout_seconds"] == 3
+    active_loop.configure_context.assert_called_once_with(saved)
+    active_loop.replace_backend.reset_mock()
+    assert runtime.apply_configuration("backend.file_input_mode", saved).startswith("pending")
+    active_loop.replace_backend.assert_not_called()

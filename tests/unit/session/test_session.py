@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta, timezone
 import pytest
 
 from loop import (
+    Agent,
     Compaction,
     CompactionContextItem,
     ContentArtifact,
@@ -17,6 +18,7 @@ from loop import (
     InputQueuedEvent,
     InputRecalledEvent,
     InputRejectedEvent,
+    InstructionsManager,
     InstructionSnapshot,
     InteractionRequestedEvent,
     InteractionSettledEvent,
@@ -38,6 +40,7 @@ from loop import (
     UnsupportedConversationItemError,
     Usage,
 )
+from loop.session import ModelDispatch, ModelWindow, WindowSettings
 from loop.session.models import (
     SESSION_NAME_SOURCE_INITIAL,
     SESSION_NAME_SOURCE_USER,
@@ -697,7 +700,7 @@ def test_session_externalizes_shipped_v11_inline_references():
     assert reference.next_cursor is not None
     assert reference.media_type == "text/plain"
     assert restored.persistence_snapshot().reference_artifacts[0].content == b"preview"
-    assert json.loads(restored.serialize())["version"] == 16
+    assert json.loads(restored.serialize())["version"] == 17
 
 
 def test_session_migrates_v13_snapshots_without_changing_existing_history():
@@ -720,7 +723,7 @@ def test_session_migrates_v13_snapshots_without_changing_existing_history():
     assert restored.messages == original.messages
     assert restored.messages[-1].output == recorded
     assert "decoding_loss" not in json.loads(restored.messages[-1].output)["result"]["stdout"]
-    assert json.loads(restored.serialize())["version"] == 16
+    assert json.loads(restored.serialize())["version"] == 17
 
 
 def test_session_persistence_snapshot_deduplicates_transient_reference_content():
@@ -852,7 +855,7 @@ def test_session_migrates_v12_snapshots_without_changing_existing_history():
     restored = Session.deserialize(json.dumps(payload))
 
     assert restored.messages == original.messages
-    assert json.loads(restored.serialize())["version"] == 16
+    assert json.loads(restored.serialize())["version"] == 17
 
 
 def test_session_migrates_v14_snapshots_without_changing_existing_history():
@@ -864,7 +867,7 @@ def test_session_migrates_v14_snapshots_without_changing_existing_history():
     restored = Session.deserialize(json.dumps(payload))
 
     assert restored.messages == original.messages
-    assert json.loads(restored.serialize())["version"] == 16
+    assert json.loads(restored.serialize())["version"] == 17
 
 
 @pytest.mark.parametrize("value", ["not-json", "[]", '{"version":99}'])
@@ -1653,3 +1656,58 @@ def test_session_deserialization_rejects_invalid_event_and_snapshot_metadata(mut
 
     with pytest.raises(ValueError, match="Invalid serialized session"):
         Session.deserialize(json.dumps(payload))
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ["window", "duplicate", "position", "pending", "checkpoint", "provider_state_start"],
+)
+def test_session_archive_validates_dispatch_replay_boundaries(corruption):
+    """Model-only records cannot reference other windows or uncaptured history."""
+    window = ModelWindow(
+        id="window",
+        route="route",
+        model="model",
+        layout="inline",
+        settings=WindowSettings(agent_name="Loop"),
+        baseline=InstructionsManager().prepare(Agent("Loop")),
+        tools=(),
+    )
+    session = Session(
+        windows=[window],
+        messages=[Message(role="user", content="input")],
+        dispatches=[ModelDispatch(id="request", window_id="window", position=1)],
+        pending_dispatch="request",
+    )
+    complete = json.loads(session.serialize())
+    restored = Session.deserialize(json.dumps(complete))
+    assert restored.pending_dispatch == "request"
+    assert restored.window == window
+    if corruption == "window":
+        complete["dispatches"][0]["window_id"] = "other"
+    elif corruption == "duplicate":
+        complete["windows"].append(complete["windows"][0])
+    elif corruption == "position":
+        complete["dispatches"][0]["position"] = 2
+    elif corruption == "pending":
+        complete["pending_dispatch"] = "other"
+    elif corruption == "checkpoint":
+        complete["windows"][0]["checkpoint_id"] = "missing checkpoint"
+    else:
+        complete["windows"][0]["provider_state_start"] = 2
+    with pytest.raises(ValueError, match="Invalid serialized session"):
+        Session.deserialize(json.dumps(complete))
+
+
+def test_schema_16_session_loads_without_establishing_a_model_window():
+    """Legacy durable conversations remain readable until their first new-layout dispatch."""
+    session = Session(messages=[Message(role="user", content="Old conversation")])
+    payload = json.loads(session.serialize())
+    payload["version"] = 16
+    for key in ("windows", "dispatches", "pending_dispatch"):
+        del payload[key]
+    encoded = json.dumps(payload)
+    assert Session.requires_migration(encoded)
+    restored = Session.deserialize(encoded)
+    assert restored.model_context() == session.messages
+    assert restored.window is None and restored.dispatches == []

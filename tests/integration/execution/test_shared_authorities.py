@@ -3,7 +3,6 @@
 import asyncio
 import json
 from threading import Event
-from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -22,6 +21,7 @@ from loop.tools.system import (
     read_command_output,
     run_command,
 )
+from tests.backend_doubles import model_backend
 
 pytestmark = pytest.mark.integration
 
@@ -34,11 +34,6 @@ def make_backend(run):
     backend.capability_failure.return_value = None
     backend.run.side_effect = run
     return backend
-
-
-def model_backend():
-    """Provide the model metadata needed to construct an application loop."""
-    return SimpleNamespace(default_model="fixture", get_context_window=lambda _: None)
 
 
 @pytest.mark.parametrize("shared", ["service", "permissions", "instructions"])

@@ -7,7 +7,6 @@ import json
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import ExitStack, aclosing, nullcontext
-from dataclasses import replace
 from datetime import datetime
 from functools import partial
 from time import perf_counter, sleep
@@ -30,6 +29,7 @@ from ..model_selection import ModelSelection, ModelSelectionError
 from ..models import (
     AgentRunStopReason,
     Message,
+    ModelAssignment,
     ModelCallMetrics,
     Response,
     ResponseEvent,
@@ -62,7 +62,6 @@ from ..utils import (
     utc_now,
 )
 from .agent import Agent
-from .context import render_environment
 from .models import (
     AgentRecoveryStatus,
     AgentRunRecoveryRequired,
@@ -70,6 +69,7 @@ from .models import (
     ToolCallCancelled,
     ToolCallInterrupted,
 )
+from .prefix import AgentContext
 
 _LOGGER = logging.getLogger(__name__)
 _UNKNOWN_TOOL_WARNING = (
@@ -112,8 +112,7 @@ class AgentRunner:
         ValueError: If ``max_turns`` is negative.
     """
 
-    _agent: Agent
-    _backend: Backend
+    _request_context: AgentContext
     _instructions_manager: InstructionsManager
     _permission_manager: PermissionManager
     _session_manager: SessionManager
@@ -121,7 +120,6 @@ class AgentRunner:
     _compaction: ContextCompaction
     _interaction: Interaction
     _working_directory: PathReference
-    _context_settings: ContextSettings
     _stream: bool
     _debug: bool
     _max_turns: int
@@ -130,6 +128,7 @@ class AgentRunner:
     _run_control: RunControl | None
     _interrupted_tools: list[ToolExecutionMetrics] | None
     _async_blocking_runner: Callable[..., Awaitable[Any]] | None
+    _response_target: tuple[Backend, str] | None
 
     def __init__(
         self,
@@ -153,8 +152,6 @@ class AgentRunner:
     ) -> None:
         if max_turns < 0:
             raise ValueError("Agent max turns must be non-negative.")
-        self._agent = agent
-        self._backend = backend
         self._instructions_manager = instructions_manager
         self._permission_manager = permission_manager
         self._session_manager = session_manager
@@ -169,20 +166,25 @@ class AgentRunner:
         self._run_control = run_control
         self._interrupted_tools = None
         self._file_observations = None
+        self._response_target = None
         self._async_blocking_runner = async_blocking_runner
-        self._context_settings = ContextSettings()
-        if context_settings is not None:
-            self.configure_context(context_settings)
+        self._request_context = AgentContext(
+            agent,
+            backend,
+            instructions_manager,
+            session_manager,
+            model_selection,
+            working_directory,
+            settings=(
+                context_settings or ContextSettings(timezone=agent.tools.registry.settings.timezone)
+            ),
+        )
+        self._request_context.apply_window(session_manager.session.window)
 
-    def configure_context(self, settings: ContextSettings) -> None:
-        """Apply a validated disclosure policy and matching clock default.
-
-        Args:
-            settings (ContextSettings): Validated effective context preferences.
-        """
-        registry = self._agent.tools.registry
-        registry.settings = replace(registry.settings, timezone=settings.timezone)
-        self._context_settings = settings
+    @property
+    def request_context(self) -> AgentContext:
+        """Return the request-window policy for application composition."""
+        return self._request_context
 
     @property
     def agent(self) -> Agent:
@@ -191,7 +193,7 @@ class AgentRunner:
         Returns:
             Agent: Configured agent.
         """
-        return self._agent
+        return self._request_context.agent
 
     @agent.setter
     def agent(self, agent: Agent) -> None:
@@ -200,7 +202,7 @@ class AgentRunner:
         Args:
             agent (Agent): Fully configured replacement agent.
         """
-        self._agent = agent
+        self._request_context.replace_agent(agent)
 
     @property
     def backend(self) -> Backend:
@@ -209,7 +211,7 @@ class AgentRunner:
         Returns:
             Backend: Configured backend.
         """
-        return self._backend
+        return self._request_context.backend
 
     @backend.setter
     def backend(self, backend: Backend) -> None:
@@ -218,7 +220,7 @@ class AgentRunner:
         Args:
             backend (Backend): Fully configured replacement backend.
         """
-        self._backend = backend
+        self._request_context.replace_backend(backend)
 
     @property
     def instructions_manager(self) -> InstructionsManager:
@@ -563,7 +565,7 @@ class AgentRunner:
                 for pending in state.pending_calls
                 if pending.status != "result_available"
             ),
-            prepare_context=self._backend.prepare_context,
+            prepare_context=self.backend.prepare_context,
         )
         warned_unknown = False
         for pending in state.pending_calls:
@@ -620,7 +622,7 @@ class AgentRunner:
             await self._session_manager.model_context_async(),
             self._instructions_manager.virtual_paths,
             pending_calls,
-            prepare_context=self._backend.prepare_context,
+            prepare_context=self.backend.prepare_context,
         )
         warned_unknown = False
         for pending in state.pending_calls:
@@ -704,8 +706,7 @@ class AgentRunner:
                             usage=response.usage,
                         )
                     )
-                    self._model_selection.record_response(response.model)
-                    self._session_manager.add_response(self._stored_response(response))
+                    self._persist_response(response)
                     if self._steering_pending():
                         self._cancel_pending_tools()
                         return self._record_run_result(
@@ -845,8 +846,7 @@ class AgentRunner:
                             usage=response.usage,
                         )
                     )
-                    await self._model_selection.record_response_async(response.model)
-                    await self._session_manager.add_response_async(self._stored_response(response))
+                    await self._persist_response_async(response)
                     if self._steering_pending():
                         await self._cancel_pending_tools_async()
                         return await self._record_run_result_async(
@@ -1087,7 +1087,7 @@ class AgentRunner:
 
     def _stored_call(self, call: ToolCall) -> ToolCall:
         """Redact registered private arguments even when a tool has a custom name."""
-        tools = self._agent.tools
+        tools = self.agent.tools
         private_names = (
             tools.private_argument_names
             if isinstance(tools, (ToolRegistry, ToolRegistryView))
@@ -1105,6 +1105,44 @@ class AgentRunner:
             return response
         calls = tuple(self._stored_call(call) for call in response.tool_calls)
         return response.model_copy(update={"items": items, "tool_calls": calls})
+
+    def _persist_response(self, response: Response) -> None:
+        """Save the reply with model metadata from the backend that produced it."""
+        target, self._response_target = self._response_target, None
+        if target is not None:
+            backend, requested_model = target
+            model = response.model or requested_model
+            try:
+                response.assignment = ModelSelection.resolve_assignment(backend, model)
+            except BackendError as error:
+                response.assignment = self._assignment_without_capacity(model, error)
+        self._session_manager.add_response(self._stored_response(response))
+
+    async def _persist_response_async(self, response: Response) -> None:
+        """Save the reply with asynchronous metadata from its owning backend."""
+        target, self._response_target = self._response_target, None
+        if target is not None:
+            backend, requested_model = target
+            model = response.model or requested_model
+            try:
+                response.assignment = await ModelSelection.resolve_assignment_async(backend, model)
+            except BackendError as error:
+                response.assignment = self._assignment_without_capacity(model, error)
+        await self._session_manager.add_response_async(self._stored_response(response))
+
+    @staticmethod
+    def _assignment_without_capacity(model: str, error: BackendError) -> ModelAssignment:
+        """Keep a completed response if its optional context capacity cannot be resolved."""
+        problem = Problem.from_exception(
+            error,
+            code="agent.context_capacity_unavailable",
+            title="Model context capacity is unavailable",
+            detail="Context capacity could not be retrieved for the completed response.",
+            severity="warning",
+            operation="resolve_model_assignment",
+        )
+        log_problem(_LOGGER, problem, error)
+        return ModelAssignment(model=model)
 
     def _reject_unstarted_retry(self, call: ToolCall, result: str, duration: float) -> Never:
         """Report the failed retry without settling the earlier unknown outcome."""
@@ -1155,7 +1193,7 @@ class AgentRunner:
 
         interruption = None
         try:
-            tool_result, duration = self._agent.tools.call_with_timing(
+            tool_result, duration = self.agent.tools.call_with_timing(
                 tool_call.name,
                 tool_call.arguments,
                 interaction=self._interaction,
@@ -1266,7 +1304,7 @@ class AgentRunner:
 
         cancellation = None
         try:
-            tool_result, duration = await self._agent.tools.call_with_timing_async(
+            tool_result, duration = await self.agent.tools.call_with_timing_async(
                 tool_call.name,
                 tool_call.arguments,
                 interaction=self._interaction,
@@ -1497,30 +1535,33 @@ class AgentRunner:
     def _query(self, recovery: str | None = None) -> Response:
         """Request and collect one response inside the active model-operation span."""
         self._checkpoint(steer=True)
-        selected_model = self._model_selection.effective
-        snapshot = self._instructions_manager.prepare(self._agent, recovery=recovery)
-        self._session_manager.update_instruction_state(
-            working_directory=str(snapshot.working_directory or self._working_directory),
-            active_skills=list(snapshot.active_skills),
-        )
-        self._model_selection.synchronize_session()
-        self._compaction.compact_if_needed(snapshot)
+        context = self._request_context
+        request = context.prepare(recovery)
+        if request.may_compact and self._compaction.compact_if_needed(request.snapshot):
+            request = context.prepare(recovery)
         self._checkpoint(steer=True)
+        model_context = request.backend.prepare_context(
+            self._session_manager.hydrate_context(request.input)
+        )
+        self._file_observations = FileObservations(
+            model_context, self._instructions_manager.virtual_paths
+        )
+        self._checkpoint(steer=True)
+        context.verify(request)
+        if not request.recorded:
+            self._session_manager.commit_model_window(
+                request.session_id,
+                request.previous_window,
+                request.previous_checkpoint,
+                request.window,
+                dispatch=request.dispatch,
+            )
+            self._checkpoint(steer=True)
+            context.verify(request, persisted=True)
+        context.remember_environment(request)
+        context.apply_window(request.window)
         started_at = perf_counter()
         first_chunk_at = None
-        model_context = self._backend.prepare_context(self._session_manager.model_context)
-        self._file_observations = FileObservations(
-            model_context,
-            self._instructions_manager.virtual_paths,
-        )
-        events = self._backend.get_response(
-            input=model_context,
-            instructions=self._request_instructions(snapshot.content),
-            stream=self._stream,
-            model=selected_model,
-            hyperparameters=self._agent.hyperparameters,
-            tools=self._agent.tools.definitions(),
-        )
 
         def measured_events():
             nonlocal first_chunk_at
@@ -1530,7 +1571,18 @@ class AgentRunner:
                     first_chunk_at = perf_counter()
                 yield event
 
-        with ExitStack() as resources:
+        with (
+            request.backend.file_projection(request.window.settings.file_input_mode),
+            ExitStack() as resources,
+        ):
+            events = request.backend.get_response(
+                input=model_context,
+                instructions=request.instructions,
+                stream=self._stream,
+                model=request.window.model,
+                hyperparameters=request.hyperparameters,
+                tools=request.window.tools,
+            )
             close_stream = getattr(events, "close", None)
             if callable(close_stream):
                 resources.callback(close_stream)
@@ -1546,38 +1598,41 @@ class AgentRunner:
                 first_chunk_at - started_at if self._stream and first_chunk_at is not None else None
             ),
         )
+        self._response_target = (request.backend, request.window.model)
         return response
 
     async def _query_async(self, recovery: str | None = None) -> Response:
         """Collect one asynchronous response inside the active model-operation span."""
         await self._checkpoint_async(steer=True)
-        selected_model = self._model_selection.effective
-        snapshot = await self._instructions_manager.prepare_async(self._agent, recovery=recovery)
-        self._session_manager.update_instruction_state(
-            working_directory=str(snapshot.working_directory or self._working_directory),
-            active_skills=list(snapshot.active_skills),
-        )
-        await self._model_selection.synchronize_session_async()
-        await self._compaction.compact_if_needed_async(snapshot)
+        context = self._request_context
+        request = await context.prepare_async(recovery)
+        if request.may_compact and await self._compaction.compact_if_needed_async(request.snapshot):
+            request = await context.prepare_async(recovery)
         await self._checkpoint_async(steer=True)
-        started_at = perf_counter()
-        first_chunk_at = None
-        model_context = self._backend.prepare_context(
-            await self._session_manager.model_context_async()
+        model_context = request.backend.prepare_context(
+            await self._session_manager.hydrate_context_async(request.input)
         )
         self._file_observations = await self._run_blocking_async(
             FileObservations,
             model_context,
             self._instructions_manager.virtual_paths,
         )
-        events = self._backend.get_response_async(
-            input=model_context,
-            instructions=self._request_instructions(snapshot.content),
-            stream=self._stream,
-            model=selected_model,
-            hyperparameters=self._agent.hyperparameters,
-            tools=self._agent.tools.definitions(),
-        )
+        await self._checkpoint_async(steer=True)
+        context.verify(request)
+        if not request.recorded:
+            await self._session_manager.commit_model_window_async(
+                request.session_id,
+                request.previous_window,
+                request.previous_checkpoint,
+                request.window,
+                dispatch=request.dispatch,
+            )
+            await self._checkpoint_async(steer=True)
+            context.verify(request, persisted=True)
+        context.remember_environment(request)
+        context.apply_window(request.window)
+        started_at = perf_counter()
+        first_chunk_at = None
 
         async def measured_events_async() -> AsyncIterator[ResponseEvent]:
             """Check cancellation and record first-event timing while yielding backend events."""
@@ -1588,17 +1643,26 @@ class AgentRunner:
                     first_chunk_at = perf_counter()
                 yield event
 
-        async with aclosing(measured_events_async()) as stream:
-            try:
-                response = await self._session_manager.response_async(
-                    stream,
-                    debug=self._debug,
-                    interaction=self._interaction,
-                )
-            finally:
-                closer = getattr(events, "aclose", None)
-                if callable(closer):
-                    await closer()
+        with request.backend.file_projection(request.window.settings.file_input_mode):
+            events = request.backend.get_response_async(
+                input=model_context,
+                instructions=request.instructions,
+                stream=self._stream,
+                model=request.window.model,
+                hyperparameters=request.hyperparameters,
+                tools=request.window.tools,
+            )
+            async with aclosing(measured_events_async()) as stream:
+                try:
+                    response = await self._session_manager.response_async(
+                        stream,
+                        debug=self._debug,
+                        interaction=self._interaction,
+                    )
+                finally:
+                    closer = getattr(events, "aclose", None)
+                    if callable(closer):
+                        await closer()
         completed_at = perf_counter()
         response.metrics = ResponseMetrics(
             duration_seconds=completed_at - started_at,
@@ -1606,25 +1670,8 @@ class AgentRunner:
                 first_chunk_at - started_at if self._stream and first_chunk_at is not None else None
             ),
         )
+        self._response_target = (request.backend, request.window.model)
         return response
-
-    def _request_instructions(self, instructions: str) -> str:
-        """Append one transient environment block within the existing instruction budget."""
-        clock = self._agent.tools.registry.settings
-        environment = render_environment(
-            self._context_settings,
-            self._working_directory,
-            timezone=clock.timezone,
-            client_timezone=clock.client_timezone,
-        )
-        if environment is None:
-            return instructions
-        combined = f"{instructions}\n\n{environment}"
-        return (
-            combined
-            if len(combined.encode()) <= self._instructions_manager.max_bytes
-            else instructions
-        )
 
     async def _run_blocking_async(
         self,
@@ -1738,6 +1785,7 @@ class AgentRunner:
 
     def _query_with_recovery(self) -> Response | None:
         """Request one response while escalating exhausted failures to the user."""
+        self._response_target = None
         recovery = None
         yolo_retries = 0
         while True:
@@ -1765,6 +1813,10 @@ class AgentRunner:
                 )
                 log_problem(_LOGGER, problem, error)
                 self._interaction.report(problem)
+                return None
+            except ProblemException as error:
+                log_problem(_LOGGER, error.problem, error)
+                self._interaction.report(error.problem)
                 return None
             except BackendError as error:
                 if isinstance(error, BackendRepetitionError) and recovery is None:
@@ -1813,6 +1865,7 @@ class AgentRunner:
             OSError: If persisting a fallback model preference fails.
             asyncio.CancelledError: If an async query or user interaction is cancelled.
         """
+        self._response_target = None
         recovery = None
         yolo_retries = 0
         while True:
@@ -1840,6 +1893,10 @@ class AgentRunner:
                 )
                 log_problem(_LOGGER, problem, error)
                 self._interaction.report(problem)
+                return None
+            except ProblemException as error:
+                log_problem(_LOGGER, error.problem, error)
+                self._interaction.report(error.problem)
                 return None
             except BackendError as error:
                 if isinstance(error, BackendRepetitionError) and recovery is None:

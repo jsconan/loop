@@ -363,6 +363,7 @@ class ApplicationRuntime:
                 refresh_sandbox_backend=getattr(execution_service, "refresh_backend", None),
                 context_settings=settings.context,
             )
+            loop.configure_context(settings)
             cls._track_close(loop.command_manager, cleanup_callbacks)
             runtime = cls(
                 loop,
@@ -387,6 +388,7 @@ class ApplicationRuntime:
                     validate_yolo=permission_manager.validate_yolo_activation,
                     yolo_active=lambda: permission_manager.yolo,
                     yolo_gate=permission_manager.suspend_yolo_decisions,
+                    pending=loop.configuration_status,
                 )
             )
             loop.register_command_provider(
@@ -464,7 +466,7 @@ class ApplicationRuntime:
         Returns:
             str: Whether the setting was applied now or requires restart.
         """
-        if path.startswith("backend."):
+        if self._refreshes_backend(path):
             self._replace_backend(settings)
             return "applied now"
         if path == "conversation.input_mode":
@@ -484,7 +486,7 @@ class ApplicationRuntime:
         Raises:
             asyncio.CancelledError: If asynchronous model metadata lookup is cancelled.
         """
-        if path.startswith("backend."):
+        if self._refreshes_backend(path):
             await self._replace_backend_async(settings)
             return "applied now"
         if path == "conversation.input_mode":
@@ -504,14 +506,16 @@ class ApplicationRuntime:
             Mapping[str, str]: Per-path statuses describing whether each change was applied now.
         """
         statuses = {}
-        if any(path.startswith("backend.") for path in paths):
+        if any(self._refreshes_backend(path) for path in paths):
             self._replace_backend(settings)
-            statuses.update({path: "applied now" for path in paths if path.startswith("backend.")})
+            statuses.update(
+                {path: "applied now" for path in paths if self._refreshes_backend(path)}
+            )
         statuses.update(
             {
                 path: self._loop.apply_runtime_settings(path, settings)
                 for path in paths
-                if not path.startswith("backend.") and path != "conversation.input_mode"
+                if not self._refreshes_backend(path) and path != "conversation.input_mode"
             }
         )
         if "conversation.input_mode" in paths:
@@ -534,16 +538,23 @@ class ApplicationRuntime:
             asyncio.CancelledError: If asynchronous model metadata lookup is cancelled.
         """
         statuses = {}
-        if any(path.startswith("backend.") for path in paths):
+        if any(self._refreshes_backend(path) for path in paths):
             await self._replace_backend_async(settings)
-            statuses.update({path: "applied now" for path in paths if path.startswith("backend.")})
+            statuses.update(
+                {path: "applied now" for path in paths if self._refreshes_backend(path)}
+            )
         for path in paths:
-            if not path.startswith("backend."):
+            if not self._refreshes_backend(path):
                 if path == "conversation.input_mode":
                     statuses[path] = self._apply_conversation_input_mode(settings)
                 else:
                     statuses[path] = await self._loop.apply_runtime_settings_async(path, settings)
         return statuses
+
+    @staticmethod
+    def _refreshes_backend(path: str) -> bool:
+        """Keep a deferred file projection separate from client refreshes."""
+        return path.startswith("backend.") and path != "backend.file_input_mode"
 
     def _apply_conversation_input_mode(self, settings: ApplicationSettings) -> str:
         """Apply the configured plain-text route to the active session controller."""
@@ -557,12 +568,14 @@ class ApplicationRuntime:
         backend = self._create_backend(settings)
         self._track_close(backend, self._cleanup_callbacks)
         self._loop.replace_backend(backend)
+        self._loop.configure_context(settings)
 
     async def _replace_backend_async(self, settings: ApplicationSettings) -> None:
         """Track a replacement backend before publishing it through async restoration."""
         backend = self._create_backend(settings)
         self._track_close(backend, self._cleanup_callbacks)
         await self._loop.replace_backend_async(backend)
+        self._loop.configure_context(settings)
 
     @staticmethod
     def _create_backend(settings: ApplicationSettings) -> OpenAIBackend:

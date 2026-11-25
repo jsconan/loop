@@ -1,6 +1,7 @@
 """Expose session persistence contracts and implementations."""
 
 __all__ = [
+    "COMMAND_TIMING_FIELDS",
     "SESSION_NAME_SOURCES",
     "SESSION_NAME_SOURCE_GENERATED",
     "SESSION_NAME_SOURCE_INITIAL",
@@ -16,11 +17,14 @@ __all__ = [
     "InputQueuedEvent",
     "InputRecalledEvent",
     "InputRejectedEvent",
+    "InstructionRevision",
     "InstructionSnapshot",
     "InteractionRequestedEvent",
     "InteractionSettledEvent",
     "LocalSessionNameGenerator",
     "MemorySessionStore",
+    "ModelDispatch",
+    "ModelWindow",
     "PendingToolCall",
     "PermissionEvent",
     "ReferenceArtifact",
@@ -53,6 +57,7 @@ __all__ = [
     "ToolExecutionStartedEvent",
     "ToolRecoveryStatus",
     "UnsupportedConversationItemError",
+    "WindowSettings",
     "export_session",
     "initial_session_name",
     "normalize_session_name",
@@ -116,3 +121,10 @@ from .naming import (
 from .session import Session
 from .session_manager import SessionManager
 from .store import MemorySessionStore, SessionStore, SQLiteSessionStore
+from .window import (
+    COMMAND_TIMING_FIELDS,
+    InstructionRevision,
+    ModelDispatch,
+    ModelWindow,
+    WindowSettings,
+)

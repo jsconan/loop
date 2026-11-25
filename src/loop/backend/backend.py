@@ -3,13 +3,17 @@
 import asyncio
 import json
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator, Iterable
+from collections.abc import AsyncIterator, Generator, Iterable
+from contextlib import contextmanager
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 from ..models import (
     CompactionContextItem,
     CompactionResult,
     ContextReference,
+    FileInputMode,
+    InstructionLayout,
     Message,
     ModelContextItem,
     ModelInfo,
@@ -118,6 +122,82 @@ class Backend(ABC):
             str | None: The default model identifier, or ``None`` when unconfigured.
         """
         return self._default_model
+
+    @property
+    def endpoint(self) -> str:
+        """Return the service endpoint with transport credentials removed.
+
+        Returns:
+            str: Normalized endpoint, or an empty string for an in-process backend.
+        """
+        if self.base_url is None:
+            return ""
+        url = urlsplit(self.base_url)
+        authority = url.netloc.rsplit("@", 1)[-1].lower()
+        return f"{url.scheme.lower()}://{authority}{url.path.rstrip('/')}"
+
+    @property
+    def route(self) -> str:
+        """Identify the deployment and protocol for a durable model window.
+
+        Returns:
+            str: Credential-free route identifier.
+        """
+        return f"{type(self).__name__}:{self.endpoint}"
+
+    @property
+    def file_input_mode(self) -> FileInputMode | None:
+        """Return the configured file projection, if supported.
+
+        Returns:
+            FileInputMode | None: Configured projection or no override.
+        """
+        return None
+
+    def resolve_file_input_mode(self, mode: FileInputMode | None) -> FileInputMode | None:
+        """Resolve a saved attachment setting for the active deployment.
+
+        Args:
+            mode (FileInputMode | None): User override, or None for the deployed default.
+
+        Returns:
+            FileInputMode | None: Projection to pin in the window.
+        """
+        return mode or self.file_input_mode
+
+    @contextmanager
+    def file_projection(self, mode: FileInputMode | None) -> Generator[None, None, None]:
+        """Scope attachment rendering to an effective window.
+
+        Args:
+            mode (FileInputMode | None): Pinned attachment representation.
+
+        Yields:
+            None: Scope in which the projection applies.
+        """
+        yield
+
+    def instruction_layout(self, model: str) -> InstructionLayout:
+        """Return the verified placement of developer and request-specific guidance.
+
+        Args:
+            model (str): Requested model identifier.
+
+        Returns:
+            InstructionLayout: Leading, inline, or inline baseline with a suffix field.
+        """
+        return "leading"
+
+    def supports_reasoning_updates(self, model: str) -> bool:
+        """Check whether live reasoning changes can be appended to history.
+
+        Args:
+            model (str): Requested model identifier.
+
+        Returns:
+            bool: Whether the route understands reasoning configuration input items.
+        """
+        return False
 
     def _select_model(self, model: str | None) -> str:
         """Return the requested or default model, rejecting missing configuration."""

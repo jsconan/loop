@@ -2,7 +2,11 @@
 
 import asyncio
 import json
+import os
+import re
 from collections.abc import AsyncIterator, Iterable, Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from copy import deepcopy
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
@@ -62,6 +66,7 @@ from ..models import (
     FileInputMode,
     Hyperparameter,
     HyperparameterPolicy,
+    InstructionLayout,
     Message,
     ModelContextItem,
     ModelInfo,
@@ -93,6 +98,7 @@ from ..utils import (
     get_binary,
     payload_digest,
     run_in_worker_async,
+    sha256_digest,
     snippet,
     validate_term,
 )
@@ -116,6 +122,9 @@ from .errors import (
 from .utils import project_context
 
 _ReasoningChannel = Literal["content", "summary"]
+
+
+_GPT_VERSION = re.compile(r"gpt-([0-9]+)(?:\.([0-9]+))?(?:-|$)")
 
 
 class OpenAIBackend(Backend):
@@ -167,6 +176,8 @@ class OpenAIBackend(Backend):
     _configured_context_window: int | None
     _context_windows: dict[str, int | None]
     _file_input_mode: FileInputMode
+    _file_projection: ContextVar[FileInputMode | None]
+    _state_namespace: str | None
     _structured_output_mode: StructuredOutputMode
     _structured_output_max_retries: int
     _prompt_structured_models: set[str]
@@ -217,6 +228,7 @@ class OpenAIBackend(Backend):
         hyperparameter_policy: HyperparameterPolicy = (constants.DEFAULT_HYPERPARAMETER_POLICY),
         retention_policy: RetentionPolicy | None = None,
     ) -> None:
+        base_url = base_url or os.environ.get("OPENAI_BASE_URL")
         super().__init__(
             base_url=base_url,
             default_model=default_model,
@@ -226,7 +238,10 @@ class OpenAIBackend(Backend):
         self._async_client = None
         self._async_client_loop = None
         self._configured_context_window = context_window
-        self._file_input_mode = file_input_mode or ("text" if base_url is not None else "native")
+        self._file_input_mode = self.resolve_file_input_mode(file_input_mode)
+        self._file_projection = ContextVar("loop_file_projection", default=None)
+        namespace = (os.environ.get("OPENAI_ORG_ID"), os.environ.get("OPENAI_PROJECT_ID"))
+        self._state_namespace = sha256_digest(json.dumps(namespace)) if any(namespace) else None
         self._context_windows = {}
         self._structured_output_mode = structured_output_mode
         self._structured_output_max_retries = structured_output_max_retries
@@ -255,6 +270,80 @@ class OpenAIBackend(Backend):
             reporter=self._report_model_input_redactions,
         )
         self._validate_attributes()
+
+    @property
+    def route(self) -> str:
+        """Identify the deployment and known state namespace.
+
+        Returns:
+            str: Credential-free route identifier.
+        """
+        route = super().route
+        return f"{route}:{self._state_namespace}" if self._state_namespace else route
+
+    @property
+    def file_input_mode(self) -> FileInputMode:
+        """Return the configured default attachment representation.
+
+        Returns:
+            FileInputMode: Native attachments or text projection.
+        """
+        return self._file_input_mode
+
+    def resolve_file_input_mode(self, mode: FileInputMode | None) -> FileInputMode:
+        """Resolve automatic file projection using the public endpoint contract.
+
+        Args:
+            mode (FileInputMode | None): Explicit override, or None for the deployed default.
+
+        Returns:
+            FileInputMode: Native attachment or text projection.
+        """
+        return mode or ("native" if self.base_url is None else "text")
+
+    @contextmanager
+    def file_projection(self, mode: FileInputMode | None) -> Iterator[None]:
+        """Use a pinned attachment projection for the current request.
+
+        Args:
+            mode (FileInputMode | None): Pinned projection, or the configured default.
+
+        Yields:
+            None: Request scope, isolated from concurrent requests and auxiliary tasks.
+        """
+        token = self._file_projection.set(mode)
+        try:
+            yield
+        finally:
+            self._file_projection.reset(token)
+
+    def instruction_layout(self, model: str) -> InstructionLayout:
+        """Select only developer-message placements supported by this route.
+
+        Args:
+            model (str): Requested model identifier.
+
+        Returns:
+            InstructionLayout: Verified request layout for the selected model.
+        """
+        if self.base_url is not None:
+            return "leading"
+        match = _GPT_VERSION.match(model)
+        if match and (int(match[1]), int(match[2] or 0)) >= (6, 2):
+            return "suffix"
+        return "inline"
+
+    def supports_reasoning_updates(self, model: str) -> bool:
+        """Check whether the selected Responses route accepts configuration updates.
+
+        Args:
+            model (str): Requested model identifier.
+
+        Returns:
+            bool: Whether an effort change can be represented as an input item.
+        """
+        match = _GPT_VERSION.match(model)
+        return self.base_url is None and match is not None and int(match[1]) >= 6
 
     def _validate_attributes(self) -> None:
         """Validate the backend attributes after initialization."""
@@ -1684,8 +1773,9 @@ class OpenAIBackend(Backend):
     def _attachment_message(self, reference: ContextReference) -> dict[str, Any]:
         """Translate one file snapshot into a backend-compatible content part."""
         media_type = reference.media_type or guess_type(reference.path)[0] or "text/plain"
-        if not isinstance(reference.content, str) or self._file_input_mode == "native":
-            if self._file_input_mode != "native":
+        mode = self._file_projection.get() or self._file_input_mode
+        if not isinstance(reference.content, str) or mode == "native":
+            if mode != "native":
                 if media_type.startswith("image/"):
                     if self._base_url is not None:
                         return {

@@ -58,6 +58,7 @@ from loop.tools.web import read_cached_content
 from loop.utils import VirtualPath
 from loop.utils import path as path_module
 from loop.utils.yaml import load_yaml
+from tests.backend_doubles import model_backend
 from tests.scheduling import receive_fifo_byte
 
 pytestmark = [pytest.mark.integration, pytest.mark.e2e, pytest.mark.macos]
@@ -3001,7 +3002,7 @@ def test_public_session_runs_pytest_from_private_unusual_scratch(
         ),
     )
     loop = Loop.create_default(
-        backend=SimpleNamespace(default_model="test", get_context_window=lambda _: None),
+        backend=model_backend(default_model="test"),
         working_directory=native_workspace,
         session_manager=sessions,
         interaction=interaction,
@@ -3932,7 +3933,7 @@ def test_session_files_survive_commands_turns_and_runtime_recreation(
             execution_service=CommandExecutionService(backend, host),
         )
         loop = Loop.create_default(
-            backend=SimpleNamespace(default_model="test", get_context_window=lambda _: None),
+            backend=model_backend(default_model="test"),
             working_directory=native_workspace,
             session_manager=manager,
             interaction=interaction,
@@ -4091,7 +4092,7 @@ def test_session_paths_round_trip_through_scripts_subprocesses_and_file_tools(
         execution_service=CommandExecutionService(backend, host),
     )
     loop = Loop.create_default(
-        backend=SimpleNamespace(default_model="test", get_context_window=lambda _: None),
+        backend=model_backend(default_model="test"),
         working_directory=native_workspace,
         session_manager=sessions,
         interaction=interaction,

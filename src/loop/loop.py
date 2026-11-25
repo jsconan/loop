@@ -10,7 +10,7 @@ from threading import get_ident
 from typing import Self
 
 from . import constants
-from .agent import Agent, AgentRunner, AgentRunResult
+from .agent import WINDOW_SETTING_PATHS, Agent, AgentRunner, AgentRunResult
 from .backend import Backend, GenerationHyperparameters
 from .commands import CommandManager, CommandsProvider
 from .compaction import CompactionCommands, ContextCompaction
@@ -83,7 +83,6 @@ class Loop:
     _completion_manager: CompletionManager
     _session_name_generator: SessionNameGenerator
     _mention_manager: MentionManager
-    _agent: Agent
     _agent_runner: AgentRunner
     _owns_session_name_generator: bool
     _skill_hints_enabled: bool
@@ -108,7 +107,6 @@ class Loop:
         interaction: Interaction | None = None,
     ) -> None:
         self._agent_runner = agent_runner
-        self._agent = agent_runner.agent
         self._session_manager = agent_runner.session_manager
         self._model_selection = agent_runner.model_selection
         self._compaction = agent_runner.compaction
@@ -239,8 +237,6 @@ class Loop:
             configured_directory,
             agents_filenames=agents_filenames,
         )
-        if instructions_manager is None:
-            configured_instructions.reactivate_skills(configured_sessions.session.active_skills)
         with configured_tools.compose_session(
             configured_sessions,
             permission_manager=configured_permissions,
@@ -268,16 +264,21 @@ class Loop:
                 reasoning_effort=reasoning_effort,
             ),
         )
-        configured_instructions.prepare(configured_agent)
+        window = configured_sessions.session.window
+        pinned = window.baseline if window is not None else None
+        configured_instructions.bind_agent_budget(configured_agent, pinned=pinned)
+        if instructions_manager is None:
+            configured_instructions.reactivate_skills(configured_sessions.session.active_skills)
+        configured_instructions.prepare(configured_agent, pinned=pinned)
+
         configured_selection = ModelSelection(
             backend,
             configured_sessions,
-            selected=(
-                configured_sessions.model if configured_sessions.model is not None else model
-            ),
+            selected=cls._restored_model(configured_sessions.session, model, backend.default_model),
             on_select=on_model_select,
             async_blocking_runner=configured_commands.run_blocking_async,
         )
+        configured_selection.preference = model
         configured_compaction = ContextCompaction(
             backend,
             configured_sessions,
@@ -316,7 +317,9 @@ class Loop:
             PermissionCommands(configured_permissions),
             SkillCommands(configured_instructions),
             ToolCommands(configured_tools, configured_instructions),
-            ModelCommands(configured_selection),
+            ModelCommands(
+                configured_selection, configured_runner.request_context.allow_route_switch
+            ),
             CompactionCommands(configured_compaction),
             SandboxCommands(
                 main_app=main_app,
@@ -398,7 +401,7 @@ class Loop:
         Returns:
             Agent: Agent configured for this conversation.
         """
-        return self._agent
+        return self._agent_runner.agent
 
     @property
     def agent_runner(self) -> AgentRunner:
@@ -416,7 +419,7 @@ class Loop:
         Returns:
             ToolRegistry: Single owner of the agent's declarations and execution dependencies.
         """
-        return self._agent.tools.registry
+        return self.agent.tools.registry
 
     def apply_runtime_settings(self, path: str, settings: ApplicationSettings) -> str:
         """Apply a supported live setting to the active loop.
@@ -428,9 +431,10 @@ class Loop:
         Returns:
             str: Whether the setting was applied now or requires restart.
         """
-        if path.startswith("context."):
-            self._agent_runner.configure_context(settings.context)
-        elif path == "app.debug":
+        if path in WINDOW_SETTING_PATHS or path.startswith("context."):
+            self.configure_context(settings)
+            return self.configuration_status(path) or "applied now"
+        if path == "app.debug":
             self._agent_runner.debug = settings.app.debug
         elif path == "app.allow_direct_host_execution":
             self.permission_manager.set_direct_host_execution(
@@ -454,24 +458,8 @@ class Loop:
             self.tool_registry.settings.sandbox_environment = settings.tools.sandbox_environment
         elif path == "tools.sandbox_path_aliases":
             self.tool_registry.settings.sandbox_path_aliases = settings.tools.sandbox_path_aliases
-        elif path == "tools.command_job_runtime_limit_seconds":
-            self.tool_registry.settings.command_job_runtime_limit_seconds = (
-                settings.tools.command_job_runtime_limit_seconds
-            )
-        elif path == "tools.command_default_initial_wait_seconds":
-            self.tool_registry.settings.command_default_initial_wait_seconds = (
-                settings.tools.command_default_initial_wait_seconds
-            )
-        elif path == "tools.command_default_poll_wait_seconds":
-            self.tool_registry.settings.command_default_poll_wait_seconds = (
-                settings.tools.command_default_poll_wait_seconds
-            )
-        elif path == "tools.command_max_wait_seconds":
-            self.tool_registry.settings.command_max_wait_seconds = (
-                settings.tools.command_max_wait_seconds
-            )
         elif path == "app.model":
-            self._model_selection.restore(settings.app.model)
+            self.restore_model(settings.app.model)
         elif path == "app.temperature":
             self._agent_runner.agent.hyperparameters.temperature = settings.app.temperature
 
@@ -497,9 +485,30 @@ class Loop:
             asyncio.CancelledError: If asynchronous model metadata lookup is cancelled.
         """
         if path == "app.model":
+            self._model_selection.preference = settings.app.model
             await self._model_selection.restore_async(settings.app.model)
+            self._agent_runner.request_context.allow_route_switch()
             return "applied now"
         return self.apply_runtime_settings(path, settings)
+
+    def configure_context(self, settings: ApplicationSettings) -> None:
+        """Store validated window and disclosure preferences from the configuration owner.
+
+        Args:
+            settings (ApplicationSettings): Latest validated application settings.
+        """
+        self._agent_runner.request_context.configure(settings)
+
+    def configuration_status(self, path: str) -> str | None:
+        """Return the effective value of a deferred setting, when it differs from the saved value.
+
+        Args:
+            path (str): Dot-separated configuration path.
+
+        Returns:
+            str | None: Pending status, or None when no value is deferred.
+        """
+        return self._agent_runner.request_context.pending(path)
 
     def replace_backend(self, backend: Backend) -> None:
         """Replace the shared backend used by all future loop operations.
@@ -551,7 +560,7 @@ class Loop:
                 and activated-skill instructions. Accessing this property refreshes stale project
                 sources before composing the document.
         """
-        return self._instructions_manager.prepare(self._agent).content
+        return self._instructions_manager.prepare(self.agent).content_with_suffix
 
     @property
     def instructions_manager(self) -> InstructionsManager:
@@ -745,6 +754,7 @@ class Loop:
             model (str): Exact backend model identifier to select.
         """
         self._model_selection.select(model)
+        self._agent_runner.request_context.allow_route_switch()
 
     def restore_model(self, model: str | None) -> None:
         """Restore a configured model selection and synchronize session metadata.
@@ -752,7 +762,9 @@ class Loop:
         Args:
             model (str | None): Explicit model or ``None`` to use the backend default.
         """
+        self._model_selection.preference = model
         self._model_selection.restore(model)
+        self._agent_runner.request_context.allow_route_switch()
 
     def run(self, *, input_source: Callable[[CompletionManager], object] | None = None) -> None:
         """Run the conversation until the user requests to exit.
@@ -826,7 +838,7 @@ class Loop:
                 if handled_command:
                     if self.session is not session:
                         with self._session_manager.execution():
-                            self._model_selection.restore(self.session.model)
+                            self._model_selection.restore(self._restore_context())
                             self._recover_session()
                     continue
                 if self._skill_hints_enabled:
@@ -841,7 +853,7 @@ class Loop:
                             )
                         )
                         if not self._instructions_manager.set_skill_catalog_priorities(
-                            skill_mentions, self._agent
+                            skill_mentions, self.agent
                         ):
                             self._interaction.warning(
                                 "Referenced skill metadata could not fit in the instruction "
@@ -971,7 +983,7 @@ class Loop:
                 if handled_command:
                     if self.session is not session:
                         with self._session_manager.execution():
-                            await self._model_selection.restore_async(self.session.model)
+                            await self._model_selection.restore_async(self._restore_context())
                             await self._recover_session_async()
                     continue
                 if self._skill_hints_enabled:
@@ -986,7 +998,7 @@ class Loop:
                             )
                         )
                         if not await self._instructions_manager.set_skill_catalog_priorities_async(
-                            skill_mentions, self._agent
+                            skill_mentions, self.agent
                         ):
                             self._interaction.warning(
                                 "Referenced skill metadata could not fit in the instruction "
@@ -1120,6 +1132,31 @@ class Loop:
         """Remove a completed title task without dropping a newer task for that session."""
         if self._session_name_tasks.get(session_id) is task:
             del self._session_name_tasks[session_id]
+
+    def _restore_context(self) -> str | None:
+        """Restore the selected session's effective tools, skills, and model selection."""
+        session = self.session
+        window = session.window
+        self._agent_runner.request_context.apply_window(window)
+        self._instructions_manager.deactivate_all_skills()
+        self._instructions_manager.reactivate_skills(session.active_skills)
+        return self._restored_model(
+            session,
+            self._model_selection.preference,
+            self.backend.default_model,
+        )
+
+    @staticmethod
+    def _restored_model(
+        session: Session,
+        preference: str | None,
+        backend_default: str | None,
+    ) -> str | None:
+        """Restore the selection mode of a saved window or the legacy model preference."""
+        window = session.window
+        if window is None:
+            return session.model or preference
+        return None if window.follows_default and backend_default else window.model
 
     def _clear_skill_catalog_priorities(self) -> None:
         """Clear request-scoped skill priorities without masking the preceding outcome."""

@@ -21,6 +21,7 @@ type FileInputMode = Literal["text", "native"]
 type ConversationInputMode = Literal["queue", "steer"]
 type StructuredOutputMode = Literal["auto", "native", "prompt"]
 type StructuredOutputTransport = Literal["native", "prompt"]
+type InstructionLayout = Literal["leading", "inline", "suffix"]
 type ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
 type RepetitionDetection = Literal["off", "client", "server", "both", "auto"]
 type Hyperparameter = Literal["temperature", "reasoning"]
@@ -831,6 +832,7 @@ class Response(BaseModel):
         items (tuple[ConversationItem, ...]): Items to retain in conversation history.
         usage (Usage): Token usage reported for the response.
         model (str | None): Model identifier reported for the response.
+        assignment (ModelAssignment | None): Resolved model and capacity of the admitted request.
         structured_output (Any | None): Validated structured answer, when requested.
         metrics (ResponseMetrics): Client-observed operation timing.
     """
@@ -841,6 +843,7 @@ class Response(BaseModel):
     items: tuple[ConversationItem, ...] = Field(default_factory=tuple)
     usage: Usage = Field(default_factory=Usage)
     model: str | None = None
+    assignment: ModelAssignment | None = Field(default=None, exclude=True)
     structured_output: Any | None = Field(default=None, exclude_if=lambda value: value is None)
     metrics: ResponseMetrics = Field(default_factory=ResponseMetrics)
 

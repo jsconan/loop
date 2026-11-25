@@ -192,22 +192,28 @@ class ContextCompaction:
 
         Raises:
             ValueError: If no effective model is configured.
+            ProblemException: If the target route cannot use the active session.
         """
         if not self._can_start(force):
             return False
 
         snapshot = instructions or self._instructions()
         model = self._model_selection.effective
-        self._start(model)
+        backend = self._backend
+        route = backend.route
+        context = self._session_manager.compaction_context(
+            route, model, backend.instruction_layout(model)
+        )
+        self._report_start(model)
         try:
-            result = self._backend.compact(
-                self._session_manager.model_context,
+            result = backend.compact(
+                self._session_manager.hydrate_context(context),
                 instructions=snapshot.content,
                 model=model,
             )
         except NotImplementedError:
             return self._unsupported()
-        return self._finish(result, snapshot, model)
+        return self._finish(result, snapshot, model, route)
 
     async def compact_async(
         self,
@@ -229,6 +235,7 @@ class ContextCompaction:
         Raises:
             BackendError: If the provider request or response fails.
             ValueError: If no effective model is configured.
+            ProblemException: If the target route cannot use the active session.
             RuntimeError: Bounded worker admission is full or unavailable when no async provider
                 was configured.
             asyncio.CancelledError: If backend compaction or session persistence is cancelled.
@@ -243,16 +250,21 @@ class ContextCompaction:
         else:
             snapshot = await run_in_worker_async(self._instructions)
         model = self._model_selection.effective
-        await self._start_async(model)
+        backend = self._backend
+        route = backend.route
+        context = self._session_manager.compaction_context(
+            route, model, backend.instruction_layout(model)
+        )
+        self._report_start(model)
         try:
-            result = await self._backend.compact_async(
-                self._session_manager.model_context,
+            result = await backend.compact_async(
+                self._session_manager.hydrate_context(context),
                 instructions=snapshot.content,
                 model=model,
             )
         except NotImplementedError:
             return self._unsupported()
-        return await self._finish_async(result, snapshot, model)
+        return await self._finish_async(result, snapshot, model, route)
 
     def _can_start(self, force: bool) -> bool:
         """Return whether compaction should proceed, reporting an explicit empty request."""
@@ -262,18 +274,8 @@ class ContextCompaction:
             return False
         return force or self.needed()
 
-    def _start(self, model: str) -> None:
-        """Synchronize the selected model and report the start of compaction."""
-        self._model_selection.synchronize_session()
-        self._report_start(model)
-
-    async def _start_async(self, model: str) -> None:
-        """Synchronize model metadata asynchronously and report compaction start."""
-        await self._model_selection.synchronize_session_async()
-        self._report_start(model)
-
     def _report_start(self, model: str) -> None:
-        """Report one compaction start after model metadata is synchronized."""
+        """Report one compaction start for its authorized model."""
         self._interaction.info("Compacting session context...")
         telemetry_activity(
             "compaction.started",
@@ -297,6 +299,7 @@ class ContextCompaction:
         result: CompactionResult | None,
         snapshot: PreparedInstructions,
         model: str,
+        route: str,
     ) -> bool:
         """Persist a complete compacted context and report its observed token change."""
         if result is None or not result.items:
@@ -313,6 +316,7 @@ class ContextCompaction:
         self._session_manager.add_compaction(
             result,
             model=model,
+            route=route,
             instructions=snapshot.content,
             working_directory=working_directory,
             active_skills=list(snapshot.active_skills),
@@ -328,6 +332,7 @@ class ContextCompaction:
         result: CompactionResult | None,
         snapshot: PreparedInstructions,
         model: str,
+        route: str,
     ) -> bool:
         """Persist compacted context asynchronously and report its observed token change."""
         if result is None or not result.items:
@@ -337,6 +342,7 @@ class ContextCompaction:
         await self._session_manager.add_compaction_async(
             result,
             model=model,
+            route=route,
             instructions=snapshot.content,
             working_directory=str(snapshot.working_directory or self._working_directory),
             active_skills=list(snapshot.active_skills),

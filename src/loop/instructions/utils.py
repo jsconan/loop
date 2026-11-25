@@ -207,7 +207,7 @@ def load_agents_instructions(
             diagnostics.append(f"Skipped '{agents_file}': {exc}")
             continue
         if content:
-            discovered.append((agents_file, content))
+            discovered.append((agents_file.resolve(), content))
 
     if not discovered:
         return LoadedAgentInstructions(

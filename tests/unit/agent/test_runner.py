@@ -75,6 +75,7 @@ from loop.tooling import (
 from loop.tooling.models import ToolExecutionInterrupted, ToolExecutionNotStarted
 from loop.tools.system import control_command_terminal, run_command
 from loop.utils import PathHolder, VirtualPath, await_value_async, content_digest, utc_now
+from tests.backend_doubles import model_backend
 from tests.scheduling import deliver_callbacks
 
 from ..execution.sandbox.helpers import logical_private_name
@@ -87,6 +88,15 @@ def automatic_process_policy(root, *, allow_direct_host_execution=False):
     return manager
 
 
+def mock_agent_tools():
+    """Isolate tool behavior while supplying window schema and timing settings."""
+    tools = Mock()
+    tools.registry.settings = ToolRuntimeSettings()
+    tools.definitions.return_value = []
+    tools.registry.definitions.side_effect = lambda **kwargs: tools.definitions()
+    return tools
+
+
 def agent_runner(
     *,
     responses=None,
@@ -97,14 +107,13 @@ def agent_runner(
     run_control=None,
 ):
     """Build a runner with isolated execution collaborators."""
-    backend = backend or Mock()
-    if isinstance(backend, Mock):
+    backend = model_backend(backend)
+    if isinstance(backend.prepare_context, Mock):
         backend.prepare_context.side_effect = list
-    agent = Agent("Assistant", tools=Mock())
+    agent = Agent("Assistant", tools=mock_agent_tools())
     instructions = instructions_manager or InstructionsManager()
     session_manager = Mock()
-    model_selection = Mock()
-    model_selection.record_response_async = AsyncMock()
+    model_selection = Mock(effective="model", selected=None)
     model_selection.synchronize_session_async = AsyncMock()
     for async_name, sync_name in (
         ("add_response_async", "add_response"),
@@ -119,6 +128,9 @@ def agent_runner(
     session_manager.messages = []
     session_manager.model_context = []
     session_manager.model_context_async = AsyncMock(return_value=[])
+    session_manager.hydrate_context.side_effect = list
+    session_manager.hydrate_context_async = AsyncMock(side_effect=list)
+    session_manager.commit_model_window_async = AsyncMock()
     session_manager.session = Session()
     run = SimpleNamespace(run_id="run-id", started_at=utc_now())
 
@@ -160,6 +172,10 @@ def agent_runner(
         "max_turns": max_turns,
         "prompt": True,
     }
+    compaction = Mock()
+    compaction.compact_if_needed.return_value = False
+    compaction.compact_if_needed_async = AsyncMock(return_value=False)
+    working_directory = PathHolder(Path.cwd())
     runner = AgentRunner(
         agent,
         backend,
@@ -167,9 +183,9 @@ def agent_runner(
         Mock(),
         session_manager,
         model_selection,
-        Mock(),
+        compaction,
         interaction,
-        PathHolder(Path.cwd()),
+        working_directory,
         stream=options["stream"],
         debug=options["debug"],
         max_turns=options["max_turns"],
@@ -276,21 +292,27 @@ def file_runner(tmp_path, backend, *, registry=None, sessions=None, run_control=
     permissions.bind_temporary_directory(sessions.temporary_directory)
     if registry is not None:
         registry.bind_session_manager(sessions)
+        if isinstance(registry, Mock):
+            tools = mock_agent_tools()
+            registry.view.return_value = tools
     agent = Agent("Assistant", tools=registry or ToolRegistry(BUILTIN_TOOLS))
     selection = Mock()
     selection.effective = "local-model"
-    selection.record_response_async = AsyncMock()
     selection.synchronize_session_async = AsyncMock()
+    working_directory = PathHolder(tmp_path)
     return AgentRunner(
         agent,
-        backend,
+        model_backend(backend),
         instructions,
         permissions,
         sessions,
         selection,
-        Mock(),
+        Mock(
+            compact_if_needed=Mock(return_value=False),
+            compact_if_needed_async=AsyncMock(return_value=False),
+        ),
         interaction,
-        PathHolder(tmp_path),
+        working_directory,
         run_control=run_control,
     )
 
@@ -1483,6 +1505,7 @@ def test_snapshot_visibility_uses_the_backend_prepared_reference(
         else (),
     )
     sdk = Mock()
+    sdk.models.list.return_value = []
     sdk.responses.create.side_effect = [
         SimpleNamespace(
             status="completed",
@@ -2190,7 +2213,7 @@ def test_runner_retries_one_detected_generation_loop_without_prompting():
 def test_runner_replaces_agent():
     """Assigning a replacement agent makes it available through the public property."""
     runner, _, _ = agent_runner(responses=[])
-    replacement = Agent("Replacement", tools=Mock())
+    replacement = Agent("Replacement", tools=mock_agent_tools())
 
     runner.agent = replacement
 
@@ -3365,6 +3388,27 @@ def test_runner_reports_and_cancels_on_a_request_preparation_failure():
     assert "instructions exceed the configured budget" in problem.detail
 
 
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_runner_reports_request_policy_failure_as_a_local_problem(asynchronous, caplog):
+    """A locally rejected request reports its own diagnostic and cancels without a retry."""
+    problem = Problem(
+        code="agent.route_unavailable",
+        title="Could not continue the session",
+        detail="The saved model route is unavailable.",
+        operation="prepare_generation",
+    )
+    runner, sessions, interaction = agent_runner(responses=[ProblemException(problem)])
+    runner.query_async = AsyncMock(side_effect=ProblemException(problem))
+
+    result = asyncio.run(runner.run_async()) if asynchronous else runner.run()
+
+    assert result.stop_reason == "cancelled"
+    interaction.report.assert_called_once_with(problem)
+    interaction.confirm.assert_not_called()
+    sessions.add_response.assert_not_called()
+    assert getattr(caplog.records[-1], "error.type") == problem.code
+
+
 def test_runner_does_not_reclassify_an_unexpected_value_error():
     """A ValueError outside known preparation boundaries remains visible to the caller."""
     runner, _, interaction = agent_runner(responses=[ValueError("malformed response")])
@@ -3454,8 +3498,8 @@ def test_runner_continues_after_max_turns_when_user_affirms():
     response_without_tools = Response(answer="finished", reasoning="")
     interaction = MagicMock(spec=Interaction)
     interaction.confirm.return_value = True
-    backend = Mock()
-    agent = Agent("Assistant", tools=Mock())
+    backend = model_backend()
+    agent = Agent("Assistant", tools=mock_agent_tools())
     instructions = InstructionsManager()
     session_manager = Mock()
     session_manager.messages = []
@@ -3465,16 +3509,19 @@ def test_runner_continues_after_max_turns_when_user_affirms():
     session_manager.tokens = 0
     session_manager.context_window = None
     session_manager.execution.side_effect = nullcontext
+    session_manager.session = Session()
+    selection = Mock()
+    working_directory = PathHolder(Path.cwd())
     runner = AgentRunner(
         agent,
         backend,
         instructions,
         Mock(),
         session_manager,
-        Mock(),
+        selection,
         Mock(),
         interaction,
-        PathHolder(Path.cwd()),
+        working_directory,
         max_turns=1,
     )
     runner.query = Mock(side_effect=[response_with_tools, response_without_tools])
@@ -3824,7 +3871,6 @@ def test_runner_run_async_uses_async_query_and_completes():
     runner.query_async.assert_awaited_once_with()
     runner.query.assert_not_called()
     runner.handle_tool_calls_async.assert_awaited_once_with(response)
-    runner.model_selection.record_response_async.assert_awaited_once_with(response.model)
     sessions.add_response.assert_called_once_with(response)
     sessions.record_run.assert_called_once()
 

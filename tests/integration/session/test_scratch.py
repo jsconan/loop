@@ -355,7 +355,8 @@ ui.info.side_effect=info
 workspace=Path(sys.argv[2]).parent
 permissions=PermissionManager(workspace)
 registry=ToolRegistry(permission_manager=permissions)
-backend=SimpleNamespace(default_model="fixture",get_context_window=lambda _model:None)
+backend=SimpleNamespace(default_model="fixture",get_context_window=lambda _model:None,
+    route="fixture",file_input_mode=None,resolve_file_input_mode=lambda mode:mode)
 loop=Loop.create_default(backend,interaction=controller.interaction,run_control=controller.control,
     session_manager=manager,working_directory=workspace,permission_manager=permissions,
     tool_registry=registry,session_name_generator=LocalSessionNameGenerator())

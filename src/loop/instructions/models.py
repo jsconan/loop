@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from html import escape
 from pathlib import Path
 from typing import Literal, NotRequired, TypedDict
 
@@ -187,12 +188,33 @@ class InstructionSection:
         content (str): Exact rendered section content.
         source (str | None): Canonical source path or logical producer.
         reference (CapturedInstruction | None): Immutable file provenance when source is a path.
+        name (str | None): Name of an active skill, when applicable.
     """
 
     kind: str
     content: str
     source: str | None = None
     reference: CapturedInstruction | None = None
+    name: str | None = None
+
+    @property
+    def identity(self) -> str:
+        """Return a stable revision label without exposing the canonical source path.
+
+        Returns:
+            str: Section kind and opaque source identity.
+        """
+        return f"{self.kind}:{sha256_digest(f'{self.source}:{self.name}')[:24]}"
+
+    def render(self) -> str:
+        """Render the section, including its skill wrapper when applicable.
+
+        Returns:
+            str: Model-facing section content.
+        """
+        if self.name is not None:
+            return f'<skill name="{escape(self.name)}">\n{self.content}\n</skill>'
+        return self.content
 
     @property
     def size_bytes(self) -> int:
@@ -224,6 +246,7 @@ class PreparedInstructions:
         active_skills (tuple[tuple[str, str], ...]): Active skill names and locations.
         sections (tuple[InstructionSection, ...]): Ordered instruction provenance.
         digest (str): SHA-256 digest of the complete document.
+        suffix (str | None): Transient recovery and prioritization for this request only.
     """
 
     content: str
@@ -232,6 +255,16 @@ class PreparedInstructions:
     active_skills: tuple[tuple[str, str], ...]
     sections: tuple[InstructionSection, ...]
     digest: str
+    suffix: str | None = None
+
+    @property
+    def content_with_suffix(self) -> str:
+        """Return the document with request-scoped presentation appended.
+
+        Returns:
+            str: Complete instructions for a leading-field request.
+        """
+        return f"{self.content}\n\n{self.suffix}" if self.suffix else self.content
 
 
 @dataclass(frozen=True)

@@ -27,11 +27,11 @@ class ModelSelectionError(ValueError):
 
 
 class ModelSelection:
-    """Own model selection and durable last-used assignment reconciliation.
+    """Own model selection and resolve backend model metadata.
 
     Args:
         backend (Backend): Backend supplying the default model, catalog, and context metadata.
-        session_manager (SessionManager): Active session that records successful assignments.
+        session_manager (SessionManager): Active session whose context capacity can be refreshed.
         selected (str | None): Explicit model selection, or ``None`` to use the backend default.
         on_select (Callable[[str], None] | None): Durable preference writer invoked before an
             explicit selection takes effect. Defaults to no durable writer.
@@ -47,6 +47,7 @@ class ModelSelection:
     _async_blocking_runner: Callable[..., Awaitable[Any]] | None
     _available_models: list[ModelInfo] | None
     _available_models_expires_at: float
+    preference: str | None
 
     def __init__(
         self,
@@ -58,7 +59,8 @@ class ModelSelection:
     ) -> None:
         self._backend = backend
         self._session_manager = session_manager
-        self._selected = selected if selected is not None else session_manager.model
+        self.preference = selected
+        self._selected = selected
         self._on_select = on_select
         self._async_blocking_runner = async_blocking_runner
         self._available_models = None
@@ -120,30 +122,46 @@ class ModelSelection:
         Raises:
             ModelSelectionError: If neither this selection nor the backend provides a model.
         """
-        return self._get_assignment(self.effective)
+        return self.resolve_assignment(self._backend, self.effective)
 
-    def _get_assignment(self, model: str | None) -> ModelAssignment:
-        """Return the backend-resolved assignment for a model."""
+    @classmethod
+    def resolve_assignment(cls, backend: Backend, model: str) -> ModelAssignment:
+        """Resolve model metadata from the backend that owns the operation.
+
+        Args:
+            backend (Backend): Backend selected for the operation.
+            model (str): Model identifier whose capacity should be resolved.
+
+        Returns:
+            ModelAssignment: Model and its known context capacity.
+
+        Raises:
+            BackendError: If the backend fails while looking up context capacity.
+        """
         return ModelAssignment(
             model=model,
-            context_window=self._get_context_window(model),
+            context_window=cls._normalize_context_window(backend.get_context_window(model)),
         )
 
-    def _get_context_window(self, model: str | None) -> int | None:
-        """Return a positive context window for a model, otherwise ``None``."""
-        return self._normalize_context_window(self._backend.get_context_window(model))
+    @classmethod
+    async def resolve_assignment_async(cls, backend: Backend, model: str) -> ModelAssignment:
+        """Resolve model metadata from the owning backend asynchronously.
 
-    async def _get_assignment_async(self, model: str | None) -> ModelAssignment:
-        """Resolve model metadata through the backend's async API."""
+        Args:
+            backend (Backend): Backend selected for the operation.
+            model (str): Model identifier whose capacity should be resolved.
+
+        Returns:
+            ModelAssignment: Model and its known context capacity.
+
+        Raises:
+            BackendError: If the backend fails while looking up context capacity.
+            asyncio.CancelledError: If the metadata lookup is cancelled.
+        """
+        context_window = await backend.get_context_window_async(model)
         return ModelAssignment(
-            model=model,
-            context_window=await self._get_context_window_async(model),
+            model=model, context_window=cls._normalize_context_window(context_window)
         )
-
-    async def _get_context_window_async(self, model: str | None) -> int | None:
-        """Return async context metadata normalized to a positive integer."""
-        context_window = await self._backend.get_context_window_async(model)
-        return self._normalize_context_window(context_window)
 
     @staticmethod
     def _normalize_context_window(context_window: int | None) -> int | None:
@@ -200,6 +218,7 @@ class ModelSelection:
         if self._on_select is not None:
             self._on_select(model)
         self._selected = model
+        self.preference = model
         self.synchronize_session()
 
     async def select_async(self, model: str) -> None:
@@ -215,9 +234,10 @@ class ModelSelection:
         """
         cancellation = await self._persist_selection_async(model)
         self._selected = model
+        self.preference = model
         if cancellation is not None:
             raise cancellation
-        self._session_manager.assignment = await self._get_assignment_async(model)
+        await self.synchronize_session_async()
 
     async def _persist_selection_async(self, model: str) -> asyncio.CancelledError | None:
         """Run the synchronous durable preference writer off-loop and settle cancellation."""
@@ -262,7 +282,7 @@ class ModelSelection:
         if model is not None or self._backend.default_model is not None:
             self.synchronize_session()
         else:
-            self._session_manager.assignment = None
+            self._session_manager.refresh_model_context(self._backend.route, None)
 
     async def restore_async(self, model: str | None) -> None:
         """Restore a session model and resolve its metadata through async backend calls.
@@ -276,71 +296,17 @@ class ModelSelection:
         """
         self._selected = model
         if model is not None or self._backend.default_model is not None:
-            self._session_manager.assignment = await self._get_assignment_async(self.effective)
+            await self.synchronize_session_async()
         else:
-            self._session_manager.assignment = None
-
-    def record_response(self, model: str | None) -> ModelAssignment:
-        """Record the model actually used by a completed response.
-
-        Args:
-            model (str | None): Provider-reported model identifier, when available.
-
-        Returns:
-            ModelAssignment: Durable assignment for the completed response.
-        """
-        if model is None:
-            assignment = self.assignment
-        else:
-            self._selected = model
-            assignment = self._get_assignment(model)
-        return self.record_assignment(assignment)
-
-    async def record_response_async(self, model: str | None) -> ModelAssignment:
-        """Record a completed response using async context metadata lookup.
-
-        Args:
-            model (str | None): Provider-reported model identifier, when available.
-
-        Returns:
-            ModelAssignment: Durable assignment for the completed response.
-
-        Raises:
-            ModelSelectionError: If no model is available when ``model`` is ``None``.
-            BackendError: If the backend cannot retrieve model context metadata.
-            asyncio.CancelledError: If the backend metadata request is cancelled.
-        """
-        if model is None:
-            assignment = await self._get_assignment_async(self.effective)
-        else:
-            self._selected = model
-            assignment = await self._get_assignment_async(model)
-        return self.record_assignment(assignment)
-
-    def record_assignment(self, assignment: ModelAssignment | None = None) -> ModelAssignment:
-        """Persist one assignment that successfully completed an operation.
-
-        Args:
-            assignment (ModelAssignment | None): Completed assignment, or ``None`` to resolve the
-                current selection.
-
-        Returns:
-            ModelAssignment: Persisted assignment.
-
-        Raises:
-            ModelSelectionError: If no effective model is configured.
-        """
-        assignment = assignment or self.assignment
-        self._session_manager.assignment = assignment
-        return assignment
+            self._session_manager.refresh_model_context(self._backend.route, None)
 
     def synchronize_session(self) -> None:
-        """Persist the effective model and its normalized context window in the active session.
+        """Refresh the selected model's normalized context capacity for the active session.
 
         Raises:
             ModelSelectionError: If neither the selection nor backend defines a model.
         """
-        self._session_manager.assignment = self.assignment
+        self._session_manager.refresh_model_context(self._backend.route, self.assignment)
 
     async def synchronize_session_async(self) -> None:
         """Synchronize the active session using native asynchronous model metadata.
@@ -353,7 +319,9 @@ class ModelSelection:
             BackendError: If context metadata cannot be retrieved from the backend.
             asyncio.CancelledError: If the backend metadata request is cancelled.
         """
-        self._session_manager.assignment = await self._get_assignment_async(self.effective)
+        backend = self._backend
+        assignment = await self.resolve_assignment_async(backend, self.effective)
+        self._session_manager.refresh_model_context(backend.route, assignment)
 
     def select_fallback(self, interaction: Interaction) -> bool:
         """Let the user replace a model rejected by the backend.

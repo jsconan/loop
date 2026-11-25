@@ -43,7 +43,7 @@ def get_current_datetime(
         ),
     ] = None,
 ) -> CurrentDatetime:
-    """Return the exact current time in the requested timezone and in UTC."""
+    """Look up the current date and exact time in the requested timezone and in UTC."""
     instant = utc_now()
     settings = context.settings if context is not None else None
     local, name = resolve_local_datetime(

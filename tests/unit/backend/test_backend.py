@@ -224,3 +224,15 @@ def test_portable_compaction_does_not_expand_local_attachment_snapshots():
     )
     history = backend.get_response.call_args.args[0][0].context[0].content
     assert "preview" in history and "private-tail" not in history
+
+
+def test_default_window_capabilities_keep_the_existing_request_representation():
+    """The base contract supports leading instructions and leaves request projection alone."""
+    backend = OpenAIBackend()
+    assert Backend.file_input_mode.fget(backend) is None
+    assert Backend.resolve_file_input_mode(backend, "native") == "native"
+    assert Backend.resolve_file_input_mode(backend, None) == backend.file_input_mode
+    assert Backend.instruction_layout(backend, "gpt-6.2") == "leading"
+    assert Backend.supports_reasoning_updates(backend, "gpt-6.2") is False
+    with Backend.file_projection(backend, "text"):
+        assert backend.file_input_mode == "native"

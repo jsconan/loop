@@ -149,6 +149,7 @@ class ConfigurationCommands:
             newly granted automatic decisions and provide a policy-aware rollback operation.
     """
 
+    _pending: Callable[[str], str | None] | None
     _configuration: ConfigurationManager
     _mutation_lock: Lock
     _apply: Callable[[str, ApplicationSettings], str]
@@ -175,6 +176,7 @@ class ConfigurationCommands:
         validate_yolo: Callable[[], None] | None = None,
         yolo_active: Callable[[], bool] | None = None,
         yolo_gate: Callable[[], AbstractContextManager[Callable[[], None]]] | None = None,
+        pending: Callable[[str], str | None] | None = None,
     ) -> None:
         self._configuration = configuration
         self._mutation_lock = Lock()
@@ -185,6 +187,7 @@ class ConfigurationCommands:
         self._validate_yolo = validate_yolo
         self._yolo_active = yolo_active
         self._yolo_gate = yolo_gate
+        self._pending = pending
 
     def get_commands(self) -> tuple[CommandRegistration, ...]:
         """Return the configuration command registration.
@@ -745,6 +748,9 @@ class ConfigurationCommands:
                 value = repr(value)
             elif value is None:
                 value = "None"
+            status = self._pending(entry.path) if self._pending is not None else None
+            if status is not None:
+                value = f"{value} ({status})"
             displayed_entries.append(replace(entry, value=value) if value != entry.value else entry)
         entries = tuple(displayed_entries)
         context.interaction.table(

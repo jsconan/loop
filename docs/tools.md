@@ -33,7 +33,7 @@ Call `get_current_datetime` with an IANA timezone such as `Europe/Luxembourg` or
 
 The result contains `datetime`, `utc`, `timezone`, `utc_offset`, and `weekday` for one captured instant. A fixed offset returns `timezone: null` and has no daylight saving rules. A host offset is returned with `timezone: null` when the IANA name is unavailable. Invalid names, shorthand such as `CST`, and malformed offsets produce a structured argument error. Existing stored clock results retain their original value.
 
-The clock accepts timezone identifiers and offsets. For a place name, the agent chooses the corresponding timezone first and asks for the region when the place is ambiguous or spans multiple zones. The clock performs no outbound lookup.
+The clock accepts timezone identifiers and offsets. For a place name, the agent chooses the corresponding timezone first and asks for the region when the place is ambiguous or spans multiple zones. The clock performs no outbound lookup. Routes without a verified request suffix use it for the current date and time to preserve the prompt prefix.
 
 ## Edit files while a model is running
 

@@ -18,6 +18,7 @@ import pytest
 
 from loop import (
     Action,
+    Agent,
     AnswerCompleted,
     AnswerDelta,
     ApprovalChoice,
@@ -31,6 +32,7 @@ from loop import (
     ContextReference,
     Decision,
     FileTarget,
+    InstructionsManager,
     InstructionSnapshot,
     InteractionRequestedEvent,
     MemorySessionStore,
@@ -61,11 +63,15 @@ from loop.constants import MAX_TOOL_RESULT_BYTES
 from loop.instructions import CapturedInstruction
 from loop.interaction import Interaction, InteractionOutput
 from loop.session import (
+    BackendSessionNameGenerator,
+    ModelDispatch,
+    ModelWindow,
     PermissionEvent,
     RunCompletedEvent,
     SessionStore,
     ToolExecutionCompletedEvent,
     ToolExecutionStartedEvent,
+    WindowSettings,
 )
 from loop.session import session_manager as session_manager_module
 from loop.session.store import WorkingDirectoryBinding
@@ -2767,6 +2773,38 @@ def test_manager_renames_persisted_sessions_without_switching_the_active_session
     assert store.load(stored_id).name == "Renamed stored"
 
 
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_backend_title_request_checks_the_saved_model_route(asynchronous):
+    """A restored session's title request requires the same route approval as generation."""
+    interaction = Mock(spec=Interaction)
+    manager = SessionManager(interaction=interaction)
+    manager.add_user_message("Question")
+    manager.add_message(Message(role="assistant", content="Answer"))
+    window = ModelWindow(
+        id="window",
+        route="origin",
+        model="model",
+        layout="leading",
+        settings=WindowSettings(agent_name="Loop"),
+        baseline=InstructionsManager().prepare(Agent("Loop")),
+        tools=(),
+    )
+    dispatch = ModelDispatch(id="dispatch", window_id=window.id, position=2)
+    manager.commit_model_window(manager.session.id, None, None, window, dispatch=dispatch)
+    backend = MagicMock(route="replacement")
+    generator = BackendSessionNameGenerator(backend)
+
+    if asynchronous:
+        asyncio.run(manager.generate_session_name_async(generator))
+    else:
+        manager.generate_session_name(generator)
+
+    backend.get_response.assert_not_called()
+    backend.get_response_async.assert_not_called()
+    assert interaction.report.call_args.args[0].code == "agent.route_unavailable"
+    assert manager.session.name_source == "initial"
+
+
 def test_manager_reports_name_generation_failures(monkeypatch):
     """Name generation reports a retryable problem and preserves the current name on failure."""
     interaction = Mock(spec=Interaction)
@@ -2947,10 +2985,11 @@ def test_manager_async_name_generation_skips_incomplete_exchange_and_reports_fai
 
 
 def test_manager_starts_a_fresh_unpersisted_session():
-    """Starting over replaces active state without creating a stored record."""
+    """Starting over drops the prior assignment without creating a stored record."""
     store = Mock(spec=SessionStore)
     manager = SessionManager(
-        session=Session(id="old", name="Old", name_source="user"), session_store=store
+        session=Session(id="old", name="Old", name_source="user", model="original-model"),
+        session_store=store,
     )
 
     manager.new_session()
@@ -2958,29 +2997,6 @@ def test_manager_starts_a_fresh_unpersisted_session():
     assert manager.session.id != "old"
     assert manager.session.messages == []
     assert manager.session.name is None
-    store.save.assert_not_called()
-
-
-def test_manager_new_session_forwards_model():
-    """Starting over forwards the current model to the new session."""
-    store = Mock(spec=SessionStore)
-    original = Session(model="original-model")
-    manager = SessionManager(session=original, session_store=store)
-
-    manager.new_session()
-
-    assert manager.session.model == "original-model"
-    store.save.assert_not_called()
-
-
-def test_manager_new_session_forwards_none_model():
-    """Starting over forwards None model when none was set."""
-    store = Mock(spec=SessionStore)
-    original = Session()  # model defaults to None
-    manager = SessionManager(session=original, session_store=store)
-
-    manager.new_session()
-
     assert manager.session.model is None
     store.save.assert_not_called()
 
@@ -4361,3 +4377,45 @@ def test_only_fresh_working_generations_allow_private_basenames(tmp_path):
     assert not reopened.working_directory_allows_private_names()
     store.bind_working_directory(session.id, replace(binding, inode=binding.inode + 1))
     assert not reopened.working_directory_allows_private_names()
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize(
+    ("session_id", "position", "diagnostic"),
+    [
+        ("stale-owner", 1, "session context changed"),
+        (None, 0, "session history changed"),
+    ],
+)
+def test_model_window_writer_rejects_stale_dispatches(
+    asynchronous,
+    session_id,
+    position,
+    diagnostic,
+):
+    """A different owner or conversation position cannot persist model-only changes."""
+    manager = SessionManager()
+    manager.add_user_message("active")
+    session = manager.session
+    window = ModelWindow(
+        id="window",
+        route="route",
+        model="model",
+        layout="inline",
+        settings=WindowSettings(agent_name="Loop"),
+        baseline=InstructionsManager().prepare(Agent("Loop")),
+        tools=(),
+    )
+    dispatch = ModelDispatch(id="dispatch", window_id=window.id, position=position)
+    with pytest.raises(ValueError, match=diagnostic):
+        if asynchronous:
+            asyncio.run(
+                manager.commit_model_window_async(
+                    session_id or session.id, None, None, window, dispatch=dispatch
+                )
+            )
+        else:
+            manager.commit_model_window(
+                session_id or session.id, None, None, window, dispatch=dispatch
+            )
+    assert session.window is None and not session.dispatches

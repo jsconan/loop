@@ -764,8 +764,8 @@ def test_configured_transport_retries_reach_both_clients():
     async_openai.assert_called_once_with(base_url=None, api_key=None, max_retries=5, timeout=600.0)
 
 
-def test_backend_does_not_read_process_configuration(monkeypatch):
-    """Backend construction remains independent of process environment and application defaults."""
+def test_backend_does_not_apply_cli_configuration(monkeypatch):
+    """The adapter leaves CLI deployment defaults and overrides to application settings."""
     monkeypatch.setenv("DEFAULT_MODEL", "environment-model")
     monkeypatch.setenv("BASE_URL", "https://environment.test/v1")
     monkeypatch.setenv("OPENAI_API_KEY", "environment-key")
@@ -775,6 +775,20 @@ def test_backend_does_not_read_process_configuration(monkeypatch):
     assert client.default_model is None
     assert client.base_url is None
     assert not hasattr(client, "api_key")
+
+
+@pytest.mark.parametrize("base_url", [None, "https://configured.test/v1"])
+def test_compatible_defaults_follow_the_endpoint_for_openai_model_names(monkeypatch, base_url):
+    """A configured or SDK environment URL selects compatible request defaults."""
+    environment_url = "https://environment.test/v1"
+    monkeypatch.setenv("OPENAI_BASE_URL", environment_url)
+    model = "gpt-6.2"
+    backend = OpenAIBackend(base_url=base_url, default_model=model)
+
+    assert backend.base_url == (base_url or environment_url)
+    assert backend.instruction_layout(model) == "leading"
+    assert not backend.supports_reasoning_updates(model)
+    assert backend.file_input_mode == "text"
 
 
 def test_response_requires_an_explicit_or_default_model():

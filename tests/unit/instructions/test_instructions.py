@@ -229,7 +229,7 @@ def test_async_skill_priorities_preserve_deduplication_and_instruction_budget(tm
         )
         is True
     )
-    limit = len(prepared(prioritized).encode("utf-8")) - 1
+    limit = len(prioritized.prepare(configured_agent()).content_with_suffix.encode("utf-8")) - 1
     constrained = configured_manager(
         skill_manager=SkillManager(skills),
         max_bytes=limit,
@@ -398,8 +398,10 @@ def test_manager_prioritizes_referenced_skill_metadata_without_activation(tmp_pa
         section.content for section in snapshot.sections if section.kind == "skill_catalog"
     )
 
-    assert instructions.index("<name>second</name>") < instructions.index("<name>first</name>")
-    assert catalog.index("<name>second</name>") < catalog.index("<name>first</name>")
+    assert snapshot.suffix.index("<name>second</name>") < snapshot.suffix.index(
+        "<name>first</name>"
+    )
+    assert catalog.index("<name>first</name>") < catalog.index("<name>second</name>")
     assert "Second instructions." not in instructions
     assert manager.active_skill_identities == []
 
@@ -438,7 +440,7 @@ def test_manager_refreshes_before_validating_catalog_priorities(tmp_path):
     baseline = configured_discovered(tmp_path, skill_manager=SkillManager(skills))
     prioritized = configured_discovered(tmp_path, skill_manager=SkillManager(skills))
     assert prioritized.set_skill_catalog_priorities(("unicode",), configured_agent()) is True
-    limit = len(prepared(prioritized).encode("utf-8")) - 1
+    limit = len(prioritized.prepare(configured_agent()).content_with_suffix.encode()) - 1
     assert len(prepared(baseline).encode("utf-8")) <= limit
 
     agents.write_text("Old rules.", encoding="utf-8")
@@ -466,7 +468,7 @@ def test_manager_revalidates_unchanged_catalog_priorities_for_an_agent(tmp_path)
     assert probe.set_skill_catalog_priorities(("unicode",)) is True
     manager = configured_manager(
         skill_manager=SkillManager(skills),
-        max_bytes=len(probe.instructions.encode("utf-8")),
+        max_bytes=len(f"{probe.instructions}\n\n{probe.request_suffix()}".encode()),
     )
 
     assert manager.set_skill_catalog_priorities(("unicode",)) is True
@@ -870,8 +872,8 @@ def test_invalidation_is_selective_and_oversized_base_refresh_is_atomic(tmp_path
     assert manager.list_skills()["instruction_context"]["dirty"] is False
 
     manager.invalidate()
-    assert manager.refresh() is True
-    assert manager.generation == 1
+    assert manager.refresh() is False
+    assert manager.generation == 0
 
     previous = manager.instructions
     (tmp_path / "AGENTS.md").write_text("x" * 100, encoding="utf-8")
@@ -892,7 +894,7 @@ def test_invalidation_is_selective_and_oversized_base_refresh_is_atomic(tmp_path
         lambda working_directory, _filenames: [missing],
     )
     racing.invalidate()
-    assert racing.refresh() is True
+    assert racing.refresh() is False
 
 
 def test_manager_rejects_invalid_and_oversized_initial_limits():

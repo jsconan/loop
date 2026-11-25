@@ -116,7 +116,7 @@ Use `/config` to browse, inspect, change, or reset effective settings. Completio
 
 Reset behavior depends on the scope. At workspace scope, reset removes the override so the user setting applies. At user or session scope, reset restores the built-in default.
 
-Session settings apply only to the current Loop process and take precedence over environment and file values. A file value remains saved when an environment variable overrides it, so the saved value applies again when the variable is absent. Backend and supported interactive-loop settings apply immediately. Logging, telemetry, and agent identity changes require a restart. API-key input and configuration output are masked.
+Session settings apply only to the current Loop process and take precedence over environment and file values. A file value remains saved when an environment variable overrides it, so the saved value applies again when the variable is absent. Live settings apply on the next relevant operation. Logging and telemetry changes require a restart. API-key input and configuration output are masked.
 
 The command settings name four separate durations. `tools.command_job_runtime_limit_seconds` sets the finite, positive deadline for the whole command, starting when the native process launches. `tools.command_default_initial_wait_seconds` is the default wait in the first `run_command` call; `tools.command_default_poll_wait_seconds` is the default wait in `poll_command_job`. Both defaults accept finite nonnegative values. `tools.command_max_wait_seconds` is the shared cap for an explicit or default `wait_seconds` value in either call; it defaults to 60 seconds and may be configured from 0 through 3,600 seconds. The initial and poll defaults must each be no greater than this cap. A wait of `0` returns immediately. A poll ends only when its wait expires or the command completes, regardless of output arriving during the wait. The runtime limit is captured when a job starts; wait settings apply to subsequent calls. Runtime limits that exceed the clock's ability to preserve the native preparation deadline are rejected.
 
@@ -144,7 +144,7 @@ Edit the TOML file to supply a table for `tools.sandbox_environment` or an array
 
 For installations with versioned directories, you can put a stable directory symlink on `PATH` and declare the exact symlink in `tools.sandbox_path_aliases`. The separate read scope must cover the current target. Loop revalidates bound search directories and executable identities at admission. If the install changes during approval, submit a fresh request after the upgrade.
 
-`app.allow_direct_host_execution` is off by default. A trusted user may enable it for the session with `/config set app.allow_direct_host_execution true`, or persist it with `scope=user`. Workspace configuration, environment variables, permission presets, and model requests cannot enable it. Persistent activation uses the same owner-private storage checks as YOLO. `/config get app.allow_direct_host_execution` shows its effective state and source. Toggling it updates model tool definitions and dispatch immediately; disabling it invalidates pending approvals and leaves remembered grants dormant. It does not terminate an already running host process.
+`app.allow_direct_host_execution` is off by default. A trusted user may enable it for the session with `/config set app.allow_direct_host_execution true`, or persist it with `scope=user`. Workspace configuration, environment variables, permission presets, and model requests cannot enable it. Persistent activation uses the same owner-private storage checks as YOLO. `/config get app.allow_direct_host_execution` shows its effective state and source. Enabling it makes the tool eligible for the next context window. Disabling it withdraws dispatch authority immediately, invalidates pending approvals, and leaves remembered grants dormant. It does not terminate an already running host process.
 
 When enabled, `request_host_command` requests a separate unrestricted run with the exact command, working directory and an agent-supplied reason. Managed host prohibitions and explicit host denies still apply. An explicit host `ask` requires one-time human approval. With YOLO also enabled, eligible host requests can execute without a prompt and do not save a grant. Sandbox resource denials do not constrain an authorized host run. A sandbox failure never enables this setting or executes a host retry.
 
@@ -156,11 +156,17 @@ While an agent run is active, `conversation.input_mode = "queue"` admits plain t
 
 ## Environment and time
 
-`[context]` uses the normal user, workspace, and session scopes. Workspace settings override user settings, and session edits apply for the current Loop process. For example, `/config set context.show_country true scope=session` opts into country disclosure for the current process. Basic disclosure supplies the current local date, execution OS and architecture, command shell, and the `$WORKSPACE_ROOT` alias. Set `show_workspace_path` to disclose the resolved tool directory. Set `mode = "off"` to disable automatic disclosure. The clock and runtime path guidance remain available.
+`[context]` uses the normal user, workspace, and session scopes. Workspace settings override user settings, and session edits apply for the current Loop process. For example, `/config set context.show_country true scope=session` opts into country disclosure for the current process. Basic disclosure supplies the execution OS and architecture, command shell, and the `$WORKSPACE_ROOT` alias. Set `show_workspace_path` to disclose the resolved tool directory. Set `mode = "off"` to disable automatic disclosure. The clock and runtime path guidance remain available.
 
-`show_timezone` controls the automatic timezone name and numeric offset. The date and on-demand clock use a configured IANA `timezone` override, then the trusted client timezone, then host local time. With `show_country` enabled, Loop uses a configured two-letter `country` override or the explicit region from the process locale. Locale discovery checks `LC_ALL`, `LC_TIME`, and `LANG` in that order. The region reflects locale settings. Loop omits the field when the effective locale supplies no two-letter region. Country disclosure defaults to off.
+Loop supplies the local date only in a verified request suffix, outside replayed history. `show_timezone` controls the timezone name and offset in that suffix. Routes without a verified suffix use `get_current_datetime` for the date and time. This keeps a date or offset change from rewriting the existing prefix when a session is reopened. Both the automatic date and the clock use a configured IANA `timezone` override, then the trusted client timezone, then host local time. Timezone changes apply immediately.
 
-Effective preferences apply to the clock and model requests as soon as they are loaded or edited. Loop adds the facts to the existing generation instructions for OpenAI and compatible Responses API endpoints. When a server places instructions before conversation input, a change to the facts can lower prompt cache reuse. Saved request history, compaction, and title requests omit the automatic facts.
+With `show_country` enabled, Loop uses a configured two-letter `country` override or the explicit region from the process locale. Locale discovery checks `LC_ALL`, `LC_TIME`, and `LANG` in that order. The region reflects locale settings. Loop omits the field when the effective locale supplies no two-letter region. Country disclosure defaults to off. Changes to disclosed non-time facts can change the leading prompt. Disclosure controls apply as soon as they are loaded or edited. Saved request history, compaction, and title requests omit the automatic facts.
+
+## Context window settings
+
+The first model request pins the agent name, instruction template, file input mode, ordered tool definitions, and four command timing values. Changes to these settings show as pending in `/config` with their current effective values. The next window uses the saved values after a successful compaction, an actual model or provider switch, or when a new session starts. Reopening a session restores the pinned values. A pending edit leaves the automatic compaction threshold unchanged.
+
+Temperature and reasoning effort apply on the next model request. On routes that support append-only reasoning changes, Loop keeps the initial request-level effort and replays changes at their original positions. Other endpoints use the current effort on each request. Replacing a backend client on the same route for a timeout or credential change preserves the window.
 
 ## Configure the backend from Python
 
@@ -192,7 +198,7 @@ For compatible local models, `repetition_detection = "auto"` sends optional repe
 
 ### File mentions
 
-When using the official OpenAI endpoint, referenced text files use native `input_file` parts by default. A custom `base_url` defaults to portable `input_text` parts because many compatible servers do not support `input_file`. Set `file_input_mode="text"` or `file_input_mode="native"` to choose explicitly.
+Compatible endpoints use portable `input_text` parts for referenced text files by default. The SDK's default OpenAI endpoint uses native `input_file` parts. Set `file_input_mode="text"` or `file_input_mode="native"` to choose explicitly.
 
 Project-path mentions use immutable content snapshots so resumed conversations see the same file contents. Loop includes at most two small files directly. Larger files, additional files, and directory contents use bounded previews and `read_cached_content` handles for the remainder. Loop stores snapshot bytes once and loads them into model context when needed.
 
@@ -232,7 +238,7 @@ The `loop` command accepts environment overrides for automation:
 | Telemetry shutdown timeout  | `LOOP_TELEMETRY_SHUTDOWN_TIMEOUT`           | `2.0`                          |
 | SQLite busy timeout         | `LOOP_TELEMETRY_SQLITE_BUSY_TIMEOUT_MS`     | `2500`                         |
 
-`OpenAIBackend` does not read environment variables or apply deployment defaults. Python callers configure it directly; credentials remain private to the backend.
+The CLI supplies its configured `backend.base_url` to the adapter and defaults to the local compatible endpoint above. A non-empty `base_url` passed to `OpenAIBackend` takes precedence over `OPENAI_BASE_URL`. To use the SDK's default OpenAI endpoint, leave `OPENAI_BASE_URL` unset and omit `base_url` in Python or set `backend.base_url = ""` in the CLI.
 
 ## Hyperparameters and retries
 

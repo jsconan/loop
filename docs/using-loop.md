@@ -48,7 +48,7 @@ Live completion sources are available while the conversation is idle. Completion
 
 Use `@` to include project files or directories and `$` to refer to discovered skills. Loop snapshots mentioned content so the model sees bounded, consistent file contents. Explicit skill mentions help select matching skill metadata; Loop loads the skill instructions only when the model activates that skill.
 
-Library authors can inject a `MentionManager` or compose their own handlers. The default manager resolves `@` paths into bounded snapshots and uses `$` references to select from the current skill catalog. OpenAI requests send file contents as multipart `input_file` parts, with a compact manifest for each reference. Inline files use MIME-qualified base64 data URLs.
+Library authors can inject a `MentionManager` or compose their own handlers. The default manager resolves `@` paths into bounded snapshots and uses `$` references to select from the current skill catalog. Requests include a compact reference manifest. Compatible endpoints receive referenced text files as `input_text` parts by default. The SDK's default OpenAI endpoint uses `input_file` parts with MIME-qualified base64 data URLs.
 
 ### Sessions
 
@@ -59,6 +59,18 @@ Model-assisted naming is the default. Library callers can use `LocalSessionNameG
 ### Provider privacy and retention
 
 Before sending requests, the OpenAI backend replaces credentials it recognizes in conversation text, attachments, and remote token-counting requests. Replacements cannot be expanded back to plaintext by model output or tool arguments. Detection is heuristic and may miss confidential text, personal information, or encoded secrets. Official OpenAI requests use `store=False`. Compatible servers may manage retention themselves; their transport setting does not guarantee provider-wide retention.
+
+### Model request history
+
+The default compatible route sends the latest project and skill guidance in the leading `instructions` field and keeps conversation items in their existing order. Changes to that field can reduce prefix cache reuse. On routes with verified developer-message replay, Loop appends revisions at the point they take effect and identifies the sections replaced or deactivated. Switching models or providers starts a new window at the next model request using eligible local history. If a saved session’s provider route is unavailable, select a model or explicitly change providers before sending history to the new route for a reply, compaction, or a generated title.
+
+For sessions saved without a model window, the first request uses portable conversation history. Loop keeps messages and paired tool calls and results, assigns local call IDs for replay, and leaves old provider reasoning in the saved transcript.
+
+A retry of an already admitted request on the same target keeps its instruction revision, and a supported reasoning change can still be appended. Automatic compaction checks the threshold on the next new request.
+
+A reply already in progress keeps the model and context capacity resolved on its original backend. Loop saves that assignment with the completed reply. The new target applies to the next request.
+
+Resume restores the session's admitted model choice. A session that followed the backend default uses the current default when available. `/new` starts from the current application model preference or the backend default.
 
 ### Command paths and results
 
@@ -91,7 +103,7 @@ Markdown exports include conversation messages, tool calls and results, displaye
 
 Each session has private working storage shared by commands using `$TMPDIR` and file tools using `$TMPDIR/...`. Fresh generations permit ordinary data names, including `.loop` and `Library`; restricted scratch keeps its private-name restrictions until explicitly discarded. Trusted session metadata, policies, and ownership locks remain outside the writable data root. Saved sessions retain these files across application restarts on the same machine; storage is isolated by database, workspace, and session identity. Selecting a different conversation is allowed while idle and rejected during model or tool execution. Working storage is kept separately from conversation history and is not included in Markdown or archive exports. It has no automatic expiry; copy important deliverables into the workspace. Validated existing storage in the same namespace is adopted in place. Bound storage that is missing, replaced or unsafe causes an explicit recovery failure instead of an empty replacement. Native ownership locks exclude cooperating harness operations on one session while allowing independent sessions to run concurrently. They do not terminate detached macOS writers or revoke old file descriptors.
 
-Archive exports are records for inspection or external processing. Loop does not currently import an archive back into its session store.
+Continuation archives include the model instruction baseline and dispatch revisions alongside the saved conversation. Markdown exports show the conversation. Loop does not currently import an archive back into its session store.
 
 Examples:
 
@@ -337,6 +349,8 @@ Tool declaration is passive: importing a tool does not register it anywhere. Com
 At startup, the loop discovers `SKILL.md` files under `.agents/skills` from the repository root through the working directory, followed by `~/.agents/skills`. Only each skill's YAML `name` and `description` are initially loaded and disclosed to the model. Before task work, the agent compares the request with those descriptions and calls `activate_skill` for every match. The complete Markdown instructions are then read and cached for the following model turn. Activated skill identities persist with the session and are restored only while the same canonical definition remains available. The model can deactivate one or all skills when their instructions are no longer needed.
 
 Instruction and skill frontmatter use YAML 1.2 by default, so unquoted values such as `yes` and `on` remain strings.
+
+`/use`, `/skills activate`, and the skill tools share the same activation state. The next model request receives the effective change. Resume restores an activation when the same skill is still discoverable. A `$skill` mention prioritizes its catalog entry for that request without activating it.
 
 Skill files under `references/`, `scripts/`, and `assets/` remain unloaded until requested through `manage_skills`. Resource paths are confined to the activated skill root. Text resources support line-oriented or byte-oriented continuation and return at most 16 KiB per call. Binary assets are returned as smaller base64 pages so their encoded result remains bounded; resource contents do not become permanent instructions.
 

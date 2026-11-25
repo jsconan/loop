@@ -26,6 +26,7 @@ def backend(**attributes):
     """Build a backend double with configurable model metadata."""
     defaults = {
         "default_model": "default",
+        "route": "model-test",
         "get_context_window": Mock(return_value=8192),
         "get_context_window_async": AsyncMock(return_value=8192),
         "get_models": Mock(return_value=[ModelInfo(id="default")]),
@@ -33,8 +34,8 @@ def backend(**attributes):
     return SimpleNamespace(**(defaults | attributes))
 
 
-def test_selection_prefers_explicit_then_restored_then_backend_default_models():
-    """Initialization applies explicit, restored, and backend-default precedence consistently."""
+def test_selection_initializes_from_its_input_or_backend_default():
+    """A durable assignment does not provide the caller's model preference."""
     explicit_session = SessionManager(session=Session(model="restored"))
     explicit = ModelSelection(backend(), explicit_session, selected="explicit")
     assert explicit.selected == "explicit"
@@ -42,7 +43,7 @@ def test_selection_prefers_explicit_then_restored_then_backend_default_models():
     assert explicit_session.model == "explicit"
     assert explicit_session.context_window == 8192
 
-    default_session = SessionManager()
+    default_session = SessionManager(session=Session(model="previous"))
     default = ModelSelection(backend(), default_session)
     assert default.selected is None
     assert default.effective == "default"
@@ -52,7 +53,7 @@ def test_selection_prefers_explicit_then_restored_then_backend_default_models():
 def test_selection_restores_last_used_model_without_a_backend_fallback():
     """A durable last-used assignment remains usable when no backend default is configured."""
     session_manager = SessionManager(session=Session(model="stale", context_window=1024))
-    selection = ModelSelection(backend(default_model=None), session_manager)
+    selection = ModelSelection(backend(default_model=None), session_manager, selected="stale")
 
     assert selection.effective == "stale"
     assert selection.assignment.context_window == 8192
@@ -62,8 +63,6 @@ def test_selection_restores_last_used_model_without_a_backend_fallback():
     empty = ModelSelection(backend(default_model=None), SessionManager())
     with pytest.raises(ModelSelectionError, match="No model was selected"):
         _ = empty.effective
-    with pytest.raises(ModelSelectionError, match="No model was selected"):
-        empty.record_assignment()
 
 
 @pytest.mark.parametrize("context_window", [None, True, False, 0, -1, "8192"])
@@ -78,8 +77,8 @@ def test_selection_normalizes_invalid_context_windows(context_window):
     assert session_manager.context_window is None
 
 
-def test_selection_persists_explicit_intent_while_reconciling_session_assignments():
-    """Explicit choices persist, while restored and reported assignments update the session."""
+def test_selection_persists_explicit_intent_and_resolves_model_metadata():
+    """Explicit choices persist and a metadata lookup preserves the selected model."""
     models = [ModelInfo(id="first"), ModelInfo(id="second")]
     active_backend = backend(get_models=Mock(return_value=models))
     session_manager = SessionManager()
@@ -91,17 +90,15 @@ def test_selection_persists_explicit_intent_while_reconciling_session_assignment
     assert selection.selected == "second"
     persist.assert_called_once_with("second")
     assert session_manager.model == "second"
-    assert selection.record_response(None).model == "second"
-    assert session_manager.model == "second"
 
     selection.restore(None)
     assert selection.selected is None
     assert selection.effective == "default"
     assert session_manager.model == "default"
 
-    assert selection.record_response("provider-alias").model == "provider-alias"
-    assert selection.selected == "provider-alias"
-    assert session_manager.model == "provider-alias"
+    assert selection.resolve_assignment(active_backend, "provider-alias").model == "provider-alias"
+    assert selection.selected is None
+    assert session_manager.model == "default"
 
     no_default = backend(default_model=None)
     unconfigured_session = SessionManager()
@@ -218,7 +215,7 @@ def test_async_selection_reuses_a_recent_catalog_and_updates_context_metadata(mo
     assert persist_threads[0] != owner_thread
 
 
-def test_async_selection_restoration_and_response_recording_use_async_context_metadata():
+def test_async_selection_restoration_and_resolution_use_async_context_metadata():
     """Async selection lifecycle resolves context metadata through native backend calls."""
     active_backend = backend(
         get_context_window_async=AsyncMock(return_value=4096),
@@ -228,21 +225,17 @@ def test_async_selection_restoration_and_response_recording_use_async_context_me
     active_backend.get_context_window.reset_mock()
 
     async def scenario():
-        """Restore and record model assignments without a synchronous backend lookup."""
+        """Restore selection and resolve provider metadata through the async backend."""
         await selection.restore_async("restored")
-        restored = await selection.record_response_async(None)
-        reported = await selection.record_response_async("provider-alias")
-        return restored, reported
+        return await selection.resolve_assignment_async(active_backend, "provider-alias")
 
-    restored, reported = asyncio.run(scenario())
+    reported = asyncio.run(scenario())
 
-    assert restored.model == "restored"
     assert reported.model == "provider-alias"
-    assert selection.selected == "provider-alias"
-    assert session_manager.model == "provider-alias"
+    assert selection.selected == "restored"
+    assert session_manager.model == "restored"
     assert session_manager.context_window == 4096
     assert active_backend.get_context_window_async.await_args_list == [
-        call("restored"),
         call("restored"),
         call("provider-alias"),
     ]
@@ -277,14 +270,6 @@ def test_async_selection_restoration_clears_an_unconfigured_assignment():
 
     assert session_manager.assignment is None
     active_backend.get_context_window_async.assert_not_awaited()
-
-
-def test_async_response_recording_requires_a_model_when_no_default_is_configured():
-    """Async response recording preserves the missing-model validation boundary."""
-    selection = ModelSelection(backend(default_model=None), SessionManager())
-
-    with pytest.raises(ModelSelectionError, match="No model was selected"):
-        asyncio.run(selection.record_response_async(None))
 
 
 def test_async_selection_settles_durable_write_before_propagating_cancellation():

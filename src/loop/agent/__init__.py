@@ -1,6 +1,7 @@
 """Expose single-agent configuration and execution."""
 
 __all__ = [
+    "WINDOW_SETTING_PATHS",
     "Agent",
     "AgentIdentity",
     "AgentInstructions",
@@ -20,4 +21,5 @@ from .models import (
     AgentRunResult,
     AgentRunStopReason,
 )
+from .prefix import WINDOW_SETTING_PATHS
 from .runner import AgentRunner

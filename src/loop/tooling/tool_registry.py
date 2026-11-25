@@ -1066,8 +1066,11 @@ class ToolRegistry:
         self._tools[tool_name] = registered
         return True
 
-    def definitions(self) -> list[ToolDefinition]:
+    def definitions(self, *, settings: ToolRuntimeSettings | None = None) -> list[ToolDefinition]:
         """Return definitions supported by the current execution service.
+
+        Args:
+            settings (ToolRuntimeSettings | None): Candidate settings for a rebuilt window.
 
         Returns:
             list[ToolDefinition]: Supported function-tool definitions in registration order.
@@ -1107,7 +1110,11 @@ class ToolRegistry:
                             " " + guidance[item.capability]
                         )
             if tool.definition_transform is not None:
-                definition = tool.definition_transform(definition, self._settings, services)
+                definition = tool.definition_transform(
+                    definition,
+                    settings or self._settings,
+                    services,
+                )
             definitions.append(definition)
         return definitions
 

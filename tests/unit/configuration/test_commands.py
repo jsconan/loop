@@ -1950,3 +1950,22 @@ def test_context_commands_respect_explicit_scope(tmp_path, scope):
         f"Reset context.timezone for {scope}?", default=False
     )
     interaction.prompt.assert_not_called()
+
+
+def test_config_reports_the_pinned_effective_value_of_a_pending_setting(tmp_path):
+    """Reading a saved setting also displays the currently active value."""
+    configuration = ConfigurationManager(tmp_path / "config.toml")
+    configuration.initialize()
+    configuration.load({})
+    interaction = Mock(spec=ConsoleInteraction)
+    pending = Mock(return_value="pending until the next context rebuild; effective value is 'Loop'")
+    manager = CommandManager(
+        providers=(ConfigurationCommands(configuration, Mock(), pending=pending),),
+        interaction=interaction,
+    )
+
+    assert manager.handle_user_command("/config get app.agent_name")
+
+    entry = interaction.table.call_args.args[0][0]
+    assert "effective value is 'Loop'" in entry.value
+    pending.assert_called_once_with("app.agent_name")
