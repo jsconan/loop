@@ -1522,15 +1522,26 @@ class AgentRunner:
         """Request and collect one response inside the active model-operation span."""
         self._checkpoint(steer=True)
         context = self._request_context
-        request = context.prepare(recovery)
-        self._checkpoint(steer=True)
-        model_context = self._model_input(request)
-        if self._can_size_for_compaction(request):
+        compacted = retried = False
+        while True:
+            request = context.prepare(recovery)
+            self._checkpoint(steer=True)
+            model_context = self._model_input(request)
+            can_compact = not compacted and self._can_size_for_compaction(request)
+            if not can_compact and not request.check_headroom:
+                break
             occupied = context.occupied_tokens(request, model_context)
-            if self._compaction.compact_if_needed(occupied, window=request.window):
-                request = context.prepare(recovery)
-                self._checkpoint(steer=True)
-                model_context = self._model_input(request)
+            if request.check_headroom and not self._compaction.has_generation_headroom(
+                occupied, request.window
+            ):
+                if retried or not request.may_compact or not self._compaction.compact(retry=True):
+                    self._raise_missing_headroom()
+                retried = True
+            elif not can_compact or not self._compaction.compact_if_needed(
+                occupied, window=request.window
+            ):
+                break
+            compacted = True
         self._file_observations = FileObservations(
             model_context, self._instructions_manager.virtual_paths
         )
@@ -1546,6 +1557,10 @@ class AgentRunner:
             )
             self._checkpoint(steer=True)
             context.verify(request, persisted=True)
+        if request.check_headroom and not self._compaction.has_generation_headroom(
+            occupied, request.window
+        ):
+            self._raise_missing_headroom()
         context.remember_environment(request)
         context.apply_window(request.window)
         started_at = perf_counter()
@@ -1593,15 +1608,30 @@ class AgentRunner:
         """Collect one asynchronous response inside the active model-operation span."""
         await self._checkpoint_async(steer=True)
         context = self._request_context
-        request = await context.prepare_async(recovery)
-        await self._checkpoint_async(steer=True)
-        model_context = await self._model_input_async(request)
-        if self._can_size_for_compaction(request):
+        compacted = retried = False
+        while True:
+            request = await context.prepare_async(recovery)
+            await self._checkpoint_async(steer=True)
+            model_context = await self._model_input_async(request)
+            can_compact = not compacted and self._can_size_for_compaction(request)
+            if not can_compact and not request.check_headroom:
+                break
             occupied = await context.occupied_tokens_async(request, model_context)
-            if await self._compaction.compact_if_needed_async(occupied, window=request.window):
-                request = await context.prepare_async(recovery)
-                await self._checkpoint_async(steer=True)
-                model_context = await self._model_input_async(request)
+            if request.check_headroom and not self._compaction.has_generation_headroom(
+                occupied, request.window
+            ):
+                if (
+                    retried
+                    or not request.may_compact
+                    or not await self._compaction.compact_async(retry=True)
+                ):
+                    self._raise_missing_headroom()
+                retried = True
+            elif not can_compact or not await self._compaction.compact_if_needed_async(
+                occupied, window=request.window
+            ):
+                break
+            compacted = True
         self._file_observations = await self._run_blocking_async(
             FileObservations,
             model_context,
@@ -1619,6 +1649,10 @@ class AgentRunner:
             )
             await self._checkpoint_async(steer=True)
             context.verify(request, persisted=True)
+        if request.check_headroom and not self._compaction.has_generation_headroom(
+            occupied, request.window
+        ):
+            self._raise_missing_headroom()
         context.remember_environment(request)
         context.apply_window(request.window)
         started_at = perf_counter()
@@ -1678,6 +1712,18 @@ class AgentRunner:
             request.may_compact
             and self._compaction.can_compact(request.window)
             and self._request_context.compaction_capacity(request.window) is not None
+        )
+
+    @staticmethod
+    def _raise_missing_headroom() -> None:
+        """Report a rebuilt request that cannot safely enter generation."""
+        raise ProblemException(
+            Problem(
+                code="agent.context_limit",
+                title="Could not prepare the request",
+                detail="There is insufficient verified space to generate from the rebuilt context.",
+                operation="prepare_generation",
+            )
         )
 
     async def _run_blocking_async(

@@ -231,7 +231,7 @@ def test_unfit_portable_candidate_keeps_original_context(tmp_path):
 
 @pytest.mark.parametrize("asynchronous", [False, True])
 def test_over_budget_checkpoint_retries_with_one_fewer_complete_turn(tmp_path, asynchronous):
-    """Reduce the retained tail when the measured rebuild exceeds its input budget."""
+    """Reduce the tail on an oversized rebuild and again on an oversized first dispatch."""
     messages = _history()
     feature, owner, backend, *_, context = _feature(tmp_path, session=Session(messages=messages))
     context.configure(ApplicationSettings(context=ContextSettings(mode="off")))
@@ -255,6 +255,19 @@ def test_over_budget_checkpoint_retries_with_one_fewer_complete_turn(tmp_path, a
     assert checkpoint.boundary == len(messages)
     assert checkpoint.input_tokens_after == 1200
     assert count.call_count == 2
+    assert owner.messages == messages
+
+    count.side_effect = [40000, 1200]
+    assert (
+        asyncio.run(feature.compact_async(retry=True))
+        if asynchronous
+        else feature.compact(retry=True)
+    )
+
+    repair = compact.call_args
+    assert repair.args[0] == [*_result().items, *messages[9:11]]
+    assert owner.session.checkpoint().coverage.tail == tuple(range(11, len(messages)))
+    assert compact.call_count == 3
     assert owner.messages == messages
 
 

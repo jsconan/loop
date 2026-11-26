@@ -195,15 +195,33 @@ class ContextCompaction:
         """
         return self.needed(occupied, window=window) and await self.compact_async()
 
-    def compact(self) -> bool:
+    def has_generation_headroom(self, occupied: int | None, window: ModelWindow) -> bool:
+        """Check whether a measured rebuilt request leaves room to generate.
+
+        Args:
+            occupied (int | None): Projected input tokens, or None if they cannot be measured.
+            window (ModelWindow): Window prepared for the next generation.
+
+        Returns:
+            bool: Whether its input fits after reserving output space.
+        """
+        capacity = self._context.compaction_capacity(window) or _UNDECLARED_CAPACITY
+        return occupied is not None and (
+            occupied <= capacity - self._context.backend.generation_reserve(capacity)
+        )
+
+    def compact(self, *, retry: bool = False) -> bool:
         """Capture, build, and atomically commit a fresh model context.
+
+        Args:
+            retry (bool): Rebuild an existing checkpoint whose first request cannot fit.
 
         Returns:
             bool: Whether an eligible rebuilt context was committed.
         """
         window = self._context.capture()
         try:
-            attempts = self._attempts(window)
+            attempts = self._attempts(window, retry=retry)
             if attempts is None:
                 return False
             for attempt in attempts:
@@ -241,8 +259,11 @@ class ContextCompaction:
         self._report_completion(checkpoint)
         return True
 
-    async def compact_async(self) -> bool:
+    async def compact_async(self, *, retry: bool = False) -> bool:
         """Capture and commit a rebuilt context using asynchronous provider operations.
+
+        Args:
+            retry (bool): Rebuild an existing checkpoint whose first request cannot fit.
 
         Returns:
             bool: Whether an eligible rebuilt context was committed.
@@ -252,7 +273,7 @@ class ContextCompaction:
         """
         window = await self._context.capture_async()
         try:
-            attempts = self._attempts(window)
+            attempts = self._attempts(window, retry=retry)
             if attempts is None:
                 return False
             for attempt in attempts:
@@ -295,7 +316,7 @@ class ContextCompaction:
         self._report_completion(checkpoint)
         return True
 
-    def _attempts(self, window: ModelWindow) -> Iterator[_Attempt] | None:
+    def _attempts(self, window: ModelWindow, *, retry: bool) -> Iterator[_Attempt] | None:
         """Capture one frontier and project candidates only as they are tried."""
         manager = self._session_manager
         backend = self._context.backend
@@ -303,7 +324,8 @@ class ContextCompaction:
         previous = session.checkpoint()
         current = session.window
         if (current is None and not session.messages) or (
-            not self.can_compact()
+            not retry
+            and not self.can_compact()
             and current is not None
             and window.checkpoint_id == current.checkpoint_id
             and (window.route, window.model, window.settings, window.baseline.digest, window.tools)
@@ -336,6 +358,12 @@ class ContextCompaction:
         previous_coverage = (
             previous.coverage if previous is not None and previous.id == checkpoint_id else None
         )
+        if retry and previous_coverage is not None and previous.boundary == len(session.messages):
+            candidates = tuple(
+                retained
+                for retained in candidates
+                if retained.coverage.cut >= previous_coverage.cut
+            )
         self._interaction.info("Compacting session context...")
         telemetry_activity("compaction.started", component="compaction", model=window.model)
 

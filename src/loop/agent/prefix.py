@@ -50,6 +50,7 @@ class AgentRequest:
         dispatch (ModelDispatch): Exact record of model-only changes at this boundary.
         recorded (bool): Whether an uncertain dispatch already committed this record.
         may_compact (bool): Whether this is a fresh request that can compact the active context.
+        check_headroom (bool): Whether this is the first generation using a rebuilt window.
         input (list[ModelContextItem]): Model-visible items before artifact hydration.
         instructions (str | None): Separate developer instructions when the layout uses them.
         leading (str | None): Countable instructions outside the transient guidance.
@@ -69,6 +70,7 @@ class AgentRequest:
     dispatch: ModelDispatch
     recorded: bool
     may_compact: bool
+    check_headroom: bool
     input: list[ModelContextItem]
     instructions: str | None
     leading: str | None
@@ -373,6 +375,12 @@ class AgentContext:
             dispatch=dispatch,
             recorded=recorded,
             may_compact=stored is None,
+            check_headroom=bool(
+                target.current is not None
+                and target.checkpoint
+                and target.checkpoint.coverage
+                and (not records or stored is not None and stored.position == records[0].position)
+            ),
             input=context,
             instructions=instructions,
             leading=leading,
@@ -511,7 +519,7 @@ class AgentContext:
         )
         return _guidance_tokens(leading, instructions, trailing)
 
-    def occupied_tokens(self, request: AgentRequest, items: list[ModelContextItem]) -> int:
+    def occupied_tokens(self, request: AgentRequest, items: list[ModelContextItem]) -> int | None:
         """Use the provider count or the latest applicable generation usage.
 
         Args:
@@ -519,7 +527,7 @@ class AgentContext:
             items (list[ModelContextItem]): Hydrated and policy-prepared request input.
 
         Returns:
-            int: Estimated occupancy before the next generation.
+            int | None: Estimated occupancy, or None if rebuilt provider state cannot be measured.
 
         Raises:
             ProblemException: The request changed before counting or dispatch.
@@ -540,7 +548,7 @@ class AgentContext:
         self,
         request: AgentRequest,
         items: list[ModelContextItem],
-    ) -> int:
+    ) -> int | None:
         """Asynchronously use the provider count or applicable generation usage.
 
         Args:
@@ -548,7 +556,7 @@ class AgentContext:
             items (list[ModelContextItem]): Hydrated and policy-prepared request input.
 
         Returns:
-            int: Estimated occupancy before the next generation.
+            int | None: Estimated occupancy, or None if rebuilt provider state cannot be measured.
 
         Raises:
             ProblemException: The request changed before counting or dispatch.
@@ -570,13 +578,17 @@ class AgentContext:
         request: AgentRequest,
         items: list[ModelContextItem],
         count: int | None,
-    ) -> int:
+    ) -> int | None:
         """Reuse observed usage only where the measured replay still applies."""
         if count is not None:
             return count + _guidance_tokens(
                 request.leading, request.instructions, request.trailing_guidance
             )
         window = request.window
+        if request.check_headroom:
+            if any(isinstance(item, CompactionContextItem) for item in items):
+                return None
+            return estimate_context(items, instructions=request.instructions, tools=window.tools)
         session = self._sessions.session
         same_window = (
             request.previous_window in (None, window.id)

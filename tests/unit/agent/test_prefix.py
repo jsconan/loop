@@ -22,7 +22,7 @@ from loop.models import (
     ToolResult,
     Usage,
 )
-from loop.session import Compaction, InstructionSnapshot
+from loop.session import Compaction, InstructionSnapshot, SessionManager, SQLiteSessionStore
 from loop.tools import BUILTIN_TOOLS, activate_skill, manage_skills
 from loop.tools.system import poll_command_job, run_command
 from loop.utils import sha256_digest, utc_now
@@ -672,7 +672,7 @@ def test_shorter_leading_instructions_keep_retained_context_in_budget(tmp_path, 
         backend.compact.return_value = CompactionResult(items=(native,))
         backend.count_generation = Mock(return_value=30000)
         assert compaction.compact()
-        backend.count_generation.side_effect = [None, 30000]
+        backend.count_generation.side_effect = [None, 30000, 30000]
     previous = loop.session.checkpoint()
     backend.compact.return_value = _portable("Previous decisions")
     compaction.threshold = (loop.session.tokens + 80) / capacity
@@ -964,6 +964,142 @@ def test_async_dispatch_rechecks_disclosure_after_persisting(tmp_path, monkeypat
         assert len(loop.session.dispatches) == 1
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize(
+    "outcome", ["fits", "unfit", "capacity_changes_again", "capacity_changes_at_dispatch"]
+)
+def test_first_rebuilt_dispatch_rechecks_live_generation_budget(
+    tmp_path, monkeypatch, asynchronous, outcome
+):
+    """Recount the first rebuilt request after a live edit during checkpoint publication."""
+    backend = _backend()
+    capacity = 8192
+    available = capacity - backend.generation_reserve(capacity)
+    backend.get_context_window.return_value = backend.get_context_window_async.return_value = (
+        capacity
+    )
+    messages = [
+        item
+        for index in range(7)
+        for item in (
+            Message(role="user", content=f"Question {index}"),
+            Message(role="assistant", content=f"Answer {index}"),
+        )
+    ] + [Message(role="user", content="Finish the current request.")]
+    store = SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="fixture")
+    manager = SessionManager(
+        session=Session(messages=messages, workspace_id="fixture"),
+        session_store=store,
+    )
+    loop = Loop.create_default(
+        backend,
+        session_manager=manager,
+        working_directory=tmp_path,
+        tool_registry=ToolRegistry([]),
+        context_settings=ContextSettings(mode="off"),
+    )
+    runner = loop.agent_runner
+    summaries = [_portable("First summary"), _portable("Reduced summary")]
+    backend.compact.side_effect = summaries
+    backend.compact_async.side_effect = summaries
+
+    def count(items, **kwargs):
+        """Count the rebuilt input near the limit until one older turn is summarized."""
+        texts = {item.content for item in items if isinstance(item, Message)}
+        if texts.intersection({"First summary", "Reduced summary"}):
+            return 1200 if outcome != "unfit" and "Question 3" not in texts else available - 4
+        return available + 10
+
+    backend.count_generation = Mock(side_effect=count)
+    backend.count_generation_async = AsyncMock(side_effect=count)
+    settings = ApplicationSettings(context=ContextSettings(mode="basic"))
+    commit = manager.commit_model_window
+    commit_async = manager.commit_model_window_async
+
+    def update_budget(checkpoint):
+        """Change the live budget after each relevant write settles."""
+        if checkpoint is not None and len(loop.session.compactions) == 1:
+            loop.configure_context(settings)
+        elif outcome == (
+            "capacity_changes_again" if checkpoint is not None else "capacity_changes_at_dispatch"
+        ):
+            manager.context_window = 1024
+
+    def commit_with_update(*args, **kwargs):
+        """Apply a late budget change after the checkpoint or dispatch has been saved."""
+        commit(*args, **kwargs)
+        update_budget(kwargs.get("checkpoint"))
+
+    async def commit_with_update_async(*args, **kwargs):
+        """Apply the same change at the async checkpoint boundary."""
+        await commit_async(*args, **kwargs)
+        update_budget(kwargs.get("checkpoint"))
+
+    monkeypatch.setattr(manager, "commit_model_window", commit_with_update)
+    monkeypatch.setattr(manager, "commit_model_window_async", commit_with_update_async)
+
+    def query():
+        """Dispatch through the public runner for the selected execution path."""
+        return asyncio.run(runner.query_async()) if asynchronous else runner.query()
+
+    transport = backend.get_response_async if asynchronous else backend.get_response
+    if outcome == "fits":
+        query()
+        request = transport.call_args.kwargs
+        assert "<environment_context>" in request["instructions"]
+        assert messages[-1] == request["input"][-1]
+        assert Message(role="user", content="Reduced summary") in request["input"]
+        assert messages[6] not in request["input"]
+        transport.assert_called_once()
+        assert len(loop.session.compactions) == 2
+    else:
+        if outcome == "unfit":
+            compact = backend.compact_async if asynchronous else backend.compact
+            compact.side_effect = None
+            compact.return_value = summaries[0]
+        with pytest.raises(ProblemException) as error:
+            query()
+        assert error.value.problem.code == "agent.context_limit"
+        transport.assert_not_called()
+        assert len(loop.session.dispatches) == (outcome == "capacity_changes_at_dispatch")
+        assert len(loop.session.compactions) == (1 if outcome == "unfit" else 2)
+    assert store.load(loop.session.id).window == loop.session.window
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_unfit_rebuilt_dispatch_preserves_the_admitted_request(tmp_path, asynchronous):
+    """Recheck a first dispatch retry without replacing its uncertain replay record."""
+    backend = _backend()
+    backend.get_context_window.return_value = backend.get_context_window_async.return_value = 8192
+    backend.count_generation = Mock(return_value=1200)
+    backend.count_generation_async = AsyncMock(return_value=1200)
+    loop = Loop.create_default(backend, working_directory=tmp_path, tool_registry=ToolRegistry([]))
+    runner = loop.agent_runner
+    runner.session_manager.add_user_message("Continue after compaction.")
+    assert runner.compaction.compact()
+    checkpoint = loop.session.checkpoint()
+    transport = backend.get_response_async if asynchronous else backend.get_response
+    transport.side_effect = BackendConnectionError(
+        "transport lost", provider="test", operation="generation"
+    )
+
+    def query():
+        """Use the same runner entry point for the original request and its retry."""
+        return asyncio.run(runner.query_async()) if asynchronous else runner.query()
+
+    with pytest.raises(BackendConnectionError, match="transport lost"):
+        query()
+    dispatch = loop.session.dispatches[-1]
+    backend.count_generation.return_value = backend.count_generation_async.return_value = 9000
+    with pytest.raises(ProblemException) as error:
+        query()
+    assert error.value.problem.code == "agent.context_limit"
+    transport.assert_called_once()
+    assert loop.session.compactions == [checkpoint]
+    assert loop.session.dispatches == [dispatch]
+    assert loop.session.pending_dispatch == dispatch.id
 
 
 @pytest.mark.parametrize("compaction", [False, True], ids=["generation", "compaction"])
