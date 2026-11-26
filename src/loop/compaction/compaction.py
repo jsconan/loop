@@ -308,6 +308,7 @@ class ContextCompaction:
         overhead = estimate_context(
             baseline, instructions=window.leading_instructions(rebuilt=True), tools=window.tools
         )
+        overhead += self._context.rebuild_guidance_tokens(window)
         retain_budget = available - overhead
         if retain_budget < 0:
             raise CompactionLimitError("Instructions and tools exceed the available context limit.")
@@ -448,12 +449,15 @@ class ContextCompaction:
         ):
             return None
         context = self._session_manager.hydrate_context(self._rebuilt_items(attempt, result))
-        return attempt.backend.estimate_generation(
+        tokens = attempt.backend.estimate_generation(
             context,
             instructions=attempt.window.leading_instructions(rebuilt=True),
             tools=attempt.window.tools,
             model=attempt.window.model,
         )
+        if tokens is None:
+            return None
+        return tokens + self._context.rebuild_guidance_tokens(attempt.window)
 
     async def _estimate_async(self, attempt: _Attempt, result: CompactionResult) -> int | None:
         """Measure the entire rebuilt generation context asynchronously."""
@@ -466,12 +470,15 @@ class ContextCompaction:
         context = await self._session_manager.hydrate_context_async(
             self._rebuilt_items(attempt, result)
         )
-        return await attempt.backend.estimate_generation_async(
+        tokens = await attempt.backend.estimate_generation_async(
             context,
             instructions=attempt.window.leading_instructions(rebuilt=True),
             tools=attempt.window.tools,
             model=attempt.window.model,
         )
+        if tokens is None:
+            return None
+        return tokens + self._context.rebuild_guidance_tokens(attempt.window)
 
     def _rebuilt_items(self, attempt: _Attempt, result: CompactionResult) -> list[ModelContextItem]:
         """Build the complete context order used to establish generation headroom."""

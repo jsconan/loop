@@ -8,8 +8,9 @@ import pytest
 
 from loop import Agent, Message, ModelSelection, Session, SessionManager
 from loop.agent import AgentContext
+from loop.backend import estimate_context
 from loop.compaction import ContextCompaction
-from loop.configuration import ContextSettings
+from loop.configuration import ApplicationSettings, ContextSettings
 from loop.instructions import InstructionsManager
 from loop.interaction import Interaction
 from loop.models import CompactionContextItem, CompactionResult, DeveloperInput, Usage
@@ -159,7 +160,7 @@ def test_empty_or_unsupported_middle_result_keeps_previous_window(tmp_path, asyn
 def test_retains_opening_and_recent_turns_around_middle(tmp_path, asynchronous):
     """The checkpoint replaces only the captured middle and estimates the whole generation."""
     messages = _history()
-    feature, owner, backend, interaction, *_ = _feature(
+    feature, owner, backend, interaction, *_, context = _feature(
         tmp_path, session=Session(messages=messages, tokens=29000)
     )
     method = backend.compact_async if asynchronous else backend.compact
@@ -192,15 +193,20 @@ def test_retains_opening_and_recent_turns_around_middle(tmp_path, asynchronous):
     assert reconstructed[1:3] == messages[:2]
     assert reconstructed[3] == _result().items[0]
     assert reconstructed[4:] == messages[7:]
+    request = context.prepare(None)
+    assert checkpoint.input_tokens_after == estimate_context(
+        request.input, instructions=request.instructions, tools=request.window.tools
+    )
     assert owner.messages == messages
     assert "estimated" in interaction.info.call_args.args[0]
 
 
 def test_native_headroom_failure_uses_only_canonical_middle_for_portable_fallback(tmp_path):
     """An unmeasurable opaque block never becomes durable continuation data."""
-    feature, owner, backend, *_ = _feature(
+    feature, owner, backend, *_, context = _feature(
         tmp_path, session=Session(messages=_history(), tokens=30000)
     )
+    context.configure(ApplicationSettings(context=ContextSettings(mode="off")))
     backend.compact.side_effect = [_result(native=True), _result()]
     backend.estimate_generation = Mock(side_effect=[None, 1200])
     assert feature.compact()
@@ -221,6 +227,37 @@ def test_unfit_portable_candidate_keeps_original_context(tmp_path):
     assert feature.compact() is False
     assert not owner.session.compactions
     assert "exceed the available context limit" in interaction.warning.call_args.args[0]
+
+
+@pytest.mark.parametrize("layout", ["leading", "inline", "suffix"])
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_rebuild_reserves_disclosure_headroom_without_sending_facts(tmp_path, layout, asynchronous):
+    """Budget default disclosure while keeping the backend estimator's inputs stable."""
+    feature, owner, backend, interaction, *_, context = _feature(
+        tmp_path, session=Session(messages=_history())
+    )
+    backend.instruction_layout = lambda model: layout
+    backend.compact.return_value = backend.compact_async.return_value = _result()
+    available = owner.context_window - backend.generation_reserve(owner.context_window)
+    estimate = AsyncMock(return_value=available) if asynchronous else Mock(return_value=available)
+    if asynchronous:
+        backend.estimate_generation_async = estimate
+    else:
+        backend.estimate_generation = estimate
+
+    outcome = asyncio.run(feature.compact_async()) if asynchronous else feature.compact()
+
+    assert outcome is False
+    assert not owner.session.compactions
+    assert "exceed the available context limit" in interaction.warning.call_args.args[0]
+    assert "<environment_context>" not in (estimate.call_args.kwargs["instructions"] or "")
+    assert "<environment_context>" not in repr(estimate.call_args.args[0])
+
+    context.configure(ApplicationSettings(context=ContextSettings(mode="off")))
+    outcome = asyncio.run(feature.compact_async()) if asynchronous else feature.compact()
+
+    assert outcome is True
+    assert owner.tokens == available
 
 
 def test_appended_input_replays_once_after_captured_frontier(tmp_path):

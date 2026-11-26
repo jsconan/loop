@@ -360,19 +360,19 @@ class AgentContext:
         sample = self._request_environment(
             window.layout, (stored or dispatch).id, snapshot, disclosure
         )
-        instructions = _join_guidance(
+        instructions, trailing = _place_request_guidance(
+            window.layout,
             window.leading_instructions(
                 revision.snapshot
                 if revision is not None
                 else self._effective_snapshot(window, records),
                 rebuilt=bool(target.checkpoint and target.checkpoint.coverage),
             ),
-            snapshot.suffix if window.layout != "inline" else None,
+            snapshot.suffix,
             sample,
         )
         context = session.model_context(window=window, dispatch=None if recorded else dispatch)
-        if window.layout == "inline" and snapshot.suffix:
-            context.append(DeveloperInput(snapshot.suffix))
+        context.extend(trailing)
         return AgentRequest(
             session_id=session.id,
             previous_window=previous_window.id if previous_window is not None else None,
@@ -496,6 +496,28 @@ class AgentContext:
         ):
             return self._selection.context_window
         return self._sessions.context_window
+
+    def rebuild_guidance_tokens(self, window: ModelWindow) -> int:
+        """Estimate the extra generation context for request-local guidance after a rebuild.
+
+        Args:
+            window (ModelWindow): Candidate with a refreshed, durable baseline.
+
+        Returns:
+            int: Local estimate for guidance that stays outside the checkpoint and provider count.
+        """
+        snapshot = replace(window.baseline, suffix=self._instructions.request_suffix())
+        sample = self._request_environment(window.layout, None, snapshot, self._disclosure)
+        leading = window.leading_instructions(rebuilt=True)
+        instructions, trailing = _place_request_guidance(
+            window.layout,
+            leading,
+            snapshot.suffix,
+            sample,
+        )
+        return estimate_context(trailing, instructions=instructions) - estimate_context(
+            (), instructions=leading
+        )
 
     def occupied_tokens(self, request: AgentRequest) -> int:
         """Project changes to the context already measured by the model.
@@ -683,7 +705,7 @@ class AgentContext:
     def _request_environment(
         self,
         layout: InstructionLayout,
-        dispatch_id: str,
+        dispatch_id: str | None,
         snapshot: PreparedInstructions,
         disclosure: ContextSettings,
     ) -> str | None:
@@ -706,6 +728,16 @@ class AgentContext:
         return sample
 
 
-def _join_guidance(*sections: str | None) -> str | None:
-    """Combine applicable request-scoped developer sections."""
-    return "\n\n".join(section for section in sections if section) or None
+def _place_request_guidance(
+    layout: InstructionLayout,
+    leading: str | None,
+    suffix: str | None,
+    environment: str | None,
+) -> tuple[str | None, tuple[DeveloperInput, ...]]:
+    """Place transient guidance in the separate field or at the end of the input."""
+    trailing = ()
+    if layout == "inline" and suffix:
+        trailing = (DeveloperInput(suffix),)
+        suffix = None
+    sections = (leading, suffix, environment)
+    return "\n\n".join(section for section in sections if section) or None, trailing
