@@ -1454,8 +1454,8 @@ class SessionManager:
             window (ModelWindow): Window receiving the dispatch or rebuild.
             dispatch (ModelDispatch | None): Logical dispatch to bind before transport.
             checkpoint (Compaction | None): Captured replacement context to publish atomically.
-            validate (Callable[[], None] | None): Synchronous candidate validation under the writer
-                lock, immediately before mutation.
+            validate (Callable[[], None] | None): Thread-safe guard invoked by the store just
+                before committing, while the session writer holds its lock.
 
         Raises:
             ModelWindowConflictError: The captured session, window, or checkpoint changed.
@@ -1464,8 +1464,6 @@ class SessionManager:
         """
 
         def apply(session: Session) -> None:
-            if validate is not None:
-                validate()
             self._apply_model_window(
                 session,
                 session_id,
@@ -1476,7 +1474,7 @@ class SessionManager:
                 checkpoint,
             )
 
-        await self._commit_async(apply)
+        await self._commit_async(apply, validate=validate)
 
     @staticmethod
     def _apply_model_window(
@@ -2550,6 +2548,7 @@ class SessionManager:
         mutation: Callable[[Session], None],
         *,
         persisted_response: Response | None = None,
+        validate: Callable[[], None] | None = None,
     ) -> None:
         """Persist a detached mutation and notify response observers after a successful commit."""
         cancellation = None
@@ -2561,19 +2560,14 @@ class SessionManager:
                 candidate = deepcopy(current)
                 mutation(candidate)
                 telemetry_activity("session.persistence.started", component="session_manager")
+                run_blocking = self._async_blocking_runner or run_in_worker_async
                 pending = asyncio.ensure_future(
-                    self._async_blocking_runner(
+                    run_blocking(
                         self._save_snapshot,
                         self._session_store,
                         self._persistence_lock,
                         candidate,
-                    )
-                    if self._async_blocking_runner is not None
-                    else run_in_worker_async(
-                        self._save_snapshot,
-                        self._session_store,
-                        self._persistence_lock,
-                        candidate,
+                        validate,
                     )
                 )
                 try:
@@ -2589,11 +2583,12 @@ class SessionManager:
                 try:
                     pending.result()
                 except BaseException as error:
-                    telemetry_error(
-                        "session.persistence.failed",
-                        error_type="session.persistence_failed",
-                        component="session_manager",
-                    )
+                    if not isinstance(error, ModelWindowConflictError):
+                        telemetry_error(
+                            "session.persistence.failed",
+                            error_type="session.persistence_failed",
+                            component="session_manager",
+                        )
                     if cancellation is not None:
                         cancellation.add_note(
                             f"Session persistence also stopped with {type(error).__name__}."
@@ -2658,9 +2653,12 @@ class SessionManager:
         session_store: SessionStore,
         persistence_lock: Lock,
         session: Session,
+        validate: Callable[[], None] | None = None,
     ) -> str:
         """Serialize store writes and persist one detached or active snapshot."""
         with persistence_lock:
+            if validate is not None:
+                return session_store.save(session, validate=validate)
             return session_store.save(session)
 
     async def _run_blocking_async(self, function: Callable[..., Any], *args: Any) -> Any:

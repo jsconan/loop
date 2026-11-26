@@ -1,6 +1,7 @@
 """Persist session snapshots in memory."""
 
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 from threading import Lock
 from weakref import finalize
@@ -131,11 +132,13 @@ class MemorySessionStore:
     def _find_session(self, session_id: str) -> StoredSession | None:
         return next(filter(lambda s: s["id"] == session_id, self._sessions), None)
 
-    def save(self, session: Session) -> str:
+    def save(self, session: Session, *, validate: Callable[[], None] | None = None) -> str:
         """Persist a session snapshot in memory.
 
         Args:
             session (Session): Session to persist.
+            validate (Callable[[], None] | None): Guard invoked immediately before committing.
+                An exception from the guard aborts the save.
 
         Returns:
             str: The session's stable identifier.
@@ -172,6 +175,8 @@ class MemorySessionStore:
                     if stored is None:
                         raise ValueError("Session references an unavailable artifact.")
                     digests.add(reference.version)
+            if validate is not None:
+                validate()
             self._references = references
             self._reference_handles = handles
             if stored_session:

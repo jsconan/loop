@@ -1,5 +1,6 @@
 """Define the session persistence adapter contract."""
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -65,11 +66,13 @@ class SessionStore(Protocol):
             tuple[Path, ...]: Dedicated namespaces or an empty tuple to use the store's own root.
         """
 
-    def save(self, session: Session) -> str:
+    def save(self, session: Session, *, validate: Callable[[], None] | None = None) -> str:
         """Persist a session under its stable identifier.
 
         Args:
             session (Session): Session to persist.
+            validate (Callable[[], None] | None): Guard invoked immediately before committing.
+                An exception from the guard aborts the save.
 
         Returns:
             str: The session's stable identifier.

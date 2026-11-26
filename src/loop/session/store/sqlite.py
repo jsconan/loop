@@ -1,6 +1,7 @@
 """Persist session snapshots in a local SQLite database."""
 
 import sqlite3
+from collections.abc import Callable
 from contextlib import closing
 from datetime import datetime
 from pathlib import Path
@@ -176,11 +177,13 @@ class SQLiteSessionStore:
         """
         return self._path
 
-    def save(self, session: Session) -> str:
+    def save(self, session: Session, *, validate: Callable[[], None] | None = None) -> str:
         """Persist a session snapshot atomically.
 
         Args:
             session (Session): Session to persist.
+            validate (Callable[[], None] | None): Guard invoked within the transaction just
+                before commit. An exception from the guard rolls back the transaction.
 
         Returns:
             str: The session's stable identifier.
@@ -302,6 +305,8 @@ class SQLiteSessionStore:
                     """,
                     ((session.id, digest) for digest in digests),
                 )
+                if validate is not None:
+                    validate()
         self._enforce_private_modes()
         session.revision = new_revision
         return session.id

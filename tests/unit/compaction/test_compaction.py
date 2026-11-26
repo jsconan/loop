@@ -14,7 +14,7 @@ from loop.configuration import ApplicationSettings, ContextSettings
 from loop.instructions import InstructionsManager
 from loop.interaction import Interaction
 from loop.models import CompactionContextItem, CompactionResult, DeveloperInput, Usage
-from loop.session import ModelWindow, WindowSettings
+from loop.session import ModelWindow, SQLiteSessionStore, WindowSettings
 from loop.utils import PathHolder
 from tests.backend_doubles import model_backend
 
@@ -49,9 +49,9 @@ def _result(*, native=False):
     )
 
 
-def _feature(tmp_path, *, session=None, threshold=0.8):
+def _feature(tmp_path, *, session=None, session_store=None, threshold=0.8):
     """Compose a compactor around an isolated session and backend transport."""
-    owner = SessionManager(session=session)
+    owner = SessionManager(session=session, session_store=session_store)
     backend = model_backend(
         get_context_window=Mock(return_value=32768),
         get_context_window_async=AsyncMock(return_value=32768),
@@ -359,6 +359,51 @@ def test_async_checkpoint_commit_rejects_a_stale_generation_budget(tmp_path, cha
 
     assert not asyncio.run(compact_with_live_update())
     assert owner.session.compactions == [previous]
+    assert "changed during compaction" in interaction.warning.call_args.args[0]
+
+
+def test_async_checkpoint_rejects_disclosure_change_during_snapshot_save(tmp_path):
+    """Keep the earlier SQLite checkpoint when settings change during a detached save."""
+    store = SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="fixture")
+    feature, owner, backend, interaction, *_, context = _feature(
+        tmp_path,
+        session=Session(messages=_history(), workspace_id="fixture"),
+        session_store=store,
+    )
+    context.configure(ApplicationSettings(context=ContextSettings(mode="off")))
+    backend.compact.return_value = _result()
+    assert feature.compact()
+    previous = owner.session.checkpoint()
+    owner.add_message(Message(role="assistant", content="Finish the previous request"))
+    owner.add_user_message("Continue after the previous checkpoint")
+    saved = store.load(owner.session.id)
+    available = owner.context_window - backend.generation_reserve(owner.context_window)
+    backend.compact_async.return_value = _result()
+    backend.count_generation_async.return_value = available - 10
+
+    async def compact_with_late_disclosure():
+        """Change live disclosure while the candidate is waiting for its snapshot write."""
+        saving = asyncio.Event()
+        updated = asyncio.Event()
+
+        async def blocking(function, *args):
+            """Delay the blocking work until the live settings have changed."""
+            if any(isinstance(value, Session) and len(value.compactions) == 2 for value in args):
+                saving.set()
+                await updated.wait()
+            return await asyncio.to_thread(function, *args)
+
+        owner.set_async_blocking_runner(blocking)
+        async with asyncio.TaskGroup() as group:
+            attempt = group.create_task(feature.compact_async())
+            await asyncio.wait_for(saving.wait(), timeout=5)
+            context.configure(ApplicationSettings(context=ContextSettings(mode="basic")))
+            updated.set()
+        return attempt.result()
+
+    assert not asyncio.run(compact_with_late_disclosure())
+    assert owner.session.compactions == [previous]
+    assert store.load(saved.id) == saved
     assert "changed during compaction" in interaction.warning.call_args.args[0]
 
 

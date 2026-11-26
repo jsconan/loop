@@ -528,7 +528,7 @@ class ContextCompaction:
         )
 
     def _validate_fit(self, attempt: _Attempt, fit: _FitEstimate) -> None:
-        """Recheck live token-bearing inputs under the session writer's admission lock."""
+        """Recheck live token-bearing inputs at the snapshot's commit boundary."""
         window = attempt.window
         if (
             self._context.backend is not attempt.backend
