@@ -16,6 +16,7 @@ from ..models import (
     ConversationItem,
     ModelContextItem,
     ReasoningConfiguration,
+    ReasoningEffort,
 )
 from ..session import (
     Compaction,
@@ -60,6 +61,15 @@ class _Attempt:
     def has_prefix(self) -> bool:
         """Check whether rebuilt input puts canonical items before the checkpoint."""
         return bool(self.opening) or self.window.layout != "leading"
+
+
+@dataclass(frozen=True)
+class _FitEstimate:
+    """Bind measured input and local guidance to the generation controls they describe."""
+
+    tokens: int
+    reasoning: tuple[ReasoningEffort | None, ReasoningConfiguration | None]
+    guidance: int
 
 
 class ContextCompaction:
@@ -199,20 +209,20 @@ class ContextCompaction:
                 result = self._summarize(attempt)
                 if result is None or (attempt.middle and not result.items):
                     return self._empty_result()
-                tokens = self._estimate(attempt, result)
-                if not self._fits(attempt, tokens) and self._native_result(result):
+                fit = self._estimate(attempt, result)
+                if not self._fits(attempt, fit) and self._native_result(result):
                     result = self._portable(attempt)
-                    tokens = self._estimate(attempt, result) if result is not None else None
+                    fit = self._estimate(attempt, result) if result is not None else None
         except NotImplementedError:
             return self._unsupported()
         except CompactionLimitError as error:
             self._interaction.warning(str(error))
             return False
-        if not self._fits(attempt, tokens):
+        if not self._fits(attempt, fit):
             return self._unfit()
         if not self._context.check_rebuild(window) or self._context.backend is not attempt.backend:
             return self._stale()
-        checkpoint = self._checkpoint(attempt, result, tokens)
+        checkpoint = self._checkpoint(attempt, result, fit.tokens)
         try:
             self._session_manager.commit_model_window(
                 attempt.session_id,
@@ -245,10 +255,10 @@ class ContextCompaction:
                 result = await self._summarize_async(attempt)
                 if result is None or (attempt.middle and not result.items):
                     return self._empty_result()
-                tokens = await self._estimate_async(attempt, result)
-                if not self._fits(attempt, tokens) and self._native_result(result):
+                fit = await self._estimate_async(attempt, result)
+                if not self._fits(attempt, fit) and self._native_result(result):
                     result = await self._portable_async(attempt)
-                    tokens = (
+                    fit = (
                         await self._estimate_async(attempt, result) if result is not None else None
                     )
         except ModelWindowConflictError:
@@ -258,9 +268,9 @@ class ContextCompaction:
         except CompactionLimitError as error:
             self._interaction.warning(str(error))
             return False
-        if not self._fits(attempt, tokens):
+        if not self._fits(attempt, fit):
             return self._unfit()
-        checkpoint = self._checkpoint(attempt, result, tokens)
+        checkpoint = self._checkpoint(attempt, result, fit.tokens)
         try:
             await self._session_manager.commit_model_window_async(
                 attempt.session_id,
@@ -268,6 +278,7 @@ class ContextCompaction:
                 attempt.previous_checkpoint,
                 attempt.window,
                 checkpoint=checkpoint,
+                validate=lambda: self._validate_fit(attempt, fit),
             )
         except ModelWindowConflictError:
             return self._stale()
@@ -438,7 +449,7 @@ class ContextCompaction:
             raise CompactionLimitError("The portable checkpoint exceeds the summary limit.")
         return items
 
-    def _estimate(self, attempt: _Attempt, result: CompactionResult) -> int | None:
+    def _estimate(self, attempt: _Attempt, result: CompactionResult) -> _FitEstimate | None:
         """Measure the entire rebuilt generation context."""
         if not attempt.backend.can_replay_checkpoint(
             result.items,
@@ -462,9 +473,14 @@ class ContextCompaction:
         tokens = self._replay_tokens(attempt, context, tokens)
         if tokens is None:
             return None
-        return tokens + self._context.rebuild_guidance_tokens(attempt.window)
+        guidance = self._context.rebuild_guidance_tokens(attempt.window)
+        return _FitEstimate(tokens + guidance, reasoning, guidance)
 
-    async def _estimate_async(self, attempt: _Attempt, result: CompactionResult) -> int | None:
+    async def _estimate_async(
+        self,
+        attempt: _Attempt,
+        result: CompactionResult,
+    ) -> _FitEstimate | None:
         """Measure replay, revalidate the candidate, then budget live guidance."""
         if not attempt.backend.can_replay_checkpoint(
             result.items,
@@ -490,9 +506,11 @@ class ContextCompaction:
         if (
             not await self._context.check_rebuild_async(attempt.window)
             or self._context.backend is not attempt.backend
+            or self._context.reasoning_configuration(attempt.window) != reasoning
         ):
             raise ModelWindowConflictError("The captured model window changed during compaction.")
-        return tokens + self._context.rebuild_guidance_tokens(attempt.window)
+        guidance = self._context.rebuild_guidance_tokens(attempt.window)
+        return _FitEstimate(tokens + guidance, reasoning, guidance)
 
     @staticmethod
     def _replay_tokens(
@@ -508,6 +526,18 @@ class ContextCompaction:
             instructions=attempt.window.leading_instructions(rebuilt=True),
             tools=attempt.window.tools,
         )
+
+    def _validate_fit(self, attempt: _Attempt, fit: _FitEstimate) -> None:
+        """Recheck live token-bearing inputs under the session writer's admission lock."""
+        window = attempt.window
+        if (
+            self._context.backend is not attempt.backend
+            or self._context.reasoning_configuration(window) != fit.reasoning
+            or self._context.rebuild_guidance_tokens(window) != fit.guidance
+        ):
+            raise ModelWindowConflictError(
+                "The captured generation budget changed during compaction."
+            )
 
     def _rebuilt_items(
         self,
@@ -527,9 +557,9 @@ class ContextCompaction:
         return [*baseline, *attempt.opening, *result.items, *reasoning, *tail]
 
     @staticmethod
-    def _fits(attempt: _Attempt, tokens: int | None) -> bool:
+    def _fits(attempt: _Attempt, fit: _FitEstimate | None) -> bool:
         """Accept only a measured or bounded request with room for generation."""
-        return tokens is not None and tokens <= attempt.available
+        return fit is not None and fit.tokens <= attempt.available
 
     @staticmethod
     def _native_result(result: CompactionResult) -> bool:

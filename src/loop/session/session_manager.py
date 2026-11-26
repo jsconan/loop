@@ -1443,6 +1443,7 @@ class SessionManager:
         *,
         dispatch: ModelDispatch | None = None,
         checkpoint: Compaction | None = None,
+        validate: Callable[[], None] | None = None,
     ) -> None:
         """Persist a planned model window through the asynchronous writer.
 
@@ -1453,14 +1454,19 @@ class SessionManager:
             window (ModelWindow): Window receiving the dispatch or rebuild.
             dispatch (ModelDispatch | None): Logical dispatch to bind before transport.
             checkpoint (Compaction | None): Captured replacement context to publish atomically.
+            validate (Callable[[], None] | None): Synchronous candidate validation under the writer
+                lock, immediately before mutation.
 
         Raises:
             ModelWindowConflictError: The captured session, window, or checkpoint changed.
             ValueError: The captured model state is inconsistent.
             asyncio.CancelledError: The write was cancelled after persistence settled.
         """
-        await self._commit_async(
-            lambda session: self._apply_model_window(
+
+        def apply(session: Session) -> None:
+            if validate is not None:
+                validate()
+            self._apply_model_window(
                 session,
                 session_id,
                 previous_window,
@@ -1469,7 +1475,8 @@ class SessionManager:
                 dispatch,
                 checkpoint,
             )
-        )
+
+        await self._commit_async(apply)
 
     @staticmethod
     def _apply_model_window(

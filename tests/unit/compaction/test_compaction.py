@@ -308,6 +308,60 @@ def test_async_compaction_rechecks_headroom_after_disclosure_changes(tmp_path, n
         assert "exceed the available context limit" in interaction.warning.call_args.args[0]
 
 
+@pytest.mark.parametrize("change", ["reasoning", "disclosure"])
+def test_async_checkpoint_commit_rejects_a_stale_generation_budget(tmp_path, change):
+    """Preserve the previous checkpoint when live input invalidates a counted candidate."""
+    feature, owner, backend, interaction, _, agent, context = _feature(
+        tmp_path, session=Session(messages=_history())
+    )
+    context.configure(ApplicationSettings(context=ContextSettings(mode="off")))
+    backend.supports_reasoning_updates = lambda model: True
+    backend.compact.return_value = _result()
+    assert feature.compact()
+    previous = owner.session.checkpoint()
+    owner.add_message(Message(role="assistant", content="Finished the previous request"))
+    owner.add_user_message("Continue from the completed work")
+    backend.compact_async.return_value = _result()
+    available = owner.context_window - backend.generation_reserve(owner.context_window)
+    backend.count_generation_async = AsyncMock(return_value=available - 10)
+
+    async def compact_with_live_update():
+        """Pause either final validation or acquisition of the session writer lock."""
+        waiting = asyncio.Event()
+        updated = asyncio.Event()
+        validate = context.check_rebuild_async
+
+        async def wait_for_reasoning(window):
+            """Allow a live effort change after the candidate's tokens were counted."""
+            if change == "reasoning":
+                waiting.set()
+                await updated.wait()
+            return await validate(window)
+
+        async def blocking(function, *args):
+            """Allow a disclosure change before the writer acquires the commit lock."""
+            if change == "disclosure" and function.__name__ == "acquire":
+                waiting.set()
+                await updated.wait()
+            return await asyncio.to_thread(function, *args)
+
+        context.check_rebuild_async = wait_for_reasoning
+        owner.set_async_blocking_runner(blocking)
+        async with asyncio.TaskGroup() as group:
+            pending = group.create_task(feature.compact_async())
+            await asyncio.wait_for(waiting.wait(), timeout=5)
+            if change == "reasoning":
+                agent.hyperparameters.reasoning_effort = "high"
+            else:
+                context.configure(ApplicationSettings(context=ContextSettings(mode="basic")))
+            updated.set()
+        return pending.result()
+
+    assert not asyncio.run(compact_with_live_update())
+    assert owner.session.compactions == [previous]
+    assert "changed during compaction" in interaction.warning.call_args.args[0]
+
+
 def test_appended_input_replays_once_after_captured_frontier(tmp_path):
     """A turn admitted while the provider summarizes is outside the checkpoint coverage."""
     messages = _history()
