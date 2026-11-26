@@ -498,7 +498,7 @@ class AgentContext:
         return self._sessions.context_window
 
     def occupied_tokens(self, request: AgentRequest) -> int:
-        """Project additions to the context already measured by the model.
+        """Project changes to the context already measured by the model.
 
         Args:
             request (AgentRequest): Prepared logical request to evaluate.
@@ -522,15 +522,13 @@ class AgentContext:
         )
         inline = window.layout != "leading"
         additions.extend(dispatch.model_items(inline=inline))
-        increase = estimate_context(additions)
+        measured = session.tokens
         if dispatch.revision is not None and not inline:
             previous = self._effective_snapshot(window, session.model_dispatches(window))
-            increase += max(
-                0,
-                estimate_context((), instructions=dispatch.revision.snapshot.content)
-                - estimate_context((), instructions=previous.content),
-            )
-        return session.tokens + increase
+            measured += estimate_context(
+                (), instructions=dispatch.revision.snapshot.content
+            ) - estimate_context((), instructions=previous.content)
+        return max(0, measured) + estimate_context(additions)
 
     def _target_model(self) -> str:
         """Resolve the authorized target for this session."""

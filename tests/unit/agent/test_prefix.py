@@ -615,6 +615,34 @@ def test_compaction_charges_only_new_input_when_usage_is_known(tmp_path):
     assert "Revised guidance." in backend.get_response.call_args.kwargs["instructions"]
 
 
+def test_shorter_leading_instructions_release_context_before_automatic_compaction(tmp_path):
+    """Replacing a large leading section uses less of the measured context budget."""
+    policy = tmp_path / "AGENTS.md"
+    policy.write_text("Keep every synthetic record in the leading policy. " * 320)
+    backend = _backend(layout="leading")
+    backend.get_context_window.return_value = 32768
+    backend.compact.return_value = _portable("Previous decisions")
+    usage = Usage(input_tokens=7900, output_tokens=100, total_tokens=8000)
+    result = ResponseCompleted(items=(Message(role="assistant", content="Recorded."),), usage=usage)
+    backend.get_response.side_effect = lambda **kwargs: iter((result,))
+    loop = Loop.create_default(backend, working_directory=tmp_path, tool_registry=ToolRegistry([]))
+    for index in range(7):
+        _turn(loop, f"Turn {index}")
+    window = loop.session.window
+    previous = backend.get_response.call_args.kwargs["input"]
+    loop.agent_runner.compaction.threshold = (usage.total_tokens + 10) / 32768
+    policy.write_text("Keep this shorter instruction.")
+
+    _turn(loop, "Continue.")
+
+    backend.compact.assert_not_called()
+    assert not loop.session.compactions
+    assert loop.session.window == window
+    request = backend.get_response.call_args.kwargs
+    assert request["input"][: len(previous)] == previous
+    assert "Keep this shorter instruction." in request["instructions"]
+
+
 @pytest.mark.parametrize("asynchronous", [False, True])
 def test_compaction_uses_the_same_route_and_replay_checks_as_generation(tmp_path, asynchronous):
     """History reaches a replacement route only after authorization and portable projection."""
