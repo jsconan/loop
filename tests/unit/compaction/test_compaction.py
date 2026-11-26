@@ -229,6 +229,35 @@ def test_unfit_portable_candidate_keeps_original_context(tmp_path):
     assert "exceed the available context limit" in interaction.warning.call_args.args[0]
 
 
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_over_budget_checkpoint_retries_with_one_fewer_complete_turn(tmp_path, asynchronous):
+    """Reduce the retained tail when the measured rebuild exceeds its input budget."""
+    messages = _history()
+    feature, owner, backend, *_, context = _feature(tmp_path, session=Session(messages=messages))
+    context.configure(ApplicationSettings(context=ContextSettings(mode="off")))
+    compact = backend.compact_async if asynchronous else backend.compact
+    compact.return_value = _result()
+    measure = AsyncMock if asynchronous else Mock
+    count = measure(side_effect=[40000, 1200])
+    if asynchronous:
+        backend.count_generation_async = count
+    else:
+        backend.count_generation = count
+
+    assert asyncio.run(feature.compact_async()) if asynchronous else feature.compact()
+
+    first, second = compact.call_args_list
+    assert first.args[0] == messages[2:7]
+    assert second.args[0] == messages[2:9]
+    checkpoint = owner.session.checkpoint()
+    assert checkpoint.coverage.opening == (0, 1)
+    assert checkpoint.coverage.tail == tuple(range(9, len(messages)))
+    assert checkpoint.boundary == len(messages)
+    assert checkpoint.input_tokens_after == 1200
+    assert count.call_count == 2
+    assert owner.messages == messages
+
+
 @pytest.mark.parametrize("layout", ["leading", "inline", "suffix"])
 @pytest.mark.parametrize("asynchronous", [False, True])
 def test_rebuild_reserves_disclosure_headroom_without_sending_facts(tmp_path, layout, asynchronous):
@@ -273,8 +302,12 @@ def test_async_compaction_rechecks_headroom_after_disclosure_changes(tmp_path, n
     owner.add_message(Message(role="assistant", content="Finished the previous request"))
     owner.add_user_message("Continue from the completed work")
     available = owner.context_window - backend.generation_reserve(owner.context_window)
-    backend.compact_async.side_effect = [_result(native=native), _result()]
-    backend.count_generation_async = AsyncMock(side_effect=[available, 1200])
+    backend.compact_async.return_value = _result()
+    if native:
+        backend.compact_async.side_effect = [_result(native=True), _result()]
+        backend.count_generation_async = AsyncMock(side_effect=[available, 1200])
+    else:
+        backend.count_generation_async = AsyncMock(return_value=available)
 
     async def compact_with_live_update():
         """Enable disclosure while the compactor is waiting for revalidation."""
@@ -303,7 +336,7 @@ def test_async_compaction_rechecks_headroom_after_disclosure_changes(tmp_path, n
         assert owner.session.checkpoint().context == _result().items
         assert 1200 < owner.tokens <= available
     else:
-        backend.compact_async.assert_awaited_once()
+        assert backend.compact_async.await_count == 5
         assert owner.session.compactions == [previous]
         assert "exceed the available context limit" in interaction.warning.call_args.args[0]
 
@@ -760,7 +793,7 @@ def test_async_unfit_or_stale_attempt_never_commits(tmp_path):
         tmp_path, session=Session(messages=_history())
     )
     backend.compact_async.return_value = _result()
-    backend.count_generation_async = AsyncMock(side_effect=[99999, 1024])
+    backend.count_generation_async = AsyncMock(return_value=99999)
     assert not asyncio.run(feature.compact_async())
     assert "context limit" in interaction.warning.call_args.args[0]
     candidate = ModelWindow(
@@ -772,6 +805,7 @@ def test_async_unfit_or_stale_attempt_never_commits(tmp_path):
         baseline=instructions.prepare(agent),
         tools=(),
     )
+    backend.count_generation_async.return_value = 1024
     context.capture_async = AsyncMock(return_value=candidate)
     context.check_rebuild_async = AsyncMock(return_value=False)
     assert not asyncio.run(feature.compact_async())

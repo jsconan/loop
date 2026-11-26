@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -202,24 +203,27 @@ class ContextCompaction:
         """
         window = self._context.capture()
         try:
-            attempt = self._start(window)
-            if attempt is None:
+            attempts = self._attempts(window)
+            if attempts is None:
                 return False
-            with attempt.backend.file_projection(window.settings.file_input_mode):
-                result = self._summarize(attempt)
-                if result is None or (attempt.middle and not result.items):
-                    return self._empty_result()
-                fit = self._estimate(attempt, result)
-                if not self._fits(attempt, fit) and self._native_result(result):
-                    result = self._portable(attempt)
-                    fit = self._estimate(attempt, result) if result is not None else None
+            for attempt in attempts:
+                with attempt.backend.file_projection(window.settings.file_input_mode):
+                    result = self._summarize(attempt)
+                    if result is None or (attempt.middle and not result.items):
+                        return self._empty_result()
+                    fit = self._estimate(attempt, result)
+                    if not self._fits(attempt, fit) and self._native_result(result):
+                        result = self._portable(attempt)
+                        fit = self._estimate(attempt, result) if result is not None else None
+                if self._fits(attempt, fit):
+                    break
+            else:
+                return self._unfit()
         except NotImplementedError:
             return self._unsupported()
         except CompactionLimitError as error:
             self._interaction.warning(str(error))
             return False
-        if not self._fits(attempt, fit):
-            return self._unfit()
         if not self._context.check_rebuild(window) or self._context.backend is not attempt.backend:
             return self._stale()
         checkpoint = self._checkpoint(attempt, result, fit.tokens)
@@ -248,19 +252,26 @@ class ContextCompaction:
         """
         window = await self._context.capture_async()
         try:
-            attempt = self._start(window)
-            if attempt is None:
+            attempts = self._attempts(window)
+            if attempts is None:
                 return False
-            with attempt.backend.file_projection(window.settings.file_input_mode):
-                result = await self._summarize_async(attempt)
-                if result is None or (attempt.middle and not result.items):
-                    return self._empty_result()
-                fit = await self._estimate_async(attempt, result)
-                if not self._fits(attempt, fit) and self._native_result(result):
-                    result = await self._portable_async(attempt)
-                    fit = (
-                        await self._estimate_async(attempt, result) if result is not None else None
-                    )
+            for attempt in attempts:
+                with attempt.backend.file_projection(window.settings.file_input_mode):
+                    result = await self._summarize_async(attempt)
+                    if result is None or (attempt.middle and not result.items):
+                        return self._empty_result()
+                    fit = await self._estimate_async(attempt, result)
+                    if not self._fits(attempt, fit) and self._native_result(result):
+                        result = await self._portable_async(attempt)
+                        fit = (
+                            await self._estimate_async(attempt, result)
+                            if result is not None
+                            else None
+                        )
+                if self._fits(attempt, fit):
+                    break
+            else:
+                return self._unfit()
         except ModelWindowConflictError:
             return self._stale()
         except NotImplementedError:
@@ -268,8 +279,6 @@ class ContextCompaction:
         except CompactionLimitError as error:
             self._interaction.warning(str(error))
             return False
-        if not self._fits(attempt, fit):
-            return self._unfit()
         checkpoint = self._checkpoint(attempt, result, fit.tokens)
         try:
             await self._session_manager.commit_model_window_async(
@@ -286,8 +295,8 @@ class ContextCompaction:
         self._report_completion(checkpoint)
         return True
 
-    def _start(self, window: ModelWindow) -> _Attempt | None:
-        """Freeze the source frontier, projected suffix, and eligible earlier checkpoint."""
+    def _attempts(self, window: ModelWindow) -> Iterator[_Attempt] | None:
+        """Capture one frontier and project candidates only as they are tried."""
         manager = self._session_manager
         backend = self._context.backend
         session = manager.session
@@ -321,54 +330,65 @@ class ContextCompaction:
         retain_budget = available - overhead
         if retain_budget < 0:
             raise CompactionLimitError("Instructions and tools exceed the available context limit.")
-        retained = RetainedContext.select(
+        candidates = RetainedContext.candidates(
             session, retain_budget - min(_SUMMARY_RESERVE, retain_budget // 4)
         )
-        middle = list(retained.middle)
-        previous_items = ()
-        previous_context_tokens = None
-        uncovered = middle
-        opening = [session.messages[index] for index in retained.coverage.opening]
-        prefix = bool(opening) or window.layout != "leading"
-        if previous is not None and previous.id == checkpoint_id and previous.coverage is not None:
-            earlier = RetainedContext(previous.boundary, previous.coverage).middle
-            if tuple(middle[: len(earlier)]) == earlier and backend.can_replay_checkpoint(
-                previous.context, window.model, prefix=prefix
-            ):
-                previous_items = previous.context
-                previous_context_tokens = previous.input_tokens_after
-                uncovered = middle[len(earlier) :]
+        previous_coverage = (
+            previous.coverage if previous is not None and previous.id == checkpoint_id else None
+        )
         self._interaction.info("Compacting session context...")
         telemetry_activity("compaction.started", component="compaction", model=window.model)
-        return _Attempt(
-            session_id=session.id,
-            previous_window=current.id if current is not None else None,
-            previous_checkpoint=previous.id if previous is not None else None,
-            backend=backend,
-            window=window,
-            retained=retained,
-            opening=opening,
-            tail=session.rebuilt_items(retained.coverage.tail),
-            native_tail=(
-                session.rebuilt_items(
-                    retained.coverage.tail, provider_state_start=window.provider_state_start
+
+        def project() -> Iterator[_Attempt]:
+            """Replay each alternative against the same captured history frontier."""
+            for retained in candidates:
+                middle = retained.middle
+                opening = [session.messages[index] for index in retained.coverage.opening]
+                previous_items = ()
+                previous_context_tokens = None
+                uncovered = middle
+                if previous_coverage is not None:
+                    earlier = RetainedContext(previous.boundary, previous_coverage).middle
+                    if middle[: len(earlier)] == earlier and backend.can_replay_checkpoint(
+                        previous.context,
+                        window.model,
+                        prefix=bool(opening) or window.layout != "leading",
+                    ):
+                        previous_items = previous.context
+                        previous_context_tokens = previous.input_tokens_after
+                        uncovered = middle[len(earlier) :]
+                yield _Attempt(
+                    session_id=session.id,
+                    previous_window=current.id if current is not None else None,
+                    previous_checkpoint=previous.id if previous is not None else None,
+                    backend=backend,
+                    window=window,
+                    retained=retained,
+                    opening=opening,
+                    tail=session.rebuilt_items(retained.coverage.tail),
+                    native_tail=(
+                        session.rebuilt_items(
+                            retained.coverage.tail,
+                            provider_state_start=window.provider_state_start,
+                        )
+                        if backend.preserves_compacted_reasoning
+                        else None
+                    ),
+                    middle=session.rebuilt_items(middle),
+                    previous_items=previous_items,
+                    previous_context_tokens=previous_context_tokens,
+                    uncovered=session.rebuilt_items(
+                        uncovered,
+                        provider_state_start=window.provider_state_start
+                        if window.layout != "leading"
+                        else None,
+                    ),
+                    available=available,
+                    summary_budget=max(1, available - min(_SUMMARY_RESERVE, available // 4)),
+                    native=limit is not None,
                 )
-                if backend.preserves_compacted_reasoning
-                else None
-            ),
-            middle=session.rebuilt_items(middle),
-            previous_items=previous_items,
-            previous_context_tokens=previous_context_tokens,
-            uncovered=session.rebuilt_items(
-                uncovered,
-                provider_state_start=window.provider_state_start
-                if window.layout != "leading"
-                else None,
-            ),
-            available=available,
-            summary_budget=max(1, available - min(_SUMMARY_RESERVE, available // 4)),
-            native=limit is not None,
-        )
+
+        return project()
 
     def _summarize(self, attempt: _Attempt) -> CompactionResult | None:
         """Summarize only the middle and retain an eligible prior compacted range."""

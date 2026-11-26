@@ -39,15 +39,15 @@ class RetainedContext:
         return tuple(index for index in range(self.coverage.cut) if index not in retained)
 
     @classmethod
-    def select(cls, session: Session, budget: int) -> "RetainedContext":
-        """Select recent complete turns and preserve the current unfinished turn first.
+    def candidates(cls, session: Session, budget: int) -> tuple["RetainedContext", ...]:
+        """Plan successively shorter tails while preserving the unfinished turn.
 
         Args:
             session (Session): Canonical history and run state to capture.
             budget (int): Portion of the generation context available for retained items.
 
         Returns:
-            RetainedContext: Captured frontier and a valid retention layout.
+            tuple[RetainedContext, ...]: Layouts at the captured frontier, longest tail first.
 
         Raises:
             CompactionLimitError: The unfinished turn cannot fit even at a tool-round boundary.
@@ -84,6 +84,7 @@ class RetainedContext:
 
         recent = [index for index in users if index < cut and index != active_start]
         retained_opening = set(opening)
+        cuts = [cut]
         for start in reversed(recent[-_RECENT_COMPLETE_TURNS:]):
             if start not in legal:
                 continue
@@ -94,13 +95,17 @@ class RetainedContext:
                 break
             remaining -= cost
             cut = start
-        return cls(
-            end=end,
-            coverage=CompactionCoverage(
-                cut=cut,
-                opening=tuple(index for index in opening if index < cut),
-                tail=(*pinned, *range(cut, end)),
-            ),
+            cuts.append(cut)
+        return tuple(
+            cls(
+                end=end,
+                coverage=CompactionCoverage(
+                    cut=cut,
+                    opening=tuple(index for index in opening if index < cut),
+                    tail=(*pinned, *range(cut, end)),
+                ),
+            )
+            for cut in reversed(cuts)
         )
 
 
