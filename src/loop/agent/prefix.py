@@ -544,13 +544,28 @@ class AgentContext:
         )
         inline = window.layout != "leading"
         additions.extend(dispatch.model_items(inline=inline))
-        measured = session.tokens
-        if dispatch.revision is not None and not inline:
-            previous = self._effective_snapshot(window, session.model_dispatches(window))
-            measured += estimate_context(
-                (), instructions=dispatch.revision.snapshot.content
-            ) - estimate_context((), instructions=previous.content)
-        return max(0, measured) + estimate_context(additions)
+        occupied = max(0, session.tokens) + estimate_context(additions)
+        if dispatch.revision is None or inline:
+            return occupied
+
+        previous = self._effective_snapshot(window, session.model_dispatches(window)).content
+        current = dispatch.revision.snapshot.content
+        change = estimate_context((), instructions=current) - estimate_context(
+            (), instructions=previous
+        )
+        if change >= 0:
+            return occupied + change
+
+        # Opaque checkpoints have no reliable local replay estimate.
+        if any(isinstance(item, CompactionContextItem) for item in request.input):
+            return occupied
+        # Padding can tokenize as a short run. Credit only reductions that survive normalization.
+        text_change = estimate_context(
+            (), instructions=" ".join(current.split())
+        ) - estimate_context((), instructions=" ".join(previous.split()))
+        # The measured usage already includes the pinned tools.
+        replay = estimate_context(request.input, instructions=request.instructions)
+        return min(occupied, max(occupied + max(change, text_change), replay))
 
     def _target_model(self) -> str:
         """Resolve the authorized target for this session."""

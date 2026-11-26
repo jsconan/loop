@@ -23,7 +23,7 @@ from loop.models import (
     Usage,
 )
 from loop.session import Compaction, InstructionSnapshot
-from loop.tools import activate_skill, manage_skills
+from loop.tools import BUILTIN_TOOLS, activate_skill, manage_skills
 from loop.tools.system import poll_command_job, run_command
 from loop.utils import sha256_digest, utc_now
 from tests.backend_doubles import model_backend
@@ -616,7 +616,7 @@ def test_compaction_charges_only_new_input_when_usage_is_known(tmp_path):
 
 
 def test_shorter_leading_instructions_release_context_before_automatic_compaction(tmp_path):
-    """Replacing a large leading section uses less of the measured context budget."""
+    """Shorter leading instructions release measured budget with the default tools pinned."""
     policy = tmp_path / "AGENTS.md"
     policy.write_text("Keep every synthetic record in the leading policy. " * 320)
     backend = _backend(layout="leading")
@@ -625,7 +625,9 @@ def test_shorter_leading_instructions_release_context_before_automatic_compactio
     usage = Usage(input_tokens=7900, output_tokens=100, total_tokens=8000)
     result = ResponseCompleted(items=(Message(role="assistant", content="Recorded."),), usage=usage)
     backend.get_response.side_effect = lambda **kwargs: iter((result,))
-    loop = Loop.create_default(backend, working_directory=tmp_path, tool_registry=ToolRegistry([]))
+    loop = Loop.create_default(
+        backend, working_directory=tmp_path, tool_registry=ToolRegistry(BUILTIN_TOOLS)
+    )
     for index in range(7):
         _turn(loop, f"Turn {index}")
     window = loop.session.window
@@ -641,6 +643,44 @@ def test_shorter_leading_instructions_release_context_before_automatic_compactio
     request = backend.get_response.call_args.kwargs
     assert request["input"][: len(previous)] == previous
     assert "Keep this shorter instruction." in request["instructions"]
+
+
+@pytest.mark.parametrize("retained", ["history", "tools", "opaque"])
+def test_shorter_leading_instructions_keep_retained_context_in_budget(tmp_path, retained):
+    """A byte-based shrink estimate cannot erase measured history or opaque replay."""
+    policy = tmp_path / "AGENTS.md"
+    policy.write_text("Keep these markers." + " " * 12300 + "Keep this marker too.")
+    backend = _backend(layout="leading")
+    capacity = 32768
+    backend.get_context_window.return_value = capacity
+    context_tokens = 7028 if retained == "tools" else 2028
+    usage = Usage(input_tokens=context_tokens - 8, output_tokens=8, total_tokens=context_tokens)
+    reply = ResponseCompleted(items=(Message(role="assistant", content="Recorded."),), usage=usage)
+    backend.get_response.side_effect = lambda **kwargs: iter((reply,))
+    loop = Loop.create_default(
+        backend,
+        working_directory=tmp_path,
+        tool_registry=ToolRegistry(BUILTIN_TOOLS if retained == "tools" else ()),
+        context_settings=ContextSettings(mode="off"),
+    )
+    for index in range(7):
+        _turn(loop, f"Turn {index}. " + "The stage retained a sample. " * 25)
+    compaction = loop.agent_runner.compaction
+    if retained == "opaque":
+        native = CompactionContextItem(data={"type": "compaction", "encrypted_content": "opaque"})
+        backend.compact.return_value = CompactionResult(items=(native,))
+        backend.estimate_generation = Mock(return_value=30000)
+        assert compaction.compact()
+    previous = loop.session.checkpoint()
+    backend.compact.return_value = _portable("Previous decisions")
+    compaction.threshold = (loop.session.tokens + 80) / capacity
+    policy.write_text("Keep these markers. Keep this marker too.")
+
+    _turn(loop, "Next sample. " + "Preserve this label in the synthetic note. " * 50)
+
+    checkpoint = loop.session.checkpoint()
+    assert checkpoint is not None and checkpoint != previous
+    assert checkpoint.boundary == len(loop.session.messages) - 1
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
