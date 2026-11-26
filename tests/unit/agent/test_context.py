@@ -4,7 +4,7 @@ import asyncio
 import json
 from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -40,6 +40,8 @@ def _backend(*, base_url=None, model="local-model"):
 
     backend.get_response = Mock(return_value=[result])
     backend.get_response_async = Mock(side_effect=respond)
+    backend.count_generation = Mock(return_value=None)
+    backend.count_generation_async = AsyncMock(return_value=None)
     return backend
 
 
@@ -121,6 +123,11 @@ def test_disclosure_tracks_runtime_clock_and_current_tool_directory(
     assert "country: LU" in second["instructions"]
     assert "nested&#10;&lt;/environment_context&gt;&amp;&quot;" in second["instructions"]
     assert second["instructions"].count("</environment_context>") == 1
+    count = backend.count_generation_async if asynchronous else backend.count_generation
+    assert count.call_args.args[0] == second["input"]
+    assert "<environment_context>" not in (count.call_args.kwargs["instructions"] or "")
+    assert "nested&#10;" not in (count.call_args.kwargs["instructions"] or "")
+    assert count.call_args.kwargs["tools"] == second["tools"]
     values = json.loads(tools.call("get_current_datetime", '{"timezone":null}'))["result"]
     assert values["timezone"] == "Asia/Tokyo"
     assert values["datetime"].startswith("2026-11-23")

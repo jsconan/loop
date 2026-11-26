@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .. import constants
-from ..backend import Backend, estimate_context
+from ..backend import Backend, GenerationHyperparameters, estimate_context
 from ..interaction import Interaction
 from ..models import (
     CompactionContextItem,
@@ -15,6 +15,7 @@ from ..models import (
     CompactionResult,
     ConversationItem,
     ModelContextItem,
+    ReasoningConfiguration,
 )
 from ..session import (
     Compaction,
@@ -445,13 +446,20 @@ class ContextCompaction:
             prefix=attempt.has_prefix,
         ):
             return None
-        context = self._session_manager.hydrate_context(self._rebuilt_items(attempt, result))
-        tokens = attempt.backend.estimate_generation(
+        reasoning = self._context.reasoning_configuration(attempt.window)
+        context = attempt.backend.prepare_context(
+            self._session_manager.hydrate_context(
+                self._rebuilt_items(attempt, result, reasoning[1])
+            )
+        )
+        tokens = attempt.backend.count_generation(
             context,
             instructions=attempt.window.leading_instructions(rebuilt=True),
             tools=attempt.window.tools,
             model=attempt.window.model,
+            hyperparameters=GenerationHyperparameters(reasoning_effort=reasoning[0]),
         )
+        tokens = self._replay_tokens(attempt, context, tokens)
         if tokens is None:
             return None
         return tokens + self._context.rebuild_guidance_tokens(attempt.window)
@@ -464,15 +472,19 @@ class ContextCompaction:
             prefix=attempt.has_prefix,
         ):
             return None
-        context = await self._session_manager.hydrate_context_async(
-            self._rebuilt_items(attempt, result)
+        reasoning = self._context.reasoning_configuration(attempt.window)
+        hydrated = await self._session_manager.hydrate_context_async(
+            self._rebuilt_items(attempt, result, reasoning[1])
         )
-        tokens = await attempt.backend.estimate_generation_async(
+        context = attempt.backend.prepare_context(hydrated)
+        tokens = await attempt.backend.count_generation_async(
             context,
             instructions=attempt.window.leading_instructions(rebuilt=True),
             tools=attempt.window.tools,
             model=attempt.window.model,
+            hyperparameters=GenerationHyperparameters(reasoning_effort=reasoning[0]),
         )
+        tokens = self._replay_tokens(attempt, context, tokens)
         if tokens is None:
             return None
         if (
@@ -482,7 +494,27 @@ class ContextCompaction:
             raise ModelWindowConflictError("The captured model window changed during compaction.")
         return tokens + self._context.rebuild_guidance_tokens(attempt.window)
 
-    def _rebuilt_items(self, attempt: _Attempt, result: CompactionResult) -> list[ModelContextItem]:
+    @staticmethod
+    def _replay_tokens(
+        attempt: _Attempt,
+        items: list[ModelContextItem],
+        count: int | None,
+    ) -> int | None:
+        """Use a local fallback only when all replayed context can be projected."""
+        if count is not None or any(isinstance(item, CompactionContextItem) for item in items):
+            return count
+        return estimate_context(
+            items,
+            instructions=attempt.window.leading_instructions(rebuilt=True),
+            tools=attempt.window.tools,
+        )
+
+    def _rebuilt_items(
+        self,
+        attempt: _Attempt,
+        result: CompactionResult,
+        update: ReasoningConfiguration | None,
+    ) -> list[ModelContextItem]:
         """Build the complete context order used to establish generation headroom."""
         window = attempt.window
         baseline = [window.baseline_item(rebuilt=True)] if window.layout != "leading" else []
@@ -491,7 +523,6 @@ class ContextCompaction:
             if attempt.native_tail is not None and self._native_result(result)
             else attempt.tail
         )
-        _, update = self._context.reasoning_configuration(window)
         reasoning = [update] if update is not None else []
         return [*baseline, *attempt.opening, *result.items, *reasoning, *tail]
 

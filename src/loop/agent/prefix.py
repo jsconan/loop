@@ -52,6 +52,8 @@ class AgentRequest:
         may_compact (bool): Whether this is a fresh request that can compact the active context.
         input (list[ModelContextItem]): Model-visible items before artifact hydration.
         instructions (str | None): Separate developer instructions when the layout uses them.
+        leading (str | None): Countable instructions outside the transient guidance.
+        trailing_guidance (tuple[DeveloperInput, ...]): Transient items appended to the input.
         hyperparameters (GenerationHyperparameters): Live generation controls.
         effort (ReasoningEffort | None): Live effort before projection onto a pinned prefix.
         environment_sample (str | None): Environment captured for this logical request.
@@ -69,25 +71,14 @@ class AgentRequest:
     may_compact: bool
     input: list[ModelContextItem]
     instructions: str | None
+    leading: str | None
+    trailing_guidance: tuple[DeveloperInput, ...]
     hyperparameters: GenerationHyperparameters
     effort: ReasoningEffort | None
     environment_sample: str | None
     backend: Backend
     disclosure: ContextSettings
     snapshot: PreparedInstructions
-
-    @property
-    def projected_tokens(self) -> int:
-        """Estimate the next request's occupied inputs for automatic compaction.
-
-        Returns:
-            int: Estimated model context before generation.
-        """
-        return estimate_context(
-            (item for item in self.input if not isinstance(item, CompactionContextItem)),
-            instructions=self.instructions,
-            tools=self.window.tools,
-        )
 
 
 @dataclass(frozen=True)
@@ -360,14 +351,15 @@ class AgentContext:
         sample = self._request_environment(
             window.layout, (stored or dispatch).id, snapshot, disclosure
         )
+        leading = window.leading_instructions(
+            revision.snapshot
+            if revision is not None
+            else self._effective_snapshot(window, records),
+            rebuilt=bool(target.checkpoint and target.checkpoint.coverage),
+        )
         instructions, trailing = _place_request_guidance(
             window.layout,
-            window.leading_instructions(
-                revision.snapshot
-                if revision is not None
-                else self._effective_snapshot(window, records),
-                rebuilt=bool(target.checkpoint and target.checkpoint.coverage),
-            ),
+            leading,
             snapshot.suffix,
             sample,
         )
@@ -383,6 +375,8 @@ class AgentContext:
             may_compact=stored is None,
             input=context,
             instructions=instructions,
+            leading=leading,
+            trailing_guidance=trailing,
             hyperparameters=hyperparameters,
             effort=effort,
             environment_sample=sample,
@@ -515,57 +509,104 @@ class AgentContext:
             snapshot.suffix,
             sample,
         )
-        return estimate_context(trailing, instructions=instructions) - estimate_context(
-            (), instructions=leading
-        )
+        return _guidance_tokens(leading, instructions, trailing)
 
-    def occupied_tokens(self, request: AgentRequest) -> int:
-        """Project changes to the context already measured by the model.
+    def occupied_tokens(self, request: AgentRequest, items: list[ModelContextItem]) -> int:
+        """Use the provider count or the latest applicable generation usage.
 
         Args:
             request (AgentRequest): Prepared logical request to evaluate.
+            items (list[ModelContextItem]): Hydrated and policy-prepared request input.
 
         Returns:
             int: Estimated occupancy before the next generation.
+
+        Raises:
+            ProblemException: The request changed before counting or dispatch.
         """
+        self.verify(request)
+        with request.backend.file_projection(request.window.settings.file_input_mode):
+            count = request.backend.count_generation(
+                items[: len(items) - len(request.trailing_guidance)],
+                instructions=request.leading,
+                tools=request.window.tools,
+                model=request.window.model,
+                hyperparameters=request.hyperparameters,
+            )
+        self.verify(request)
+        return self._occupied_tokens(request, items, count)
+
+    async def occupied_tokens_async(
+        self,
+        request: AgentRequest,
+        items: list[ModelContextItem],
+    ) -> int:
+        """Asynchronously use the provider count or applicable generation usage.
+
+        Args:
+            request (AgentRequest): Prepared logical request to evaluate.
+            items (list[ModelContextItem]): Hydrated and policy-prepared request input.
+
+        Returns:
+            int: Estimated occupancy before the next generation.
+
+        Raises:
+            ProblemException: The request changed before counting or dispatch.
+        """
+        self.verify(request)
+        with request.backend.file_projection(request.window.settings.file_input_mode):
+            count = await request.backend.count_generation_async(
+                items[: len(items) - len(request.trailing_guidance)],
+                instructions=request.leading,
+                tools=request.window.tools,
+                model=request.window.model,
+                hyperparameters=request.hyperparameters,
+            )
+        self.verify(request)
+        return self._occupied_tokens(request, items, count)
+
+    def _occupied_tokens(
+        self,
+        request: AgentRequest,
+        items: list[ModelContextItem],
+        count: int | None,
+    ) -> int:
+        """Reuse observed usage only where the measured replay still applies."""
+        if count is not None:
+            return count + _guidance_tokens(
+                request.leading, request.instructions, request.trailing_guidance
+            )
         window = request.window
-        if (
-            request.previous_window not in (None, window.id)
-            or request.previous_checkpoint != window.checkpoint_id
-        ):
-            return request.projected_tokens
         session = self._sessions.session
-        if request.previous_window is None or session.usage_boundary is None:
-            return max(session.tokens, request.projected_tokens)
-
+        same_window = (
+            request.previous_window in (None, window.id)
+            and request.previous_checkpoint == window.checkpoint_id
+        )
         dispatch = request.dispatch
-        additions: list[ModelContextItem] = list(
-            session.messages[session.usage_boundary : dispatch.position]
-        )
         inline = window.layout != "leading"
-        additions.extend(dispatch.model_items(inline=inline))
-        occupied = max(0, session.tokens) + estimate_context(additions)
-        if dispatch.revision is None or inline:
-            return occupied
-
-        previous = self._effective_snapshot(window, session.model_dispatches(window)).content
-        current = dispatch.revision.snapshot.content
-        change = estimate_context((), instructions=current) - estimate_context(
-            (), instructions=previous
+        rewritten = not inline and dispatch.revision is not None
+        observed = max(0, session.tokens) if same_window else 0
+        if (
+            same_window
+            and request.previous_window is not None
+            and session.usage_boundary is not None
+        ):
+            additions: list[ModelContextItem] = list(
+                session.messages[session.usage_boundary : dispatch.position]
+            )
+            additions.extend(dispatch.model_items(inline=inline))
+            observed += estimate_context(additions)
+            if not rewritten:
+                return observed
+        visible = [item for item in items if not isinstance(item, CompactionContextItem)]
+        projected = estimate_context(
+            visible,
+            instructions=request.instructions,
+            tools=window.tools,
         )
-        if change >= 0:
-            return occupied + change
-
-        # Opaque checkpoints have no reliable local replay estimate.
-        if any(isinstance(item, CompactionContextItem) for item in request.input):
-            return occupied
-        # Padding can tokenize as a short run. Credit only reductions that survive normalization.
-        text_change = estimate_context(
-            (), instructions=" ".join(current.split())
-        ) - estimate_context((), instructions=" ".join(previous.split()))
-        # The measured usage already includes the pinned tools.
-        replay = estimate_context(request.input, instructions=request.instructions)
-        return min(occupied, max(occupied + max(change, text_change), replay))
+        if rewritten and len(visible) == len(items):
+            return projected
+        return max(observed, projected)
 
     def _target_model(self) -> str:
         """Resolve the authorized target for this session."""
@@ -756,3 +797,14 @@ def _place_request_guidance(
         suffix = None
     sections = (leading, suffix, environment)
     return "\n\n".join(section for section in sections if section) or None, trailing
+
+
+def _guidance_tokens(
+    leading: str | None,
+    instructions: str | None,
+    trailing: tuple[DeveloperInput, ...],
+) -> int:
+    """Budget transient fields locally because they are sent only with generation."""
+    return estimate_context(trailing, instructions=instructions) - estimate_context(
+        (), instructions=leading
+    )

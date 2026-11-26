@@ -4649,10 +4649,10 @@ def test_opaque_checkpoint_headroom_uses_responses_input_count(asynchronous, sup
     )
     sdk = Mock()
     if asynchronous:
-        sdk.responses.input_tokens.count = AsyncMock()
-    count = sdk.responses.input_tokens.count
+        sdk.post = AsyncMock()
+    count = sdk.post
     if supported:
-        count.return_value = SimpleNamespace(input_tokens=350)
+        count.return_value = {"input_tokens": 350}
     else:
         count.side_effect = APIConnectionError(
             request=httpx.Request("POST", "https://api.openai.com/v1/responses/input_tokens")
@@ -4667,14 +4667,116 @@ def test_opaque_checkpoint_headroom_uses_responses_input_count(asynchronous, sup
     symbol = "AsyncOpenAI" if asynchronous else "OpenAI"
     with patch(f"loop.backend.openai.{symbol}", return_value=sdk):
         result = (
-            asyncio.run(backend.estimate_generation_async(items, **kwargs))
+            asyncio.run(backend.count_generation_async(items, **kwargs))
             if asynchronous
-            else backend.estimate_generation(items, **kwargs)
+            else backend.count_generation(items, **kwargs)
         )
     assert backend.generation_reserve(16500) == 900
     assert result == (350 if supported else None)
-    assert count.call_args.kwargs["input"][2] == item.data
-    assert len(count.call_args.kwargs["input"]) == 4
+    assert count.call_args.args == ("/responses/input_tokens",)
+    assert count.call_args.kwargs["body"]["input"][2] == item.data
+    assert len(count.call_args.kwargs["body"]["input"]) == 4
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize(
+    "endpoint",
+    ["count", "render", "tokenize", "strict", "unavailable", "absent", "malformed"],
+)
+def test_count_generation_uses_available_provider_capability(asynchronous, endpoint):
+    """Count prepared input with the first available endpoint without running inference."""
+    secret = "local-count-redaction-fixture-key"
+    base = "https://counter.test/v1"
+    backend = OpenAIBackend(
+        base_url=base,
+        api_key=secret,
+        retention_policy="required_false" if endpoint == "strict" else "provider_managed",
+    )
+    paths = []
+    items = [Message(role="user", content=f"Check {secret}")]
+    if endpoint == "unavailable":
+        items.append(ToolCall(call_id="call_1", name="fixture", arguments="{}"))
+    tools = (
+        ToolDefinition(name="fixture", description="Tool description", parameters={}, strict=True),
+    )
+
+    def handle(request):
+        """Expose only the counting capability under test at the actual SDK wire boundary."""
+        path = request.url.path
+        paths.append(path)
+        body = json.loads(request.content)
+        assert secret not in repr(body)
+        assert body["model"] == "fixture-model"
+        if path == "/v1/responses/input_tokens":
+            assert "store" not in body
+            assert body["input"][0]["content"] == "Check <redacted:secret>"
+            assert body["reasoning"] == {"effort": "none"}
+            if endpoint == "count":
+                return httpx.Response(200, json={"input_tokens": 123})
+            if endpoint == "malformed":
+                return httpx.Response(200, json=[123])
+            return httpx.Response(405, json={"detail": "Method Not Allowed"})
+        if path == "/v1/responses/render":
+            assert body["store"] is False
+            if endpoint == "render":
+                return httpx.Response(200, json={"token_ids": list(range(123))})
+            if endpoint == "malformed":
+                return httpx.Response(200, json={"token_ids": 123})
+            return httpx.Response(403, json={"error": {"message": "Rendering is disabled"}})
+        assert path == "/tokenize"
+        assert body["messages"] == [
+            {"role": "system", "content": "Count these instructions"},
+            {"role": "user", "content": "Check <redacted:secret>"},
+        ]
+        assert body["tools"][0]["function"]["strict"] is True
+        assert body["chat_template_kwargs"] == {"enable_thinking": False}
+        if endpoint == "absent":
+            return httpx.Response(404, json={"detail": "Not Found"})
+        if endpoint == "malformed":
+            return httpx.Response(200, json={"count": True})
+        return httpx.Response(200, json={"count": 123})
+
+    transport = httpx.MockTransport(handle)
+    options = {
+        "instructions": "Count these instructions",
+        "tools": tools,
+        "model": "fixture-model",
+        "hyperparameters": GenerationHyperparameters(reasoning_effort="none"),
+    }
+    if asynchronous:
+
+        async def run():
+            """Use one backend on its owning loop for two independent count requests."""
+            async with httpx.AsyncClient(transport=transport) as client:
+                sdk = SDKAsyncOpenAI(api_key=secret, base_url=base, http_client=client)
+                with patch("loop.backend.openai.AsyncOpenAI", return_value=sdk):
+                    return [
+                        await backend.count_generation_async(items, **options) for _ in range(2)
+                    ]
+
+        counts = asyncio.run(run())
+    else:
+        with httpx.Client(transport=transport) as client:
+            sdk = SDKOpenAI(api_key=secret, base_url=base, http_client=client)
+            with patch("loop.backend.openai.OpenAI", return_value=sdk):
+                counts = [backend.count_generation(items, **options) for _ in range(2)]
+
+    primary = "/v1/responses/input_tokens"
+    render = "/v1/responses/render"
+    assert (
+        paths
+        == {
+            "count": [primary, primary],
+            "render": [primary, render, render],
+            "tokenize": [primary, render, "/tokenize", "/tokenize"],
+            "strict": [render, "/tokenize", "/tokenize"],
+            "unavailable": [primary, render],
+            "absent": [primary, render, "/tokenize"],
+            "malformed": [primary, render, "/tokenize"] * 2,
+        }[endpoint]
+    )
+    expected = None if endpoint in ("unavailable", "absent", "malformed") else 123
+    assert counts == [expected, expected]
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
@@ -4821,12 +4923,6 @@ def test_ineligible_custom_compaction_uses_portable_generation(asynchronous, pre
         operation = getattr(backend, method)(source, model="model", prefix=prefix)
         result = asyncio.run(operation) if asynchronous else operation
     assert result == expected
-    options = {"instructions": "rules", "model": "model", "tools": ()}
-    if asynchronous:
-        size = asyncio.run(backend.estimate_generation_async([portable], **options))
-    else:
-        size = backend.estimate_generation([portable], **options)
-    assert size > 0
     assert not backend.can_replay_checkpoint(
         [CompactionContextItem(data={"role": "developer", "content": "bad"})],
         "model",

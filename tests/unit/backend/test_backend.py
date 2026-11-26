@@ -221,8 +221,8 @@ def test_portable_compaction_does_not_expand_local_attachment_snapshots():
     assert "preview" in history and "private-tail" not in history
 
 
-def test_default_window_capabilities_and_complete_request_estimate():
-    """A plain backend uses leading instructions and estimates its semantic checkpoint."""
+def test_default_window_capabilities_and_unavailable_count():
+    """A plain backend uses leading instructions and has no provider counter."""
     backend = OpenAIBackend(base_url="https://user:pass@example.test/v1/?query=private")
     assert Backend.endpoint.fget(backend) == "https://example.test/v1"
     assert Backend.endpoint.fget(OpenAIBackend()) == ""
@@ -241,6 +241,5 @@ def test_default_window_capabilities_and_complete_request_estimate():
         backend, [CompactionContextItem(data={"type": "compaction"})], "model"
     )
     kwargs = {"instructions": "guidance", "tools": (), "model": "model"}
-    estimate = Backend.estimate_generation(backend, [portable], **kwargs)
-    assert estimate > len("guidance") // 3
-    assert asyncio.run(Backend.estimate_generation_async(backend, [portable], **kwargs)) == estimate
+    assert Backend.count_generation(backend, [portable], **kwargs) is None
+    assert asyncio.run(Backend.count_generation_async(backend, [portable], **kwargs)) is None

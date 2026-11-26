@@ -208,7 +208,7 @@ def test_native_headroom_failure_uses_only_canonical_middle_for_portable_fallbac
     )
     context.configure(ApplicationSettings(context=ContextSettings(mode="off")))
     backend.compact.side_effect = [_result(native=True), _result()]
-    backend.estimate_generation = Mock(side_effect=[None, 1200])
+    backend.count_generation = Mock(side_effect=[None, 1200])
     assert feature.compact()
     assert backend.compact.call_count == 2
     assert backend.compact.call_args.kwargs["native"] is False
@@ -223,7 +223,7 @@ def test_unfit_portable_candidate_keeps_original_context(tmp_path):
         tmp_path, session=Session(messages=_history(), tokens=29000)
     )
     backend.compact.return_value = _result()
-    backend.estimate_generation = Mock(return_value=40000)
+    backend.count_generation = Mock(return_value=40000)
     assert feature.compact() is False
     assert not owner.session.compactions
     assert "exceed the available context limit" in interaction.warning.call_args.args[0]
@@ -241,9 +241,9 @@ def test_rebuild_reserves_disclosure_headroom_without_sending_facts(tmp_path, la
     available = owner.context_window - backend.generation_reserve(owner.context_window)
     estimate = AsyncMock(return_value=available) if asynchronous else Mock(return_value=available)
     if asynchronous:
-        backend.estimate_generation_async = estimate
+        backend.count_generation_async = estimate
     else:
-        backend.estimate_generation = estimate
+        backend.count_generation = estimate
 
     outcome = asyncio.run(feature.compact_async()) if asynchronous else feature.compact()
 
@@ -274,7 +274,7 @@ def test_async_compaction_rechecks_headroom_after_disclosure_changes(tmp_path, n
     owner.add_user_message("Continue from the completed work")
     available = owner.context_window - backend.generation_reserve(owner.context_window)
     backend.compact_async.side_effect = [_result(native=native), _result()]
-    backend.estimate_generation_async = AsyncMock(side_effect=[available, 1200])
+    backend.count_generation_async = AsyncMock(side_effect=[available, 1200])
 
     async def compact_with_live_update():
         """Enable disclosure while the compactor is waiting for revalidation."""
@@ -431,7 +431,7 @@ def test_async_portable_rebuild_resumes_from_canonical_middle_when_native_count_
         tmp_path, session=Session(messages=_history(), tokens=30000)
     )
     backend.compact_async.side_effect = [_result(native=True), _result()]
-    backend.estimate_generation_async = AsyncMock(side_effect=[None, 1200])
+    backend.count_generation_async = AsyncMock(side_effect=[None, 1200])
     assert asyncio.run(feature.compact_async())
     assert backend.compact_async.await_count == 2
     assert backend.compact_async.call_args.kwargs["native"] is False
@@ -546,7 +546,7 @@ def test_repeated_native_compaction_uses_measured_cost_instead_of_wire_size(tmp_
         data={"type": "compaction", "encrypted_content": "opaque" * 32000}
     )
     backend.compact.return_value = CompactionResult(items=(native,))
-    backend.estimate_generation = Mock(return_value=1000)
+    backend.count_generation = Mock(return_value=1000)
     assert feature.compact()
     owner.add_message(Message(role="assistant", content="finish earlier request"))
     owner.add_user_message("another request")
@@ -590,7 +590,7 @@ def test_async_unfit_or_stale_attempt_never_commits(tmp_path):
         tmp_path, session=Session(messages=_history())
     )
     backend.compact_async.return_value = _result()
-    backend.estimate_generation_async = AsyncMock(side_effect=[99999, 1024])
+    backend.count_generation_async = AsyncMock(side_effect=[99999, 1024])
     assert not asyncio.run(feature.compact_async())
     assert "context limit" in interaction.warning.call_args.args[0]
     candidate = ModelWindow(

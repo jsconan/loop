@@ -453,9 +453,9 @@ def test_live_reasoning_replays_updates_and_restores_effort_after_rebuild(tmp_pa
     reasoning = [item for item in request["input"] if isinstance(item, ReasoningConfiguration)]
     assert reasoning == [ReasoningConfiguration("high"), ReasoningConfiguration(None)]
     backend.compact.return_value = _portable("Old history")
-    backend.estimate_generation = Mock(return_value=1000)
+    backend.count_generation = Mock(return_value=1000)
     assert loop.agent_runner.compaction.compact()
-    measured = backend.estimate_generation.call_args.args[0]
+    measured = backend.count_generation.call_args.args[0]
     assert [item for item in measured if isinstance(item, ReasoningConfiguration)] == [
         ReasoningConfiguration(None)
     ]
@@ -594,6 +594,7 @@ def test_first_request_after_switch_uses_target_compaction_capacity(tmp_path, as
 
 def test_compaction_charges_only_new_input_when_usage_is_known(tmp_path):
     """A small follow-up does not re-estimate a prefix already measured by the model."""
+    (tmp_path / "AGENTS.md").write_text("Keep these instructions.", encoding="utf-8")
     backend = _backend(layout="leading")
     backend.get_context_window.return_value = 32768
     backend.compact.return_value = _portable("Previous decisions")
@@ -607,12 +608,11 @@ def test_compaction_charges_only_new_input_when_usage_is_known(tmp_path):
         _turn(loop, f"Turn {index} followed by whitespace" + " " * 4200)
 
     loop.session.context_window = 13000
-    (tmp_path / "AGENTS.md").write_text("Revised guidance.", encoding="utf-8")
     _turn(loop, "Small follow-up")
 
     backend.compact.assert_not_called()
     assert not loop.session.compactions
-    assert "Revised guidance." in backend.get_response.call_args.kwargs["instructions"]
+    assert "Keep these instructions." in backend.get_response.call_args.kwargs["instructions"]
 
 
 def test_shorter_leading_instructions_release_context_before_automatic_compaction(tmp_path):
@@ -634,6 +634,7 @@ def test_shorter_leading_instructions_release_context_before_automatic_compactio
     previous = backend.get_response.call_args.kwargs["input"]
     loop.agent_runner.compaction.threshold = (usage.total_tokens + 10) / 32768
     policy.write_text("Keep this shorter instruction.")
+    backend.count_generation = Mock(return_value=7800)
 
     _turn(loop, "Continue.")
 
@@ -669,8 +670,9 @@ def test_shorter_leading_instructions_keep_retained_context_in_budget(tmp_path, 
     if retained == "opaque":
         native = CompactionContextItem(data={"type": "compaction", "encrypted_content": "opaque"})
         backend.compact.return_value = CompactionResult(items=(native,))
-        backend.estimate_generation = Mock(return_value=30000)
+        backend.count_generation = Mock(return_value=30000)
         assert compaction.compact()
+        backend.count_generation.side_effect = [None, 30000]
     previous = loop.session.checkpoint()
     backend.compact.return_value = _portable("Previous decisions")
     compaction.threshold = (loop.session.tokens + 80) / capacity
@@ -681,6 +683,99 @@ def test_shorter_leading_instructions_keep_retained_context_in_budget(tmp_path, 
     checkpoint = loop.session.checkpoint()
     assert checkpoint is not None and checkpoint != previous
     assert checkpoint.boundary == len(loop.session.messages) - 1
+
+
+@pytest.mark.parametrize("grows", [False, True])
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_provider_count_decides_threshold_after_leading_instruction_rewrite(
+    tmp_path, grows, asynchronous
+):
+    """Use the rendered count even when instruction bytes move in the opposite direction."""
+    policy = tmp_path / "AGENTS.md"
+    padded = "Before" + " " * 12300 + "after."
+    substantive = "Keep the sample and record its outcome. " * 130
+    policy.write_text(padded if grows else substantive, encoding="utf-8")
+    backend = _backend(layout="leading")
+    backend.get_context_window.return_value = 32768
+    backend.get_context_window_async.return_value = 32768
+    backend.compact.return_value = _portable("Previous decisions")
+    backend.compact_async.return_value = _portable("Previous decisions")
+    observed = 2028 if grows else 2903
+    reply = ResponseCompleted(
+        items=(Message(role="assistant", content="Recorded."),),
+        usage=Usage(input_tokens=observed - 8, output_tokens=8, total_tokens=observed),
+    )
+    backend.get_response.side_effect = lambda **kwargs: iter((reply,))
+
+    async def respond(**kwargs):
+        """Report the measured usage for the original instruction prefix."""
+        yield reply
+
+    backend.get_response_async.side_effect = respond
+    loop = Loop.create_default(
+        backend,
+        working_directory=tmp_path,
+        tool_registry=ToolRegistry([]),
+        context_settings=ContextSettings(mode="off"),
+    )
+    for index in range(7):
+        _turn(loop, f"Turn {index}.")
+    compaction = loop.agent_runner.compaction
+    compaction.threshold = (observed + 80) / 32768
+    policy.write_text(substantive if grows else padded, encoding="utf-8")
+    measured = 2913 if grows else 2038
+    backend.count_generation = Mock(return_value=measured)
+    backend.count_generation_async = AsyncMock(return_value=measured)
+
+    if asynchronous:
+        asyncio.run(_turn_async(loop, "Continue."))
+    else:
+        _turn(loop, "Continue.")
+
+    assert bool(loop.session.compactions) is grows
+    count = backend.count_generation_async if asynchronous else backend.count_generation
+    assert "Continue." == count.call_args_list[0].args[0][-1].content
+    assert (substantive.strip() if grows else padded) in count.call_args_list[0].kwargs[
+        "instructions"
+    ]
+
+
+@pytest.mark.parametrize("grows", [False, True])
+def test_leading_rewrite_reestimates_the_replay_when_counting_is_unavailable(tmp_path, grows):
+    """A rewritten leading field invalidates the previous measurement of the replay."""
+    policy = tmp_path / "AGENTS.md"
+    short = "Record the outcome."
+    long = "Keep the relevant sample and record its outcome in the fixture. " * 150
+    policy.write_text(short if grows else long, encoding="utf-8")
+    backend = _backend(layout="leading")
+    capacity = 32768
+    backend.get_context_window.return_value = capacity
+    backend.compact.return_value = _portable("Previous decisions")
+    observed = 1850 if grows else 6000
+    reply = ResponseCompleted(
+        items=(Message(role="assistant", content="Recorded."),),
+        usage=Usage(input_tokens=observed - 8, output_tokens=8, total_tokens=observed),
+    )
+    backend.get_response.side_effect = lambda **kwargs: iter((reply,))
+    loop = Loop.create_default(
+        backend,
+        working_directory=tmp_path,
+        tool_registry=ToolRegistry([]),
+        context_settings=ContextSettings(mode="off"),
+    )
+    owner = loop.agent_runner.session_manager
+    owner.add_user_message("Read the fixture")
+    owner.add_message(ToolCall(call_id="fixture", name="read_text_file", arguments="{}"))
+    owner.add_message(ToolResult(call_id="fixture", output="Sample found"))
+    for index in range(7):
+        _turn(loop, f"Turn {index}.")
+    assert loop.session.tokens == observed
+    loop.agent_runner.compaction.threshold = 3100 / capacity
+    policy.write_text(long if grows else short, encoding="utf-8")
+
+    _turn(loop, "Continue.")
+
+    assert bool(loop.session.compactions) is grows
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
@@ -698,6 +793,7 @@ def test_compaction_uses_the_same_route_and_replay_checks_as_generation(tmp_path
         data={"type": "compaction", "encrypted_content": "opaque checkpoint"},
     )
     origin.compact.return_value = CompactionResult(items=(checkpoint,))
+    origin.count_generation = Mock(return_value=1200)
     assert loop.agent_runner.compaction.compact()
     _turn(loop, "Continue on the same route")
     bound = origin.get_response.call_args.kwargs["input"]

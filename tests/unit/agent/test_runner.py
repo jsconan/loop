@@ -3637,6 +3637,7 @@ def test_runner_queries_backend_asynchronously(tmp_path, streaming):
     runner.stream = streaming
     runner.compaction.compact_if_needed_async = AsyncMock(return_value=False)
     sessions = runner.session_manager
+    sessions.context_window = 32768
 
     async def events():
         """Yield normalized response events in backend order."""
@@ -5449,6 +5450,7 @@ def test_runner_checks_cancellation_after_compaction(tmp_path):
     control = RunControl()
     backend = Mock()
     runner = file_runner(tmp_path, backend, run_control=control)
+    runner.session_manager.context_window = 32768
     runner.compaction.compact_if_needed.side_effect = lambda _occupied, *, window: control.stop()
 
     with pytest.raises(KeyboardInterrupt):

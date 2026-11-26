@@ -3,12 +3,11 @@
 from contextlib import nullcontext
 from unittest.mock import AsyncMock, Mock
 
-from loop.backend import Backend, estimate_context
+from loop.backend import Backend
 
 
-async def _estimate_async(items, *, instructions, tools, model):
-    """Estimate a complete request without contacting a server."""
-    return estimate_context(items, instructions=instructions, tools=tools)
+async def _unavailable_async(*args, **kwargs):
+    """Simulate a deployment without a token-count endpoint."""
 
 
 def model_backend(backend=None, **properties):
@@ -26,10 +25,8 @@ def model_backend(backend=None, **properties):
         "preserves_compacted_reasoning": False,
         "generation_reserve": lambda capacity: max(1, min(2048, capacity // 8)),
         "prepare_context": list,
-        "estimate_generation": lambda items, *, instructions, tools, model: estimate_context(
-            items, instructions=instructions, tools=tools
-        ),
-        "estimate_generation_async": _estimate_async,
+        "count_generation": lambda *args, **kwargs: None,
+        "count_generation_async": _unavailable_async,
         "get_context_window": Mock(return_value=None),
         "get_context_window_async": AsyncMock(return_value=None),
     }

@@ -30,6 +30,7 @@ from ..models import (
     Message,
     ModelAssignment,
     ModelCallMetrics,
+    ModelContextItem,
     Response,
     ResponseEvent,
     ResponseMetrics,
@@ -68,7 +69,7 @@ from .models import (
     ToolCallCancelled,
     ToolCallInterrupted,
 )
-from .prefix import AgentContext
+from .prefix import AgentContext, AgentRequest
 
 _LOGGER = logging.getLogger(__name__)
 _UNKNOWN_TOOL_WARNING = (
@@ -1522,14 +1523,14 @@ class AgentRunner:
         self._checkpoint(steer=True)
         context = self._request_context
         request = context.prepare(recovery)
-        if request.may_compact and self._compaction.compact_if_needed(
-            context.occupied_tokens(request), window=request.window
-        ):
-            request = context.prepare(recovery)
         self._checkpoint(steer=True)
-        model_context = request.backend.prepare_context(
-            self._session_manager.hydrate_context(request.input)
-        )
+        model_context = self._model_input(request)
+        if self._can_size_for_compaction(request):
+            occupied = context.occupied_tokens(request, model_context)
+            if self._compaction.compact_if_needed(occupied, window=request.window):
+                request = context.prepare(recovery)
+                self._checkpoint(steer=True)
+                model_context = self._model_input(request)
         self._file_observations = FileObservations(
             model_context, self._instructions_manager.virtual_paths
         )
@@ -1593,14 +1594,14 @@ class AgentRunner:
         await self._checkpoint_async(steer=True)
         context = self._request_context
         request = await context.prepare_async(recovery)
-        if request.may_compact and await self._compaction.compact_if_needed_async(
-            context.occupied_tokens(request), window=request.window
-        ):
-            request = await context.prepare_async(recovery)
         await self._checkpoint_async(steer=True)
-        model_context = request.backend.prepare_context(
-            await self._session_manager.hydrate_context_async(request.input)
-        )
+        model_context = await self._model_input_async(request)
+        if self._can_size_for_compaction(request):
+            occupied = await context.occupied_tokens_async(request, model_context)
+            if await self._compaction.compact_if_needed_async(occupied, window=request.window):
+                request = await context.prepare_async(recovery)
+                await self._checkpoint_async(steer=True)
+                model_context = await self._model_input_async(request)
         self._file_observations = await self._run_blocking_async(
             FileObservations,
             model_context,
@@ -1661,6 +1662,23 @@ class AgentRunner:
         )
         self._response_target = (request.backend, request.window.model)
         return response
+
+    def _model_input(self, request: AgentRequest) -> list[ModelContextItem]:
+        """Hydrate and prepare the same input used for sizing and generation."""
+        return request.backend.prepare_context(self._session_manager.hydrate_context(request.input))
+
+    async def _model_input_async(self, request: AgentRequest) -> list[ModelContextItem]:
+        """Hydrate and prepare model input without blocking the async runner."""
+        hydrated = await self._session_manager.hydrate_context_async(request.input)
+        return request.backend.prepare_context(hydrated)
+
+    def _can_size_for_compaction(self, request: AgentRequest) -> bool:
+        """Count only when the threshold policy could advance this window."""
+        return (
+            request.may_compact
+            and self._compaction.can_compact(request.window)
+            and self._request_context.compaction_capacity(request.window) is not None
+        )
 
     async def _run_blocking_async(
         self,

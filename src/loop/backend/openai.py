@@ -121,12 +121,13 @@ from .errors import (
     BackendStatusError,
     BackendTimeoutError,
 )
-from .utils import estimate_context, project_context
+from .utils import project_context
 
 _ReasoningChannel = Literal["content", "summary"]
 
 
 _GPT_VERSION = re.compile(r"gpt-([0-9]+)(?:\.([0-9]+))?(?:-|$)")
+_TOKEN_COUNT_OPTIONS = {"timeout": 2.0, "max_retries": 0}
 
 
 class OpenAIBackend(Backend):
@@ -197,6 +198,7 @@ class OpenAIBackend(Backend):
     _retention_policy: RetentionPolicy
     _unsupported_hyperparameters: dict[str, set[str]]
     _unsupported_extensions: dict[str, set[str]]
+    _unavailable_count_routes: set[str]
     _declared_hyperparameters: dict[str, frozenset[str]]
     _hyperparameter_discovery_attempted: set[str]
     _schema_annotation_keys = frozenset(
@@ -264,6 +266,7 @@ class OpenAIBackend(Backend):
         self._retention_policy = retention_policy
         self._unsupported_hyperparameters = {}
         self._unsupported_extensions = {}
+        self._unavailable_count_routes = set()
         self._declared_hyperparameters = {}
         self._hyperparameter_discovery_attempted = set()
         registered_secrets = (api_key,) if api_key and api_key != constants.DEFAULT_API_KEY else ()
@@ -450,78 +453,173 @@ class OpenAIBackend(Backend):
         """
         return self._max_output_tokens or super().generation_reserve(capacity)
 
-    def estimate_generation(
+    def count_generation(
         self,
         items: list[ModelContextItem],
         *,
         instructions: str | None,
         tools: tuple[ToolDefinition, ...],
         model: str,
+        hyperparameters: GenerationHyperparameters | None = None,
     ) -> int | None:
-        """Count native replacement context or estimate projected semantic context.
+        """Count the prepared request through a supported provider endpoint.
 
         Args:
             items (list[ModelContextItem]): Model input to measure.
             instructions (str | None): Separate instruction field when supported.
             tools (tuple[ToolDefinition, ...]): Ordered function definitions.
             model (str): Selected model.
+            hyperparameters (GenerationHyperparameters | None): Live request controls.
 
         Returns:
-            int | None: Estimated context, or None if an opaque block cannot be measured.
+            int | None: Provider input count, or None if unavailable.
         """
-        if not any(isinstance(item, CompactionContextItem) for item in items):
-            return estimate_context(items, instructions=instructions, tools=tools)
-        try:
-            response = self._get_client().responses.input_tokens.count(
-                **self._count_request(items, instructions, tools, model)
-            )
-        except OpenAIError:
-            return None
-        return response.input_tokens
+        for path, body, field in self._count_requests(
+            items, instructions, tools, model, hyperparameters
+        ):
+            try:
+                response = self._get_client().post(
+                    path,
+                    body=body,
+                    cast_to=object,
+                    options=_TOKEN_COUNT_OPTIONS,
+                )
+            except OpenAIError as error:
+                self._record_count_unavailable(path, error)
+                continue
+            count = self._count_result(response, field)
+            if count is not None:
+                return count
+        return None
 
-    async def estimate_generation_async(
+    async def count_generation_async(
         self,
         items: list[ModelContextItem],
         *,
         instructions: str | None,
         tools: tuple[ToolDefinition, ...],
         model: str,
+        hyperparameters: GenerationHyperparameters | None = None,
     ) -> int | None:
-        """Measure rebuilt context using the asynchronous Responses token counter.
+        """Count the prepared request through a supported async provider endpoint.
 
         Args:
             items (list[ModelContextItem]): Model input to measure.
             instructions (str | None): Separate instruction field when supported.
             tools (tuple[ToolDefinition, ...]): Ordered function definitions.
             model (str): Selected model.
+            hyperparameters (GenerationHyperparameters | None): Live request controls.
 
         Returns:
-            int | None: Estimated context, or None if an opaque block cannot be measured.
+            int | None: Provider input count, or None if unavailable.
         """
-        if not any(isinstance(item, CompactionContextItem) for item in items):
-            return estimate_context(items, instructions=instructions, tools=tools)
-        try:
-            response = await self._get_async_client().responses.input_tokens.count(
-                **self._count_request(items, instructions, tools, model)
-            )
-        except OpenAIError:
-            return None
-        return response.input_tokens
+        for path, body, field in self._count_requests(
+            items, instructions, tools, model, hyperparameters
+        ):
+            try:
+                response = await self._get_async_client().post(
+                    path,
+                    body=body,
+                    cast_to=object,
+                    options=_TOKEN_COUNT_OPTIONS,
+                )
+            except OpenAIError as error:
+                self._record_count_unavailable(path, error)
+                continue
+            count = self._count_result(response, field)
+            if count is not None:
+                return count
+        return None
 
-    def _count_request(
+    def _count_requests(
         self,
         items: list[ModelContextItem],
         instructions: str | None,
         tools: tuple[ToolDefinition, ...],
         model: str,
-    ) -> dict[str, object]:
-        """Prepare the same token-bearing fields used in the next generation request."""
-        return self._prepared_request(
+        hyperparameters: GenerationHyperparameters | None,
+    ) -> Iterator[tuple[str, dict, str]]:
+        """Try non-inference endpoints that can measure the prepared generation input."""
+        base = self.base_url
+        routes = {}
+        if base is None or self._retention_policy != "required_false":
+            routes["/responses/input_tokens"] = "input_tokens"
+        if base is not None:
+            routes["/responses/render"] = "token_ids"
+            routes[f"{base.rstrip('/').removesuffix('/v1')}/tokenize"] = "count"
+        paths = {
+            path: field
+            for path, field in routes.items()
+            if path not in self._unavailable_count_routes
+        }
+        if not paths:
+            return
+        controls = self._hyperparameter_request_parameters(model, hyperparameters)
+        request = self._prepared_request(
             model=model,
             input=self._serialize_input(items, model),
             tools=self._serialize_tools(tools),
             **({"instructions": instructions} if instructions else {}),
+            **({"reasoning": controls["reasoning"]} if "reasoning" in controls else {}),
         )
+        for path, field in paths.items():
+            if field == "count":
+                if tokenizer := self._tokenizer_projection(request):
+                    yield path, tokenizer, field
+                continue
+            body = {**request, "store": False} if field == "token_ids" else request
+            yield path, body, field
+
+    @staticmethod
+    def _tokenizer_projection(request: dict) -> dict | None:
+        """Project text-only Responses input onto a chat template with the same tool schema."""
+        items = request["input"]
+        if any(
+            item.get("role") not in ("user", "assistant")
+            or not isinstance(item.get("content"), str)
+            for item in items
+        ):
+            return None
+        messages = (
+            [{"role": "system", "content": request["instructions"]}]
+            if request.get("instructions")
+            else []
+        )
+        messages.extend({"role": item["role"], "content": item["content"]} for item in items)
+        return {
+            "model": request["model"],
+            "messages": messages,
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {key: value for key, value in tool.items() if key != "type"},
+                }
+                for tool in request["tools"]
+            ],
+            "add_generation_prompt": True,
+            **(
+                {"chat_template_kwargs": {"enable_thinking": False}}
+                if request.get("reasoning", {}).get("effort") == "none"
+                else {}
+            ),
+        }
+
+    def _record_count_unavailable(self, path: str, error: OpenAIError) -> None:
+        """Skip confirmed unsupported or unavailable counting endpoints for this client."""
+        if isinstance(error, APIStatusError) and (
+            error.status_code == 403 or self._missing_endpoint(error)
+        ):
+            self._unavailable_count_routes.add(path)
+
+    @staticmethod
+    def _count_result(response: object, field: str) -> int | None:
+        """Read a measured count, including token IDs returned by a renderer."""
+        if not isinstance(response, dict):
+            return None
+        value = response.get(field)
+        if field == "token_ids":
+            return len(value) if isinstance(value, list) else None
+        return value if type(value) is int and value >= 0 else None
 
     def _validate_attributes(self) -> None:
         """Validate the backend attributes after initialization."""
@@ -1840,23 +1938,35 @@ class OpenAIBackend(Backend):
         return request
 
     @staticmethod
-    def _can_fallback_compact(error: APIStatusError) -> bool:
-        """Identify an unsupported route or item without masking unrelated provider failures."""
+    def _missing_endpoint(error: APIStatusError) -> bool:
+        """Distinguish an unavailable endpoint from missing request resources."""
         if error.status_code in (405, 501):
             return True
-        if error.status_code == 404:
-            return error.body == {"detail": "Not Found"} or error.code in {
+        return error.status_code == 404 and (
+            error.body == {"detail": "Not Found"}
+            or error.code
+            in {
                 "route_not_found",
                 "endpoint_not_found",
                 "unsupported_endpoint",
             }
-        return error.status_code in (400, 422) and error.code in {
-            "invalid_encrypted_content",
-            "unsupported_input_item",
-            "unsupported_attachment",
-            "unsupported_endpoint",
-            "unsupported_store",
-        }
+        )
+
+    @staticmethod
+    def _can_fallback_compact(error: APIStatusError) -> bool:
+        """Identify an unsupported route or item without masking unrelated provider failures."""
+        return (
+            OpenAIBackend._missing_endpoint(error)
+            or error.status_code in (400, 422)
+            and error.code
+            in {
+                "invalid_encrypted_content",
+                "unsupported_input_item",
+                "unsupported_attachment",
+                "unsupported_endpoint",
+                "unsupported_store",
+            }
+        )
 
     def _native_compaction_result(
         self,

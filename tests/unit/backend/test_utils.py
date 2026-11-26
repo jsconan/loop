@@ -2,6 +2,7 @@
 
 import pytest
 
+from loop.backend import estimate_context
 from loop.backend.utils import project_context, project_portable_context
 from loop.models import (
     CompactionContextItem,
@@ -81,7 +82,6 @@ def test_portable_projection_omits_provider_replay_state_but_keeps_semantics():
 def test_portable_context_omits_model_only_updates_and_opaque_binary_attachment():
     """Portable summaries retain reference metadata without transmitting encoded binary."""
     from loop.backend import project_portable_context
-    from loop.backend.utils import estimate_context
     from loop.models import DeveloperInput, ReasoningConfiguration
 
     ref = ContextReference(
@@ -113,6 +113,26 @@ def test_portable_context_omits_model_only_updates_and_opaque_binary_attachment(
         )
         < 1024
     )
+
+
+def test_estimate_budgets_hydrated_text_or_its_recorded_prefix():
+    """Fallback sizing uses sanitized text when present and saved byte bounds otherwise."""
+    reference = ContextReference(
+        kind="file",
+        path="notes.txt",
+        content="<redacted:secret>",
+        included_bytes=900,
+        size_bytes=900,
+        truncated=False,
+        payload_redacted=True,
+        media_type="text/plain",
+    )
+    hydrated = Message(role="user", content="Read this", context=(reference,))
+    unhydrated = hydrated.model_copy(
+        update={"context": (reference.model_copy(update={"content": None}),)}
+    )
+
+    assert estimate_context([hydrated]) < 300 <= estimate_context([unhydrated])
 
 
 @pytest.mark.parametrize(
