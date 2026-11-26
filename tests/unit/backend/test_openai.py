@@ -4681,7 +4681,17 @@ def test_opaque_checkpoint_headroom_uses_responses_input_count(asynchronous, sup
 @pytest.mark.parametrize("asynchronous", [False, True])
 @pytest.mark.parametrize(
     "endpoint",
-    ["count", "render", "tokenize", "strict", "unavailable", "absent", "malformed"],
+    [
+        "count",
+        "render",
+        "tokenize",
+        "tool_history",
+        "strict",
+        "unavailable",
+        "partial",
+        "absent",
+        "malformed",
+    ],
 )
 def test_count_generation_uses_available_provider_capability(asynchronous, endpoint):
     """Count prepared input with the first available endpoint without running inference."""
@@ -4694,8 +4704,66 @@ def test_count_generation_uses_available_provider_capability(asynchronous, endpo
     )
     paths = []
     items = [Message(role="user", content=f"Check {secret}")]
+    messages = [
+        {"role": "system", "content": "Count these instructions"},
+        {"role": "user", "content": "Check <redacted:secret>"},
+    ]
+    if endpoint == "tool_history":
+        items.extend(
+            [
+                ToolCall(call_id="call_1", name="fixture", arguments='{"number":1}'),
+                ToolCall(call_id="call_2", name="fixture", arguments='{"number":2}'),
+                Message(role="assistant", content="Checking both"),
+                ToolResult(call_id="call_2", output="Second result"),
+                ToolResult(call_id="call_1", output=f"First result: {secret}"),
+                Reasoning(content="One more check"),
+                ToolCall(call_id="call_1", name="fixture", arguments="{}"),
+                ToolResult(call_id="call_1", output="Done"),
+                Reasoning(content=""),
+                Message(role="assistant", content="Finished"),
+                Message(role="user", content="Continue"),
+            ]
+        )
+        messages.extend(
+            [
+                {
+                    "role": "assistant",
+                    "content": "Checking both",
+                    "tool_calls": [
+                        {
+                            "type": "function",
+                            "id": f"call_{number}",
+                            "function": {"name": "fixture", "arguments": f'{{"number":{number}}}'},
+                        }
+                        for number in (1, 2)
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_2", "content": "Second result"},
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "content": "First result: <redacted:secret>",
+                },
+                {
+                    "role": "assistant",
+                    "reasoning": "One more check",
+                    "tool_calls": [
+                        {
+                            "type": "function",
+                            "id": "call_1",
+                            "function": {"name": "fixture", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "Done"},
+                {"role": "assistant", "reasoning": "", "content": "Finished"},
+                {"role": "user", "content": "Continue"},
+            ]
+        )
     if endpoint == "unavailable":
-        items.append(ToolCall(call_id="call_1", name="fixture", arguments="{}"))
+        items.append(Reasoning(content="", encrypted_content="opaque"))
+    if endpoint == "partial":
+        items.append(Reasoning(content="Unfinished", status="incomplete"))
     tools = (
         ToolDefinition(name="fixture", description="Tool description", parameters={}, strict=True),
     )
@@ -4724,10 +4792,7 @@ def test_count_generation_uses_available_provider_capability(asynchronous, endpo
                 return httpx.Response(200, json={"token_ids": 123})
             return httpx.Response(403, json={"error": {"message": "Rendering is disabled"}})
         assert path == "/tokenize"
-        assert body["messages"] == [
-            {"role": "system", "content": "Count these instructions"},
-            {"role": "user", "content": "Check <redacted:secret>"},
-        ]
+        assert body["messages"] == messages
         assert body["tools"][0]["function"]["strict"] is True
         assert body["chat_template_kwargs"] == {"enable_thinking": False}
         if endpoint == "absent":
@@ -4769,13 +4834,15 @@ def test_count_generation_uses_available_provider_capability(asynchronous, endpo
             "count": [primary, primary],
             "render": [primary, render, render],
             "tokenize": [primary, render, "/tokenize", "/tokenize"],
+            "tool_history": [primary, render, "/tokenize", "/tokenize"],
             "strict": [render, "/tokenize", "/tokenize"],
             "unavailable": [primary, render],
+            "partial": [primary, render],
             "absent": [primary, render, "/tokenize"],
             "malformed": [primary, render, "/tokenize"] * 2,
         }[endpoint]
     )
-    expected = None if endpoint in ("unavailable", "absent", "malformed") else 123
+    expected = None if endpoint in ("unavailable", "partial", "absent", "malformed") else 123
     assert counts == [expected, expected]
 
 

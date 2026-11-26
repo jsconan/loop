@@ -572,20 +572,50 @@ class OpenAIBackend(Backend):
 
     @staticmethod
     def _tokenizer_projection(request: dict) -> dict | None:
-        """Project text-only Responses input onto a chat template with the same tool schema."""
+        """Project ordinary Responses messages and tool rounds for chat tokenization."""
         items = request["input"]
-        if any(
-            item.get("role") not in ("user", "assistant")
-            or not isinstance(item.get("content"), str)
-            for item in items
-        ):
+        if items and items[-1].get("status") in ("in_progress", "incomplete"):
             return None
         messages = (
             [{"role": "system", "content": request["instructions"]}]
             if request.get("instructions")
             else []
         )
-        messages.extend({"role": item["role"], "content": item["content"]} for item in items)
+        for item in items:
+            kind = item.get("type", "message")
+            assistant = messages[-1] if messages and messages[-1]["role"] == "assistant" else None
+            if kind == "function_call":
+                if assistant is None:
+                    assistant = {"role": "assistant"}
+                    messages.append(assistant)
+                assistant.setdefault("tool_calls", []).append(
+                    {
+                        "type": "function",
+                        "id": item["call_id"],
+                        "function": {"name": item["name"], "arguments": item["arguments"]},
+                    }
+                )
+                continue
+            if kind == "function_call_output":
+                messages.append(
+                    {"role": "tool", "tool_call_id": item["call_id"], "content": item["output"]}
+                )
+                continue
+            if kind == "reasoning" and not item.get("encrypted_content"):
+                parts = item["content"] or item["summary"]
+                role, field, value = "assistant", "reasoning", parts[0]["text"] if parts else ""
+            elif (
+                kind == "message"
+                and item.get("role") in ("user", "assistant")
+                and isinstance(item.get("content"), str)
+            ):
+                role, field, value = item["role"], "content", item["content"]
+            else:
+                return None
+            if role == "assistant" and assistant is not None and field not in assistant:
+                assistant[field] = value
+            else:
+                messages.append({"role": role, field: value})
         return {
             "model": request["model"],
             "messages": messages,
