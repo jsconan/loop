@@ -250,6 +250,8 @@ class ContextCompaction:
                     tokens = (
                         await self._estimate_async(attempt, result) if result is not None else None
                     )
+        except ModelWindowConflictError:
+            return self._stale()
         except NotImplementedError:
             return self._unsupported()
         except CompactionLimitError as error:
@@ -257,11 +259,6 @@ class ContextCompaction:
             return False
         if not self._fits(attempt, tokens):
             return self._unfit()
-        if (
-            not await self._context.check_rebuild_async(window)
-            or self._context.backend is not attempt.backend
-        ):
-            return self._stale()
         checkpoint = self._checkpoint(attempt, result, tokens)
         try:
             await self._session_manager.commit_model_window_async(
@@ -460,7 +457,7 @@ class ContextCompaction:
         return tokens + self._context.rebuild_guidance_tokens(attempt.window)
 
     async def _estimate_async(self, attempt: _Attempt, result: CompactionResult) -> int | None:
-        """Measure the entire rebuilt generation context asynchronously."""
+        """Measure replay, revalidate the candidate, then budget live guidance."""
         if not attempt.backend.can_replay_checkpoint(
             result.items,
             attempt.window.model,
@@ -478,6 +475,11 @@ class ContextCompaction:
         )
         if tokens is None:
             return None
+        if (
+            not await self._context.check_rebuild_async(attempt.window)
+            or self._context.backend is not attempt.backend
+        ):
+            raise ModelWindowConflictError("The captured model window changed during compaction.")
         return tokens + self._context.rebuild_guidance_tokens(attempt.window)
 
     def _rebuilt_items(self, attempt: _Attempt, result: CompactionResult) -> list[ModelContextItem]:

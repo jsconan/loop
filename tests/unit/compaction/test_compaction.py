@@ -260,6 +260,54 @@ def test_rebuild_reserves_disclosure_headroom_without_sending_facts(tmp_path, la
     assert owner.tokens == available
 
 
+@pytest.mark.parametrize("native", [False, True])
+def test_async_compaction_rechecks_headroom_after_disclosure_changes(tmp_path, native):
+    """An update during async instruction validation affects the fit of the candidate."""
+    feature, owner, backend, interaction, *_, context = _feature(
+        tmp_path, session=Session(messages=_history())
+    )
+    context.configure(ApplicationSettings(context=ContextSettings(mode="off")))
+    backend.compact.return_value = _result()
+    assert feature.compact()
+    previous = owner.session.checkpoint()
+    owner.add_message(Message(role="assistant", content="Finished the previous request"))
+    owner.add_user_message("Continue from the completed work")
+    available = owner.context_window - backend.generation_reserve(owner.context_window)
+    backend.compact_async.side_effect = [_result(native=native), _result()]
+    backend.estimate_generation_async = AsyncMock(side_effect=[available, 1200])
+
+    async def compact_with_live_update():
+        """Enable disclosure while the compactor is waiting for revalidation."""
+        validating = asyncio.Event()
+        updated = asyncio.Event()
+        validate = context.check_rebuild_async
+
+        async def wait_for_update(window):
+            """Suspend instruction validation at its public async boundary."""
+            validating.set()
+            await updated.wait()
+            return await validate(window)
+
+        context.check_rebuild_async = wait_for_update
+        async with asyncio.TaskGroup() as group:
+            pending = group.create_task(feature.compact_async())
+            await asyncio.wait_for(validating.wait(), timeout=5)
+            context.configure(ApplicationSettings(context=ContextSettings(mode="basic")))
+            updated.set()
+        return pending.result()
+
+    assert asyncio.run(compact_with_live_update()) is native
+    if native:
+        assert backend.compact_async.await_count == 2
+        assert backend.compact_async.call_args.kwargs["native"] is False
+        assert owner.session.checkpoint().context == _result().items
+        assert 1200 < owner.tokens <= available
+    else:
+        backend.compact_async.assert_awaited_once()
+        assert owner.session.compactions == [previous]
+        assert "exceed the available context limit" in interaction.warning.call_args.args[0]
+
+
 def test_appended_input_replays_once_after_captured_frontier(tmp_path):
     """A turn admitted while the provider summarizes is outside the checkpoint coverage."""
     messages = _history()
