@@ -15,7 +15,7 @@ from dataclasses import fields, replace
 from datetime import datetime
 from pathlib import Path
 from re import fullmatch
-from threading import Lock, RLock, get_ident
+from threading import Event, Lock, RLock, get_ident
 from typing import Any
 
 from ..errors import Problem, ProblemException, log_problem
@@ -1460,7 +1460,8 @@ class SessionManager:
         Raises:
             ModelWindowConflictError: The captured session, window, or checkpoint changed.
             ValueError: The captured model state is inconsistent.
-            asyncio.CancelledError: The write was cancelled after persistence settled.
+            asyncio.CancelledError: The write was cancelled. A checkpoint replacement leaves
+                the prior snapshot active.
         """
 
         def apply(session: Session) -> None:
@@ -1474,7 +1475,11 @@ class SessionManager:
                 checkpoint,
             )
 
-        await self._commit_async(apply, validate=validate)
+        await self._commit_async(
+            apply,
+            validate=validate,
+            cancel_checkpoint=checkpoint is not None,
+        )
 
     @staticmethod
     def _apply_model_window(
@@ -2549,10 +2554,42 @@ class SessionManager:
         *,
         persisted_response: Response | None = None,
         validate: Callable[[], None] | None = None,
+        cancel_checkpoint: bool = False,
     ) -> None:
         """Persist a detached mutation and notify response observers after a successful commit."""
         cancellation = None
         committed_session_id = None
+        cancelled = Event() if cancel_checkpoint else None
+        run_blocking = self._async_blocking_runner or run_in_worker_async
+
+        def validate_checkpoint() -> None:
+            """Reject a cancelled replacement before the store commits it."""
+            if validate is not None:
+                validate()
+            if cancelled.is_set():
+                raise ModelWindowConflictError("The checkpoint write was cancelled.")
+
+        async def persist_async(snapshot: Session, guard: Callable[[], None] | None = None) -> None:
+            """Let the store settle before releasing the writer lock."""
+            nonlocal cancellation
+            pending = asyncio.ensure_future(
+                run_blocking(
+                    self._save_snapshot,
+                    self._session_store,
+                    self._persistence_lock,
+                    snapshot,
+                    guard,
+                )
+            )
+            while not pending.done():
+                try:
+                    await asyncio.wait({pending})
+                except asyncio.CancelledError as error:
+                    cancellation = cancellation or error
+                    if cancelled is not None:
+                        cancelled.set()
+            pending.result()
+
         async with self._async_commit_lock:
             await self._acquire_commit_lock_async()
             try:
@@ -2560,28 +2597,10 @@ class SessionManager:
                 candidate = deepcopy(current)
                 mutation(candidate)
                 telemetry_activity("session.persistence.started", component="session_manager")
-                run_blocking = self._async_blocking_runner or run_in_worker_async
-                pending = asyncio.ensure_future(
-                    run_blocking(
-                        self._save_snapshot,
-                        self._session_store,
-                        self._persistence_lock,
-                        candidate,
-                        validate,
+                try:
+                    await persist_async(
+                        candidate, validate_checkpoint if cancel_checkpoint else validate
                     )
-                )
-                try:
-                    await asyncio.wait({pending})
-                except asyncio.CancelledError as error:
-                    cancellation = error
-                while not pending.done():
-                    try:
-                        await asyncio.wait({pending})
-                    except asyncio.CancelledError as error:
-                        cancellation = cancellation or error
-
-                try:
-                    pending.result()
                 except BaseException as error:
                     if not isinstance(error, ModelWindowConflictError):
                         telemetry_error(
@@ -2595,6 +2614,25 @@ class SessionManager:
                         )
                         raise cancellation  # pylint: disable=raise-missing-from
                     raise
+
+                if cancellation is not None and cancel_checkpoint:
+                    # SQLite may have passed the guard before the async owner saw cancellation.
+                    previous = deepcopy(current)
+                    previous.revision = candidate.revision
+                    try:
+                        await persist_async(previous)
+                    except (OSError, RuntimeError, ValueError, sqlite3.Error) as error:
+                        cancellation.add_note(
+                            f"Restoring the previous checkpoint failed with {type(error).__name__}."
+                        )
+                        telemetry_error(
+                            "session.persistence.failed",
+                            error_type="session.persistence_failed",
+                            component="session_manager",
+                        )
+                    else:
+                        current.revision = previous.revision
+                        raise cancellation
 
                 if self._session is not current:
                     if cancellation is not None:

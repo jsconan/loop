@@ -10,7 +10,7 @@ from loop import Agent, Message, ModelSelection, Session, SessionManager
 from loop.agent import AgentContext
 from loop.backend import estimate_context
 from loop.compaction import ContextCompaction
-from loop.configuration import ApplicationSettings, ContextSettings
+from loop.configuration import ApplicationSettings, AppSettings, ContextSettings
 from loop.instructions import InstructionsManager
 from loop.interaction import Interaction
 from loop.models import CompactionContextItem, CompactionResult, DeveloperInput, Usage
@@ -490,6 +490,77 @@ def test_async_cancellation_keeps_checkpoint_and_effective_window(tmp_path):
     asyncio.run(cancel_attempt())
     assert owner.session.window == window
     assert owner.session.compactions == [checkpoint]
+
+
+@pytest.mark.parametrize("outcome", ["queued", "persisted", "restore_fails"])
+def test_async_cancellation_at_sqlite_checkpoint_replacement(tmp_path, monkeypatch, outcome):
+    """Keep the old window on cancellation and report an interrupted restoration accurately."""
+    store = SQLiteSessionStore(tmp_path / "sessions.db", workspace_id="fixture")
+    feature, owner, backend, *_, context = _feature(
+        tmp_path,
+        session=Session(messages=_history(), workspace_id="fixture"),
+        session_store=store,
+    )
+    backend.compact.return_value = backend.compact_async.return_value = _result()
+    assert feature.compact()
+    owner.add_message(Message(role="assistant", content="Finish the previous turn"))
+    owner.add_user_message("Continue from the saved context")
+    saved = store.load(owner.session.id)
+    context.configure(ApplicationSettings(app=AppSettings(agent_name="Pending name")))
+    if outcome == "restore_fails":
+        save = store.save
+
+        def fail_restore(session, *, validate=None):
+            """Inject a storage failure only for the compensating write."""
+            if session.revision > saved.revision and session.compactions == saved.compactions:
+                raise OSError("Restoration failed")
+            return save(session, validate=validate)
+
+        monkeypatch.setattr(store, "save", fail_restore)
+
+    async def cancel_at_write():
+        """Request cancellation immediately before or after the replacement is saved."""
+        waiting = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocking(function, *args):
+            """Expose the replacement save at its asynchronous worker boundary."""
+            if not any(isinstance(part, Session) and len(part.compactions) == 2 for part in args):
+                return await asyncio.to_thread(function, *args)
+            if outcome != "queued":
+                value = await asyncio.to_thread(function, *args)
+            waiting.set()
+            await release.wait()
+            return value if outcome != "queued" else await asyncio.to_thread(function, *args)
+
+        owner.set_async_blocking_runner(blocking)
+        attempt = asyncio.create_task(feature.compact_async())
+        await asyncio.wait_for(waiting.wait(), 5)
+        attempt.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError) as error:
+            await attempt
+        if outcome == "restore_fails":
+            assert error.value.__notes__ == [
+                "Restoring the previous checkpoint failed with OSError."
+            ]
+            return
+        await owner.add_user_message_async("The writer can continue after cancellation")
+
+    asyncio.run(cancel_at_write())
+    restored = store.load(saved.id)
+    assert restored.compactions == owner.session.compactions
+    assert restored.window == owner.session.window
+    if outcome == "restore_fails":
+        assert restored.compactions[:-1] == saved.compactions
+        assert restored.window.settings.agent_name == "Pending name"
+        return
+    assert restored.compactions == saved.compactions
+    assert restored.window == saved.window
+    assert restored.messages[:-1] == saved.messages
+    assert restored.messages[-1].content == "The writer can continue after cancellation"
+    assert context.pending("app.agent_name") is not None
+    assert context.capture().settings.agent_name == "Pending name"
 
 
 def test_bound_candidate_changes_are_atomic_with_validation(tmp_path):
