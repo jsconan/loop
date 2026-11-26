@@ -72,6 +72,7 @@ def test_clock_defaults_and_nullable_schema(monkeypatch, selector, asynchronous)
         (0, "-03:30", "21:00:00", "-03:30", None),
         (0, "UTC", "00:30:00", "+00:00", "UTC"),
         (0, "GMT", "00:30:00", "+00:00", "GMT"),
+        (0, "PRC", "08:30:00", "+08:00", "PRC"),
     ],
 )
 def test_clock_converts_one_instant_and_leaves_its_default(
@@ -98,7 +99,9 @@ def test_clock_converts_one_instant_and_leaves_its_default(
     assert json.loads(registry.call("get_current_datetime", "{}"))["result"]["timezone"] == "UTC"
 
 
-@pytest.mark.parametrize("selector", ["CST", "No/Such_Zone", "UTC+3", "+5:45", "+01:60", "+24:00"])
+@pytest.mark.parametrize(
+    "selector", ["CST", "EST", "MST", "CET", "No/Such_Zone", "UTC+3", "+5:45", "+01:60", "+24:00"]
+)
 def test_clock_reports_correctable_selector_errors(selector):
     """Invalid names, abbreviations and offsets produce model-readable argument errors."""
     registry = ToolRegistry([get_current_datetime])

@@ -7,6 +7,8 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 _OFFSET = re.compile(r"([+-])([0-9]{2}):([0-9]{2})")
+_ABBREVIATION = re.compile(r"[A-Z]{3,4}")
+_UNAMBIGUOUS_ZONE_ALIASES = frozenset(("GMT", "PRC", "ROC", "ROK", "UCT", "UTC"))
 _ZONE_ERROR = "Use an IANA timezone such as Europe/Luxembourg or UTC."
 _SELECTOR_ERROR = f"{_ZONE_ERROR} A signed UTC offset such as +05:45 is also accepted."
 
@@ -47,6 +49,8 @@ def _selected_timezone(selector: str) -> tuple[tzinfo, str | None]:
             raise ValueError(_SELECTOR_ERROR)
         delta = timedelta(hours=hours, minutes=minutes)
         return timezone(-delta if sign == "-" else delta), None
+    if _ABBREVIATION.fullmatch(selector) and selector not in _UNAMBIGUOUS_ZONE_ALIASES:
+        raise ValueError(_SELECTOR_ERROR)
     try:
         return _named_timezone(selector), selector
     except ValueError as error:
