@@ -4685,9 +4685,12 @@ def test_opaque_checkpoint_headroom_uses_responses_input_count(asynchronous, sup
         "count",
         "render",
         "tokenize",
+        "text_attachment",
+        "native_attachment",
         "tool_history",
         "strict",
         "unavailable",
+        "incomplete_text_part",
         "partial",
         "absent",
         "malformed",
@@ -4708,6 +4711,18 @@ def test_count_generation_uses_available_provider_capability(asynchronous, endpo
         {"role": "system", "content": "Count these instructions"},
         {"role": "user", "content": "Check <redacted:secret>"},
     ]
+    if endpoint in ("text_attachment", "native_attachment"):
+        content = f"Note with {secret}"
+        reference = ContextReference(
+            kind="file",
+            path="$WORKSPACE_ROOT/notes.txt",
+            content=content,
+            size_bytes=len(content),
+            included_bytes=len(content),
+            truncated=False,
+            media_type="text/plain",
+        )
+        items.append(Message(role="user", content="Read the note", context=(reference,)))
     if endpoint == "tool_history":
         items.extend(
             [
@@ -4762,14 +4777,25 @@ def test_count_generation_uses_available_provider_capability(asynchronous, endpo
         )
     if endpoint == "unavailable":
         items.append(Reasoning(content="", encrypted_content="opaque"))
+    if endpoint == "incomplete_text_part":
+        items.insert(
+            0,
+            CompactionContextItem(
+                route=backend.route,
+                model="fixture-model",
+                data={"type": "message", "role": "user", "content": [{"type": "input_text"}]},
+            ),
+        )
     if endpoint == "partial":
         items.append(Reasoning(content="Unfinished", status="incomplete"))
     tools = (
         ToolDefinition(name="fixture", description="Tool description", parameters={}, strict=True),
     )
+    attachment_text = None
 
     def handle(request):
         """Expose only the counting capability under test at the actual SDK wire boundary."""
+        nonlocal attachment_text
         path = request.url.path
         paths.append(path)
         body = json.loads(request.content)
@@ -4777,7 +4803,7 @@ def test_count_generation_uses_available_provider_capability(asynchronous, endpo
         assert body["model"] == "fixture-model"
         if path == "/v1/responses/input_tokens":
             assert "store" not in body
-            assert body["input"][0]["content"] == "Check <redacted:secret>"
+            assert any(item.get("content") == "Check <redacted:secret>" for item in body["input"])
             assert body["reasoning"] == {"effort": "none"}
             if endpoint == "count":
                 return httpx.Response(200, json={"input_tokens": 123})
@@ -4786,12 +4812,25 @@ def test_count_generation_uses_available_provider_capability(asynchronous, endpo
             return httpx.Response(405, json={"detail": "Method Not Allowed"})
         if path == "/v1/responses/render":
             assert body["store"] is False
+            if endpoint == "text_attachment":
+                parts = body["input"][-1]["content"]
+                assert [part["type"] for part in parts] == ["input_text"] * 3
+                assert "Note with <redacted:secret>" in parts[-1]["text"]
+                attachment_text = [part["text"] for part in parts]
+            if endpoint == "native_attachment":
+                assert body["input"][-1]["content"][-1]["type"] == "input_file"
             if endpoint == "render":
                 return httpx.Response(200, json={"token_ids": list(range(123))})
             if endpoint == "malformed":
                 return httpx.Response(200, json={"token_ids": 123})
             return httpx.Response(403, json={"error": {"message": "Rendering is disabled"}})
         assert path == "/tokenize"
+        if endpoint == "text_attachment":
+            assert attachment_text is not None
+            assert body["messages"].pop() == {
+                "role": "user",
+                "content": [{"type": "text", "text": text} for text in attachment_text],
+            }
         assert body["messages"] == messages
         assert body["tools"][0]["function"]["strict"] is True
         assert body["chat_template_kwargs"] == {"enable_thinking": False}
@@ -4808,13 +4847,17 @@ def test_count_generation_uses_available_provider_capability(asynchronous, endpo
         "model": "fixture-model",
         "hyperparameters": GenerationHyperparameters(reasoning_effort="none"),
     }
+    file_mode = "native" if endpoint == "native_attachment" else "text"
     if asynchronous:
 
         async def run():
             """Use one backend on its owning loop for two independent count requests."""
             async with httpx.AsyncClient(transport=transport) as client:
                 sdk = SDKAsyncOpenAI(api_key=secret, base_url=base, http_client=client)
-                with patch("loop.backend.openai.AsyncOpenAI", return_value=sdk):
+                with (
+                    patch("loop.backend.openai.AsyncOpenAI", return_value=sdk),
+                    backend.file_projection(file_mode),
+                ):
                     return [
                         await backend.count_generation_async(items, **options) for _ in range(2)
                     ]
@@ -4823,7 +4866,10 @@ def test_count_generation_uses_available_provider_capability(asynchronous, endpo
     else:
         with httpx.Client(transport=transport) as client:
             sdk = SDKOpenAI(api_key=secret, base_url=base, http_client=client)
-            with patch("loop.backend.openai.OpenAI", return_value=sdk):
+            with (
+                patch("loop.backend.openai.OpenAI", return_value=sdk),
+                backend.file_projection(file_mode),
+            ):
                 counts = [backend.count_generation(items, **options) for _ in range(2)]
 
     primary = "/v1/responses/input_tokens"
@@ -4834,15 +4880,26 @@ def test_count_generation_uses_available_provider_capability(asynchronous, endpo
             "count": [primary, primary],
             "render": [primary, render, render],
             "tokenize": [primary, render, "/tokenize", "/tokenize"],
+            "text_attachment": [primary, render, "/tokenize", "/tokenize"],
+            "native_attachment": [primary, render],
             "tool_history": [primary, render, "/tokenize", "/tokenize"],
             "strict": [render, "/tokenize", "/tokenize"],
             "unavailable": [primary, render],
+            "incomplete_text_part": [primary, render],
             "partial": [primary, render],
             "absent": [primary, render, "/tokenize"],
             "malformed": [primary, render, "/tokenize"] * 2,
         }[endpoint]
     )
-    expected = None if endpoint in ("unavailable", "partial", "absent", "malformed") else 123
+    unavailable = (
+        "native_attachment",
+        "unavailable",
+        "incomplete_text_part",
+        "partial",
+        "absent",
+        "malformed",
+    )
+    expected = None if endpoint in unavailable else 123
     assert counts == [expected, expected]
 
 

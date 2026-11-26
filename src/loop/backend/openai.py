@@ -607,9 +607,16 @@ class OpenAIBackend(Backend):
             elif (
                 kind == "message"
                 and item.get("role") in ("user", "assistant")
-                and isinstance(item.get("content"), str)
+                and isinstance(item.get("content"), (str, list))
             ):
                 role, field, value = item["role"], "content", item["content"]
+                if isinstance(value, list):
+                    if any(
+                        part.get("type") != "input_text" or not isinstance(part.get("text"), str)
+                        for part in value
+                    ):
+                        return None
+                    value = [{"type": "text", "text": part["text"]} for part in value]
             else:
                 return None
             if role == "assistant" and assistant is not None and field not in assistant:
