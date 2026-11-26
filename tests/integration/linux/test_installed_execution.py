@@ -3815,7 +3815,8 @@ def test_public_uv_runs_a_workspace_virtualenv_with_its_user_local_runtime(
         dirs_exist_ok=True,
         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
     )
-    shutil.copyfile(project / "tests/scheduling.py", workspace / "tests/scheduling.py")
+    for relative in ("tests/backend_doubles.py", "tests/scheduling.py"):
+        shutil.copyfile(project / relative, workspace / relative)
     shutil.copyfile(project / "pyproject.toml", workspace / "pyproject.toml")
     full_suite = run_with_interpreter(
         f'COVERAGE_FILE="{VirtualPath.TEMPORARY}/.coverage" '

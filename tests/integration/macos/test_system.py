@@ -2940,6 +2940,7 @@ def test_public_session_runs_pytest_from_private_unusual_scratch(
             "Makefile",
             "pyproject.toml",
             "tests/__init__.py",
+            "tests/backend_doubles.py",
             "tests/conftest.py",
             "tests/scheduling.py",
         ):
