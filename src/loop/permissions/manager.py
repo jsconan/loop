@@ -48,6 +48,7 @@ from ..interaction import (
 from ..sandbox_catalog import (
     SANDBOX_OPTIONS,
     hardlink_source_paths,
+    hardlink_sources_within_roots,
     sandbox_options,
 )
 from ..telemetry import telemetry_audit, telemetry_error, telemetry_trace_event
@@ -1149,10 +1150,10 @@ class PermissionManager:
             source_paths = hardlink_source_paths(request.backend_options)
         except ValueError as error:
             return str(error)
-        if request.hardlink_sources != source_paths:
+        if not hardlink_sources_within_roots(request.hardlink_sources, source_paths):
             return (
                 "Metadata sources differ from the selected sandbox access. "
-                "Review the cache location."
+                "Review the account directory."
             )
         for name in request.backend_options:
             if name not in SANDBOX_OPTIONS:
@@ -1164,6 +1165,36 @@ class PermissionManager:
             if not self._has_sandbox_option(request, name):
                 return f"Workspace opt-in is off for {SANDBOX_OPTIONS[name]['label']}."
         return None
+
+    def sandbox_hardlink_sources(self, options: tuple[str, ...]) -> tuple[Path, ...]:
+        """Select metadata roots within the current account authority and hard read ceiling.
+
+        Args:
+            options (tuple[str, ...]): Native options proposed for one command.
+
+        Returns:
+            tuple[Path, ...]: Account roots or their readable directory subscopes. The command
+                still requires normal sandbox policy review before using them.
+
+        Raises:
+            ValueError: The operating system cannot identify the account home.
+        """
+        roots = hardlink_source_paths(options)
+        if not roots:
+            return ()
+        with self._policy_lock:
+            effective = self.effective_configuration
+            if effective.limit_classifications.readable_roots is not LimitClassification.HARD:
+                return roots
+            readable = tuple(
+                path
+                for configured in effective.limits.readable_roots
+                if (path := self._root_path(configured)) is not None and path.is_dir()
+            )
+            (account,) = roots
+            if any(account.is_relative_to(path) for path in readable):
+                return roots
+            return tuple(dict.fromkeys(path for path in readable if path.is_relative_to(account)))
 
     def _has_sandbox_option(self, request: SandboxRequest, name: str) -> bool:
         """Check proposed resources and existing enrolled or command-scoped permissions."""
@@ -1282,7 +1313,9 @@ class PermissionManager:
                     continue
                 options = tuple(sorted((*request.backend_options, name)))
                 try:
-                    proposed = request.with_backend_options(options, hardlink_source_paths(options))
+                    proposed = request.with_backend_options(
+                        options, self.sandbox_hardlink_sources(options)
+                    )
                 except (OSError, ValueError):
                     continue
                 proposed = replace(
@@ -3001,7 +3034,9 @@ class PermissionManager:
                 if root.is_relative_to(request.workspace):
                     continue
                 if any(
-                    root.is_relative_to(protected) or protected.is_relative_to(root)
+                    root.is_relative_to(protected)
+                    or root in request.read_roots
+                    and protected.is_relative_to(root)
                     for protected in self._protected_read_roots
                 ):
                     return "A requested read root intersects protected application policy or state."

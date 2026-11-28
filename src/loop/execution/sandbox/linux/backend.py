@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING
 from .... import constants
 from ....constants import NATIVE_FILE_READ_CHUNK_BYTES, NATIVE_INSTALLATION_DIRECTORY
 from ....permissions.protection import IncompleteHardlinkAliases
-from ....sandbox_catalog import hardlink_source_paths
+from ....sandbox_catalog import hardlink_source_paths, hardlink_sources_within_roots
 from ....utils.process import ProcessCapture, ProcessCaptureStatus, is_finite_deadline
 from ....utils.virtual_path import VirtualPath
 from ..constants import (
@@ -361,7 +361,7 @@ class LinuxNativeBackend:
         return runtime_read_roots()
 
     def inferred_options(self, request: SandboxRequest) -> tuple[str, ...]:
-        """Offer cache metadata only when strict admission finds visible unresolved hardlinks.
+        """Offer account metadata only when strict admission finds visible unresolved hardlinks.
 
         Use the receiver's path checks with no cache authority. The receiver repeats those checks
         after approval and refuses incomplete, denied, or changed paths before command entry.
@@ -645,8 +645,10 @@ class LinuxNativeBackend:
                     request.backend_options != ("shared_dependencies",)
                     or request.backend_options != self.backend_options
                     or request.permission_revision is None
-                    or request.hardlink_sources
-                    != hardlink_source_paths(request.backend_options, "linux")
+                    or not hardlink_sources_within_roots(
+                        request.hardlink_sources,
+                        hardlink_source_paths(request.backend_options, "linux"),
+                    )
                 ):
                     return CommandProcessResult(
                         SandboxOutcome.UNSUPPORTED, detail="Shared dependency scope is unavailable."

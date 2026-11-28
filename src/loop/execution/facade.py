@@ -26,7 +26,6 @@ from ..errors import Problem, log_problem
 from ..models import SandboxOutputPath
 from ..permissions import Action, ProcessBoundary, ProcessTarget, match_git_mutation
 from ..permissions.protection import is_protected_external_read, write_file_state
-from ..sandbox_catalog import hardlink_source_paths
 from ..session.models import SessionExecutionConflictError
 from ..telemetry import telemetry_trace_event
 from ..utils import (
@@ -3211,7 +3210,11 @@ class CommandExecutionService:
                     network=network,
                     egress_origins=tuple(egress_origins or ()),
                     backend_options=backend_options,
-                    hardlink_sources=hardlink_source_paths(backend_options),
+                    hardlink_sources=(
+                        context.permission_manager.sandbox_hardlink_sources(backend_options)
+                        if backend_options
+                        else ()
+                    ),
                     ingress_port=ingress_port,
                     local_network=network
                     or local_ipc

@@ -2228,10 +2228,10 @@ def test_public_external_python_library_runs_from_a_hardlinked_read_root(
 
 
 @pytest.mark.parametrize("public_workspace_root", ["home"], indirect=True)
-def test_native_approved_cache_link_preserves_workspace_read_and_cache_isolation(
+def test_native_approved_account_links_keep_shared_files_read_only(
     installation, public, native_directory
 ):
-    """The installed receiver admits a real shared file while keeping its cache inaccessible."""
+    """The installed receiver verifies several account names and mounts only the workspace name."""
     from loop.sandbox_catalog import hardlink_source_paths
 
     backend, generation = installation
@@ -2240,13 +2240,20 @@ def test_native_approved_cache_link_preserves_workspace_read_and_cache_isolation
     workspace = public[1]
     scratch = native_directory(Path("/tmp"))
     fixture = native_directory(sources[0])
-    shared = fixture / "dependency.dat"
-    shared.write_text("cached dependency")
+    first_store = fixture / "first-store"
+    second_store = fixture / "second-store"
+    first_store.mkdir()
+    second_store.mkdir()
+    shared = first_store / "dependency.dat"
+    shared.write_text("shared dependency")
+    peer = second_store / "dependency.dat"
+    peer.hardlink_to(shared)
     (fixture / "sibling").write_text("outside")
     (workspace / "dependency.dat").hardlink_to(shared)
     source = (
         f"test ! -e {shlex.quote(str(fixture / 'sibling'))} || exit 3; "
         f"test ! -e {shlex.quote(str(shared))} || exit 4; "
+        f"test ! -e {shlex.quote(str(peer))} || exit 6; "
         "if (printf edit > dependency.dat) 2>/dev/null; then exit 5; fi; "
         "cat dependency.dat && printf done > ordinary-output"
     )
@@ -2260,9 +2267,9 @@ def test_native_approved_cache_link_preserves_workspace_read_and_cache_isolation
     )
     result = backend.run(approved)
     assert result.outcome is SandboxOutcome.COMPLETED and result.exit_code == 0, result.detail
-    assert result.stdout == "cached dependency"
+    assert result.stdout == "shared dependency"
     assert (workspace / "ordinary-output").read_text() == "done"
-    assert shared.read_text() == "cached dependency" and shared.stat().st_nlink == 2
+    assert shared.read_text() == "shared dependency" and shared.stat().st_nlink == 3
     require_drained(generation)
 
 

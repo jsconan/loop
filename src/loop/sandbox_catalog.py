@@ -56,14 +56,14 @@ def sandbox_options(platform: str | None = None) -> dict[str, dict[str, str | bo
 def hardlink_source_paths(
     options: tuple[str, ...], platform: str | None = None
 ) -> tuple[Path, ...]:
-    """Return backend-declared metadata sources for selected options under the account home.
+    """Return the backend-declared bounds for metadata lookup by selected options.
 
     Args:
         options (tuple[str, ...]): Selected option keys.
         platform (str | None): Operating system identifier, defaulting to the current host.
 
     Returns:
-        tuple[Path, ...]: Fixed host paths where the backend may verify other hardlink names.
+        tuple[Path, ...]: Account roots that may contain approved metadata sources.
 
     Raises:
         ValueError: The operating system cannot identify the account home.
@@ -83,6 +83,22 @@ def hardlink_source_paths(
             "The account home for the selected sandbox access is unavailable."
         ) from error
     return tuple(home / source for source in sources)
+
+
+def hardlink_sources_within_roots(sources: tuple[Path, ...], roots: tuple[Path, ...]) -> bool:
+    """Check that the requested metadata scope stays within the backend's account roots.
+
+    Args:
+        sources (tuple[Path, ...]): Approved source directories bound to the command.
+        roots (tuple[Path, ...]): Account roots available to the selected native option.
+
+    Returns:
+        bool: Whether the command has a source exactly when its options allow lookup, and
+            every source is within an allowed root.
+    """
+    return bool(sources) == bool(roots) and all(
+        any(source.is_relative_to(root) for root in roots) for source in sources
+    )
 
 
 def validate_sandbox_options(options: tuple[str, ...]) -> tuple[str, ...]:

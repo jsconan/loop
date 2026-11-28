@@ -5,8 +5,7 @@ from __future__ import annotations
 import os
 import stat
 import time
-from collections import deque
-from collections.abc import Callable, Generator, Iterable, Iterator
+from collections.abc import Callable, Collection, Generator, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -23,7 +22,7 @@ PRIVATE_READ_COMPONENTS = (
 )
 _PRIVATE_READ_FOLDED = frozenset(name.casefold() for name in PRIVATE_READ_COMPONENTS)
 ENVIRONMENT_TEMPLATE_SUFFIXES = (".example", ".sample", ".template")
-_MAX_ALIAS_ENTRIES = 100_000
+_MAX_ALIAS_RECORDS = 100_000
 _MAX_SCRATCH_RESCANS = 2
 
 
@@ -160,15 +159,345 @@ def _open_peer_directory(path: Path, flags: int) -> Generator[int, None, None]:
         os.close(descriptor)
 
 
+def _inventory_state(details: os.stat_result) -> tuple[int, ...]:
+    """Compare identity, authority and change metadata while ignoring access time."""
+    return (
+        details.st_dev,
+        details.st_ino,
+        details.st_mode,
+        details.st_uid,
+        details.st_gid,
+        details.st_nlink,
+        details.st_mtime_ns,
+        details.st_ctime_ns,
+    )
+
+
+@dataclass
+class _LinkGroup:
+    """Keep one metadata observation for an inode and its distinct physical names."""
+
+    details: os.stat_result
+    entries: dict[tuple[int, int, str], Path]
+    visible: int = 0
+
+
+class HardlinkInventory:
+    """Gather and verify bounded, attempt-local evidence for a permitted filesystem view.
+
+    Args:
+        deadline (float): Absolute monotonic deadline for traversal and verification.
+        scratch (Path | None): Bound scratch root whose membership alone can trigger a retry.
+        max_records (int): Directory and hardlink record limit shared by scans and retries.
+    """
+
+    _deadline: float
+    _scratch: Path | None
+    _scratch_identity: tuple[int, ...] | None
+    _remaining: int
+    _rescans: int
+    _directories: dict[Path, os.stat_result]
+    _single_link_directories: set[Path]
+    _groups: dict[tuple[int, int], _LinkGroup]
+
+    _FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+    def __init__(
+        self,
+        deadline: float,
+        scratch: Path | None = None,
+        max_records: int = _MAX_ALIAS_RECORDS,
+    ) -> None:
+        self._deadline = deadline
+        self._scratch = scratch
+        self._scratch_identity = self._identity(scratch.lstat()) if scratch is not None else None
+        self._remaining = max_records
+        self._rescans = 0
+        self._directories = {}
+        self._single_link_directories = set()
+        self._groups = {}
+
+    @staticmethod
+    def _identity(details: os.stat_result) -> tuple[int, ...]:
+        """Pin scratch authority independently of directory membership."""
+        return details.st_dev, details.st_ino, details.st_uid, details.st_gid, details.st_mode
+
+    def _check_deadline(self) -> None:
+        """Bound both admitted traversal and metadata-only discovery."""
+        if time.monotonic() >= self._deadline:
+            raise TimeoutError("Alias inventory deadline expired.")
+
+    def _reserve_record(self) -> None:
+        """Bound retained evidence across all scans."""
+        self._remaining -= 1
+        if self._remaining < 0:
+            raise ValueError("Hardlink inventory metadata limit exceeded.")
+
+    def _record(
+        self,
+        path: Path,
+        details: os.stat_result,
+        parent: os.stat_result,
+        *,
+        visible: bool,
+    ) -> _LinkGroup:
+        """Record one physical entry against its inode's common evidence."""
+        self._reserve_record()
+        identity = details.st_dev, details.st_ino
+        group = self._groups.get(identity)
+        if group is None:
+            group = self._groups[identity] = _LinkGroup(details, {})
+        elif _inventory_state(group.details) != _inventory_state(details):
+            raise ValueError("Alias inventory entry changed.")
+        key = parent.st_dev, parent.st_ino, path.name
+        if key in group.entries:
+            raise ValueError("Alias inventory contains duplicate directory entries.")
+        group.entries[key] = path
+        group.visible += visible
+        return group
+
+    def scan(
+        self,
+        roots: tuple[Path, ...],
+        observe: Callable[[Path, Path, os.stat_result], None] | None = None,
+    ) -> None:
+        """Replace the current data view in one no-follow, depth-first walk.
+
+        Args:
+            roots (tuple[Path, ...]): Canonical admitted directories. Overlaps are traversed once.
+            observe (Callable[[Path, Path, os.stat_result], None] | None): Optional observer
+                receiving the traversal root, entry path and same no-follow stat used for proof.
+
+        Raises:
+            ValueError: A root or physical entry is unsafe, changed, or exceeds the record limit.
+            TimeoutError: The shared deadline expires.
+            OSError: A required directory or entry cannot be inspected.
+        """
+        selected = []
+        for root in sorted(set(roots), key=lambda path: (len(path.parts), str(path))):
+            if not root.is_absolute() or root.resolve(strict=True) != root:
+                raise ValueError("Alias inventory requires canonical absolute roots.")
+            if not any(root.is_relative_to(parent) for parent in selected):
+                selected.append(root)
+        self._directories.clear()
+        self._single_link_directories.clear()
+        self._groups.clear()
+
+        def visit(root, directory, descriptor):
+            """Walk pinned directories and share each admitted entry observation."""
+            before = os.fstat(descriptor)
+            if not os.path.samestat(before, directory.lstat()):
+                raise ValueError("Alias inventory directory changed.")
+            self._reserve_record()
+            self._directories[directory] = before
+            with os.scandir(descriptor) as entries:
+                for entry in entries:
+                    self._check_deadline()
+                    details = entry.stat(follow_symlinks=False)
+                    if observe is not None:
+                        observe(root, directory / entry.name, details)
+                    if stat.S_ISDIR(details.st_mode):
+                        child = os.open(entry.name, self._FLAGS, dir_fd=descriptor)
+                        try:
+                            if not os.path.samestat(os.fstat(child), details):
+                                raise ValueError("Alias inventory directory changed.")
+                            visit(root, directory / entry.name, child)
+                        finally:
+                            os.close(child)
+                    elif stat.S_ISREG(details.st_mode):
+                        if details.st_nlink > 1:
+                            if details.st_dev != before.st_dev or details.st_ino != entry.inode():
+                                raise ValueError(
+                                    "Alias inventory requires physical directory entries."
+                                )
+                            self._record(directory / entry.name, details, before, visible=True)
+                        else:
+                            self._single_link_directories.add(directory)
+
+        for root in selected:
+            self._check_deadline()
+            descriptor = os.open(root, self._FLAGS)
+            try:
+                visit(root, root, descriptor)
+            finally:
+                os.close(descriptor)
+
+    def search(
+        self,
+        sources: tuple[Path, ...],
+        denied_peer: Callable[[Path, os.stat_result], bool] | None = None,
+        *,
+        relevant: Callable[[Path], bool] | None = None,
+    ) -> None:
+        """Find missing names by metadata, keeping only matching entries and their ancestry.
+
+        Args:
+            sources (tuple[Path, ...]): Approved canonical source directories.
+            denied_peer (Callable[[Path, os.stat_result], bool] | None): Additional path
+                and mount exclusions using the pinned traversal metadata.
+            relevant (Callable[[Path], bool] | None): Select visible names that need a complete
+                group. Defaults to all visible names.
+
+        Raises:
+            ValueError: A source or matching entry changes, is ambiguous, or exceeds the record
+                limit.
+            TimeoutError: The shared deadline expires.
+            OSError: A required directory or matching entry cannot be inspected.
+        """
+        missing = {
+            identity
+            for identity, group in self._groups.items()
+            if len(group.entries) != group.details.st_nlink
+            and (relevant is None or any(relevant(path) for path in group.entries.values()))
+        }
+        seen = {(details.st_dev, details.st_ino) for details in self._directories.values()}
+
+        def visit(directory, descriptor, expected):
+            """Walk source directories through pinned parents with bounded live state."""
+            before = os.fstat(descriptor)
+            if _inventory_state(before) != _inventory_state(expected):
+                raise ValueError("Alias inventory directory changed.")
+            key = before.st_dev, before.st_ino
+            if key in seen:
+                return False
+            seen.add(key)
+            matched = False
+            with os.scandir(descriptor) as entries:
+                for entry in entries:
+                    self._check_deadline()
+                    identity = before.st_dev, entry.inode()
+                    candidate = identity in missing
+                    if not candidate and not entry.is_dir(follow_symlinks=False):
+                        continue
+                    path = directory / entry.name
+                    if entry.name.casefold() in _PRIVATE_READ_FOLDED or is_environment_value(
+                        entry.name
+                    ):
+                        continue
+                    details = entry.stat(follow_symlinks=False)
+                    if (details.st_dev, details.st_ino) != identity or (
+                        denied_peer is not None and denied_peer(path, details)
+                    ):
+                        continue
+                    if stat.S_ISDIR(details.st_mode):
+                        child = os.open(entry.name, self._FLAGS, dir_fd=descriptor)
+                        try:
+                            matched |= visit(path, child, details)
+                        finally:
+                            os.close(child)
+                    elif candidate:
+                        group = self._record(path, details, before, visible=False)
+                        matched = True
+                        if len(group.entries) == group.details.st_nlink:
+                            missing.remove(identity)
+                    if not missing:
+                        break
+            if matched:
+                self._reserve_record()
+                self._directories[directory] = before
+            else:
+                seen.remove(key)
+            return matched
+
+        for directory in sources:
+            if not missing:
+                break
+            self._check_deadline()
+            if not directory.is_absolute() or ".." in directory.parts:
+                raise ValueError("Alias inventory requires canonical absolute sources.")
+            if any(
+                part.casefold() in _PRIVATE_READ_FOLDED or is_environment_value(part)
+                for part in directory.parts
+            ):
+                continue
+            with _open_peer_directory(directory, self._FLAGS) as descriptor:
+                details = os.fstat(descriptor)
+                if denied_peer is None or not denied_peer(directory, details):
+                    visit(directory, descriptor, details)
+
+    def _has_new_links(self, directory: Path, before: os.stat_result) -> bool:
+        """Recheck ordinary files without retaining a snapshot of each file."""
+        descriptor = os.open(directory, self._FLAGS)
+        try:
+            if not os.path.samestat(before, os.fstat(descriptor)):
+                raise ValueError("Alias inventory directory changed.")
+            with os.scandir(descriptor) as entries:
+                for entry in entries:
+                    self._check_deadline()
+                    details = entry.stat(follow_symlinks=False)
+                    if details.st_nlink > 1 and stat.S_ISREG(details.st_mode):
+                        group = self._groups.get((details.st_dev, details.st_ino))
+                        key = before.st_dev, before.st_ino, entry.name
+                        if group is None or group.entries.get(key) != directory / entry.name:
+                            return True
+            return False
+        finally:
+            os.close(descriptor)
+
+    def verify(self) -> bool:
+        """Revalidate the evidence, allowing only a bounded scratch membership retry.
+
+        Returns:
+            bool: Whether this inventory is stable. False calls for a fresh scan and classification.
+
+        Raises:
+            ValueError: Directory or hardlink evidence changes outside the allowed scratch retry.
+            TimeoutError: The shared deadline expires.
+            OSError: A retained directory or linked entry cannot be inspected.
+        """
+        changed = False
+        for path, before in self._directories.items():
+            self._check_deadline()
+            after = path.lstat()
+            new_links = False
+            state = _inventory_state(before)
+            if path in self._single_link_directories and state == _inventory_state(after):
+                new_links = self._has_new_links(path, before)
+                after = path.lstat()
+            if path == self._scratch and (
+                self._identity(before) != self._scratch_identity
+                or self._identity(after) != self._scratch_identity
+            ):
+                raise ValueError("Alias inventory scratch identity changed.")
+            if state != _inventory_state(after):
+                if path != self._scratch or self._rescans == _MAX_SCRATCH_RESCANS:
+                    raise ValueError("Alias inventory entry changed.")
+                changed = True
+            elif new_links:
+                raise ValueError("Alias inventory entry changed.")
+        for group in self._groups.values():
+            state = _inventory_state(group.details)
+            for path in group.entries.values():
+                self._check_deadline()
+                if state != _inventory_state(path.lstat()):
+                    raise ValueError("Alias inventory entry changed.")
+        if self._scratch is not None and self._scratch not in self._directories:
+            raise ValueError("Alias inventory did not traverse the bound scratch directory.")
+        self._rescans += changed
+        return not changed
+
+    def groups(self) -> Iterator[tuple[Collection[Path], int, bool]]:
+        """Iterate sparse inode groups for the admission policy.
+
+        Yields:
+            tuple[Collection[Path], int, bool]: A view of observed names in order, the number
+                of leading names in the admitted view, and whether all names were accounted for.
+        """
+        for group in self._groups.values():
+            self._check_deadline()
+            yield (
+                group.entries.values(),
+                group.visible,
+                len(group.entries) == (group.details.st_nlink),
+            )
+
+
 def inspect_hardlink_aliases(
     roots: tuple[Path, ...],
     deadline: float,
     *,
-    max_entries: int = _MAX_ALIAS_ENTRIES,
-    unaccounted: set[Path] | None = None,
+    max_records: int = _MAX_ALIAS_RECORDS,
     scratch: Path | None = None,
-    hardlink_sources: tuple[Path, ...] = (),
-    denied_peer: Callable[[Path], bool] | None = None,
 ) -> dict[Path, tuple[Path, ...]]:
     """Account for regular-file links within a bounded, stable no-follow root inventory.
 
@@ -178,201 +507,29 @@ def inspect_hardlink_aliases(
     Args:
         roots (tuple[Path, ...]): Canonical directories constituting the permitted data view.
         deadline (float): Absolute monotonic time at which inspection must stop.
-        max_entries (int): Maximum total directory entries across all scans. Defaults to the
-            safety ceiling.
-        unaccounted (set[Path] | None): Collect all visible names of incomplete alias sets.
-            The caller must mask those names before access. Omitting this option refuses them.
-        scratch (Path | None): Bound private scratch directory. Concurrent changes to its
-            membership can restart the entire inventory within the original deadline and entry
-            limit. Other changes still refuse admission. Defaults to no resumable directory.
-        hardlink_sources (tuple[Path, ...]): Approved external directories to search for missing
-            names by metadata only. Their contents remain outside the permitted data view.
-        denied_peer (Callable[[Path], bool] | None): Additional policy denials and native mount
-            boundaries for external candidates. Built-in private names are always excluded.
+        max_records (int): Directory and hardlink record limit across scans and retries.
+        scratch (Path | None): Bound private scratch directory eligible for membership retries.
 
     Returns:
-        dict[Path, tuple[Path, ...]]: Every accounted multiply linked path mapped to all names,
-            including external peers. An external name confers no command access.
+        dict[Path, tuple[Path, ...]]: Each accounted multiply linked name mapped to its group.
 
     Raises:
-        ValueError: A root or entry changes, aliases are incomplete, or the bound is exhausted.
+        ValueError: Directory or hardlink evidence changes, aliases are incomplete, or the
+            record limit is exhausted.
         TimeoutError: The inspection deadline expires.
         OSError: A required directory or entry cannot be inspected without following a link.
     """
-    selected = []
-    for root in sorted(set(roots), key=lambda path: (len(path.parts), str(path))):
-        if not root.is_absolute() or root.resolve(strict=True) != root:
-            raise ValueError("Alias inventory requires canonical absolute roots.")
-        if not any(root.is_relative_to(parent) for parent in selected):
-            selected.append(root)
-
-    def directory_identity(details: os.stat_result) -> tuple[int, ...]:
-        """Pin the object, ownership and access mode independently of directory membership."""
-        return details.st_dev, details.st_ino, details.st_uid, details.st_gid, details.st_mode
-
-    scratch_identity = directory_identity(scratch.lstat()) if scratch is not None else None
-    remaining = max_entries
-    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-
-    def consume_entry():
-        """Share the original deadline and entry limit across every walk and retry."""
-        nonlocal remaining
-        if time.monotonic() >= deadline:
-            raise TimeoutError("Alias inventory deadline expired.")
-        remaining -= 1
-        if remaining < 0:
-            raise ValueError("Alias inventory entry bound exhausted.")
-
-    def record(path, details, parent):
-        """Count a physical directory entry once even when its parent has another spelling."""
-        regular[path] = details
-        if details.st_nlink > 1:
-            names = identities.setdefault((details.st_dev, details.st_ino), {})
-            key = parent.st_dev, parent.st_ino, path.name
-            if key in names:
-                raise ValueError("Alias inventory contains duplicate directory entries.")
-            names[key] = path
-
-    def inspect(directory, descriptor):
-        """Traverse pinned directories and retain membership and regular-file identities."""
-        before = os.fstat(descriptor)
-        current = directory.lstat()
-        if (before.st_dev, before.st_ino) != (current.st_dev, current.st_ino):
-            raise ValueError("Alias inventory directory changed.")
-        directories[directory] = before
-        with os.scandir(descriptor) as entries:
-            for entry in entries:
-                consume_entry()
-                path = directory / entry.name
-                details = entry.stat(follow_symlinks=False)
-                if stat.S_ISDIR(details.st_mode):
-                    child = os.open(entry.name, flags, dir_fd=descriptor)
-                    try:
-                        opened = os.fstat(child)
-                        if (opened.st_dev, opened.st_ino) != (details.st_dev, details.st_ino):
-                            raise ValueError("Alias inventory directory changed.")
-                        inspect(path, child)
-                    finally:
-                        os.close(child)
-                elif stat.S_ISREG(details.st_mode):
-                    if details.st_nlink > 1 and (
-                        details.st_dev != before.st_dev or details.st_ino != entry.inode()
-                    ):
-                        raise ValueError("Alias inventory requires physical directory entries.")
-                    record(path, details, before)
-
-    def find_peers():
-        """Visit approved source directories breadth first until every visible inode is complete."""
-        missing = {
-            identity
-            for identity, names in identities.items()
-            if len(names) != regular[next(iter(names.values()))].st_nlink
-        }
-        seen = {(details.st_dev, details.st_ino) for details in directories.values()}
-        pending = deque((path, None) for path in hardlink_sources)
-        while missing and pending:
-            if time.monotonic() >= deadline:
-                raise TimeoutError("Alias inventory deadline expired.")
-            directory, expected = pending.popleft()
-            if not directory.is_absolute() or ".." in directory.parts:
-                raise ValueError("Alias inventory requires canonical absolute sources.")
-            if any(
-                part.casefold() in _PRIVATE_READ_FOLDED or is_environment_value(part)
-                for part in directory.parts
-            ) or (denied_peer is not None and denied_peer(directory)):
-                continue
-            with _open_peer_directory(directory, flags) as descriptor:
-                before = os.fstat(descriptor)
-                if expected is not None and not os.path.samestat(expected, before):
-                    raise ValueError("Alias inventory directory changed.")
-                key = before.st_dev, before.st_ino
-                if key in seen:
-                    continue
-                seen.add(key)
-                directories[directory] = before
-                with os.scandir(descriptor) as entries:
-                    for entry in entries:
-                        consume_entry()
-                        path = directory / entry.name
-                        if (
-                            entry.name.casefold() in _PRIVATE_READ_FOLDED
-                            or is_environment_value(entry.name)
-                            or denied_peer is not None
-                            and denied_peer(path)
-                        ):
-                            continue
-                        details = entry.stat(follow_symlinks=False)
-                        if details.st_dev != before.st_dev or details.st_ino != entry.inode():
-                            continue
-                        if stat.S_ISDIR(details.st_mode):
-                            pending.append((path, details))
-                        elif (details.st_dev, details.st_ino) in missing:
-                            record(path, details, before)
-                            identity = details.st_dev, details.st_ino
-                            if len(identities[identity]) == details.st_nlink:
-                                missing.remove(identity)
-                                if not missing:
-                                    break
-
-    rescans = 0
+    inventory = HardlinkInventory(deadline, scratch, max_records)
     while True:
-        identities = {}
-        directories = {}
-        regular = {}
-        changed = False
-        for root in selected:
-            if time.monotonic() >= deadline:
-                raise TimeoutError("Alias inventory deadline expired.")
-            descriptor = os.open(root, flags)
-            try:
-                inspect(root, descriptor)
-            finally:
-                os.close(descriptor)
-        visible = set(regular) if unaccounted is not None and hardlink_sources else None
-        if hardlink_sources:
-            find_peers()
-        for path, before in (*directories.items(), *regular.items()):
-            if time.monotonic() >= deadline:
-                raise TimeoutError("Alias inventory deadline expired.")
-            after = path.lstat()
-            if path == scratch and (
-                directory_identity(before) != scratch_identity
-                or directory_identity(after) != scratch_identity
-            ):
-                raise ValueError("Alias inventory scratch identity changed.")
-            if (
-                before.st_dev,
-                before.st_ino,
-                before.st_mode,
-                before.st_nlink,
-                before.st_mtime_ns,
-                before.st_ctime_ns,
-            ) != (
-                after.st_dev,
-                after.st_ino,
-                after.st_mode,
-                after.st_nlink,
-                after.st_mtime_ns,
-                after.st_ctime_ns,
-            ):
-                if path != scratch or rescans == _MAX_SCRATCH_RESCANS:
-                    raise ValueError("Alias inventory entry changed.")
-                changed = True
-        if scratch is not None and scratch not in directories:
-            raise ValueError("Alias inventory did not traverse the bound scratch directory.")
-        if not changed:
+        inventory.scan(roots)
+        if inventory.verify():
             break
-        rescans += 1
     aliases = {}
-    for entries in identities.values():
-        paths = entries.values()
-        if any(regular[path].st_nlink != len(paths) for path in paths):
-            if unaccounted is None:
-                raise IncompleteHardlinkAliases()
-            unaccounted.update(paths if visible is None else visible.intersection(paths))
-        else:
-            names = tuple(sorted(paths))
-            aliases.update((path, names) for path in names)
+    for names, _, complete in inventory.groups():
+        if not complete:
+            raise IncompleteHardlinkAliases()
+        group = tuple(sorted(names))
+        aliases.update(dict.fromkeys(group, group))
     return aliases
 
 

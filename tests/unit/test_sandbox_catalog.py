@@ -42,7 +42,7 @@ def test_hardlink_sources_use_account_home_for_selected_native_options(tmp_path,
     monkeypatch.setattr(
         "loop.sandbox_catalog.pwd.getpwuid", lambda _: SimpleNamespace(pw_dir=str(tmp_path))
     )
-    assert hardlink_source_paths(("shared_dependencies",), "linux") == (tmp_path / ".cache",)
+    assert hardlink_source_paths(("shared_dependencies",), "linux") == (tmp_path,)
     assert not hardlink_source_paths(("shared_dependencies",), "darwin")
     assert not hardlink_source_paths((), "linux")
 

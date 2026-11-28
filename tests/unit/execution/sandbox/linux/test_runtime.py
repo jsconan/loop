@@ -462,7 +462,7 @@ def test_wire_negotiation_rejects_unsupported_requests_before_transport(
         source = source.replace(b'    "sandbox-exact-write-files-v1",\n', b"")
     if case == "hardlink-feature":
         envelope["request"]["hardlink_source_identities"] = [{"path": "/home/owner/.cache"}]
-        source = source.replace(b'    "hardlink-sources-v1",\n', b"")
+        source = source.replace(b'    "hardlink-sources-v2",\n', b"")
     if case == "hard-policy-feature":
         source = source.replace(b'    "native-hard-policy-v1",\n', b"")
     if case == "undeclared":

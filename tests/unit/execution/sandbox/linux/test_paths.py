@@ -2,7 +2,7 @@
 
 import errno
 import os
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -33,8 +33,6 @@ def bound(monkeypatch, tmp_path):
         "loop.execution.sandbox.contracts.tempfile.gettempdir", lambda: str(tmp_path)
     )
     monkeypatch.setattr("loop.execution.sandbox.linux.paths.time.monotonic", lambda: 0)
-    # Isolate mount preparation from the separately tested complete-link accountant.
-    monkeypatch.setattr(linux_paths, "inspect_hardlink_aliases", Mock(return_value={}))
     monkeypatch.setattr(linux_paths, "NATIVE_SCRATCH_PATH", _TEST_NATIVE_SCRATCH)
     monkeypatch.setattr(
         linux_paths,
@@ -127,7 +125,7 @@ def test_prepare_paths_records_read_only_hardlinks_for_granted_roots(bound, tmp_
     create, workspace, scratch = bound
     external = tmp_path / "external"
     external.mkdir()
-    outside = tmp_path / "outside"
+    outside = external / "outside"
     outside.write_text("original")
     root = external if read_only else workspace
     os.link(outside, root / "alias")
@@ -141,74 +139,88 @@ def test_prepare_paths_records_read_only_hardlinks_for_granted_roots(bound, tmp_
     "case,refusal",
     [
         ("approved", None),
-        ("public-cache", None),
+        ("public-storage", None),
         ("owner-only-traversal", None),
+        ("several-installations", None),
+        ("scoped-sources", None),
+        ("separate-home-filesystem", None),
         ("missing-revision", "Unapproved Linux hardlink source"),
-        ("wrong-cache", "Unapproved Linux hardlink source"),
-        ("shared-write-cache", "owner-controlled account cache"),
-        ("denied-cache", "owner-controlled account cache"),
-        ("writable-home", "unsafe account ancestry"),
+        ("wrong-account", "Unapproved Linux hardlink source"),
+        ("shared-write-home", "owner-controlled account directory"),
+        ("denied-home", "owner-controlled account directory"),
+        ("writable-parent", "unsafe account ancestry"),
         ("writable-peer", "names outside the verified scope"),
         ("denied-file", "names outside the verified scope"),
         ("protected-file", "names outside the verified scope"),
+        ("protected-storage", "names outside the verified scope"),
         ("third-name", "names outside the verified scope"),
-        ("cache-file-mount", "names outside the verified scope"),
+        ("peer-file-mount", "names outside the verified scope"),
         ("workspace-file-mount", "shared dependency has a mounted alias"),
-        ("mounted-cache", "source has a mounted alias"),
+        ("mounted-account-alias", "source has a mounted alias"),
         ("mounted-home-alias", "source has a mounted alias"),
         ("bad-mountinfo", "Ambiguous Linux hardlink source mount authority"),
         ("changed-mountinfo", "source mounts changed"),
     ],
 )
-def test_cache_witness_checks_native_policy_without_becoming_a_mount(
+def test_account_peers_check_native_policy_without_becoming_a_mount(
     bound, tmp_path, monkeypatch, case, refusal
 ):
     """A complete approved group supplies one immutable workspace entry; uncertain peers refuse."""
-    from loop.permissions.protection import inspect_hardlink_aliases
-
     create, workspace, scratch = bound
-    cache = tmp_path / ".cache"
-    cache.mkdir(mode=0o700)
-    source = cache / ("AGENTS.md" if case == "protected-file" else "package")
+    account = tmp_path / "account"
+    account.mkdir(mode=0o755)
+    storage = account / "storage"
+    storage.mkdir(mode=0o700)
+    source = storage / ("AGENTS.md" if case == "protected-file" else "package")
     source.write_text("dependency")
     source.chmod(0o644)
     alias = workspace / "dependency"
     alias.hardlink_to(source)
     if case == "third-name":
         (tmp_path / "other").hardlink_to(source)
-    if case in {"public-cache", "writable-peer"}:
-        cache.chmod(0o755)
-    if case == "shared-write-cache":
-        cache.chmod(0o770)
-    if case == "writable-home":
+    alternate = account / "other-installation"
+    if case in {"several-installations", "scoped-sources", "protected-storage"}:
+        alternate.mkdir(mode=0o755)
+        (alternate / "package").hardlink_to(source)
+    if case in {"public-storage", "writable-peer"}:
+        storage.chmod(0o755)
+    if case == "shared-write-home":
+        account.chmod(0o770)
+    if case == "writable-parent":
         tmp_path.chmod(0o770)
     if case in {"writable-peer", "owner-only-traversal"}:
         source.chmod(0o664)
-    denial = {"denied-cache": (cache,), "denied-file": (source,)}.get(case, ())
+    denial = {"denied-home": (account,), "denied-file": (source,)}.get(case, ())
     request = create(
-        hard_denied_paths=denial, permission_revision=None if case == "missing-revision" else 2
-    ).with_backend_options((), (cache,))
+        hard_denied_paths=denial,
+        protected_host_roots=(alternate,) if case == "protected-storage" else (),
+        permission_revision=None if case == "missing-revision" else 2,
+    ).with_backend_options((), (storage, alternate) if case == "scoped-sources" else (account,))
     mount = {
-        "cache-file-mount": source,
+        "peer-file-mount": source,
         "workspace-file-mount": alias,
-        "mounted-cache": cache,
+        "mounted-account-alias": account,
+        "separate-home-filesystem": account,
         "mounted-home-alias": tmp_path,
     }.get(case, Path("/"))
-    mount_root = "/subtree" if case == "mounted-home-alias" else "/"
+    mount_root = "/subtree" if case in {"mounted-home-alias", "mounted-account-alias"} else "/"
     fields = ["1", "0", "1:0", mount_root, str(mount), "rw", "-", "ext4", "device", "rw"]
     first = [[]] if case == "bad-mountinfo" else [fields]
     changed = [[*fields[:4], str(workspace / "late-mount"), *fields[5:]]]
     mountinfo = Mock(side_effect=[first, changed if case == "changed-mountinfo" else first])
     monkeypatch.setattr(linux_paths, "read_mountinfo", mountinfo)
-    monkeypatch.setattr(linux_paths, "inspect_hardlink_aliases", inspect_hardlink_aliases)
-    resolved = tmp_path / "another-cache" if case == "wrong-cache" else cache
+    resolved = tmp_path / "another-account" if case == "wrong-account" else account
     monkeypatch.setattr(linux_paths, "hardlink_source_paths", lambda *_: (resolved,))
     if refusal is None:
         assert prepare_paths(request, scratch) == ((), (), (), (alias,))
     else:
         with pytest.raises(ValueError, match=refusal):
             prepare_paths(request, scratch)
-    assert source.stat().st_nlink == (3 if case == "third-name" else 2)
+    assert source.stat().st_nlink == (
+        3
+        if case in {"several-installations", "scoped-sources", "protected-storage", "third-name"}
+        else 2
+    )
 
 
 @pytest.mark.parametrize("concealed", [False, True])
@@ -216,8 +228,6 @@ def test_cache_is_unused_when_all_visible_links_are_accounted_for(
     bound, tmp_path, monkeypatch, concealed
 ):
     """Ordinary and masked files work without inspecting an unrelated unsafe cache."""
-    from loop.permissions.protection import inspect_hardlink_aliases
-
     create, workspace, scratch = bound
     cache = tmp_path / ".cache"
     cache.mkdir()
@@ -234,7 +244,6 @@ def test_cache_is_unused_when_all_visible_links_are_accounted_for(
     mountinfo = Mock(side_effect=AssertionError("Unexpected cache inspection."))
     monkeypatch.setattr(linux_paths, "read_mountinfo", mountinfo)
     monkeypatch.setattr(linux_paths, "hardlink_source_paths", lambda *_: (cache,))
-    monkeypatch.setattr(linux_paths, "inspect_hardlink_aliases", inspect_hardlink_aliases)
 
     _, private, _, immutable = prepare_paths(request, scratch)
     assert (directory in private) is concealed
@@ -247,8 +256,6 @@ def test_runtime_duplicate_does_not_reclassify_system_hardlinks_as_data(
     bound, tmp_path, monkeypatch, authority
 ):
     """Only exact authenticated read-only runtime duplicates avoid the data alias census."""
-    from loop.permissions.protection import inspect_hardlink_aliases
-
     create, _, scratch = bound
     runtime = tmp_path / "runtime"
     runtime.mkdir()
@@ -257,7 +264,6 @@ def test_runtime_duplicate_does_not_reclassify_system_hardlinks_as_data(
     outside = tmp_path / "outside"
     outside.write_text("system-tool")
     (selected / "tool").hardlink_to(outside)
-    monkeypatch.setattr(linux_paths, "inspect_hardlink_aliases", inspect_hardlink_aliases)
     changes = {"read_roots": (selected,)}
     if authority == "write":
         changes["write_roots"] = (selected,)
@@ -400,7 +406,7 @@ def test_prepare_paths_enforces_the_deadline_at_every_scan_boundary(bound, monke
         return request.deadline if calls == expiry_call else 0
 
     monkeypatch.setattr("loop.execution.sandbox.linux.paths.time.monotonic", clock)
-    with pytest.raises(TimeoutError, match="exceeded the command deadline"):
+    with pytest.raises(TimeoutError, match="deadline expired|exceeded the command deadline"):
         prepare_paths(request, scratch)
 
 
@@ -451,12 +457,9 @@ def test_prepare_paths_rejects_directory_drift_and_closes_scan_descriptors(
         opened.add(descriptor)
         details = original_fstat(descriptor)
         if change == "descriptor" and calls == 2:
-            return SimpleNamespace(
-                st_dev=details.st_dev,
-                st_ino=details.st_ino + 1,
-                st_mtime_ns=details.st_mtime_ns,
-                st_ctime_ns=details.st_ctime_ns,
-            )
+            values = list(details)
+            values[1] += 1
+            return os.stat_result(values)
         return details
 
     root_calls = 0
@@ -467,7 +470,7 @@ def test_prepare_paths_rejects_directory_drift_and_closes_scan_descriptors(
         details = original_lstat(path, *args, **kwargs)
         if path == workspace and opened:
             root_calls += 1
-            selected = 1 if change == "pathname" else 2
+            selected = 1 if change == "pathname" else 3
             if change != "descriptor" and root_calls == selected:
                 workspace.rename(workspace.with_name("old-workspace"))
                 workspace.mkdir()
@@ -482,7 +485,11 @@ def test_prepare_paths_rejects_directory_drift_and_closes_scan_descriptors(
     monkeypatch.setattr("loop.execution.sandbox.linux.paths.os.fstat", fstat)
     monkeypatch.setattr("loop.execution.sandbox.linux.paths.os.close", close)
     monkeypatch.setattr(Path, "lstat", lstat)
-    diagnostic = "path root changed" if change == "root" else "scanned directory changed"
+    diagnostic = {
+        "root": "path root changed",
+        "descriptor": "Alias inventory directory changed",
+        "pathname": "Alias inventory directory changed",
+    }[change]
     with pytest.raises(ValueError, match=diagnostic):
         prepare_paths(request, scratch)
     assert opened == closed
@@ -509,8 +516,33 @@ def test_prepare_paths_rechecks_earlier_directories_after_the_complete_walk(boun
         return original(path, *args, **kwargs)
 
     monkeypatch.setattr(Path, "lstat", lstat)
-    with pytest.raises(ValueError, match="scanned directory changed"):
+    with pytest.raises(ValueError, match="Alias inventory entry changed"):
         prepare_paths(request, scratch)
+
+
+def test_prepare_paths_classifies_scratch_again_after_live_membership_change(bound, monkeypatch):
+    """A permitted scratch retry also refreshes its protected and private classification."""
+    create, _, scratch = bound
+    directory = scratch.stat()
+    original = os.scandir
+    first = True
+
+    @contextmanager
+    def scandir(descriptor):
+        """Publish a new scratch policy entry just after its initial scan."""
+        nonlocal first
+        with original(descriptor) as entries:
+            yield entries
+        if (
+            isinstance(descriptor, int)
+            and os.path.samestat(os.fstat(descriptor), directory)
+            and first
+        ):
+            first = False
+            (scratch / ".aws").mkdir()
+
+    monkeypatch.setattr(os, "scandir", scandir)
+    assert prepare_paths(create(), scratch) == ((), (scratch / ".aws",), (scratch / ".aws",), ())
 
 
 @pytest.fixture
@@ -731,7 +763,7 @@ def test_bind_paths_enforces_deadline_during_binding_and_before_yield(binding, m
         """Expire after path scanning at a selected binding boundary."""
         nonlocal calls
         calls += 1
-        return request.deadline if calls == {"source": 9, "recheck": 10, "yield": 12}[phase] else 0
+        return request.deadline if calls == {"source": 10, "recheck": 11, "yield": 13}[phase] else 0
 
     monkeypatch.setattr("loop.execution.sandbox.linux.paths.time.monotonic", clock)
     with (
@@ -806,7 +838,9 @@ def test_conventional_temporary_mount_rejects_existing_hardlinks(binding, monkey
     monkeypatch.setattr(linux_paths, "NATIVE_CONVENTIONAL_TMP_PATH", destination)
     subtree = scratch / linux_paths.SESSION_CONVENTIONAL_TMP_NAME
     subtree.mkdir(mode=0o700)
-    outside = tmp_path / "outside"
+    peers = tmp_path / "peers"
+    peers.mkdir()
+    outside = peers / "outside"
     outside.write_text("outside-data")
     os.link(outside, subtree / "link")
     request = create(scratch_root=scratch, scratch_data=True)
@@ -998,11 +1032,13 @@ def test_conventional_temporary_subtree_refuses_unsafe_existing_authority(
 def test_mount_arguments_binds_hardlinks_read_only_after_writable_roots(binding, tmp_path):
     """A hardlinked leaf is readable but read-only inside an otherwise writable workspace."""
     create, workspace, scratch, _ = binding
-    outside = tmp_path / "outside"
+    peers = tmp_path / "peers"
+    peers.mkdir()
+    outside = peers / "outside"
     outside.write_text("outside-data")
     alias = workspace / "alias"
     os.link(outside, alias)
-    request = create()
+    request = create(read_roots=(peers,))
     with mount_arguments(request, scratch) as (arguments, inherited, _):
         workspace_index = arguments.index(str(workspace))
         alias_index = arguments.index(str(alias))
@@ -1018,19 +1054,21 @@ def test_mount_arguments_binds_hardlinks_read_only_after_writable_roots(binding,
 def test_large_hardlink_sets_use_containing_directory_mounts(binding, tmp_path, monkeypatch):
     """Group dense hardlink sets to stay within Bubblewrap's argument limit."""
     create, workspace, scratch, _ = binding
+    peers = tmp_path / "peers"
+    peers.mkdir()
     monkeypatch.setattr("loop.execution.sandbox.linux.paths._MAX_HARDLINK_MOUNTS", 2)
     package = workspace / ".venv/site-packages/package"
     package.mkdir(parents=True)
     for index in range(3):
-        outside = tmp_path / f"outside-{index}"
+        outside = peers / f"outside-{index}"
         outside.write_text(f"module-{index}")
         os.link(outside, package / f"module-{index}.py")
     nested = package / "data"
     nested.mkdir()
-    outside = tmp_path / "outside-nested"
+    outside = peers / "outside-nested"
     outside.write_text("nested-module")
     os.link(outside, nested / "module.py")
-    request = create()
+    request = create(read_roots=(peers,))
     with mount_arguments(request, scratch) as (arguments, inherited, _):
         workspace_index = arguments.index(str(workspace))
         package_index = arguments.index(str(package))
@@ -1043,31 +1081,35 @@ def test_large_hardlink_sets_use_containing_directory_mounts(binding, tmp_path, 
 def test_large_hardlink_sets_group_at_a_shared_ancestor_when_needed(bound, tmp_path, monkeypatch):
     """Escalate grouping only enough to keep scattered hardlink mounts within their bound."""
     create, workspace, scratch = bound
+    peers = tmp_path / "peers"
+    peers.mkdir()
     monkeypatch.setattr("loop.execution.sandbox.linux.paths._MAX_HARDLINK_MOUNTS", 2)
     site_packages = workspace / ".venv/site-packages"
     for index in range(3):
         package = site_packages / f"package-{index}"
         package.mkdir(parents=True)
-        outside = tmp_path / f"outside-{index}"
+        outside = peers / f"outside-{index}"
         outside.write_text(f"module-{index}")
         os.link(outside, package / "module.py")
-    assert prepare_paths(create(), scratch)[3] == (site_packages,)
+    assert prepare_paths(create(read_roots=(peers,)), scratch)[3] == (site_packages,)
 
 
 def test_scattered_hardlink_grouping_stops_when_its_deadline_expires(bound, tmp_path, monkeypatch):
     """Expiry while classifying scattered links cannot return late mount authority."""
     create, workspace, scratch = bound
+    peers = tmp_path / "peers"
+    peers.mkdir()
     monkeypatch.setattr("loop.execution.sandbox.linux.paths._MAX_HARDLINK_MOUNTS", 2)
     links = set()
     for index in range(3):
         directory = workspace / "group" / str(index)
         directory.mkdir(parents=True)
-        outside = tmp_path / f"outside-{index}"
+        outside = peers / f"outside-{index}"
         outside.write_text("canary")
         link = directory / "linked"
         os.link(outside, link)
         links.add(link)
-    request = create()
+    request = create(read_roots=(peers,))
     clock = {"now": 0}
     original = Path.is_relative_to
 
@@ -1080,13 +1122,15 @@ def test_scattered_hardlink_grouping_stops_when_its_deadline_expires(bound, tmp_
 
     monkeypatch.setattr(Path, "is_relative_to", relative)
     monkeypatch.setattr("loop.execution.sandbox.linux.paths.time.monotonic", lambda: clock["now"])
-    with pytest.raises(TimeoutError, match="exceeded the command deadline"):
+    with pytest.raises(TimeoutError, match="deadline expired|exceeded the command deadline"):
         prepare_paths(request, scratch)
 
 
 def test_hardlink_grouping_preserves_nested_writable_roots(bound, tmp_path, monkeypatch):
     """A group containing another write root cannot silently make that root read-only."""
     create, workspace, scratch = bound
+    peers = tmp_path / "peers"
+    peers.mkdir()
     monkeypatch.setattr("loop.execution.sandbox.linux.paths._MAX_HARDLINK_MOUNTS", 2)
     group = workspace / "group"
     nested = group / "writable"
@@ -1094,10 +1138,10 @@ def test_hardlink_grouping_preserves_nested_writable_roots(bound, tmp_path, monk
     for index in range(3):
         directory = group / str(index)
         directory.mkdir()
-        outside = tmp_path / f"outside-{index}"
+        outside = peers / f"outside-{index}"
         outside.write_text("canary")
         os.link(outside, directory / "linked")
-    value = create(write_roots=(workspace, nested), read_roots=(group,))
+    value = create(write_roots=(workspace, nested), read_roots=(group, peers))
     with pytest.raises(ValueError, match="exceed the bounded mount limit"):
         prepare_paths(value, scratch)
 
@@ -1105,30 +1149,38 @@ def test_hardlink_grouping_preserves_nested_writable_roots(bound, tmp_path, monk
 def test_hardlink_grouping_updates_disjoint_ancestor_membership(bound, tmp_path, monkeypatch):
     """Several narrow groups meet the cap without making their shared parent read-only."""
     create, workspace, scratch = bound
+    peers = tmp_path / "peers"
+    peers.mkdir()
     monkeypatch.setattr("loop.execution.sandbox.linux.paths._MAX_HARDLINK_MOUNTS", 3)
     leaves = []
     for group, size in (("a", 2), ("b", 2), ("c", 1)):
         for index in range(size):
             directory = workspace / group / str(index)
             directory.mkdir(parents=True)
-            outside = tmp_path / f"outside-{group}-{index}"
+            outside = peers / f"outside-{group}-{index}"
             outside.write_text("canary")
             leaf = directory / "linked"
             os.link(outside, leaf)
             leaves.append(leaf)
-    assert prepare_paths(create(), scratch)[3] == (workspace / "a", workspace / "b", leaves[-1])
+    assert prepare_paths(create(read_roots=(peers,)), scratch)[3] == (
+        workspace / "a",
+        workspace / "b",
+        leaves[-1],
+    )
 
 
 def test_large_root_hardlink_sets_fail_before_exceeding_mount_limit(bound, tmp_path, monkeypatch):
     """Root-level aliases cannot force the trusted helper beyond its bounded mount count."""
     create, workspace, scratch = bound
+    peers = tmp_path / "peers"
+    peers.mkdir()
     monkeypatch.setattr("loop.execution.sandbox.linux.paths._MAX_HARDLINK_MOUNTS", 2)
     for index in range(3):
-        outside = tmp_path / f"outside-{index}"
+        outside = peers / f"outside-{index}"
         outside.write_text(f"module-{index}")
         os.link(outside, workspace / f"alias-{index}")
     with pytest.raises(ValueError, match="exceed the bounded mount limit"):
-        prepare_paths(create(), scratch)
+        prepare_paths(create(read_roots=(peers,)), scratch)
 
 
 def test_mount_arguments_preserves_nested_write_grants_inside_readonly_workspace(binding):
@@ -1301,7 +1353,9 @@ def test_mount_arguments_keeps_selected_workspace_read_only_in_scratch_mirror(bi
 def test_mount_arguments_mirrors_scratch_hardlinks_and_private_masks(binding, tmp_path):
     """The stable scratch view retains read-only linked leaves and masked private entries."""
     create, _, scratch, _ = binding
-    outside = tmp_path / "outside"
+    peers = tmp_path / "peers"
+    peers.mkdir()
+    outside = peers / "outside"
     outside.write_text("preserve")
     os.link(outside, scratch / "linked")
     (scratch / ".ssh").mkdir()
@@ -1310,7 +1364,11 @@ def test_mount_arguments_mirrors_scratch_hardlinks_and_private_masks(binding, tm
     mask.write_bytes(b"")
     with (
         mask.open("rb") as empty,
-        mount_arguments(create(), scratch, empty_mask=empty.fileno()) as (arguments, inherited, _),
+        mount_arguments(create(read_roots=(peers,)), scratch, empty_mask=empty.fileno()) as (
+            arguments,
+            inherited,
+            _,
+        ),
     ):
         for name in ("linked", ".aws"):
             path = _TEST_NATIVE_SCRATCH / name
@@ -1596,14 +1654,25 @@ def test_prepare_paths_refuses_environment_value_root(bound, tmp_path):
         prepare_paths(create(read_roots=(values,)), scratch)
 
 
-def test_prepare_paths_uses_complete_alias_accounting_before_mounts(bound, monkeypatch):
-    """Mount preparation invokes the shared inventory and refuses its uncertain view."""
+def test_prepare_paths_checks_alias_authority_in_one_overlapping_walk(bound, monkeypatch):
+    """An inner read grant does not repeat classification or bypass the outer protection."""
     create, workspace, scratch = bound
-    census = Mock(side_effect=ValueError("Incomplete hardlink aliases"))
-    monkeypatch.setattr(linux_paths, "inspect_hardlink_aliases", census)
-    with pytest.raises(ValueError, match="Incomplete hardlink aliases"):
-        prepare_paths(create(), scratch)
-    census.assert_called_once_with((workspace, scratch), 1000, unaccounted=set(), scratch=scratch)
+    inner = workspace / "nested"
+    inner.mkdir()
+    instruction = inner / "AGENTS.md"
+    instruction.write_text("instructions")
+    request = create(read_roots=(inner,))
+    check = SandboxRequest.denies_path
+    classified = []
+
+    def denies_path(value, path):
+        """Record policy classification of each physical filesystem entry."""
+        classified.append(path)
+        return check(value, path)
+
+    monkeypatch.setattr(SandboxRequest, "denies_path", denies_path)
+    assert prepare_paths(request, scratch) == ((instruction,), (), (inner,), ())
+    assert classified.count(instruction) == 1
 
 
 @pytest.mark.parametrize(
@@ -1624,8 +1693,6 @@ def test_prepare_paths_hides_links_only_inside_denied_directories(
     bound, tmp_path, monkeypatch, required
 ):
     """Unaccounted links stay refused unless a native directory mask already conceals them."""
-    from loop.permissions.protection import inspect_hardlink_aliases
-
     create, workspace, scratch = bound
     environment = workspace / "tools" / "retired"
     packages = environment / "packages"
@@ -1637,7 +1704,6 @@ def test_prepare_paths_hides_links_only_inside_denied_directories(
     (packages / ".env").write_text("private")
     if required == "unused":
         (environment / "legacy-tool").symlink_to(cached)
-    monkeypatch.setattr(linux_paths, "inspect_hardlink_aliases", inspect_hardlink_aliases)
     changes = {
         "write_roots": (workspace,),
         "hard_denied_paths": () if required == "visible" else (environment,),

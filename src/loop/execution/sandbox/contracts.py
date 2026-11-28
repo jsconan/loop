@@ -74,7 +74,7 @@ NATIVE_REQUEST_FEATURES = (
     "protected-host-scratch-v1",
     "attempt-ingress-v1",
     "sandbox-exact-write-files-v1",
-    "hardlink-sources-v1",
+    "hardlink-sources-v2",
 )
 NATIVE_RESULT_SCHEMAS = (1,)
 # The client may decode more result schemas than this retained receiver can emit.

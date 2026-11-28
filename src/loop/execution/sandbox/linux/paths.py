@@ -13,8 +13,9 @@ import fcntl
 import os
 import stat
 import time
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import ExitStack, contextmanager
+from itertools import islice
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -22,12 +23,12 @@ from .... import constants
 from ....constants import GIT_DIRECTORY
 from ....permissions.protection import (
     PRIVATE_READ_COMPONENTS,
+    HardlinkInventory,
     IncompleteHardlinkAliases,
-    inspect_hardlink_aliases,
     is_environment_value,
     is_protected_external_read,
 )
-from ....sandbox_catalog import hardlink_source_paths
+from ....sandbox_catalog import hardlink_source_paths, hardlink_sources_within_roots
 from ..constants import TMPDIR_ENVIRONMENT_VARIABLE
 from .constants import (
     NATIVE_ALIAS_PATH,
@@ -49,11 +50,6 @@ def _check_deadline(deadline: float) -> None:
     """Refuse continued preparation after the bound command deadline."""
     if time.monotonic() >= deadline:
         raise TimeoutError("Linux path preparation exceeded the command deadline.")
-
-
-def _directory_state(details: os.stat_result) -> tuple[int, int, int, int]:
-    """Bind a scanned directory to its inode and membership-change timestamps."""
-    return details.st_dev, details.st_ino, details.st_mtime_ns, details.st_ctime_ns
 
 
 def payload_path(path: Path, scratch: Path) -> Path:
@@ -155,7 +151,7 @@ def _conventional_tmp_source(
 
 
 def _hardlink_mount_sources(
-    hardlinked: dict[Path, tuple[int, int]],
+    hardlinked: tuple[Path, ...],
     writable_roots: tuple[Path, ...],
     deadline: float,
 ) -> tuple[Path, ...]:
@@ -217,12 +213,8 @@ def _hardlink_mount_sources(
     return tuple(sorted(minimal))
 
 
-def _scan(
-    root: Path,
-    request: SandboxRequest,
-    inspected: dict[Path, os.stat_result],
-) -> tuple[set[Path], set[Path], dict[Path, tuple[int, int]], set[tuple[int, int]]]:
-    """Collect protected, private and hardlinked entries while checking directory stability."""
+def _validate_root(root: Path, request: SandboxRequest) -> os.stat_result:
+    """Validate each explicit scope, including roots covered by the shared walk."""
     original = root.lstat()
     if not stat.S_ISDIR(original.st_mode) or root.resolve(strict=True) != root:
         raise ValueError("Linux path root is not a real directory.")
@@ -238,102 +230,148 @@ def _scan(
         ).parts
     ):
         raise ValueError("Linux path root includes environment values.")
+    return original
+
+
+def _inspect_data_view(
+    request: SandboxRequest,
+    roots: tuple[Path, ...],
+    scratch: Path,
+) -> tuple[set[Path], dict[Path, bool], set[Path], tuple[Path, ...]]:
+    """Classify entries in the alias walk and retain only mounts and relevant link evidence."""
     protection = request.protected_paths
+    protected_names = frozenset((*protection.instruction_names, *protection.files))
     git_granted = request.git_create or request.workspace / GIT_DIRECTORY in request.write_roots
-    protected, private, hardlinked, sensitive_inodes = set(), set(), {}, set()
-    pending = [(root, False, False)]
-    while pending:
-        _check_deadline(request.deadline)
-        current, protected_parent, private_parent = pending.pop()
-        descriptor = os.open(current, _DIRECTORY_FLAGS)
-        try:
-            before = os.fstat(descriptor)
-            inspected.setdefault(current, before)
-            with os.scandir(descriptor) as entries:
-                for entry in entries:
-                    _check_deadline(request.deadline)
-                    details = entry.stat(follow_symlinks=False)
-                    path = current / entry.name
-                    relative = path.relative_to(root)
-                    if git_granted and relative.parts[0] == GIT_DIRECTORY.as_posix():
-                        relative = Path(*relative.parts[1:])
-                    is_protected = (
-                        protected_parent
-                        or root == request.workspace
-                        and (
-                            protection.protects_directory(relative)
-                            or entry.name in (*protection.instruction_names, *protection.files)
-                        )
-                    )
-                    is_private = (
-                        private_parent
-                        or request.denies_path(path)
-                        or (
-                            not (request.scratch_data and root == request.scratch_root)
-                            and (
-                                entry.name.casefold() in _PRIVATE_NAMES
-                                or is_environment_value(entry.name)
-                            )
-                        )
-                    )
-                    inode = (details.st_dev, details.st_ino)
-                    if stat.S_ISREG(details.st_mode) and (is_protected or is_private):
-                        sensitive_inodes.add(inode)
-                    if stat.S_ISREG(details.st_mode) and details.st_nlink > 1:
-                        if request.scratch_data and root == request.scratch_root:
-                            raise ValueError("Session scratch contains a shared inode.")
-                        hardlinked[path] = inode
-                    if (
-                        (is_protected or is_private)
-                        and stat.S_ISLNK(details.st_mode)
-                        and not (private_parent and request.denies_path(current))
-                    ):
-                        raise ValueError("Linux protected or private entry is a symlink.")
-                    if is_protected and not protected_parent:
-                        protected.add(path)
-                    if is_private and not private_parent:
-                        if not (stat.S_ISDIR(details.st_mode) or stat.S_ISREG(details.st_mode)):
-                            raise ValueError("Linux private entry has an unsafe type.")
-                        private.add(path)
-                    if stat.S_ISDIR(details.st_mode):
-                        pending.append((path, is_protected, is_private))
-            for latest in (os.fstat(descriptor), current.lstat()):
-                if _directory_state(before) != _directory_state(latest):
-                    raise ValueError("Linux scanned directory changed.")
-        finally:
-            os.close(descriptor)
-    latest = root.lstat()
-    if (original.st_dev, original.st_ino) != (latest.st_dev, latest.st_ino):
-        raise ValueError("Linux path root changed during preparation.")
-    return protected, private, hardlinked, sensitive_inodes
+    scratch_data_root = request.scratch_root if request.scratch_data else None
+    root_set = set(roots)
+    inventory = HardlinkInventory(request.deadline, scratch)
+    protected: set[Path] = set()
+    private: dict[Path, bool] = {}
+    anchors: set[Path] = set()
+    sensitive: set[Path] = set()
+    stack: list[tuple[Path, list[tuple[Path, bool, bool]]]] = []
+
+    def observe(walk_root: Path, path: Path, details: os.stat_result) -> None:
+        """Apply all active grant scopes to this one physical entry observation."""
+        parent = path.parent
+        while stack and stack[-1][0] != parent:
+            stack.pop()
+        scopes = stack[-1][1] if stack else [(walk_root, False, False)]
+        children = []
+        directory = stat.S_ISDIR(details.st_mode)
+        regular = stat.S_ISREG(details.st_mode)
+        shared = regular and details.st_nlink > 1
+        if shared and scratch_data_root is not None and path.is_relative_to(scratch_data_root):
+            raise ValueError("Session scratch contains a shared inode.")
+        denied = request.denies_path(path)
+        private_name = path.name.casefold() in _PRIVATE_NAMES or is_environment_value(path.name)
+        for root, protected_parent, private_parent in scopes:
+            is_protected = protected_parent
+            if not is_protected and root == request.workspace:
+                relative = path.relative_to(root)
+                if git_granted and relative.parts[0] == GIT_DIRECTORY.as_posix():
+                    relative = Path(*relative.parts[1:])
+                is_protected = path.name in protected_names or protection.protects_directory(
+                    relative
+                )
+            is_private = private_parent or denied or (root != scratch_data_root and private_name)
+            if is_protected or is_private:
+                if stat.S_ISLNK(details.st_mode) and not (
+                    private_parent and request.denies_path(parent)
+                ):
+                    raise ValueError("Linux protected or private entry is a symlink.")
+                if shared:
+                    sensitive.add(path)
+            new_protected = is_protected and not protected_parent
+            new_private = is_private and not private_parent
+            if new_protected:
+                protected.add(path)
+            if new_private:
+                if not (directory or regular):
+                    raise ValueError("Linux private entry has an unsafe type.")
+                private[path] = directory
+            if new_protected or new_private:
+                anchor = path if directory else parent
+                while anchor != root:
+                    anchors.add(anchor)
+                    anchor = anchor.parent
+            if directory:
+                children.append((root, is_protected, is_private))
+        if directory:
+            if path in root_set:
+                children.append((path, False, False))
+            stack.append((path, children))
+
+    def concealed(path: Path) -> bool:
+        """Check whether a private directory mask hides a name."""
+        return any(private.get(parent, False) for parent in path.parents)
+
+    def visible(path: Path) -> bool:
+        """Check whether missing peer evidence is needed for this name."""
+        return not concealed(path)
+
+    while True:
+        inventory.scan(roots, observe)
+        if request.hardlink_sources and any(
+            not complete and any(visible(path) for path in names)
+            for names, _, complete in inventory.groups()
+        ):
+            _inspect_external_aliases(request, roots, inventory, visible)
+        if inventory.verify():
+            break
+        protected.clear()
+        private.clear()
+        anchors.clear()
+        sensitive.clear()
+        stack.clear()
+
+    writable_roots = (*request.write_roots, scratch)
+    hardlinked = []
+    for names, count, complete in inventory.groups():
+        exposed = tuple(path for path in islice(names, count) if visible(path))
+        if not exposed:
+            continue
+        if not complete:
+            raise IncompleteHardlinkAliases(
+                "Some links have names outside the verified scope or in protected data."
+            )
+        if any(path in sensitive for path in names):
+            raise ValueError("Linux hardlinked file aliases protected or private data.")
+        hardlinked.extend(
+            path for path in exposed if any(path.is_relative_to(root) for root in writable_roots)
+        )
+    return protected, private, anchors, tuple(sorted(hardlinked))
 
 
-def _hardlink_mounts(roots: tuple[Path, ...], source: Path) -> frozenset[tuple[str, ...]]:
-    """Identify nested mounts and refuse a cache rooted at a mount or aliased subtree."""
+def _hardlink_mounts(
+    roots: tuple[Path, ...],
+    sources: tuple[Path, ...],
+) -> frozenset[tuple[str, ...]]:
+    """Track mount boundaries and refuse a metadata source on an aliased subtree."""
     mounts = set()
     for fields in read_mountinfo():
         if len(fields) < MINIMUM_MOUNTINFO_FIELDS or "-" not in fields:
             raise ValueError("Ambiguous Linux hardlink source mount authority.")
         mount = Path(fields[4])
-        if mount == source or (
-            mount != Path("/") and source.is_relative_to(mount) and fields[3] != "/"
+        if (
+            mount != Path("/")
+            and fields[3] != "/"
+            and any(source.is_relative_to(mount) for source in sources)
         ):
             raise ValueError("Linux hardlink source has a mounted alias.")
-        if any(mount.is_relative_to(root) for root in (*roots, source)):
+        if any(mount.is_relative_to(root) for root in (*roots, *sources)):
             mounts.add(tuple(fields))
     return frozenset(mounts)
 
 
-def _inspect_cache_aliases(
+def _inspect_external_aliases(
     request: SandboxRequest,
     roots: tuple[Path, ...],
-    scratch: Path,
-    unaccounted: set[Path],
+    inventory: HardlinkInventory,
+    relevant: Callable[[Path], bool],
 ) -> None:
-    """Verify unresolved visible links against the owner-bound cache metadata."""
+    """Verify unresolved visible links against the approved account metadata scope."""
     sources = request.hardlink_sources
-    (source,) = sources
-    details = source.lstat()
     uid = os.getuid()
 
     def controlled(details: os.stat_result) -> bool:
@@ -342,59 +380,49 @@ def _inspect_cache_aliases(
             details.st_mode & constants.GROUP_AND_OTHER_WRITE_MODE_MASK
         )
 
-    if (
-        source.resolve(strict=True) != source
-        or not stat.S_ISDIR(details.st_mode)
-        or details.st_uid != uid
-        or not controlled(details)
-        or source.parent.lstat().st_uid != uid
-        or request.denies_path(source)
-    ):
-        raise ValueError("Linux hardlink source is not an owner-controlled account cache.")
-    for directory in source.parents:
-        parent = directory.lstat()
-        if not controlled(parent) and not (
-            directory != source.parent and parent.st_uid == 0 and parent.st_mode & stat.S_ISVTX
-        ):
-            raise ValueError("Linux hardlink source has unsafe account ancestry.")
-    mounts = _hardlink_mounts(roots, source)
-    mounted = {Path(fields[4]) for fields in mounts}
-    protection = request.protected_paths
-    owner_only = set()
-
-    def denied_peer(path: Path) -> bool:
-        """Apply policy and stop at native mount boundaries, including mounted files."""
+    for source in sources:
+        details = source.lstat()
         if (
-            path in mounted
-            or request.denies_path(path)
-            or protection.protects_write_file(path.relative_to(source))
+            source.resolve(strict=True) != source
+            or not stat.S_ISDIR(details.st_mode)
+            or details.st_uid != uid
+            or not controlled(details)
+            or request.denies_path(source)
         ):
+            raise ValueError("Linux hardlink source is not an owner-controlled account directory.")
+        for directory in source.parents:
+            parent = directory.lstat()
+            if not controlled(parent) and not (
+                parent.st_uid == 0 and parent.st_mode & stat.S_ISVTX
+            ):
+                raise ValueError("Linux hardlink source has unsafe account ancestry.")
+    mounts = _hardlink_mounts(roots, sources)
+    mounted = {Path(fields[4]) for fields in mounts} - set(sources)
+    protection = request.protected_paths
+    owner_only = []
+
+    def denied_peer(path: Path, details: os.stat_result) -> bool:
+        """Apply policy and stop at native mount boundaries, including mounted files."""
+        # Source discovery is depth-first, so only active owner-only ancestors are needed.
+        while owner_only and owner_only[-1] not in path.parents:
+            owner_only.pop()
+        if path in mounted or request.denies_path(path) or protection.protects_write_file(path):
             return True
-        details = path.lstat()
-        if details.st_uid not in (0, uid) or (
-            not owner_only.intersection(path.parents) and not controlled(details)
-        ):
+        if details.st_uid not in (0, uid) or (not owner_only and not controlled(details)):
             return True
         if stat.S_ISDIR(details.st_mode) and not details.st_mode & (stat.S_IXGRP | stat.S_IXOTH):
-            owner_only.add(path)
+            owner_only.append(path)
         return False
 
-    aliases = inspect_hardlink_aliases(
-        roots,
-        request.deadline,
-        unaccounted=unaccounted,
-        scratch=scratch,
-        hardlink_sources=sources,
-        denied_peer=denied_peer,
-    )
-    for path, group in aliases.items():
+    inventory.search(sources, denied_peer, relevant=relevant)
+    for names, visible, complete in inventory.groups():
         if (
-            path.is_relative_to(source)
-            and not any(path.is_relative_to(root) for root in roots)
-            and any(name.is_relative_to(mount) for name in group for mount in mounted)
+            complete
+            and visible < len(names)
+            and any(name.is_relative_to(mount) for name in names for mount in mounted)
         ):
             raise ValueError("Linux shared dependency has a mounted alias.")
-    if _hardlink_mounts(roots, source) != mounts:
+    if _hardlink_mounts(roots, sources) != mounts:
         raise ValueError("Linux hardlink source mounts changed.")
 
 
@@ -408,11 +436,9 @@ def prepare_paths(
 
     Scan the workspace, scratch and additional read/write roots, including protected subtrees.
     Collect multiply linked regular files for read-only bind mounts, preserving reads and
-    execution while preventing writes through those paths. Small sets use individual file mounts;
-    larger sets use containing directories to stay below Bubblewrap's argument ceiling, which also
-    makes other files in those directories read-only. Refuse visible hardlinks that alias a
+    execution while preventing writes through those paths. Refuse visible hardlinks that alias a
     protected or private file or whose alias set is incomplete. If a visible group is incomplete,
-    the authorized account cache may supply missing names without becoming a mount. Conceal
+    the authorized account home may supply missing names without becoming a mount. Conceal
     hardlinks already under private directory masks without denying an unrelated command. Skip
     ordinary symlinks while rejecting symlinks within protected/private entries. Return ancestor
     directories for self-bind mountpoints so
@@ -431,14 +457,15 @@ def prepare_paths(
     Returns:
         tuple[tuple[Path, ...], tuple[Path, ...], tuple[Path, ...], tuple[Path, ...]]: Sorted
             existing protected entries for read-only binds, private entries for type-correct
-            masks, ancestor directories for self-bind mountpoints, and multiply linked regular
-            file or containing-directory paths for read-only binds. The caller must bind and
+            masks, ancestor directories for self-bind mountpoints, and visible multiply linked
+            regular files or their containing directories requiring read-only binds. The caller
+            must bind and
             revalidate every mount source before applying mounts; this result is not a launch
             authorization.
 
     Raises:
         ValueError: Request/scratch authority is stale or unsafe, a hardlink aliases a protected
-            or private file, its mount count cannot be bounded, a private/protected symlink or
+            or private file, a private/protected symlink or
             unsafe private type is found, or a directory changes during scan.
         TimeoutError: Preparation reaches the approved execution deadline.
         OSError: A required root, entry or no-follow descriptor cannot be inspected.
@@ -456,56 +483,30 @@ def prepare_paths(
         or stat.S_IMODE(details.st_mode) != constants.PRIVATE_DIRECTORY_MODE
     ):
         raise ValueError("Linux scratch is not a bound private directory.")
-    protected, private, anchors, hardlinked = set(), set(), set(), {}
-    sensitive_inodes = set()
-    inspected = {}
-    roots = dict.fromkeys(
-        (
-            request.workspace,
-            *(root for root in request.read_roots if root not in runtime_roots),
-            *request.write_roots,
-            scratch,
+    roots = tuple(
+        dict.fromkeys(
+            (
+                request.workspace,
+                *(root for root in request.read_roots if root not in runtime_roots),
+                *request.write_roots,
+                scratch,
+            )
         )
     )
-    unaccounted: set[Path] = set()
     if request.hardlink_sources and (
         request.permission_revision is None
-        or request.hardlink_sources != hardlink_source_paths(("shared_dependencies",), "linux")
+        or not hardlink_sources_within_roots(
+            request.hardlink_sources, hardlink_source_paths(("shared_dependencies",), "linux")
+        )
     ):
         raise ValueError("Unapproved Linux hardlink source.")
-    inspect_hardlink_aliases(
-        tuple(roots), request.deadline, unaccounted=unaccounted, scratch=scratch
-    )
-    for root in roots:
-        root_protected, root_private, root_hardlinked, root_sensitive = _scan(
-            root, request, inspected
-        )
-        protected.update(root_protected)
-        private.update(root_private)
-        hardlinked.update(root_hardlinked)
-        sensitive_inodes.update(root_sensitive)
-        for path in root_protected | root_private:
-            anchor = path if path.is_dir() else path.parent
-            while anchor != root:
-                anchors.add(anchor)
-                anchor = anchor.parent
-    directory_masks = {path for path in private if path.is_dir()}
+    initial_roots = {root: _validate_root(root, request) for root in roots}
+    protected, private, anchors, hardlinked = _inspect_data_view(request, roots, scratch)
+    directory_masks = {path for path, directory in private.items() if directory}
 
     def is_concealed(path: Path) -> bool:
         """Check whether a directory mask prevents every access to this descendant."""
         return not directory_masks.isdisjoint(path.parents)
-
-    if request.hardlink_sources and any(not is_concealed(path) for path in unaccounted):
-        unaccounted.clear()
-        _inspect_cache_aliases(request, tuple(roots), scratch, unaccounted)
-    if any(not is_concealed(path) for path in unaccounted):
-        raise IncompleteHardlinkAliases(
-            "Some links have names outside the verified scope or in protected data."
-        )
-    if any(
-        inode in sensitive_inodes and not is_concealed(path) for path, inode in hardlinked.items()
-    ):
-        raise ValueError("Linux hardlinked file aliases protected or private data.")
 
     required_paths = (
         request.cwd,
@@ -525,29 +526,18 @@ def prepare_paths(
     if any(path in directory_masks or is_concealed(path) for path in required_paths):
         raise ValueError("A required Linux sandbox path is inside a denied directory.")
 
-    protected = {path for path in protected - private if not is_concealed(path)}
-    private = {path for path in private if not is_concealed(path)}
-    anchors = {path for path in anchors if not is_concealed(path)}
-    # An earlier subtree can change while another approved root is scanned. Keep the first
-    # observation of overlapping directories and recheck the whole request before returning.
-    for current, before in inspected.items():
+    for root, original in initial_roots.items():
         _check_deadline(request.deadline)
-        if _directory_state(before) != _directory_state(current.lstat()):
-            raise ValueError("Linux scanned directory changed.")
+        if not os.path.samestat(original, root.lstat()):
+            raise ValueError("Linux path root changed during preparation.")
     if not request.paths_are_current():
         raise ValueError("Linux approved path authority changed.")
     _check_deadline(request.deadline)
-    read_only_mounts = _hardlink_mount_sources(
-        {path: identity for path, identity in hardlinked.items() if not is_concealed(path)},
-        (*request.write_roots, scratch),
-        request.deadline,
-    )
-    _check_deadline(request.deadline)
     return (
-        tuple(sorted(protected)),
-        tuple(sorted(private)),
-        tuple(sorted(anchors)),
-        read_only_mounts,
+        tuple(sorted(path for path in protected if path not in private and not is_concealed(path))),
+        tuple(sorted(path for path in private if not is_concealed(path))),
+        tuple(sorted(path for path in anchors if not is_concealed(path))),
+        _hardlink_mount_sources(hardlinked, (*request.write_roots, scratch), request.deadline),
     )
 
 

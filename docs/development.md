@@ -24,7 +24,7 @@ Run `tests/integration/macos/` from a terminal whose parent process permits Seat
 
 ## Linux native integration
 
-Provision the Linux sandbox explicitly through the main app before running installed execution checks. Ordinary integration tests do not install, refresh, or remove it. Use an authenticated installation compatible with the package being tested. Without a working installation, the suite checks unavailable behavior and skips enforcement cases.
+Provision the Linux sandbox explicitly through the main app before running installed execution checks. Ordinary integration tests do not install, refresh, or remove it. Use an authenticated installation compatible with the package being tested. The installed receiver runs its own protected copy of the sandbox code. Use `/sandbox refresh` from the updated Loop after changing receiver-side path preparation. Without a working installation, the suite checks unavailable behavior and skips enforcement cases.
 
 Linux policy attestation requires the compiled policy bytes to match the kernel export. If the AppArmor parser emits a recognized compressed container, Loop retries with `--zstd-compress-level=0` under the original deadline. A parser that cannot produce attestable uncompressed policy leaves the sandbox unavailable; Loop does not weaken the byte comparison.
 

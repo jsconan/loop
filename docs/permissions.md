@@ -136,7 +136,7 @@ The command includes any backend resources it needs in the same process approval
 
 | Resource | Authority and limits |
 | --- | --- |
-| Read-only access to linked project dependencies | A qualified Linux backend offers the metadata check when visible hardlink groups have missing names in the selected scope. It verifies every hardlink name and leaves the shared files read-only. The command receives access through the project names and receives no cache mount. |
+| Read-only access to hard-linked files | A qualified Linux backend offers an account-home metadata lookup when a visible hardlink group has names outside the selected scope. It respects read policy and omits protected paths. The command sees verified shared files through its approved paths with read-only enforcement. |
 | Look up system users and groups | The host directory service can return account and group metadata, including directory-supplied password fields, and contact directory servers while direct command networking is disabled. |
 | Use process pools for parallel work | Stock runtimes can use host POSIX named semaphores. The native owner filter protects live unrelated objects. Names and capacity are shared, and forced termination can leave a same-user object that another command can open or unlink. |
 

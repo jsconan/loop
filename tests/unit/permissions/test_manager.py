@@ -1450,12 +1450,15 @@ def test_prepare_project_and_explicit_resources_obeys_workspace_and_admin_limits
 
 
 def test_hardlink_option_requires_selected_host_path_and_regular_read_policy(tmp_path, monkeypatch):
-    """A metadata grant is visible at approval and obeys the owner's hard read ceiling."""
+    """Metadata lookup keeps the owner's read ceilings and excludes protected descendants."""
     cache = tmp_path / "cache"
+    protected = cache / "app-control"
     workspace = tmp_path / "project"
     workspace.mkdir()
     arguments, _, _ = durable_policy_inputs(workspace)
-    manager = PermissionManager(**arguments, bootstrap_pristine_policy=True)
+    manager = PermissionManager(
+        **arguments, bootstrap_pristine_policy=True, protected_host_roots=(protected,)
+    )
     name = "shared_dependencies"
     monkeypatch.setattr(
         manager_module, "hardlink_source_paths", lambda names: (cache,) if name in names else ()
@@ -1469,6 +1472,9 @@ def test_hardlink_option_requires_selected_host_path_and_regular_read_policy(tmp
     selected = manager.prepare_sandbox_options(strict, (name,), project=False, infer=infer)
     assert selected.hardlink_sources == (cache,)
     assert manager.sandbox_scope_limit(selected) is None
+    assert manager.sandbox_access_for_review(selected, "run_command") is selected
+    as_data_root = native_request(workspace, read_roots=(cache,), write_roots=())
+    assert "intersects protected application" in manager.sandbox_scope_limit(as_data_root)
     assert manager._sandbox_scope(selected)["hardlink_metadata"] == [str(cache)]
     display = manager._sandbox_permission_message(
         selected, scratch_roots=set(), findings=(), explicit_ask=True, reason=None
@@ -1511,6 +1517,14 @@ def test_hardlink_option_requires_selected_host_path_and_regular_read_policy(tmp
     assert "readable_roots limit is hard" in manager.sandbox_scope_limit(
         replace(selected, permission_revision=manager.egress_policy_revision())
     )
+    allowed = cache / "allowed-storage"
+    allowed.mkdir()
+    assert manager.update_limit_values("readable_roots", str(allowed), add=True)
+    narrowed = manager.prepare_sandbox_options(strict, (name,), project=False, infer=infer)
+    assert narrowed.hardlink_sources == (allowed,)
+    assert manager.sandbox_scope_limit(narrowed) is None
+    assert manager.update_limit_values("readable_roots", str(cache.parent), add=True)
+    assert manager.sandbox_hardlink_sources((name,)) == (cache,)
 
     def absent_account(_options):
         """Simulate an unmapped operating system account after enrollment."""
