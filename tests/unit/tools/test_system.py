@@ -1450,15 +1450,35 @@ def test_run_command_explains_tool_temporary_directory_settings(registry):
     assert "Preserve the exit status when running checks" in description
     assert "Use output pagination for long output" in description
     assert "can hide its failing exit status" in description
-    assert "The result already includes the exit code" in description
+    assert "The result includes the shell's exit code" in description
+    assert "can reflect only the final stage" in definition.instructions
     assert (
         f'"${OUTPUT_DIRECTORY_ENVIRONMENT_VARIABLE}" is the private output directory '
-        "created before launch" in description
+        "created for this launch" in description
     )
+    assert "session temporary directory for files shared between commands" in description
     assert "Preserve the requested wrapper and checks" in description
-    assert "Use the tool's output settings" in description
+    assert "Use the tool's output settings in the first command" in description
     assert "Review possible effects and `write_scope.retry`" in description
     assert "before any authorized retry" in description
+
+
+def test_run_command_distinguishes_scratch_from_a_checkout_directory(registry):
+    """Describe the default policy and how to select a read-only checkout."""
+    definition = next(item for item in registry.definitions() if item.name == "run_command")
+
+    assert "workspace policy" in definition.instructions
+    assert '"write_roots": []' in definition.instructions
+    assert f'generated files under "${OUTPUT_DIRECTORY_ENVIRONMENT_VARIABLE}"' in (
+        definition.instructions
+    )
+    field = definition.parameters["properties"]["write_roots"]
+    assert field.get("default") is None
+    description = field["description"]
+    assert "Use [] for private scratch" in description
+    assert "workspace policy" in description
+    assert "A nonempty list names existing directories" in description
+    assert f'under "${OUTPUT_DIRECTORY_ENVIRONMENT_VARIABLE}"' in description
 
 
 def test_runtime_services_schema_tracks_current_backend_and_policy():
@@ -1615,12 +1635,12 @@ def test_platform_command_capabilities_shape_live_model_definitions(monkeypatch)
         assert "JSON null (unquoted)" in field["description"]
         assert {"type": "null"} in field["anyOf"]
     properties = supported["sandbox_shell"].parameters["properties"]
-    for name in ("write_roots", "write_files"):
-        (directory_list,) = (
-            item for item in properties[name]["anyOf"] if item.get("type") == "array"
-        )
-        assert directory_list["minItems"] == 1
-    assert any(item.get("const") == "scratch" for item in properties["write_roots"]["anyOf"])
+    assert {item["type"] for item in properties["write_roots"]["anyOf"]} == {"array", "null"}
+    (directory_list,) = (
+        item for item in properties["write_roots"]["anyOf"] if item["type"] == "array"
+    )
+    assert "minItems" not in directory_list
+    assert properties["write_files"]["anyOf"][0]["minItems"] == 1
     exact_write = supported["sandbox_shell"].parameters["properties"]["write_files"]["description"]
     assert "one known fixed filename" in exact_write
     assert "generated names, siblings, temporary files or caches" in exact_write
@@ -1663,6 +1683,9 @@ def test_command_wait_schema_tracks_configured_durations(registry):
         in initial["description"]
     )
     assert "up to 45 seconds (tools.command_max_wait_seconds)" in initial["description"]
+    assert "Set wait_seconds to 45 when you need the completed result" in (
+        definitions["run_command"].instructions
+    )
     assert (
         "runtime limit of 300 seconds (tools.command_job_runtime_limit_seconds)"
         in initial["description"]
@@ -2030,7 +2053,16 @@ def test_known_read_command_defaults_to_read_only(monkeypatch, registry):
     assert backend.run.call_args.args[0].write_roots == ()
 
 
-@pytest.mark.parametrize("scope", [None, [], "scratch"])
+@pytest.mark.parametrize(
+    "scope",
+    [
+        {},
+        {"write_roots": None},
+        {"write_roots": []},
+        {"write_roots": "scratch"},
+        {"write_roots": None, "write_files": []},
+    ],
+)
 def test_command_tool_reports_its_prepared_write_scope_in_the_initial_review(
     monkeypatch, tmp_path, scope
 ):
@@ -2047,7 +2079,7 @@ def test_command_tool_reports_its_prepared_write_scope_in_the_initial_review(
     ):
         monkeypatch.setattr(registry._execution_service, "_backend", backend)
         result, problem = call(
-            registry, "./wrapper", cwd=str(tmp_path), interaction=interaction, write_roots=scope
+            registry, "./wrapper", cwd=str(tmp_path), interaction=interaction, **scope
         )
 
     assert problem is None
@@ -2059,7 +2091,7 @@ def test_command_tool_reports_its_prepared_write_scope_in_the_initial_review(
         "details",
     }
     command = backend.run.call_args.args[0]
-    expected = () if scope == "scratch" else (command.workspace,)
+    expected = (command.workspace,) if scope in ({}, {"write_roots": None}) else ()
     assert f'"workspace_write": {str(bool(expected)).lower()}' in interaction.info.call_args.args[0]
     assert command.write_roots == expected
     assert result["write_scope"]["roots"] == ([VirtualPath.WORKSPACE] if expected else [])
@@ -2101,7 +2133,9 @@ def test_command_tool_keeps_only_selected_stock_reads_narrow(
         closing(native_registry(permission_manager=manager)) as registry,
     ):
         monkeypatch.setattr(registry._execution_service, "_backend", backend)
-        _, problem = call(registry, source, cwd=str(tmp_path), interaction=interaction)
+        _, problem = call(
+            registry, source, cwd=str(tmp_path), interaction=interaction, write_roots=None
+        )
 
     assert problem is None
     interaction.prompt.assert_called_once()

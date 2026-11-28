@@ -112,9 +112,8 @@ def test_runtime_environment_uses_shared_prefixes_without_exposing_host_paths(
         in rendered
     )
     assert "passed unchanged" in rendered
-    assert "owner's write preference" in rendered
-    assert "default is private session scratch" in rendered
-    assert "write_roots" in rendered and "write_files" in rendered
+    assert "Commands can write in private session scratch" in rendered
+    assert "selected scope and filesystem policy" in rendered
     assert "legacy" not in rendered.casefold()
     assert "concrete" not in rendered.casefold()
     assert str(tmp_path) not in rendered

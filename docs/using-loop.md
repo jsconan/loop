@@ -173,7 +173,7 @@ When the model requests a file write, Loop shows the operation and asks for conf
 
 For an explicit no-prompt choice, `/config set app.yolo true` activates YOLO for this process and shows its authority warning before it takes effect. [Configuration](configuration.md#edit-settings-while-loop-is-running) explains persistent user scope, how to disable it, and the hard boundaries that still apply.
 
-The shell sandbox writes to the live checkout. Concurrent commands can change the same files. Loop does not detect these conflicts or roll back shell changes.
+Ordinary commands use the workspace policy and include any eligible project write scope in the command review. When the checkout must stay read-only, use `write_roots: []` and configure the program's generated output under `$LOOP_OUTPUT_DIR` before launch. Approved workspace writes go to live files. Concurrent commands can change the same files. Loop does not detect these conflicts or roll back shell changes.
 
 ## Use the backend directly
 

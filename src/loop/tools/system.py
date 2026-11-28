@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from pydantic import BeforeValidator, Field, ValidationInfo
+from pydantic.json_schema import SkipJsonSchema
 from pydantic_core import PydanticCustomError
 
 from .. import constants
@@ -157,9 +158,26 @@ def _configure_wait_definition(
 
 
 def _run_command_definition(
-    definition: ToolDefinition, settings: ToolRuntimeSettings, services: tuple[str, ...]
+    definition: ToolDefinition,
+    settings: ToolRuntimeSettings,
+    services: tuple[str, ...],
 ) -> ToolDefinition:
-    """Include active wait durations and only the services this workspace can request."""
+    """Include command usage, active wait durations, and available runtime services."""
+    definition.instructions = (
+        "Run the requested command with its normal options and configuration. "
+        'Use `"write_roots": null` for ordinary commands so Loop can apply the workspace policy '
+        "and include any eligible write scope in the command review. "
+        'Use `"write_roots": []` when the checkout must stay read-only. '
+        "Use the program's supported output settings to put "
+        f'generated files under "${OUTPUT_DIRECTORY_ENVIRONMENT_VARIABLE}". '
+        f"Set wait_seconds to {settings.command_max_wait_seconds:g} when you need the completed "
+        "result, or to 0 when you need a job handle immediately. "
+        "Run the command directly when you only need to limit displayed output. "
+        "Loop returns a bounded preview and retains output for paging. "
+        "When the operation needs a pipeline, verify the relevant stage from its own result. "
+        "The shell's exit code can reflect only the final stage. "
+        "Label any reported pipeline exit code as the shell's exit code."
+    )
     properties = definition.parameters["properties"]
     if services:
         field = properties["runtime_services"]
@@ -284,13 +302,13 @@ def run_command(
             "Use '.' to source a POSIX script. Select an explicit interpreter for other syntax. "
             "Preserve the exit status when running checks. Use output pagination for long output. "
             "Appending echo or piping a check into a display command can hide its failing exit "
-            "status. The result already includes the exit code. "
+            "status. The result includes the shell's exit code. "
             f'Use "{VirtualPath.TEMPORARY}/..." for session temporary files. '
-            f'"${OUTPUT_DIRECTORY_ENVIRONMENT_VARIABLE}" is the private output directory '
-            "created before launch. "
-            "Preserve the requested wrapper and checks. Use the tool's output settings to put "
-            "generated files and caches there, or request the required write scope. "
-            "Review possible effects and `write_scope.retry` before any authorized retry.",
+            f'"${OUTPUT_DIRECTORY_ENVIRONMENT_VARIABLE}" is the private output directory created '
+            "for this launch. Use the session temporary directory for files shared between "
+            "commands. Preserve the requested wrapper and checks. Use the tool's output settings "
+            "in the first command to put generated files and caches there when using private "
+            "scratch. Review possible effects and `write_scope.retry` before any authorized retry.",
             min_length=1,
         ),
     ],
@@ -317,12 +335,14 @@ def run_command(
         BeforeValidator(normalize_optional_null),
     ] = None,
     write_roots: Annotated[
-        Literal["scratch"] | Annotated[list[str], Field(json_schema_extra={"minItems": 1})] | None,
+        list[str] | None | SkipJsonSchema[Literal["scratch"]],
         Field(
-            description="Write scope for the command. JSON null (unquoted) lets Loop prepare "
-            "the scope under the workspace policy. Use the string scratch when the workspace "
-            "can stay read-only, or supply a nonempty list of specific output directories. "
-            "Each requested directory is checked against filesystem policy."
+            description="Write scope for the command. JSON null (unquoted) applies the default "
+            "workspace policy when no exact files are requested. Loop can include eligible "
+            "checkout writes in the command review. "
+            "Use [] for private scratch and a read-only workspace. "
+            f'Configure generated outputs under "${OUTPUT_DIRECTORY_ENVIRONMENT_VARIABLE}". '
+            "A nonempty list names existing directories subject to filesystem policy.",
         ),
         BeforeValidator(normalize_optional_null),
     ] = None,
@@ -473,7 +493,7 @@ def run_command(
         command,
         cwd,
         read_roots,
-        write_roots,
+        [] if write_roots == "scratch" else write_roots,
         executable_grant,
         network,
         git_write,

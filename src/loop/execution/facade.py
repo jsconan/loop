@@ -17,7 +17,7 @@ from collections.abc import Callable, Generator, Iterator
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 from uuid import uuid4
 
 from .. import constants
@@ -1690,23 +1690,21 @@ class CommandExecutionService:
             )
             guidance = (
                 "Check whether a write denial caused the failure and inspect possible "
-                "effects before repeating. Keep the requested command and its options. "
+                "effects before repeating. Preserve the requested operation, its options, "
+                "configuration and outputs. Each retry should address the observed failure. "
             )
             if candidates is None:
-                guidance += (
-                    "The creation denials may involve generated sidecar files. For "
-                    "generated files and caches, configure the tool's output directory under "
-                    f'"${OUTPUT_DIRECTORY_ENVIRONMENT_VARIABLE}", or request a dedicated '
-                    "directory in write_roots. "
-                )
-            else:
-                guidance += (
-                    "For generated files and caches, use "
-                    f'"${OUTPUT_DIRECTORY_ENVIRONMENT_VARIABLE}" '
-                    "or request a dedicated directory in write_roots. "
-                )
+                guidance += "The creation denials may involve generated sidecar files. "
+            guidance += (
+                "For a generated-output write failure, configure the tool's output directory "
+                f'under "${OUTPUT_DIRECTORY_ENVIRONMENT_VARIABLE}". This path is already writable. '
+                "Find the program's supported output-path setting before relaunching. Use it in "
+                "the shell command to change where the output is written while keeping the same "
+                "work and configuration. For a scratch-only retry, keep write_roots set to [] "
+                "and leave write_files unset. "
+            )
             retry: dict[str, object] = {"tool": "run_command"}
-            if candidates:
+            if candidates and (request.write_roots or request.write_files):
                 files = [*output["write_scope"]["files"], *candidates]
                 if len(files) <= constants.MAX_COMMAND_PATH_COUNT:
                     retry["arguments_to_merge"] = {"write_files": files}
@@ -2038,7 +2036,7 @@ class CommandExecutionService:
         command: str,
         cwd: str = ".",
         read_roots: list[str] | None = None,
-        write_roots: Literal["scratch"] | list[str] | None = None,
+        write_roots: list[str] | None = None,
         executable_grant: str | list[str] | None = None,
         network: bool = False,
         git_write: bool = False,
@@ -2060,7 +2058,7 @@ class CommandExecutionService:
             command (str): Opaque source passed to the host shell.
             cwd (str): Resolved host working directory.
             read_roots (list[str] | None): Additional explicitly approved read roots.
-            write_roots (Literal["scratch"] | list[str] | None): Private scratch only, explicit
+            write_roots (list[str] | None): Private scratch only, explicit
                 writable directories, or None to use the workspace's ordinary write preference.
             executable_grant (str | list[str] | None): Bound references from executable lookups.
             network (bool): Request general network egress.
@@ -2118,7 +2116,7 @@ class CommandExecutionService:
         command: str,
         cwd: str = ".",
         read_roots: list[str] | None = None,
-        write_roots: Literal["scratch"] | list[str] | None = None,
+        write_roots: list[str] | None = None,
         executable_grant: str | list[str] | None = None,
         network: bool = False,
         git_write: bool = False,
@@ -3415,8 +3413,8 @@ class CommandExecutionService:
 
             if (
                 ordinary
-                and not write_roots
-                and not write_files
+                and write_roots is None
+                and write_files is None
                 and getattr(context.interaction, "supports_fresh_host_approval", False) is True
             ):
 

@@ -1476,7 +1476,8 @@ def test_completed_command_keeps_unattributed_denial_in_trace(tmp_path, output_m
 @pytest.mark.parametrize(
     "case",
     [
-        "ordinary",
+        "existing_directory_scope",
+        "scratch_only",
         "preserve_granted_files",
         "file_count_limit",
         "generated",
@@ -1530,6 +1531,11 @@ def test_write_denial_guides_same_command_retry(tmp_path, monkeypatch, case):
             f"report-{index}" for index in range(execution_facade.constants.MAX_COMMAND_PATH_COUNT)
         ],
     }.get(case)
+    write_roots = []
+    if case == "existing_directory_scope" or other_created:
+        existing_root = workspace / "output"
+        existing_root.mkdir()
+        write_roots.append(str(existing_root))
     operation = "file-write-unlink"
     if generated_name or case == "generated":
         operation = "file-write-create"
@@ -1596,6 +1602,7 @@ def test_write_denial_guides_same_command_retry(tmp_path, monkeypatch, case):
         result = service.run_command(
             context,
             "false",
+            write_roots=write_roots,
             write_files=write_files,
         )
 
@@ -1609,10 +1616,17 @@ def test_write_denial_guides_same_command_retry(tmp_path, monkeypatch, case):
     retry = result.metadata["write_scope"]["retry"]
     assert retry["tool"] == "run_command"
     assert not result.retryable
-    assert "Keep the requested command and its options" in retry["guidance"]
+    assert (
+        "Preserve the requested operation, its options, configuration and outputs"
+        in (retry["guidance"])
+    )
+    assert (
+        "Find the program's supported output-path setting before relaunching" in retry["guidance"]
+    )
+    assert "write_roots set to []" in retry["guidance"]
     assert '"$LOOP_OUTPUT_DIR"' in retry["guidance"]
     assert "Follow the user's retry instructions" in retry["guidance"]
-    if case in {"ordinary", "preserve_granted_files"}:
+    if case in {"existing_directory_scope", "preserve_granted_files"}:
         expected = ["$WORKSPACE_ROOT/.coverage"]
         if case == "preserve_granted_files":
             expected.insert(0, "$WORKSPACE_ROOT/existing-report")
