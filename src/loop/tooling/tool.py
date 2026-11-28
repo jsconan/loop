@@ -1358,7 +1358,13 @@ class Tool:
                 detail=f"Invalid arguments for tool '{name}'. {guidance}".rstrip(),
                 severity="warning",
                 operation=name,
-                metadata={"fields": fields},
+                metadata={
+                    "fields": fields,
+                    "guidance": (
+                        "The tool did not run. Correct the invalid arguments using the tool "
+                        "schema. Use JSON null for unset nullable fields."
+                    ),
+                },
             )
         )
 

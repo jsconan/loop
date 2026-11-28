@@ -2051,6 +2051,7 @@ def test_validate_arguments_returns_errors_without_invoking(monkeypatch):
     failure = json.loads(error)
     assert failure["problem"]["code"] == "tool.invalid_arguments"
     assert failure["problem"]["metadata"]["fields"]
+    assert "JSON null for unset nullable fields" in failure["problem"]["metadata"]["guidance"]
     function.assert_not_called()
 
 
