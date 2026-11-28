@@ -6140,7 +6140,7 @@ def test_command_job_poll_wait_is_independent_of_initial_wait_and_uses_shared_ca
     job.poll.assert_called_with(
         0, max_wait_seconds=60, stdout_cursor=None, stderr_cursor=None, cancellation_event=None
     )
-    maximum = execution_facade.constants.DEFAULT_COMMAND_MAX_WAIT_SECONDS
+    maximum = context.settings.command_max_wait_seconds
     service.poll_command_job(context, "handle", wait_seconds=maximum)
     job.poll.assert_called_with(
         maximum,
@@ -6420,7 +6420,8 @@ def test_command_rejects_invalid_initial_wait_before_launch(
     result = service.run_command(context, ":", wait_seconds=wait)
     assert result.code == "command_job.invalid_wait"
     assert (
-        "between 0 and 60 seconds, as configured by tools.command_max_wait_seconds" in result.detail
+        f"between 0 and {context.settings.command_max_wait_seconds:g} seconds, "
+        "as configured by tools.command_max_wait_seconds" in result.detail
     )
     assert "Use JSON null for the default wait" in result.detail
     assert "Poll any returned job handle for completion" in result.detail

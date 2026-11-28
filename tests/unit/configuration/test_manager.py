@@ -612,7 +612,7 @@ def test_initialize_creates_private_commented_defaults(tmp_path):
     assert "command_job_runtime_limit_seconds = 3600.0" in content
     assert "command_default_initial_wait_seconds = 10.0" in content
     assert "command_default_poll_wait_seconds = 30.0" in content
-    assert "command_max_wait_seconds = 60.0" in content
+    assert f"command_max_wait_seconds = {constants.DEFAULT_COMMAND_MAX_WAIT_SECONDS}" in content
     assert path.stat().st_mode & 0o777 == 0o600
     assert manager.load().backend.api_key.get_secret_value() == "local-api-key"
 
@@ -719,11 +719,12 @@ def test_command_wait_defaults_cannot_exceed_the_shared_maximum(tmp_path, settin
     manager.initialize()
     manager.load()
 
+    excessive_wait = constants.DEFAULT_COMMAND_MAX_WAIT_SECONDS + 1
     with pytest.raises(ValidationError) as exc_info:
-        manager.set_session(f"tools.{setting}", constants.DEFAULT_COMMAND_MAX_WAIT_SECONDS + 1)
+        manager.set_session(f"tools.{setting}", excessive_wait)
 
     message = str(exc_info.value)
-    assert f"tools.{setting}=61" in message
+    assert f"tools.{setting}={excessive_wait:g}" in message
     assert (
         f"tools.command_max_wait_seconds={constants.DEFAULT_COMMAND_MAX_WAIT_SECONDS:g}" in message
     )
