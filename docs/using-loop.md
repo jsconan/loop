@@ -163,6 +163,8 @@ The default `Agent` contains its identity, built-in instructions, and model-visi
 
 At startup, Loop indexes instruction files in the Git repository and loads the files that apply from the project root through the current working directory. `AGENTS.md` is the default filename. Library callers can set `agents_filenames=("AGENTS.md", "CUSTOM.md")`; Loop uses a later filename only when earlier names are absent in the same directory. More specific project instructions follow less specific ones, then runtime context, the skill catalog, and active skills. Optional YAML frontmatter is validated and removed before instructions are sent. The complete instruction document has a 64 KiB UTF-8 safety limit. If the combined instructions exceed the configured limit, Loop reports the problem before generation instead of silently dropping rules.
 
+A tool definition can supply usage instructions for its own operation. Loop includes those instructions with requests that offer the tool, in a section separate from the shared agent instructions. They count toward the instruction and model context budgets.
+
 Successful local file reads, directory listings, and writes update the active instruction scope before the next model request. Context diagnostics show source paths, sizes, and digests.
 
 ### File and command permissions

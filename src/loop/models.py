@@ -708,12 +708,14 @@ class ToolDefinition(BaseModel):
         description (str): Description presented to the model.
         parameters (dict[str, Any]): JSON Schema describing accepted arguments.
         strict (bool): Whether the argument schema should be enforced.
+        instructions (str | None): Optional usage guidance for requests offering this tool.
     """
 
     name: str
     description: str
     parameters: dict[str, Any]
     strict: bool = True
+    instructions: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class ModelInfo(BaseModel):

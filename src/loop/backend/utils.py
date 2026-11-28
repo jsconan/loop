@@ -147,7 +147,7 @@ def estimate_context(
     return (
         tokens
         + _estimate_json(instructions or "")
-        + sum(_estimate_json(tool.model_dump()) + 8 for tool in tools)
+        + sum(_estimate_json(tool.model_dump(exclude={"instructions"})) + 8 for tool in tools)
     )
 
 

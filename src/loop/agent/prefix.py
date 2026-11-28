@@ -6,7 +6,7 @@ from dataclasses import dataclass, replace
 from ..backend import Backend, GenerationHyperparameters, estimate_context
 from ..configuration import ApplicationSettings, ContextSettings
 from ..errors import Problem, ProblemException
-from ..instructions import InstructionsManager, PreparedInstructions
+from ..instructions import InstructionBudgetExceededError, InstructionsManager, PreparedInstructions
 from ..model_selection import ModelSelection
 from ..models import (
     CompactionContextItem,
@@ -350,9 +350,7 @@ class AgentContext:
         if not recorded and window.follows_default != follows_default:
             window = window.model_copy(update={"follows_default": follows_default})
         disclosure = self._disclosure
-        sample = self._request_environment(
-            window.layout, (stored or dispatch).id, snapshot, disclosure
-        )
+        sample = self._request_environment(window, (stored or dispatch).id, snapshot, disclosure)
         leading = window.leading_instructions(
             revision.snapshot
             if revision is not None
@@ -509,7 +507,7 @@ class AgentContext:
             int: Local estimate for guidance that stays outside the checkpoint and provider count.
         """
         snapshot = replace(window.baseline, suffix=self._instructions.request_suffix())
-        sample = self._request_environment(window.layout, None, snapshot, self._disclosure)
+        sample = self._request_environment(window, None, snapshot, self._disclosure)
         leading = window.leading_instructions(rebuilt=True)
         instructions, trailing = _place_request_guidance(
             window.layout,
@@ -772,12 +770,20 @@ class AgentContext:
 
     def _request_environment(
         self,
-        layout: InstructionLayout,
+        window: ModelWindow,
         dispatch_id: str | None,
         snapshot: PreparedInstructions,
         disclosure: ContextSettings,
     ) -> str | None:
-        """Render one request sample and reserve time facts for a true suffix."""
+        """Check the instruction budget and render an environment sample if space remains."""
+        instruction_bytes = len(snapshot.content_with_suffix.encode()) + len(
+            window.tool_instructions.encode()
+        )
+        if instruction_bytes > self._instructions.max_bytes:
+            raise InstructionBudgetExceededError(
+                "Prepared instructions exceed the configured instruction limit when including "
+                "tool instructions."
+            )
         cached = self._environment_sample
         if cached is not None and cached[0] == dispatch_id:
             sample = cached[1]
@@ -786,11 +792,10 @@ class AgentContext:
                 disclosure,
                 self._working_directory,
                 client_timezone=self.agent.tools.registry.settings.client_timezone,
-                include_time=layout == "suffix",
+                include_time=window.layout == "suffix",
             )
         if sample is not None and (
-            len(snapshot.content_with_suffix.encode()) + len(sample.encode()) + 2
-            > self._instructions.max_bytes
+            instruction_bytes + len(sample.encode()) + 2 > self._instructions.max_bytes
         ):
             return None
         return sample

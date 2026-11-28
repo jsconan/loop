@@ -2,6 +2,7 @@
 
 import json
 from collections.abc import Iterable
+from html import escape
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -133,6 +134,22 @@ class ModelWindow(BaseModel):
             raise ValueError("Invalid model-window instruction baseline.")
         return self
 
+    @property
+    def tool_instructions(self) -> str:
+        """Render a separate usage block from the window's pinned tool definitions.
+
+        Returns:
+            str: Tool instructions with their separator, or an empty string.
+        """
+        sections = [
+            f'<tool name="{escape(tool.name)}">\n{tool.instructions}\n</tool>'
+            for tool in self.tools
+            if tool.instructions
+        ]
+        if not sections:
+            return ""
+        return "\n\n<tool_instructions>\n" + "\n".join(sections) + "\n</tool_instructions>"
+
     def baseline_item(self, *, rebuilt: bool = False) -> DeveloperInput:
         """Render the initial developer item and the rules for applying later revisions.
 
@@ -150,6 +167,7 @@ class ModelWindow(BaseModel):
             "An instruction revision replaces the listed sections, removes deactivated "
             "sections, and supplies their new order. Obsolete sections no longer apply. "
             f"{history}\n<instruction_baseline>\n{content}\n</instruction_baseline>"
+            f"{self.tool_instructions}"
         )
 
     def leading_instructions(
@@ -169,7 +187,7 @@ class ModelWindow(BaseModel):
         """
         if self.layout != "leading":
             return None
-        content = (snapshot or self.baseline).content
+        content = (snapshot or self.baseline).content + self.tool_instructions
         if not rebuilt:
             return content
         return f"{content}\n\n{_HISTORY_GUIDANCE}"

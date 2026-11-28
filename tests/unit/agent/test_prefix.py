@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from loop import Message, Reasoning, ResponseCompleted, Session, ToolRegistry
+from loop import Message, Reasoning, ResponseCompleted, Session, ToolRegistry, tool
 from loop.backend import BackendConnectionError
 from loop.configuration import ApplicationSettings, ContextSettings
 from loop.errors import ProblemException
@@ -116,6 +116,64 @@ def test_inline_environment_is_omitted_when_it_exceeds_the_budget(tmp_path):
     _turn(loop, "Continue")
 
     assert backend.get_response.call_args.kwargs["instructions"] is None
+
+
+@pytest.mark.parametrize(
+    ("layout", "too_large"),
+    [("leading", False), ("inline", False), ("suffix", False), ("leading", True)],
+)
+def test_published_tool_instructions_follow_the_request_and_its_budget(tmp_path, layout, too_large):
+    """Render the offered tool's instructions once and respect the complete instruction limit."""
+
+    def guide(definition, _settings, _options):
+        """Attach fixture instructions to an offered tool definition."""
+        definition.instructions = f"Usage guidance for {definition.name}."
+        return definition
+
+    @tool(definition_transform=guide)
+    def published() -> str:
+        """Provide an available tool with its own instructions."""
+        return "ready"
+
+    @tool(definition_transform=guide, platform_capability="fixture-missing")
+    def unavailable() -> str:
+        """Require a capability the fixture does not expose."""
+        return "ready"
+
+    backend = _backend(layout=layout)
+    registry = ToolRegistry([published, unavailable])
+    loop = Loop.create_default(backend, working_directory=tmp_path, tool_registry=registry)
+    if too_large:
+        instructions = InstructionsManager.discover(
+            tmp_path, max_bytes=len(loop.instructions.encode())
+        )
+        loop = Loop.create_default(
+            backend,
+            working_directory=tmp_path,
+            tool_registry=registry,
+            instructions_manager=instructions,
+        )
+        with pytest.raises(ValueError, match="when including tool instructions"):
+            _turn(loop, "Attempt a request")
+        backend.get_response.assert_not_called()
+        return
+
+    _turn(loop, "Send a request")
+    request = backend.get_response.call_args.kwargs
+    text = "\n".join(
+        [
+            request["instructions"] or "",
+            *(item.content for item in request["input"] if isinstance(item, DeveloperInput)),
+        ]
+    )
+    assert '<tool name="published">\nUsage guidance for published.' in text
+    assert text.count("Usage guidance for published.") == 1
+    assert "Usage guidance for unavailable." not in text
+    restored = Session.deserialize(loop.session.serialize())
+    assert "<tool_instructions>" not in restored.window.baseline.content
+    assert next(t for t in restored.window.tools if t.name == "published").instructions == (
+        "Usage guidance for published."
+    )
 
 
 def test_instruction_edits_and_removal_append_in_replay_order(tmp_path):
