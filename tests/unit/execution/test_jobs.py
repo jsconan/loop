@@ -36,8 +36,9 @@ def workers(monkeypatch):
     return created
 
 
-def test_command_job_spools_and_pages_the_complete_output():
-    """Large streams remain byte exact and cursor-readable beyond native capture ceilings."""
+@pytest.mark.parametrize("failed", [False, True])
+def test_command_job_spools_and_pages_the_complete_output(failed):
+    """Large completed streams expose their end and remain byte exact when paged."""
     from types import SimpleNamespace
 
     from loop.constants import MAX_OUTPUT_CHARS, MAX_TOOL_CONTENT_BYTES
@@ -53,7 +54,16 @@ def test_command_job_spools_and_pages_the_complete_output():
     )
     stdout = job.stream_result("stdout", len(content) - MAX_OUTPUT_CHARS)
     stderr = job.stream_result("stderr", 0)
-    job.complete({"exit_code": 0, "stdout": stdout, "stderr": stderr})
+    result = {"exit_code": int(failed), "stdout": stdout, "stderr": stderr}
+    if failed:
+        job.complete(Problem(code="test.exit", title="Failed", detail="Failed", metadata=result))
+    else:
+        job.complete(result)
+
+    poll = job.poll(0)
+    assert poll["stdout"]["tail"] == stdout["tail"]
+    assert poll["stdout"]["tail"]["content"].endswith("tail")
+    assert "tail" not in poll["stderr"]
 
     assert stdout["capture_complete"] is True
     assert stdout["captured_bytes"] == len(content.encode("utf-8"))
@@ -183,22 +193,35 @@ def test_job_poll_cursors_return_only_new_output_pages():
     assert second["stdout"]["start_byte"] == len("first")
 
 
-def test_job_poll_pages_fit_the_tool_result_budget():
-    """Poll pages shrink when escaped text would exceed the complete result budget."""
-    from loop.constants import MAX_TOOL_RESULT_BYTES
+@pytest.mark.parametrize("complete", [False, True])
+def test_job_poll_pages_fit_the_tool_result_budget(complete):
+    """Even control-heavy streams keep readable pages within the result budget."""
+    from loop.constants import MAX_TOOL_CONTENT_BYTES, MAX_TOOL_RESULT_BYTES
 
     job = jobs.CommandJob("session", 3600.0)
     job.admitted()
-    job.publish("stdout", "\x01" * 5000)
-    job.publish("stderr", "\x02" * 5000)
+    job.publish("stdout", "\x01" * 10_000)
+    job.publish("stderr", "\x02" * 10_000)
+    if complete:
+        job.complete({stream: job.stream_result(stream, 0) for stream in ("stdout", "stderr")})
 
     status = job.poll(0)
 
     assert len(json.dumps({"ok": True, "result": status}).encode("utf-8")) < MAX_TOOL_RESULT_BYTES
-    assert status["stdout"]["included_bytes"] < status["stdout"]["captured_bytes"]
-    assert status["stderr"]["included_bytes"] < status["stderr"]["captured_bytes"]
-    assert status["stdout"]["next_cursor"]
-    assert status["stderr"]["next_cursor"]
+    assert 0 < status["stdout"]["included_bytes"] < status["stdout"]["captured_bytes"]
+    assert 0 < status["stderr"]["included_bytes"] < status["stderr"]["captured_bytes"]
+    for stream in ("stdout", "stderr"):
+        page = status[stream]
+        follow = page["next_tool_call"]
+        assert follow["name"] == "read_command_output"
+        assert follow["arguments"] == {
+            "handle": status["handle"],
+            "stream": stream,
+            "cursor": page["next_cursor"],
+            "max_bytes": MAX_TOOL_CONTENT_BYTES,
+        }
+        assert status["output_handles"][stream] != status["handle"]
+        assert "handle" not in page
 
 
 def test_job_poll_reduces_page_to_zero_when_the_envelope_budget_is_too_small(monkeypatch):
@@ -219,15 +242,25 @@ def test_job_poll_reduces_page_to_zero_when_the_envelope_budget_is_too_small(mon
     assert status["stdout"]["next_cursor"]
 
 
-def test_job_poll_rejects_cursor_beyond_current_output():
-    """A cursor into future bytes is rejected before the poll starts waiting."""
+def test_job_poll_checks_cursor_against_output_at_the_start_of_the_wait(monkeypatch):
+    """A cursor cannot skip bytes that only arrive while a poll waits."""
     job = jobs.CommandJob("session", 3600.0)
     job.admitted()
     job.publish("stdout", "current")
-    future = encode_content_cursor(job._outputs["stdout"].handle, 100)
+    future = encode_content_cursor(job.output_handles()["stdout"], len("current more"))
 
-    with pytest.raises(ValueError, match="beyond the end"):
-        job.poll(5, stdout_cursor=future)
+    def finish(_timeout):
+        """Append output and settle during the completion wait."""
+        job.publish("stdout", " more")
+        job.complete({"exit_code": 0})
+
+    monkeypatch.setattr(job._condition, "wait", finish)
+    status = job.poll(5, stdout_cursor=future)
+
+    assert status["status"] == "complete"
+    assert status["exit_code"] == 0
+    assert status["stdout"]["content"] == "current more"
+    assert status["cursor_errors"] == {"stdout": "Content cursor is beyond the end of the content."}
 
 
 def test_job_poll_interrupt_stops_wait_without_cancelling_command(monkeypatch):

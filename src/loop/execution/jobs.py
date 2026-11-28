@@ -376,13 +376,25 @@ class CommandJob:
             ),
         }
         if "next_cursor" in page:
-            result.update(
-                handle=output.handle,
-                next_cursor=page["next_cursor"],
-                continuation=(
-                    "Pass this stream cursor to poll_command_job or read_command_output."
-                ),
-            )
+            result["next_cursor"] = page["next_cursor"]
+        if end < size:
+            result["next_tool_call"] = {
+                "name": "read_command_output",
+                "arguments": {
+                    "handle": self.handle,
+                    "stream": stream,
+                    "cursor": page["next_cursor"],
+                    "max_bytes": constants.MAX_TOOL_CONTENT_BYTES,
+                },
+            }
+            if max_bytes:
+                outcome = (
+                    self._result.metadata if isinstance(self._result, Problem) else self._result
+                )
+                final_stream = (outcome or {}).get(stream)
+                tail = final_stream.get("tail") if isinstance(final_stream, dict) else None
+                if tail is not None and tail["end_byte"] - tail["start_byte"] <= max_bytes:
+                    result["tail"] = tail
         return result
 
     def status_with_output(
@@ -679,6 +691,7 @@ class CommandJob:
 
         Returns:
             dict: Current lifecycle status and available pages for both process streams.
+                Invalid cursors are reported in cursor_errors, with a fresh page for that stream.
 
         Raises:
             ValueError: The wait budget or configured maximum is invalid or unsupported.
@@ -701,14 +714,18 @@ class CommandJob:
                 f"{max_wait_seconds:g} seconds."
             )
         with self._condition:
-            for stream, cursor in (
-                ("stdout", stdout_cursor),
-                ("stderr", stderr_cursor),
-            ):
+            cursors = {"stdout": stdout_cursor, "stderr": stderr_cursor}
+            cursor_errors = {}
+            for stream, cursor in cursors.items():
                 if cursor is not None:
-                    offset = decode_content_cursor(cursor, self._outputs[stream].handle)
-                    if offset > self._outputs[stream].size_bytes:
-                        raise ValueError("Content cursor is beyond the end of the content.")
+                    output = self._outputs[stream]
+                    try:
+                        offset = decode_content_cursor(cursor, output.handle)
+                        if offset > output.size_bytes:
+                            raise ValueError("Content cursor is beyond the end of the content.")
+                    except ValueError as error:
+                        cursors[stream] = None
+                        cursor_errors[stream] = str(error)
             deadline = time.monotonic() + wait_seconds
             while not self.finished.is_set() and not (
                 cancellation_event is not None and cancellation_event.is_set()
@@ -722,7 +739,10 @@ class CommandJob:
                     else remaining
                 )
                 self._condition.wait(interval)
-            return self.status_with_output(stdout_cursor, stderr_cursor)
+            result = self.status_with_output(cursors["stdout"], cursors["stderr"])
+            if cursor_errors:
+                result["cursor_errors"] = cursor_errors
+            return result
 
 
 class CommandJobs:

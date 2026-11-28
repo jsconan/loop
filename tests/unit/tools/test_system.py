@@ -1572,9 +1572,7 @@ def test_platform_command_capabilities_shape_live_model_definitions(monkeypatch)
         f"runtime limit of {DEFAULT_COMMAND_JOB_RUNTIME_LIMIT_SECONDS:g} seconds "
         "(tools.command_job_runtime_limit_seconds)"
     ) in initial_description
-    assert (
-        "JSON null (unquoted) for the default, including for long commands" in initial_description
-    )
+    assert "JSON null (unquoted) for the default" in initial_description
     assert "poll_command_job to continue waiting for the same process" in initial_description
     assert "interactive" not in properties
     assert "egress_origins" not in properties
@@ -1627,8 +1625,11 @@ def test_platform_command_capabilities_shape_live_model_definitions(monkeypatch)
     assert "interactive" in supported["sandbox_shell"].parameters["properties"]
     assert "egress_origins" in supported["sandbox_shell"].parameters["properties"]
     assert "Run sandboxed shell source" in supported["sandbox_shell"].description
-    assert "default wait for long jobs" in supported["sandbox_shell"].description
-    assert "poll_command_job until completion" in supported["sandbox_shell"].description
+    assert "return its result or job handle" in supported["sandbox_shell"].description
+    assert (
+        "poll_command_job to continue waiting"
+        in (supported["sandbox_shell"].parameters["properties"]["wait_seconds"]["description"])
+    )
     assert "JSON null" not in supported["sandbox_shell"].description
     for name in ("read_roots", "write_roots", "executable_grant", "egress_origins", "reason"):
         field = supported["sandbox_shell"].parameters["properties"][name]

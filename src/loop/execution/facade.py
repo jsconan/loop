@@ -1224,8 +1224,8 @@ class CommandExecutionService:
                 at the beginning of that stream.
 
         Returns:
-            dict | Problem: Current lifecycle status and one bounded page from each stream, or a
-                safe refusal.
+            dict | Problem: Command status and bounded stream pages with any cursor errors, or a
+                refusal if the job or its wait is unavailable.
         """
         try:
             owner = self._job_owner(context)
@@ -2356,9 +2356,9 @@ class CommandExecutionService:
                         return result
                     response = {
                         **reserved.status_with_output(),
-                        "continuation": "Use poll_command_job to wait for completion and read "
-                        "new output. Pass stdout.next_cursor and stderr.next_cursor to continue; "
-                        "use read_command_output for immediate additional pages.",
+                        "continuation": "Poll this handle with null cursors until it is complete. "
+                        "Read the exit code and retained output tail. For sequential pages, "
+                        "use read_command_output with the returned cursor.",
                     }
                     return response
             except (OSError, ValueError, SessionExecutionConflictError):

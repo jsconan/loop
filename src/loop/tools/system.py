@@ -436,12 +436,11 @@ def run_command(
             description=(
                 "Wait for up to {maximum_seconds:g} seconds ({maximum_setting}) during the "
                 "initial call. The default is {default_seconds:g} seconds ({default_setting}); "
-                "use JSON null (unquoted) for the default, including for long commands, or 0 "
-                "for an immediate response after approval. The whole command has a runtime "
-                "limit of {runtime_limit_seconds:g} seconds ({runtime_limit_setting}). "
-                "If the command remains active, poll the returned job handle with "
-                "poll_command_job to continue waiting for the same process. Use "
-                "read_command_output only when more output pages are needed."
+                "use JSON null (unquoted) for the default or 0 for an immediate response after "
+                "approval. The whole command has a runtime limit of {runtime_limit_seconds:g} "
+                "seconds ({runtime_limit_setting}). If the command remains active, poll the "
+                "returned job handle with poll_command_job to continue waiting for the same "
+                "process. Use read_command_output only when more output pages are needed."
             ),
             ge=0,
             allow_inf_nan=False,
@@ -458,8 +457,7 @@ def run_command(
         ),
     ] = False,
 ) -> dict | Problem:
-    """Run sandboxed shell source. Use the default wait for long jobs and poll the returned handle
-    with poll_command_job until completion. Output may expose physical paths."""
+    """Run sandboxed shell source and return its result or job handle. Output may expose paths."""
     if context.execution_service is None:
         return Problem(
             code="sandbox.unavailable",
@@ -538,7 +536,9 @@ def poll_command_job(
                 "immediate status check. The whole command has a runtime limit of "
                 "{runtime_limit_seconds:g} seconds ({runtime_limit_setting}). Output arriving "
                 "during this wait does not return early. The result includes one available "
-                "page from each output stream."
+                "page from each output stream and any retained tail preview that fits when "
+                "a completed stream extends beyond its page. Use null cursors and read "
+                "the exit code and available output, including the tail."
             ),
             ge=0,
             allow_inf_nan=False,
@@ -549,16 +549,18 @@ def poll_command_job(
         str | None,
         BeforeValidator(normalize_optional_null),
         Field(
-            description="Cursor from stdout.next_cursor in a prior run or poll result; "
-            "JSON null (unquoted) or an empty string starts at the beginning."
+            description="Copy stdout.next_cursor exactly from the prior result for sequential "
+            "reading. Use JSON null (unquoted) for a completion check or to start at the "
+            "beginning. Invalid cursors restart at the beginning and return a cursor error."
         ),
     ] = None,
     stderr_cursor: Annotated[
         str | None,
         BeforeValidator(normalize_optional_null),
         Field(
-            description="Cursor from stderr.next_cursor in a prior run or poll result; "
-            "JSON null (unquoted) or an empty string starts at the beginning."
+            description="Copy stderr.next_cursor exactly from the prior result for sequential "
+            "reading. Use JSON null (unquoted) for a completion check or to start at the "
+            "beginning. Invalid cursors restart at the beginning and return a cursor error."
         ),
     ] = None,
 ) -> dict | Problem:
@@ -582,7 +584,12 @@ def poll_command_job(
 @tool(requires_execution_service=True)
 def read_command_output(
     context: ToolContext,
-    handle: Annotated[str, Field(description="Opaque handle from run_command.", min_length=32)],
+    handle: Annotated[
+        str,
+        Field(
+            description="Top-level command job handle from run_command or its poll.", min_length=32
+        ),
+    ],
     stream: Annotated[Literal["stdout", "stderr"], Field(description="Process output stream.")],
     cursor: Annotated[
         str | None,

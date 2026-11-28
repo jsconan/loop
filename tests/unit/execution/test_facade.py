@@ -6183,6 +6183,41 @@ def test_command_job_poll_forwards_per_stream_cursors(tmp_path):
     )
 
 
+@pytest.mark.parametrize("position", ["malformed", "foreign", "future"])
+def test_command_job_invalid_cursor_keeps_the_same_job_status(tmp_path, position):
+    """A bad cursor leaves process status and the other stream's valid cursor usable."""
+    from loop.utils.content import encode_content_cursor
+
+    service = CommandExecutionService(Mock(), Mock())
+    context = ToolContext(None, "poll_command_job", permission_manager=PermissionManager(tmp_path))
+    job = CommandJob("owner", 3600)
+    job.admitted()
+    job.publish("stdout", "current")
+    job.publish("stderr", "previous warning")
+    service._jobs.get = Mock(return_value=job)
+    context.settings.command_default_poll_wait_seconds = 0
+    handles = job.output_handles()
+    cursor, diagnostic = {
+        "malformed": ("invalid", "Invalid cached content cursor."),
+        "foreign": (encode_content_cursor(handles["stderr"], 0), "Invalid cached content cursor."),
+        "future": (
+            encode_content_cursor(handles["stdout"], 8),
+            "Content cursor is beyond the end of the content.",
+        ),
+    }[position]
+    stderr_cursor = encode_content_cursor(handles["stderr"], len("previous "))
+
+    result = service.poll_command_job(
+        context, job.handle, stdout_cursor=cursor, stderr_cursor=stderr_cursor
+    )
+
+    assert result["handle"] == job.handle
+    assert result["status"] == "running"
+    assert result["stdout"]["content"] == "current"
+    assert result["stderr"]["content"] == "warning"
+    assert result["cursor_errors"] == {"stdout": diagnostic}
+
+
 @pytest.mark.parametrize(
     "wait",
     [
