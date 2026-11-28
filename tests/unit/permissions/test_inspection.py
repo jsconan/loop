@@ -244,6 +244,7 @@ def test_command_analysis_identifies_inherited_path_lookup(source, inherited):
         ("set value -k; second", (("second", True),)),
         ("pushd somewhere; second", (("second", False),)),
         ("env -i first; second", (("second", True),)),
+        ('"$COMMAND"; second', ()),
         ("cd somewhere; second", (("second", False),)),
         ("cd .; second", (("second", True),)),
         ("if first; then second; fi", ()),

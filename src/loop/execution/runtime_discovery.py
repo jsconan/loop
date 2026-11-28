@@ -47,21 +47,26 @@ class WorkspaceExecutableLink(NamedTuple):
 def linked_project_installations(
     workspace: Path,
     system_roots: tuple[Path, ...],
-    may_list: Callable[[Path], bool],
+    may_inspect: Callable[[Path, bool], bool],
+    *,
+    launchers: Collection[str] | None = None,
 ) -> dict[Path, list[WorkspaceExecutableLink]]:
     """Identify external installations referenced by the project’s executable links.
 
     Args:
         workspace (Path): Canonical active checkout.
         system_roots (tuple[Path, ...]): Already visible native system paths.
-        may_list (Callable[[Path], bool]): Current permission to inspect a project directory.
+        may_inspect (Callable[[Path, bool], bool]): Current permission to inspect a path.
+            The second argument selects directory listing or file reading.
+        launchers (Collection[str] | None): Literal child-command hints. When supplied, offer
+            only links identified by those named launchers.
 
     Returns:
         dict[Path, list[WorkspaceExecutableLink]]: Candidate bin/lib installations with
             identity-bound executable spellings. Each new read scope requires review.
     """
     installations: dict[Path, list[WorkspaceExecutableLink]] = {}
-    for name in workspace_tool_links(workspace, may_list):
+    for name in workspace_tool_links(workspace, may_inspect, launchers=launchers):
         try:
             selected = resolve_selected_executable(name, "", workspace)
             if selected is None:
@@ -162,7 +167,30 @@ def workspace_shell_programs(
         return None
 
 
-def workspace_tool_links(workspace: Path, may_list: Callable[[Path], bool]) -> tuple[str, ...]:
+def _launcher_interpreter(
+    workspace: Path,
+    launcher: Path,
+    may_read: Callable[[Path], bool],
+) -> str | None:
+    """Read one executable launcher for an absolute interpreter reference."""
+    try:
+        if not may_read(launcher) or not os.access(launcher, os.X_OK):
+            return None
+        content = _read_workspace_file(workspace, launcher, may_read)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    if not content or not content.startswith(b"#!"):
+        return None
+    words = content.partition(b"\n")[0][2:].split(maxsplit=1)
+    return os.fsdecode(words[0]) if words and words[0].startswith(b"/") else None
+
+
+def workspace_tool_links(
+    workspace: Path,
+    may_inspect: Callable[[Path, bool], bool],
+    *,
+    launchers: Collection[str] | None = None,
+) -> tuple[str, ...]:
     """Find linked executables in immediate project tool installations without running them.
 
     Inspect only the conventional bin directory of each immediate project directory.
@@ -171,15 +199,24 @@ def workspace_tool_links(workspace: Path, may_list: Callable[[Path], bool]) -> t
 
     Args:
         workspace (Path): Canonical active checkout.
-        may_list (Callable[[Path], bool]): Current permission to inspect a workspace directory.
+        may_inspect (Callable[[Path, bool], bool]): Current permission to inspect a path.
+            The second argument selects directory listing or file reading.
+        launchers (Collection[str] | None): When supplied, intersect the available links
+            with those named directly or used as interpreters by these local executables.
 
     Returns:
         tuple[str, ...]: Absolute executable link spellings in deterministic order.
     """
     limit = constants.MAX_COMMAND_PATH_COUNT
-    if not may_list(workspace):
+    if not may_inspect(workspace, True):
         return ()
-    links = set()
+    links: set[str] = set()
+    identified: set[str] = set()
+
+    def may_read(path: Path) -> bool:
+        """Check workspace file policy before reading a candidate launcher."""
+        return may_inspect(path, False)
+
     try:
         with os.scandir(workspace) as children:
             entries = tuple(islice(children, limit + 1))
@@ -188,7 +225,7 @@ def workspace_tool_links(workspace: Path, may_list: Callable[[Path], bool]) -> t
             directories = [entry.name for entry in entries if entry.is_dir(follow_symlinks=False)]
         for child in sorted(directories):
             directory = workspace / child / "bin"
-            if not may_list(directory):
+            if not may_inspect(directory, True):
                 continue
             try:
                 with open_selected_parent(directory) as parent:
@@ -201,15 +238,27 @@ def workspace_tool_links(workspace: Path, may_list: Callable[[Path], bool]) -> t
                     for count, entry in enumerate(entries):
                         if count >= _MAX_INSTALLATION_ENTRIES:
                             return ()
-                        if entry.is_symlink():
+                        linked = entry.is_symlink()
+                        if linked:
                             links.add(str(directory / entry.name))
                             if len(links) > limit:
                                 return ()
+                        if launchers is not None and entry.name in launchers:
+                            path = directory / entry.name
+                            if linked:
+                                identified.add(str(path))
+                            elif entry.is_file(follow_symlinks=False):
+                                interpreter = _launcher_interpreter(workspace, path, may_read)
+                                if (
+                                    interpreter is not None
+                                    and Path(interpreter).parent == directory
+                                ):
+                                    identified.add(interpreter)
             finally:
                 os.close(descriptor)
     except (OSError, RuntimeError):
         return ()
-    return tuple(sorted(links))
+    return tuple(sorted(links if launchers is None else links & identified))
 
 
 def workspace_command_source(source: str, workspace: Path, cwd: Path) -> str:
@@ -486,37 +535,51 @@ def discover_makefile_commands(
     try:
         inspection = CommandInspection()
         tokens = shell_tokens(source)
-        pipe = next(
-            (index for index, token in enumerate(tokens) if token.operator and token.value == "|"),
+        boundary = next(
+            (
+                index
+                for index, token in enumerate(tokens)
+                if token.operator and token.value in {";", "\n", "&&", "||", "|"}
+            ),
             None,
         )
-        if pipe is not None:
-            expecting_command = True
-            for token in tokens[pipe + 1 :]:
-                if token.operator and token.value == "|" and not expecting_command:
-                    expecting_command = True
+        if boundary is not None:
+            separator = tokens[boundary].value
+            remainder = tokens[boundary + 1 :]
+            if separator == "|":
+                expecting_command = True
+                for token in remainder:
+                    if token.operator and token.value == "|" and not expecting_command:
+                        expecting_command = True
+                    elif (
+                        token.operator
+                        or not literal_shell_word(token.raw)
+                        or not token.value
+                        or expecting_command
+                        and (
+                            token.raw in CommandInspection.SHELL_KEYWORDS | {"!"}
+                            or re.match(r"[A-Za-z_][A-Za-z0-9_]*=", token.value) is not None
+                        )
+                    ):
+                        return ()
+                    else:
+                        expecting_command = False
+                if expecting_command:
+                    return ()
+            else:
+                following = next((token for token in remainder if token.value != "\n"), None)
+                if following is None:
+                    if separator in {"&&", "||"}:
+                        return ()
                 elif (
-                    token.operator
-                    or not literal_shell_word(token.raw)
-                    or not token.value
-                    or expecting_command
-                    and (
-                        token.raw in CommandInspection.SHELL_KEYWORDS | {"!"}
-                        or re.match(r"[A-Za-z_][A-Za-z0-9_]*=", token.value) is not None
-                    )
+                    following.operator
+                    or following.raw in CommandInspection.SHELL_KEYWORDS
+                    or not literal_shell_word(following.raw)
                 ):
                     return ()
-                else:
-                    expecting_command = False
-            if expecting_command:
-                return ()
-            source = source[: tokens[pipe].start]
-            tokens = tokens[:pipe]
+            source = source[: tokens[boundary].start]
+            tokens = tokens[:boundary]
         analysis = inspection.analyze(source)
-        while tokens and tokens[-1].operator and tokens[-1].value == "\n":
-            tokens.pop()
-        if tokens and tokens[-1].operator and tokens[-1].value == ";":
-            tokens.pop()
         for index, token in enumerate(tokens):
             if token.operator and (
                 token.value not in {"<", ">", ">>", "<>", ">|", "<&", ">&"}

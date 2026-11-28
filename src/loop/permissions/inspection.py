@@ -189,6 +189,9 @@ class CommandAnalysis:
             inherited PATH, paired with whether their working directory is unchanged.
         first_executable_arguments (tuple[str, ...]): Literal argument prefix before any
             expansion, bounded independently of later shell commands.
+        literal_invocations (tuple[tuple[str, tuple[str, ...]], ...]): Bounded top-level
+            executable and argument prefixes with known inherited PATH and working directory.
+        has_pipeline (bool): Whether a simple top-level shell command list contains a pipeline.
     """
 
     findings: tuple[CommandFinding, ...]
@@ -201,6 +204,8 @@ class CommandAnalysis:
     first_path_inherited: bool = False
     inherited_path_executables: tuple[tuple[str, bool], ...] = ()
     first_executable_arguments: tuple[str, ...] = ()
+    literal_invocations: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    has_pipeline: bool = False
 
 
 class CommandScanResult(NamedTuple):
@@ -218,6 +223,8 @@ class CommandScanResult(NamedTuple):
         inherited_executables (list[tuple[str, bool]]): Literal inherited-PATH candidates and
             whether their working directory is unchanged.
         first_arguments (list[str]): Literal argument prefix of the first command.
+        literal_invocations (list[tuple[str, tuple[str, ...]]]): Stable top-level selections.
+        has_pipeline (bool): A pipe operator is visible in a simple shell command list.
     """
 
     findings: list[CommandFinding | None]
@@ -230,6 +237,8 @@ class CommandScanResult(NamedTuple):
     first_path_inherited: bool
     inherited_executables: list[tuple[str, bool]]
     first_arguments: list[str]
+    literal_invocations: list[tuple[str, tuple[str, ...]]]
+    has_pipeline: bool
 
 
 def match_destructive_command(command: list[str]) -> CommandFinding | None:
@@ -535,6 +544,8 @@ class CommandInspection:
             scan.first_path_inherited,
             tuple(dict.fromkeys(scan.inherited_executables))[:128],
             tuple(scan.first_arguments),
+            tuple(scan.literal_invocations),
+            scan.has_pipeline,
         )
 
     def _scan(
@@ -555,6 +566,7 @@ class CommandInspection:
         first_arguments = []
         first_path_inherited = False
         inherited_executables = []
+        literal_invocations = []
         path_stable = True
         cwd_stable = True
         try:
@@ -571,7 +583,11 @@ class CommandInspection:
                 first_path_inherited,
                 inherited_executables,
                 first_arguments,
+                literal_invocations,
+                False,
             )
+        operators = {token.value for token in tokens if token.operator}
+        simple_source = not operators.intersection({"<<", "<<-", "(", ")"})
         start = 0
         for index in range(len(tokens) + 1):
             if index < len(tokens) and not (
@@ -615,23 +631,36 @@ class CommandInspection:
             )
             literal = literal_shell_word(word_tokens[-len(command)].raw)
             function_syntax = index < len(tokens) and tokens[index].value == "("
-            if (
+            inherited_executable = (
                 inherited
                 and literal
                 and not function_syntax
                 and command[0]
                 not in self.PATH_CONTEXT_MUTATORS | self.SHELL_KEYWORDS | self.SHELL_BUILTINS
-            ):
+            )
+            if inherited_executable:
                 inherited_executables.append((command[0], cwd_stable))
-            if not executables:
-                first_literal = literal
-                first_initial = initial and not function_syntax and valid_prefixes
-                first_path_inherited = inherited
+            identify_invocation = (
+                depth == 0
+                and (simple_source or not executables and initial)
+                and inherited_executable
+                and cwd_stable
+                and len(literal_invocations) < 128
+            )
+            if not executables or identify_invocation:
+                prefix = []
                 argument_start = len(word_tokens) - len(command) + 1
                 for token in word_tokens[argument_start : argument_start + 128]:
                     if not literal_shell_word(token.raw):
                         break
-                    first_arguments.append(token.value)
+                    prefix.append(token.value)
+                if identify_invocation:
+                    literal_invocations.append((command[0], tuple(prefix)))
+            if not executables:
+                first_literal = literal
+                first_initial = initial and not function_syntax and valid_prefixes
+                first_path_inherited = inherited
+                first_arguments = prefix
                 first_argument = first_arguments[0] if first_arguments else None
             name = Path(command[0]).name
             executables.append(command[0])
@@ -672,7 +701,11 @@ class CommandInspection:
                 for nested_position, finding in enumerate(nested.findings):
                     if findings[nested_position] is None:
                         findings[nested_position] = finding
-            if command[0] in self.PATH_CONTEXT_MUTATORS | self.SHELL_KEYWORDS or function_syntax:
+            if (
+                not literal
+                or function_syntax
+                or command[0] in self.PATH_CONTEXT_MUTATORS | self.SHELL_KEYWORDS
+            ):
                 path_stable = False
             if command[0] == "printf" and len(command) > 1 and command[1].startswith("-v"):
                 path_stable = False
@@ -691,6 +724,8 @@ class CommandInspection:
             first_path_inherited,
             inherited_executables,
             first_arguments,
+            literal_invocations,
+            simple_source and "|" in operators,
         )
 
     def _add_destructive_finding(

@@ -3100,6 +3100,22 @@ def test_sandbox_read_scope_rejects_protected_application_storage(tmp_path):
     )
 
 
+def test_sandbox_read_alias_cannot_cross_protected_application_storage(tmp_path):
+    """A permitted target does not grant access through a protected alias spelling."""
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    private = tmp_path / "app-data"
+    private.mkdir()
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    alias = private / "current"
+    alias.symlink_to(runtime, target_is_directory=True)
+    manager = PermissionManager(workspace, protected_host_roots=(private,))
+    request = native_request(workspace, read_roots=(runtime,), read_aliases=(alias,))
+    assert "read alias is blocked" in manager.sandbox_scope_limit(request)
+    assert manager.sandbox_scope_limit(native_request(workspace, read_roots=(runtime,))) is None
+
+
 def test_namespace_identity_and_recovery_block_policy_writes(tmp_path):
     """Invalid user identity and unresolved namespaces cannot publish policy changes."""
     arguments, _workspace_id, _ = durable_policy_inputs(tmp_path)

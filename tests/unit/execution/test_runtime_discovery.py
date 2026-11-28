@@ -372,12 +372,16 @@ def test_makefile_discovers_quoted_parentheses_but_not_shell_operators(project, 
         "make test > /dev/null",
         "make test;",
         "make test;\n",
+        'make test 2>&1; echo "EXIT_CODE=$?"',
+        "make test && printf finished",
+        "make test || printf issue",
+        "make test\nprintf 'later command'",
         'cd "$WORKSPACE_ROOT" && make test 2>&1 | tail -200',
         "make test | fixture-filter --quiet | fixture-summary",
     ],
 )
 def test_makefile_discovery_understands_shell_structure(project, monkeypatch, source):
-    """A no-op directory change, assignments and redirections retain make selection."""
+    """A fixed initial build retains its tool selection in a simple shell command list."""
     workspace = project
     (workspace / "Makefile").write_text(".PHONY: test\ntest:\n\tfixture-tool\n")
     monkeypatch.setattr(
@@ -421,7 +425,7 @@ def test_makefile_discovery_understands_shell_structure(project, monkeypatch, so
         r"make test \| tail",
         "make test; )",
         "make test; if",
-        "make test && printf finished",
+        'make test; "$COMMAND"',
     ],
 )
 def test_makefile_discovery_preserves_ambiguous_shell_selection(project, monkeypatch, source):
@@ -744,8 +748,64 @@ def test_workspace_tool_links_are_bounded_and_stay_within_project(project, monke
             (folder / str(index)).touch()
     if case == "missing":
         project = project / "missing"
-    result = runtime_discovery.workspace_tool_links(project, lambda path: case != "denied")
+    result = runtime_discovery.workspace_tool_links(
+        project, lambda _path, _directory: case != "denied"
+    )
     assert result == ((str(folder / "linked"),) if case == "eligible" else ())
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "script",
+        "link",
+        "directory",
+        "unreadable",
+        "not-executable",
+        "changed",
+        "binary",
+        "relative",
+    ],
+)
+def test_workspace_tool_links_selects_only_the_named_launcher_interpreter(
+    project, monkeypatch, case
+):
+    """Bound launcher evidence excludes unreadable, indirect and unrelated runtime links."""
+    directory = project / "tools" / "bin"
+    directory.mkdir(parents=True)
+    interpreter = directory / "runtime"
+    interpreter.symlink_to("/external-runtime")
+    (directory / "unrelated").symlink_to("/another-runtime")
+    launcher = directory / "verify"
+    if case == "directory":
+        launcher.mkdir()
+    elif case == "link":
+        launcher.symlink_to("/external-launcher")
+    else:
+        body = {
+            "relative": "#!runtime\n",
+            "binary": "other format",
+        }.get(case, f"#!{interpreter} -I\n")
+        launcher.write_text(body)
+        launcher.chmod(0o600 if case == "not-executable" else 0o700)
+
+    if case == "changed":
+        real_open = runtime_discovery.open_selected_file
+
+        def changed(root, path, identity):
+            """Simulate the exact launcher disappearing while its contents are pinned."""
+            if path == launcher:
+                raise FileNotFoundError(path)
+            return real_open(root, path, identity)
+
+        monkeypatch.setattr(runtime_discovery, "open_selected_file", changed)
+
+    result = runtime_discovery.workspace_tool_links(
+        project,
+        lambda _path, directory: directory or case != "unreadable",
+        launchers={"verify"},
+    )
+    assert result == {"script": (str(interpreter),), "link": (str(launcher),)}.get(case, ())
 
 
 @pytest.mark.parametrize(
@@ -811,11 +871,15 @@ def test_linked_installations_skip_changed_or_shared_executables(project, monkey
     program.chmod(0o700)
     (program.parent / "second").hardlink_to(program)
     (folder / "launcher").symlink_to(program)
-    assert not runtime_discovery.linked_project_installations(project, (), lambda _path: True)
+    assert not runtime_discovery.linked_project_installations(
+        project, (), lambda _path, _directory: True
+    )
 
     def changed(*_args):
         """Simulate a disappearing executable during selection."""
         raise OSError("tool disappeared")
 
     monkeypatch.setattr(runtime_discovery, "resolve_selected_executable", changed)
-    assert not runtime_discovery.linked_project_installations(project, (), lambda _path: True)
+    assert not runtime_discovery.linked_project_installations(
+        project, (), lambda _path, _directory: True
+    )

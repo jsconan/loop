@@ -3307,8 +3307,15 @@ def test_public_workspace_runtime_is_available_through_approved_scope(
     require_drained(generation)
 
 
-def test_piped_make_prepares_its_selected_tool(public, monkeypatch):
-    """A piped build prepares its selected tool while private files stay confined."""
+@pytest.mark.parametrize(
+    ("source", "pipeline"),
+    [
+        ('cd "$WORKSPACE_ROOT" && make test 2>&1 | tail -200', True),
+        ('cd "$WORKSPACE_ROOT" && make test 2>&1; echo "BUILD_STATUS=$?"', False),
+    ],
+)
+def test_compound_build_prepares_its_selected_tool(public, monkeypatch, source, pipeline):
+    """Prepare the build's tool without altering the submitted shell command."""
     if _QUALIFICATION_UV is None or _SYSTEM_MAKE is None:
         pytest.skip("A managed tool and system build tool are required")
     interaction, workspace, generation = public
@@ -3320,15 +3327,19 @@ def test_piped_make_prepares_its_selected_tool(public, monkeypatch):
     private.mkdir()
     (private / "canary").write_text("private-canary", encoding="utf-8")
     monkeypatch.setenv("PATH", os.pathsep.join((str(Path(_QUALIFICATION_UV).parent), os.defpath)))
-    result, denied = invoke_tools(
+    result, masked, denied = invoke_tools(
         public,
         [
             {
                 "tool": "run_command",
                 "arguments": {
-                    "command": 'cd "$WORKSPACE_ROOT" && make test 2>&1 | tail -200',
+                    "command": source,
                     "cwd": "$WORKSPACE_ROOT",
                 },
+            },
+            {
+                "tool": "run_command",
+                "arguments": {"command": "false | cat", "cwd": "$WORKSPACE_ROOT"},
             },
             {
                 "tool": "run_command",
@@ -3343,6 +3354,12 @@ def test_piped_make_prepares_its_selected_tool(public, monkeypatch):
     )
     assert result["ok"], json.dumps({"result": result, "scope": interaction.infos})
     assert "uv " in result["result"]["stdout"]["content"]
+    if pipeline:
+        assert result["result"]["exit_status"]["pipeline_stages"] == "unobserved"
+    else:
+        assert "BUILD_STATUS=0" in result["result"]["stdout"]["content"]
+    assert masked["ok"] and masked["result"]["exit_code"] == 0
+    assert masked["result"]["exit_status"]["pipeline_stages"] == "unobserved"
     assert not denied["ok"] and "private-canary" not in json.dumps(denied)
     assert interaction.prompts
     require_drained(generation)
@@ -5300,6 +5317,7 @@ def test_workspace_selected_executable_retarget_is_stale(
     [
         "direct",
         "direct-file",
+        "direct-later",
         "forwarded",
         "forwarded-chain",
         "forwarded-path",
@@ -5431,6 +5449,8 @@ def test_workspace_executable_link_requests_installation_scope(
         if invocation == "outside-relative"
         else "./fixture-tool"
         if invocation in {"direct", "direct-file"}
+        else 'cd "$WORKSPACE_ROOT" && mkdir -p "$LOOP_OUTPUT_DIR" && ./fixture-tool'
+        if invocation == "direct-later"
         else "./fixture-launcher ./fixture-forwarder ./fixture-tool"
         if invocation in {"forwarded-chain", "not-forwarded-chain"}
         else "./fixture-launcher fixture-tool"

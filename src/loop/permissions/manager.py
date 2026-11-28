@@ -3030,6 +3030,12 @@ class PermissionManager:
                 return "A requested write scope intersects a read-only sandbox path."
             if request.local_network and not self.sandbox_local_network_enabled():
                 return "The effective user or managed policy denies sandbox-local networking."
+            if request.read_aliases and any(
+                alias.is_relative_to(denied)
+                for denied in (*self._sandbox_hard_paths(), *self._protected_read_roots)
+                for alias in request.read_aliases
+            ):
+                return "A requested read alias is blocked by your sandbox path policy."
             for root in (*request.read_roots, *request.hardlink_sources):
                 if root.is_relative_to(request.workspace):
                     continue

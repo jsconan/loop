@@ -54,6 +54,100 @@ def automatic_process_policy(root, *, allow_direct_host_execution=False):
 
 
 @pytest.mark.parametrize(
+    ("source", "model", "exit_code", "pipeline"),
+    [
+        ("producer | consumer", True, 0, True),
+        ("producer | consumer", False, 0, True),
+        ("producer | consumer", True, 7, True),
+        ("producer | consumer", True, None, True),
+        ("sh -c 'producer | consumer'", True, 0, False),
+        ("printf '%s' '|'", True, 0, False),
+        ("cat <<'EOF'\ntext | data\nEOF", True, 0, False),
+        ("case word in one|word) printf result;; esac", True, 0, False),
+    ],
+)
+def test_pipeline_reports_shell_status_without_changing_execution(
+    source, model, exit_code, pipeline, tmp_path
+):
+    """A pipe runs unchanged, and its shell status carries the limits of stage evidence."""
+    backend = Mock()
+    outcome = SandboxOutcome.COMPLETED if exit_code is not None else SandboxOutcome.TIMED_OUT
+    backend.run.return_value = CommandProcessResult(outcome, exit_code=exit_code)
+    interaction = Mock()
+    context = ToolContext(
+        interaction,
+        "run_command",
+        operations=(
+            Operation(
+                tool_id="run_command",
+                action=Action.PROCESS_EXECUTE,
+                target=ProcessTarget(
+                    argv=("/bin/sh", "-c", source),
+                    cwd=str(tmp_path),
+                    boundary=ProcessBoundary.SANDBOXED,
+                ),
+            ),
+        ),
+        call_id="model-call" if model else None,
+        permission_manager=automatic_process_policy(tmp_path),
+    )
+
+    result = CommandExecutionService(backend, Mock()).run_command(context, source)
+
+    request = backend.run.call_args.args[0]
+    assert request.source == request.execution_source == source
+    if exit_code is None:
+        assert result.code == "sandbox.timed_out"
+        assert "exit_status" not in result.metadata
+        return
+    if exit_code:
+        assert result.code == "process.nonzero_exit"
+        output = result.metadata
+    else:
+        output = result
+    assert output["exit_code"] == exit_code
+    if pipeline:
+        status = output["exit_status"]
+        assert status["scope"] == "shell"
+        assert status["pipeline_stages"] == "unobserved"
+        assert "retained output" in status["guidance"]
+    else:
+        assert "exit_status" not in output
+
+
+def test_completed_pipeline_poll_retains_shell_status_evidence(tmp_path, command_operation):
+    """A poll reports the same stage-evidence limits as an inline command completion."""
+    finish = Event()
+
+    def run(*_args, **_kwargs):
+        """Settle only after the initial call returns the continuation."""
+        assert finish.wait(5)
+        return CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
+
+    backend = Mock()
+    backend.run.side_effect = run
+    context = ToolContext(
+        Mock(),
+        "run_command",
+        operations=(command_operation,),
+        call_id="model-call",
+        permission_manager=automatic_process_policy(tmp_path),
+    )
+    service = CommandExecutionService(backend, Mock())
+    try:
+        initial = service.run_command(context, "producer | consumer", wait_seconds=0)
+        assert initial["status"] == "running"
+    finally:
+        finish.set()
+
+    result = service.poll_command_job(context, initial["handle"], wait_seconds=5)
+
+    assert result["status"] == "complete"
+    assert result["exit_code"] == 0
+    assert result["result"]["metadata"]["exit_status"]["pipeline_stages"] == "unobserved"
+
+
+@pytest.mark.parametrize(
     "variable", ["MODE", "REPORT_FILE", "HOME", "IFS", "LOOP_SYNC_SOCKET", "bad-name", "nul"]
 )
 def test_configured_sandbox_environment_is_applied_inside_the_boundary(tmp_path, variable):
@@ -6843,9 +6937,9 @@ def test_project_launcher_prepares_only_active_eligible_installations(
     if selection == "removed":
         discover = execution_facade.linked_project_installations
 
-        def remove_after_discovery(*args):
+        def remove_after_discovery(*args, **kwargs):
             """Withdraw the optional installation before the command can bind its identity."""
-            result = discover(*args)
+            result = discover(*args, **kwargs)
             installation.rename(installation.with_name("retired-installation"))
             return result
 
@@ -6886,6 +6980,129 @@ def test_project_launcher_prepares_only_active_eligible_installations(
         selection in {"active", "inactive", "scratch", "already-reviewed", "saved-explicit"}
     )
     assert tmp_path not in approved.write_roots
+    assert not manager.configuration.workspace_command_writes
+
+
+@pytest.mark.parametrize(
+    "selection",
+    [
+        "literal",
+        "compound",
+        "direct-later",
+        "direct-later-changed-directory",
+        "direct-later-denied",
+        "direct-later-other-root",
+        "direct-later-parent-traversal",
+        "changed-directory",
+        "changed-path",
+        "expanded",
+        "unrelated",
+        "denied",
+        "saved",
+        "explicit",
+        "ambiguous",
+        "linked-runner",
+    ],
+)
+def test_opaque_runner_only_prepares_a_runtime_witnessed_by_a_local_launcher(
+    tmp_path, command_operation, selection
+):
+    """A literal installed entry point can identify its external runtime for command review."""
+    runtime = tmp_path.parent / f"{tmp_path.name}-runtime"
+    interpreter = runtime / "bin" / "tool"
+    interpreter.parent.mkdir(parents=True)
+    (runtime / "lib").mkdir()
+    interpreter.write_text("interpreter")
+    interpreter.chmod(0o700)
+    stable = runtime.parent / f"{tmp_path.name}-links" / "current"
+    stable.parent.mkdir()
+    stable.symlink_to(runtime, target_is_directory=True)
+    local = tmp_path / "local-installation" / "bin"
+    local.mkdir(parents=True)
+    tool = local / "tool"
+    tool.symlink_to(stable / "bin/tool")
+    command = local / "check"
+    command.write_text("#!/bin/sh\n:" if selection == "unrelated" else f"#!{tool}\n:")
+    command.chmod(0o700)
+    external = runtime.parent / f"{tmp_path.name}-tools"
+    external.mkdir()
+    runner = external / "runner"
+    runner.write_text("runner")
+    runner.chmod(0o700)
+
+    if selection == "ambiguous":
+        other = runtime.parent / f"{tmp_path.name}-other"
+        other_tool = other / "bin/tool"
+        other_tool.parent.mkdir(parents=True)
+        (other / "lib").mkdir()
+        other_tool.write_text("another interpreter")
+        other_tool.chmod(0o700)
+        other_local = tmp_path / "alternate-installation" / "bin"
+        other_local.mkdir(parents=True)
+        (other_local / "check").symlink_to(other_tool)
+
+    manager = PermissionManager(tmp_path)
+    if selection == "linked-runner":
+        installation = external.with_name(f"{external.name}-installation")
+        installation.mkdir()
+        physical = installation / "runner"
+        runner.rename(physical)
+        runner.symlink_to(physical)
+        manager.update_sandbox_paths(ApprovalChoice.SESSION, {str(installation): Decision.ALLOW})
+    if selection == "denied":
+        manager.update_sandbox_paths(ApprovalChoice.SESSION, {str(runtime): Decision.DENY})
+    if selection == "direct-later-denied":
+        manager.update_sandbox_paths(ApprovalChoice.SESSION, {str(local): Decision.DENY})
+    interaction = Mock()
+    interaction.prompt.return_value = "approve"
+    backend = Mock(system_read_roots=())
+    backend.run.return_value = CommandProcessResult(SandboxOutcome.COMPLETED, exit_code=0)
+    context = ToolContext(
+        interaction,
+        "run_command",
+        operations=(command_operation,),
+        permission_manager=manager,
+        instructions_manager=InstructionsManager(
+            runtime_environment=RuntimeEnvironment(tmp_path, manager.temporary_directory)
+        ),
+        settings=ToolRuntimeSettings(sandbox_environment={"PATH": str(external)}),
+        sandbox_output_only=selection == "saved",
+    )
+    name = '"$TEST_ENTRY"' if selection == "expanded" else "check"
+    source = f'cd "$WORKSPACE_ROOT" && runner --flag run {name} 2>&1'
+    if selection == "compound":
+        source = f'cd "$WORKSPACE_ROOT" && printf ready; runner --flag run {name} 2>&1'
+    elif selection in {"direct-later", "direct-later-denied"}:
+        source = (
+            'cd "$WORKSPACE_ROOT" && mkdir -p "$LOOP_OUTPUT_DIR" && ./local-installation/bin/tool'
+        )
+    elif selection == "direct-later-changed-directory":
+        source = (
+            'cd "$WORKSPACE_ROOT/local-installation" && mkdir -p "$LOOP_OUTPUT_DIR" && ./bin/tool'
+        )
+    elif selection == "direct-later-other-root":
+        source = f"printf ready && {interpreter}"
+    elif selection == "direct-later-parent-traversal":
+        source = "printf ready && ./local-installation/bin/../bin/tool"
+    elif selection == "changed-directory":
+        source = f'cd "$WORKSPACE_ROOT/local-installation" && runner --flag run {name} 2>&1'
+    elif selection == "changed-path":
+        source = f'cd "$WORKSPACE_ROOT" && PATH=/no-tools; runner --flag run {name} 2>&1'
+    scope = {"read_roots": [str(stable)]} if selection == "explicit" else {}
+    result = CommandExecutionService(backend, Mock()).run_command(context, source, **scope)
+    assert result["exit_code"] == 0
+    approved = backend.run.call_args.args[0]
+    assert approved.source == source
+    expected = (
+        (runtime,)
+        if selection in {"literal", "compound", "direct-later", "explicit", "linked-runner"}
+        else ()
+    )
+    assert approved.read_roots == (
+        (installation, *expected) if selection == "linked-runner" else expected
+    )
+    assert approved.read_aliases == ((stable,) if expected else ())
+    assert not approved.write_roots
     assert not manager.configuration.workspace_command_writes
 
 

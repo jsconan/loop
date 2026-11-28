@@ -585,6 +585,21 @@ def _executable_directory_links(
             continue
 
 
+def _external_directory_alias(
+    link: Path,
+    roots: tuple[Path, ...],
+    workspace: Path,
+    system_roots: tuple[Path, ...],
+) -> bool:
+    """Check whether a separate mount spelling is useful and outside private paths."""
+    return (
+        not link.is_relative_to(workspace)
+        and not any(link.is_relative_to(root) for root in (*roots, *system_roots))
+        and not Path.home().resolve().is_relative_to(link.parent)
+        and not is_protected_external_read(link)
+    )
+
+
 def _approved_executable_aliases(
     names: tuple[str, ...],
     path_value: str,
@@ -599,12 +614,8 @@ def _approved_executable_aliases(
     aliases = []
     for link, target, _ in _executable_directory_links(names, path_value, cwd, roots):
         try:
-            if (
-                any(target.is_relative_to(root) for root in roots)
-                and not link.is_relative_to(workspace)
-                and not any(link.is_relative_to(root) for root in (*roots, *system_roots))
-                and not Path.home().resolve().is_relative_to(link.parent)
-                and not is_protected_external_read(link)
+            if any(target.is_relative_to(root) for root in roots) and _external_directory_alias(
+                link, roots, workspace, system_roots
             ):
                 aliases.append(link)
         except (OSError, RuntimeError, ValueError):
@@ -1446,6 +1457,7 @@ class CommandExecutionService:
         display_path: Callable[[str], str],
         *,
         job: CommandJob,
+        has_pipeline: bool,
         prepared_access: bool = False,
         skill_snapshot: tuple[tuple[str, Path, str], ...] = (),
         prelaunch_failure: CommandProcessResult | None = None,
@@ -1599,6 +1611,22 @@ class CommandExecutionService:
         output = {
             "boundary": boundary,
             "exit_code": result.exit_code,
+            **(
+                {
+                    "exit_status": {
+                        "scope": "shell",
+                        "pipeline_stages": "unobserved",
+                        "guidance": (
+                            "A pipeline can return zero even when an earlier stage failed. "
+                            "Verify the relevant stage from its own result. If its exit code "
+                            "is needed and a retry is safe, run that command directly and use "
+                            "Loop's retained output to limit display."
+                        ),
+                    },
+                }
+                if has_pipeline and result.outcome is SandboxOutcome.COMPLETED
+                else {}
+            ),
             "write_scope": {
                 "roots": [redact(str(root)) for root in request.write_roots],
                 "files": [redact(str(path)) for path in request.write_files],
@@ -1720,8 +1748,8 @@ class CommandExecutionService:
         if denial_candidates:
             output["sandbox_diagnostics"]["candidate_note"] = (
                 (
-                    "The command succeeded; denied operations may have been handled or optional "
-                    "and do not establish failure. "
+                    "The shell exited with code 0. Denied operations may have been handled or "
+                    "optional and do not establish failure. "
                     if attempt.result.exit_code == 0
                     else ""
                 )
@@ -2629,12 +2657,12 @@ class CommandExecutionService:
                     temporary_directory=context.permission_manager.temporary_directory,
                 )
 
-            def resolve_directory(root: str) -> Path:
-                """Resolve relative and virtual roots against the current workspace."""
-                path = Path(root) if Path(root).is_absolute() else Path(paths.resolve(root))
-                return path.resolve(strict=True)
+            def directory_spelling(root: str) -> Path:
+                """Resolve virtual roots while preserving their spelling for binding."""
+                return Path(root) if Path(root).is_absolute() else Path(paths.resolve(root))
 
-            manual_reads = tuple(resolve_directory(root) for root in read_roots or ())
+            read_spellings = tuple(directory_spelling(root) for root in read_roots or ())
+            manual_reads = tuple(path.resolve(strict=True) for path in read_spellings)
             scope_policy_revision = None
             if write_roots is None and write_files is None:
                 manual_writes, scope_policy_revision = (
@@ -2642,7 +2670,9 @@ class CommandExecutionService:
                 )
             elif isinstance(write_roots, list):
                 manual_writes = tuple(
-                    dict.fromkeys(resolve_directory(root) for root in write_roots)
+                    dict.fromkeys(
+                        directory_spelling(root).resolve(strict=True) for root in write_roots
+                    )
                 )
             else:
                 manual_writes = ()
@@ -2899,6 +2929,25 @@ class CommandExecutionService:
                     ),
                 )
             workspace_links = script_discovery.workspace_links
+            if not context.sandbox_output_only:
+                later_paths = tuple(
+                    name
+                    for name, _ in discovery_analysis.literal_invocations
+                    if name not in direct_names
+                    and "/" in name
+                    and (spelling := command_cwd / name).is_relative_to(workspace)
+                    and ".." not in spelling.parts
+                    and may_read_project(spelling)
+                )
+                # Bind the selected file links without reading later scripts for dependencies.
+                later_links = _workspace_script_interpreters(
+                    later_paths,
+                    path_value,
+                    command_cwd,
+                    workspace,
+                    may_read=lambda _: False,
+                ).workspace_links
+                workspace_links = tuple(dict.fromkeys((*workspace_links, *later_links)))
             runtime_reader = getattr(type(self._backend), "automatic_tool_read_roots", None)
             path_roots = path_search_roots({PATH_ENVIRONMENT_VARIABLE: path_value}, command_cwd)
             runtime_reads = (
@@ -2966,6 +3015,15 @@ class CommandExecutionService:
                 dict.fromkeys(
                     (
                         *read_aliases,
+                        *(
+                            path
+                            for path in read_spellings
+                            if path.is_symlink()
+                            and path.parent.resolve(strict=True) == path.parent
+                            and _external_directory_alias(
+                                path, manual_reads, workspace, system_roots
+                            )
+                        ),
                         *_approved_executable_aliases(
                             selected_alias_names,
                             path_value,
@@ -3276,21 +3334,46 @@ class CommandExecutionService:
                     may_read_project,
                 )
                 project = project or programs is not None
-                if project:
+                launchers = set()
+                if not project and ordinary and read_roots is None:
+                    runners = {name: resolved for name, _, resolved, _, _ in executable_identities}
+                    reviewed_roots = (*policy_reads, *grant_reads, *runtime_reads)
+                    for name, arguments in discovery_analysis.literal_invocations:
+                        if not arguments:
+                            continue
+                        runner = runners.get(name)
+                        if runner is None and reviewed_roots:
+                            selected = _selected_executable(name, path_value, command_cwd)
+                            if selected is not None and any(
+                                selected[1].is_relative_to(root) for root in reviewed_roots
+                            ):
+                                runner = selected[1]
+                        if runner is not None and not any(
+                            runner.is_relative_to(root) for root in (workspace, *system_roots)
+                        ):
+                            launchers.update(
+                                word
+                                for word in arguments
+                                if word and not word.startswith("-") and "/" not in word
+                            )
+                if project or launchers:
                     installations = linked_project_installations(
                         workspace,
                         system_roots,
-                        lambda path: context.permission_manager.can_inspect_command_path(
-                            context.tool_name, workspace, path, directory=True
+                        lambda path, directory: context.permission_manager.can_inspect_command_path(
+                            context.tool_name, workspace, path, directory=directory
                         ),
+                        launchers=None if project else frozenset(launchers),
                     )
                     active_directories = {directory for _, directory in path_roots}
                     project_tools = {
                         root: links
                         for root, links in installations.items()
                         if len(installations) == 1
-                        or any(link.spelling.parent in active_directories for link in links)
+                        or project
+                        and any(link.spelling.parent in active_directories for link in links)
                     }
+                    project = project or bool(project_tools)
                 for identity in _automatic_executable_identities(
                     programs if ordinary and programs else (),
                     path_value,
@@ -3408,6 +3491,7 @@ class CommandExecutionService:
                 prelaunch_failure=prelaunch_failure,
                 reason=reason,
                 job=job,
+                has_pipeline=analysis.has_pipeline,
                 prepared_access=prepared_access,
                 skill_snapshot=skill_snapshot,
                 admission_cancellation_event=admission_cancellation_event,
