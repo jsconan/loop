@@ -1112,6 +1112,26 @@ def test_mount_descriptor_failures_refuse_before_payload(execution, case):
     execution.launch.assert_not_called()
 
 
+@pytest.mark.parametrize("number", [errno.E2BIG, errno.EMFILE, errno.ENFILE, errno.EIO])
+def test_native_spawn_reports_resource_errors_without_payload(execution, number):
+    """A transient system limit change at exec fails safely without retrying the command."""
+    execution.launch.side_effect = OSError(number, "before exec")
+    if number == errno.EIO:
+        with pytest.raises(OSError, match="before exec"):
+            linux_runtime.execute_installed_request(
+                execution.record, b"snapshot", execution.connection
+            )
+    else:
+        result = linux_runtime.execute_installed_request(
+            execution.record, b"snapshot", execution.connection
+        )
+        assert result.outcome is SandboxOutcome.INVALID
+        assert not result.possible_effects
+        assert ("argument size" if number == errno.E2BIG else "open-file") in result.detail
+    execution.launch.assert_called_once()
+    execution.supervisor.assert_not_called()
+
+
 @pytest.mark.parametrize("case", ["emfile", "enfile", "io"])
 def test_tracking_descriptor_failures_refuse_before_payload(execution, monkeypatch, case):
     """Tracking descriptor exhaustion is reported without starting the command."""

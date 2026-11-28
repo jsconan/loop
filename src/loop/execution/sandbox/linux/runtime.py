@@ -45,7 +45,7 @@ from ..constants import (
 from ..contracts import CommandProcessResult, SandboxOutcome, SandboxRequest
 from . import constants as linux_constants
 from .admission import admission_group, receive_request
-from .compiler import CompilationCancelled, compile_payload
+from .compiler import PAYLOAD_COMPILER_DESCRIPTOR_HEADROOM, CompilationCancelled, compile_payload
 from .constants import (
     BOOT_FILENAME,
     CACHE_LOCK_FILENAME,
@@ -624,30 +624,6 @@ def execute_installed_request(
             broker = NetworkBroker(request, bridge_host)
             pins.callback(broker.close)
         try:
-            arguments, inherited, mounted_request = prepared_paths.enter_context(
-                namespace_arguments(request, Path(scratch), empty_mask=empty_mask)
-            )
-            if mounted_request.hardlink_source_identities:
-                # Host-only inode witnesses have served their purpose before namespace entry.
-                mounted_request = replace(mounted_request, hardlink_source_identities=())
-            if mounted_request is not request:
-                payload = replace(mounted_request, deadline=execution_deadline).to_wire()
-                request = mounted_request
-        except ValueError as error:
-            return CommandProcessResult(
-                SandboxOutcome.INVALID,
-                detail=str(error),
-                failure_context="Native sandbox path preparation was refused.",
-            )
-        except OSError as error:
-            if error.errno not in (errno.EMFILE, errno.ENFILE):
-                raise
-            return CommandProcessResult(
-                SandboxOutcome.INVALID,
-                detail="Native sandbox mount preparation exceeded the open-file limit.",
-                failure_context="Native sandbox path preparation was refused.",
-            )
-        try:
             for bound in (
                 authority,
                 installed.helper,
@@ -658,7 +634,6 @@ def execute_installed_request(
                 receipt["apparmor"],
             ):
                 pins.enter_context(bound.open_verified(deadline=request.deadline))
-            runtime_roots = runtime_read_roots()
             group = admission_group(installed.config)
             group_fd = os.open(group.parent, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC)
             pins.callback(os.close, group_fd)
@@ -670,6 +645,62 @@ def execute_installed_request(
                 or (current_group.st_dev, current_group.st_ino) != group_identity
             ):
                 raise ValueError("Generation tracking directory changed before binding.")
+            root_fd = os.open(record.parent, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC)
+            pins.callback(os.close, root_fd)
+            security = Path("/sys/kernel/security/apparmor")
+            security_fd = os.open(security, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC)
+            pins.callback(os.close, security_fd)
+            executable = str(installed.helper.path)
+            bootstrap_arguments = (
+                "--ro-bind-fd",
+                str(root_fd),
+                str(record.parent),
+                "--bind-fd",
+                str(security_fd),
+                str(security),
+                "--dir",
+                str(NATIVE_ALIAS_PATH),
+                "--ro-bind-fd",
+                str(group_fd),
+                str(NATIVE_TRACKING_PATH),
+                "--cap-add",
+                "CAP_MAC_ADMIN",
+                "--cap-add",
+                "CAP_SETPCAP",
+                str(python.path),
+                "-I",
+                "-B",
+                str(entry.path),
+            )
+            environment = {
+                PATH_ENVIRONMENT_VARIABLE: MINIMAL_SYSTEM_PATH,
+                LC_ALL_ENVIRONMENT_VARIABLE: SYSTEM_LOCALE,
+            }
+            try:
+                arguments, inherited, mounted_request = prepared_paths.enter_context(
+                    namespace_arguments(
+                        request,
+                        Path(scratch),
+                        empty_mask=empty_mask,
+                        executable=executable,
+                        bootstrap=bootstrap_arguments,
+                        environment=environment,
+                        transient_descriptors=PAYLOAD_COMPILER_DESCRIPTOR_HEADROOM,
+                    )
+                )
+                if mounted_request.hardlink_source_identities:
+                    # Host-only inode witnesses have served their purpose before namespace entry.
+                    mounted_request = replace(mounted_request, hardlink_source_identities=())
+                if mounted_request is not request:
+                    payload = replace(mounted_request, deadline=execution_deadline).to_wire()
+                    request = mounted_request
+            except ValueError as error:
+                return CommandProcessResult(
+                    SandboxOutcome.INVALID,
+                    detail=str(error),
+                    failure_context="Native sandbox path preparation was refused.",
+                )
+            runtime_roots = runtime_read_roots()
             try:
                 profile = (
                     payload_profile(request, Path(scratch), cache.path, runtime_roots)
@@ -739,11 +770,6 @@ def execute_installed_request(
                     "Trusted setup input exceeds its bound or was not written completely."
                 )
             stream.seek(0)
-            root_fd = os.open(record.parent, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC)
-            pins.callback(os.close, root_fd)
-            security = Path("/sys/kernel/security/apparmor")
-            security_fd = os.open(security, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC)
-            pins.callback(os.close, security_fd)
             with (
                 authority.open_verified(deadline=request.deadline),
                 mask.open_verified(deadline=request.deadline),
@@ -783,50 +809,35 @@ def execute_installed_request(
                 attributes[1] &= ~termios.ONLCR
                 termios.tcsetattr(slave, termios.TCSANOW, attributes)
                 fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
-            process = subprocess.Popen(
-                [
-                    str(installed.helper.path),
-                    *arguments,
-                    "--ro-bind-fd",
-                    str(root_fd),
-                    str(record.parent),
-                    "--bind-fd",
-                    str(security_fd),
-                    str(security),
-                    "--dir",
-                    str(NATIVE_ALIAS_PATH),
-                    "--ro-bind-fd",
-                    str(group_fd),
-                    str(NATIVE_TRACKING_PATH),
-                    "--cap-add",
-                    "CAP_MAC_ADMIN",
-                    "--cap-add",
-                    "CAP_SETPCAP",
-                    str(python.path),
-                    "-I",
-                    "-B",
-                    str(entry.path),
-                ],
-                stdin=stream,
-                stdout=terminal_slave if request.terminal else subprocess.PIPE,
-                stderr=terminal_slave if request.terminal else subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                cwd="/",
-                env={
-                    PATH_ENVIRONMENT_VARIABLE: MINIMAL_SYSTEM_PATH,
-                    LC_ALL_ENVIRONMENT_VARIABLE: SYSTEM_LOCALE,
-                },
-                pass_fds=(
-                    *inherited,
-                    root_fd,
-                    security_fd,
-                    group_fd,
-                    *((bridge_child.fileno(),) if bridge_child is not None else ()),
-                ),
-                start_new_session=True,
-            )
+            try:
+                process = subprocess.Popen(
+                    [executable, *arguments, *bootstrap_arguments],
+                    stdin=stream,
+                    stdout=terminal_slave if request.terminal else subprocess.PIPE,
+                    stderr=terminal_slave if request.terminal else subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    cwd="/",
+                    env=environment,
+                    pass_fds=(
+                        *inherited,
+                        root_fd,
+                        security_fd,
+                        group_fd,
+                        *((bridge_child.fileno(),) if bridge_child is not None else ()),
+                    ),
+                    start_new_session=True,
+                )
+            except OSError as error:
+                if error.errno not in (errno.EMFILE, errno.ENFILE, errno.E2BIG):
+                    raise
+                exhausted = "argument size" if error.errno == errno.E2BIG else "open-file"
+                return CommandProcessResult(
+                    SandboxOutcome.INVALID,
+                    detail=f"Native sandbox launch exceeded the {exhausted} limit.",
+                    failure_context="Native sandbox path preparation was refused.",
+                )
             if terminal_slave is not None:
                 terminal_slave.close()
                 read_end, write_end = os.pipe()

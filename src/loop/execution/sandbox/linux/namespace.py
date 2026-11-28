@@ -10,14 +10,14 @@ import os
 import stat
 import tempfile
 import time
-from collections.abc import Generator
+from collections.abc import Generator, Iterator
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ....permissions.protection import is_protected_external_read
 from .host import protected_path, runtime_read_files, runtime_read_roots
-from .paths import mount_arguments
+from .paths import MountBudget, mount_arguments
 from .seccomp import descriptor_filter
 
 if TYPE_CHECKING:
@@ -218,17 +218,28 @@ def _runtime_path_alias_mounts(
     return tuple(covered_spellings), tuple(arguments)
 
 
+def _bind_descriptor_indices(arguments: tuple[str, ...]) -> Iterator[int]:
+    """Find descriptor arguments in the trusted Bubblewrap portion of argv."""
+    for index, value in enumerate(arguments):
+        if value in ("--bind-fd", "--ro-bind-fd"):
+            yield index + 1
+
+
 @contextmanager
 def namespace_arguments(
     request: SandboxRequest,
     scratch: Path,
     *,
     empty_mask: int,
+    executable: str,
+    bootstrap: tuple[str, ...],
+    environment: dict[str, str],
+    transient_descriptors: int,
 ) -> Generator[tuple[tuple[str, ...], tuple[int, ...], SandboxRequest], None, None]:
     """Keep fixed isolated setup arguments and inherited source/filter descriptors owned.
 
-    Reuse the filesystem owner before generating the production filter. Resolve live protected
-    symlink targets needed by PATH roots that are already covered by native runtime mounts. Isolate
+    Use the fixed launcher arguments and environment to measure the mount budget. Resolve live
+    protected symlink targets needed by PATH roots that are already covered by native runtime mounts. Isolate
     user, mount, PID and IPC views, map the ordinary caller to namespace zero, create a new session,
     die with the parent and drop all capabilities. Isolate network unless explicitly granted.
     Pin protected runtime spellings and canonical destinations with read-only O_PATH mounts, and
@@ -242,6 +253,11 @@ def namespace_arguments(
         request (SandboxRequest): Already authorized, current shared request and original deadline.
         scratch (Path): Private real scratch bound as the request's TMPDIR.
         empty_mask (int): Original authenticated read-only empty control inode descriptor.
+        executable (str): Exact authenticated Bubblewrap executable spelling.
+        bootstrap (tuple[str, ...]): Fixed control mounts, bootstrap executable and arguments
+            appended by the trusted launcher. Control descriptors must already be open.
+        environment (dict[str, str]): Exact environment for the native helper.
+        transient_descriptors (int): Slots for later preparation and launch operations.
 
     Yields:
         tuple[tuple[str, ...], tuple[int, ...], SandboxRequest]: Fixed Bubblewrap arguments,
@@ -290,10 +306,60 @@ def namespace_arguments(
             _runtime_executable_aliases(request, tuple(runtime_bindings)),
         )
         runtime_mounts.extend(runtime_aliases)
+        prefix = (
+            "--unshare-user",
+            "--uid",
+            "0",
+            "--gid",
+            "0",
+            "--unshare-pid",
+            "--unshare-ipc",
+            "--new-session",
+            "--die-with-parent",
+            "--cap-drop",
+            "ALL",
+            *(("--unshare-net",) if not request.network else ()),
+            *runtime_mounts,
+        )
+        suffix = (
+            "--proc",
+            "/proc",
+            "--dev",
+            "/dev",
+            "--size",
+            str(_SHARED_MEMORY_CAPACITY),
+            "--perms",
+            "0700",
+            "--tmpfs",
+            "/dev/shm",
+            "--chdir",
+            str(request.cwd),
+            "--seccomp",
+            str(stream.fileno()),
+        )
+
+        def measure(mounts: tuple[str, ...]) -> MountBudget:
+            """Account for all fixed argv, including pending duplicate source descriptors."""
+            native = (*prefix, *mounts, *suffix, *bootstrap)
+            seen = set()
+            repeated = []
+            for index in _bind_descriptor_indices(native):
+                descriptor = native[index]
+                if descriptor in seen:
+                    repeated.append(descriptor)
+                seen.add(descriptor)
+            return MountBudget.measure(
+                (executable, *native),
+                environment,
+                tuple(repeated),
+                transient_descriptors,
+            )
+
         with mount_arguments(
             request,
             scratch,
             empty_mask=empty_mask,
+            measure=measure,
             skip_path_roots=covered_paths,
             skip_executable_roots=tuple(canonical for _, canonical in runtime_bindings),
             runtime_roots=tuple(dict.fromkeys(path for pair in runtime_bindings for path in pair)),
@@ -307,48 +373,17 @@ def namespace_arguments(
             stream.seek(0)
             if time.monotonic() >= request.deadline:
                 raise TimeoutError("Namespace preparation request deadline expired.")
-            arguments = (
-                "--unshare-user",
-                "--uid",
-                "0",
-                "--gid",
-                "0",
-                "--unshare-pid",
-                "--unshare-ipc",
-                "--new-session",
-                "--die-with-parent",
-                "--cap-drop",
-                "ALL",
-                *(("--unshare-net",) if not request.network else ()),
-                *runtime_mounts,
-                *mounts,
-                "--proc",
-                "/proc",
-                "--dev",
-                "/dev",
-                "--size",
-                str(_SHARED_MEMORY_CAPACITY),
-                "--perms",
-                "0700",
-                "--tmpfs",
-                "/dev/shm",
-                "--chdir",
-                str(request.cwd),
-                "--seccomp",
-                str(stream.fileno()),
-            )
+            arguments = (*prefix, *mounts, *suffix)
             inherited = (*runtime_descriptors, *sources, stream.fileno())
             distinct = list(arguments)
             seen: set[int] = set()
             duplicates = []
-            for index, value in enumerate(arguments):
-                if value not in ("--bind-fd", "--ro-bind-fd"):
-                    continue
-                descriptor = int(arguments[index + 1])
+            for index in _bind_descriptor_indices(arguments):
+                descriptor = int(arguments[index])
                 if descriptor in seen:
                     duplicate = os.dup(descriptor)
                     runtime.callback(os.close, duplicate)
-                    distinct[index + 1] = str(duplicate)
+                    distinct[index] = str(duplicate)
                     duplicates.append(duplicate)
                 seen.add(descriptor)
             arguments = tuple(distinct)

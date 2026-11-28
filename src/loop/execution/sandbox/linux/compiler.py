@@ -26,6 +26,9 @@ if TYPE_CHECKING:
     from ..contracts import SandboxRequest
 
 _LOCK_RETRY_SECONDS = 0.01
+# One compiler lock, six retained parser/limiter/ABI pins at the uncompressed retry,
+# one input stream, and up to six stdout/stderr/exec-status pipe ends during spawn.
+PAYLOAD_COMPILER_DESCRIPTOR_HEADROOM = 1 + 6 + 1 + 6
 
 
 class CompilationCancelled(Exception):

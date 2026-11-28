@@ -11,11 +11,15 @@ from __future__ import annotations
 import errno
 import fcntl
 import os
+import resource
 import stat
+import struct
 import time
-from collections.abc import Callable, Generator
+from collections import Counter
+from collections.abc import Callable, Generator, Iterable
 from contextlib import ExitStack, contextmanager
-from itertools import islice
+from dataclasses import dataclass
+from itertools import chain, islice
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -43,7 +47,7 @@ if TYPE_CHECKING:
 
 _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _PRIVATE_NAMES = frozenset(name.casefold() for name in PRIVATE_READ_COMPONENTS)
-_MAX_HARDLINK_MOUNTS = 2_000
+_POINTER_BYTES = struct.calcsize("P")
 
 
 def _check_deadline(deadline: float) -> None:
@@ -150,67 +154,173 @@ def _conventional_tmp_source(
         yield path, descriptor, state
 
 
+def _argument_size(value: str | Path) -> int:
+    """Count a native argument's encoded bytes, terminator and pointer."""
+    return len(os.fsencode(value)) + 1 + _POINTER_BYTES
+
+
+@dataclass(frozen=True)
+class MountBudget:
+    """Represent the remaining resources for one native launch.
+
+    Args:
+        argument_bytes (int): Bytes available after the fixed launch arguments and environment.
+        free_descriptors (tuple[int, ...]): Available descriptor counts by decimal width.
+        fixed_duplicates (int): Additional descriptors needed for repeated fixed bind sources.
+        transient_descriptors (int): Slots needed after binding, including native process setup.
+    """
+
+    argument_bytes: int
+    free_descriptors: tuple[int, ...]
+    fixed_duplicates: int
+    transient_descriptors: int
+
+    @classmethod
+    def measure(
+        cls,
+        arguments: tuple[str, ...],
+        environment: dict[str, str],
+        repeated: tuple[str, ...],
+        transient_descriptors: int,
+    ) -> MountBudget:
+        """Measure the fixed launch after its source descriptors are pinned.
+
+        Args:
+            arguments (tuple[str, ...]): Complete fixed native argv, including argv[0].
+            environment (dict[str, str]): Exact native process environment.
+            repeated (tuple[str, ...]): Fixed argv descriptor numbers that will be replaced
+                with duplicates.
+            transient_descriptors (int): Additional slots required by later setup operations.
+
+        Returns:
+            MountBudget: Available argument bytes and descriptor slots.
+
+        Raises:
+            OSError: The kernel cannot report the receiver's descriptor or argument usage.
+        """
+        used_bytes = (
+            sum(map(_argument_size, arguments))
+            + sum(_argument_size(f"{key}={value}") for key, value in environment.items())
+            + len(os.fsencode(arguments[0]))
+            + 1  # Linux also copies the executed filename onto the argument stack.
+            - sum(map(len, repeated))
+        )
+
+        limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+        occupied = {int(name) for name in os.listdir("/proc/self/fd")}
+        # The receiver owns preparation on one thread. The closed enumeration descriptor
+        # occupied the lowest free slot, as does this brief probe.
+        probe = os.open(os.devnull, os.O_RDONLY | os.O_CLOEXEC)
+        os.close(probe)
+        occupied.discard(probe)
+        widths = Counter(len(str(descriptor)) for descriptor in occupied if descriptor < limit)
+        free = []
+        first, stop = 0, 10
+        while first < limit:
+            free.append(min(stop, limit) - first - widths[len(free) + 1])
+            first, stop = stop, stop * 10
+        return cls(
+            os.sysconf("SC_ARG_MAX") - used_bytes,
+            tuple(free),
+            len(repeated),
+            transient_descriptors,
+        )
+
+    def fits(self, descriptors: int, argument_bytes: int) -> bool:
+        """Check a candidate set of additional read-only mounts against both native limits.
+
+        Args:
+            descriptors (int): New descriptor numbers, including one for each mirrored bind.
+            argument_bytes (int): Encoded mount arguments excluding the descriptor digits.
+
+        Returns:
+            bool: Whether all mounts, fixed duplicates and later setup fit.
+        """
+        remaining = self.fixed_duplicates + descriptors
+        if remaining + self.transient_descriptors > sum(self.free_descriptors):
+            return False
+        for width, available in enumerate(self.free_descriptors, start=1):
+            used = min(remaining, available)
+            argument_bytes += width * used
+            remaining -= used
+        return argument_bytes <= self.argument_bytes
+
+
+def _hardlink_cost(path: Path, scratch: Path) -> tuple[int, int]:
+    """Count mount arguments and descriptors for the original path and any scratch mirror."""
+    fixed = _argument_size("--ro-bind-fd") + _argument_size("")
+    native = payload_path(path, scratch)
+    source = fixed + _argument_size(path)
+    if native != path:
+        return 2, source + fixed + _argument_size(native)
+    return 1, source
+
+
 def _hardlink_mount_sources(
-    hardlinked: tuple[Path, ...],
-    writable_roots: tuple[Path, ...],
+    files: tuple[Path, ...],
+    scratch: Path,
+    write_grants: tuple[Path, ...],
+    budget: MountBudget,
     deadline: float,
 ) -> tuple[Path, ...]:
-    """Choose bounded read-only file or containing-directory mounts for writable hardlinks."""
-    paths = set()
-    for path in hardlinked:
+    """Keep individual mounts unless a narrower subtree plan is needed to launch."""
+    count = size = 0
+    for path in files:
         _check_deadline(deadline)
-        if any(path.is_relative_to(root) for root in writable_roots):
-            paths.add(path)
-    if len(paths) <= _MAX_HARDLINK_MOUNTS:
-        return tuple(sorted(paths))
+        descriptors, arguments = _hardlink_cost(path, scratch)
+        count += descriptors
+        size += arguments
+    if budget.fits(count, size):
+        return files
+    if not budget.fits(0, 0):
+        raise ValueError("Linux fixed launch arguments or descriptors exceed native limits.")
 
-    by_parent: dict[Path, set[Path]] = {}
-    for path in paths:
+    blocked = {ancestor for grant in write_grants for ancestor in (grant, *grant.parents)}
+    totals: dict[Path, tuple[int, int]] = {}
+    for path in files:
         _check_deadline(deadline)
-        by_parent.setdefault(path.parent, set()).add(path)
-    mounts = set()
-    for parent, siblings in by_parent.items():
-        _check_deadline(deadline)
-        if len(siblings) > 1 and not any(root.is_relative_to(parent) for root in writable_roots):
-            mounts.add(parent)
-        else:
-            mounts.update(siblings)
-
-    # Index each ancestor once; update membership when a subtree becomes one mount.
-    coverage: dict[Path, set[Path]] = {}
-    for path in mounts:
+        descriptors, arguments = _hardlink_cost(path, scratch)
         parent = path.parent
-        while parent not in writable_roots:
-            _check_deadline(deadline)
-            coverage.setdefault(parent, set()).add(path)
+        while parent not in blocked:
+            before_count, before_size = totals.get(parent, (0, 0))
+            totals[parent] = before_count + descriptors, before_size + arguments
             parent = parent.parent
-    while len(mounts) > _MAX_HARDLINK_MOUNTS:
-        candidates = {}
-        for parent, covered in coverage.items():
-            _check_deadline(deadline)
-            if len(covered) > 1 and not any(root.is_relative_to(parent) for root in writable_roots):
-                candidates[parent] = covered
-        if not candidates:
-            raise ValueError("Linux writable hardlinks exceed the bounded mount limit.")
-        parent = min(
-            candidates, key=lambda path: (len(candidates[path]), -len(path.parts), str(path))
-        )
-        removed = candidates[parent].copy()
-        mounts.difference_update(removed)
-        mounts.add(parent)
-        for ancestor, covered in coverage.items():
-            _check_deadline(deadline)
-            covered.difference_update(removed)
-            if parent != ancestor and parent.is_relative_to(ancestor):
-                covered.add(parent)
 
-    minimal = set()
-    for path in sorted(mounts, key=lambda item: (len(item.parts), str(item))):
+    # Children precede their ancestors, including branches with the same initial count.
+    # Store subtree totals instead of copying every leaf name into its ancestors.
+    savings: dict[Path, tuple[int, int]] = {}
+    for parent in sorted(totals, key=lambda path: (totals[path][0], -len(path.parts), path)):
         _check_deadline(deadline)
-        if not any(path.is_relative_to(parent) for parent in minimal if parent != path):
-            minimal.add(path)
-    _check_deadline(deadline)
-    return tuple(sorted(minimal))
+        previous_count, previous_size = totals[parent]
+        descriptors, arguments = _hardlink_cost(parent, scratch)
+        if previous_count <= descriptors:
+            continue
+        saved_count = previous_count - descriptors
+        saved_bytes = previous_size - arguments
+        savings[parent] = saved_count, saved_bytes
+        count -= saved_count
+        size -= saved_bytes
+        if budget.fits(count, size):
+            # A larger merge can make an earlier merge redundant. Reopen a subtree into
+            # its narrower mounts when the final plan can afford the difference.
+            selected = set(savings)
+            for directory, (extra_count, extra_size) in reversed(savings.items()):
+                _check_deadline(deadline)
+                if selected.isdisjoint(directory.parents) and budget.fits(
+                    count + extra_count, size + extra_size
+                ):
+                    selected.remove(directory)
+                    count += extra_count
+                    size += extra_size
+            return tuple(
+                sorted(path for path in chain(files, selected) if selected.isdisjoint(path.parents))
+            )
+        ancestor = parent.parent
+        while ancestor not in blocked:
+            before_count, before_size = totals[ancestor]
+            totals[ancestor] = before_count - saved_count, before_size - saved_bytes
+            ancestor = ancestor.parent
+    raise ValueError("Linux writable hardlinks exceed the native argument or open-file limit.")
 
 
 def _validate_root(root: Path, request: SandboxRequest) -> os.stat_result:
@@ -458,8 +568,7 @@ def prepare_paths(
         tuple[tuple[Path, ...], tuple[Path, ...], tuple[Path, ...], tuple[Path, ...]]: Sorted
             existing protected entries for read-only binds, private entries for type-correct
             masks, ancestor directories for self-bind mountpoints, and visible multiply linked
-            regular files or their containing directories requiring read-only binds. The caller
-            must bind and
+            regular files requiring read-only binds. The caller must bind and
             revalidate every mount source before applying mounts; this result is not a launch
             authorization.
 
@@ -537,7 +646,7 @@ def prepare_paths(
         tuple(sorted(path for path in protected if path not in private and not is_concealed(path))),
         tuple(sorted(path for path in private if not is_concealed(path))),
         tuple(sorted(path for path in anchors if not is_concealed(path))),
-        _hardlink_mount_sources(hardlinked, (*request.write_roots, scratch), request.deadline),
+        hardlinked,
     )
 
 
@@ -555,6 +664,43 @@ def _source_state(details: os.stat_result) -> tuple[int, ...]:
     )
 
 
+def _bind_sources(
+    paths: Iterable[Path],
+    opened: ExitStack,
+    deadline: float,
+    *,
+    hardlinked: bool = False,
+) -> dict[Path, int]:
+    """Pin mount sources by stable no-follow identities under the caller's lifetime."""
+    path_flag = getattr(os, "O_PATH", None)
+    if path_flag is None:
+        raise OSError(errno.ENOTSUP, "Linux inode-bound mount preparation requires O_PATH.")
+    descriptors, identities = {}, {}
+    for path in paths:
+        _check_deadline(deadline)
+        before = path.lstat()
+        if (
+            not (stat.S_ISDIR(before.st_mode) or stat.S_ISREG(before.st_mode))
+            or stat.S_ISREG(before.st_mode)
+            and not hardlinked
+            and before.st_nlink != 1
+            or path.resolve(strict=True) != path
+        ):
+            raise ValueError("Linux mount source is not a real directory or single-link file.")
+        descriptor = os.open(path, path_flag | os.O_NOFOLLOW | os.O_CLOEXEC)
+        opened.callback(os.close, descriptor)
+        if _source_state(os.fstat(descriptor)) != _source_state(before):
+            raise ValueError("Linux mount source changed during binding.")
+        descriptors[path] = descriptor
+        identities[path] = before
+    for path, descriptor in descriptors.items():
+        _check_deadline(deadline)
+        for latest in (path.lstat(), os.fstat(descriptor)):
+            if _source_state(latest) != _source_state(identities[path]):
+                raise ValueError("Linux bound mount source changed.")
+    return descriptors
+
+
 @contextmanager
 def bind_paths(
     request: SandboxRequest,
@@ -569,44 +715,29 @@ def bind_paths(
     None,
     None,
 ]:
-    """Inspect approved paths and hold inode-bound mount descriptors for trusted native setup.
+    """Inspect approved paths and pin the fixed mount sources for native setup.
 
-    Pin workspace/read/write/scratch roots, protected entries, private mask targets and ancestor
-    mountpoints, and hardlink file or containing-directory sources using Linux O_PATH descriptors
-    with no-follow and close-on-exec flags. Revalidate every pathname and descriptor plus shared
-    request authority before yielding. The caller owns mount construction and must use
-    descriptor-backed sources, apply type-correct masks, mount hardlinked paths read-only and
-    enforce the filename policy, then close all setup descriptors before opaque source executes.
-    This context performs no mounts, launch, policy loading or filesystem mutation. Its
-    descriptors remain valid only inside the context and close on normal exit, caller failure or
-    preparation failure.
+    The caller must bind the selected hardlink sources after measuring the launch budget.
+    Fixed descriptors close on every exit. Private target descriptors pin types for the masks.
 
     Args:
         request (SandboxRequest): Approved command authority and execution deadline.
         scratch (Path): Live private directory bound as the request's TMPDIR.
-        runtime_roots (tuple[Path, ...]): Already authenticated read-only runtime roots, passed
+        runtime_roots (tuple[Path, ...]): Already authenticated read-only runtime roots passed
             to data-root inspection without exempting workspace or write authority.
 
     Yields:
         tuple[tuple[tuple[Path, ...], tuple[Path, ...], tuple[Path, ...], tuple[Path, ...]],
-        dict[Path, int]]: Protected/private/ancestor/hardlink inventories from prepare_paths and
-            their mount-source descriptor mapping, also including every workspace/read/write/
-            scratch root. Private descriptors pin original target types; they are never sources
-            for exposing private bytes. This result supplies no runtime, mask-control or helper
-            authority.
+        dict[Path, int]]: Protected, private and ancestor mount paths and hardlink candidates,
+            together with the fixed root, metadata, protected and mask-target descriptors.
 
     Raises:
-        ValueError: Approved path authority is unsafe/stale, the bounded hardlink mount count is
-            exceeded, a mount source changes or has an unsafe type, or path inspection finds a
-            protected/private hardlink alias or drift.
+        ValueError: Request authority is unsafe or stale, an alias is unsafe or incomplete,
+            or a fixed mount source changes or has an unsafe type.
         TimeoutError: Preparation reaches the approved command deadline.
         OSError: Linux O_PATH is unavailable or a required source cannot be inspected or opened.
     """
-    path_flag = getattr(os, "O_PATH", None)
-    if path_flag is None:
-        raise OSError(errno.ENOTSUP, "Linux inode-bound mount preparation requires O_PATH.")
     inventories = prepare_paths(request, scratch, runtime_roots=runtime_roots)
-    hardlinked = inventories[3]
     sources = dict.fromkeys(
         (
             request.workspace,
@@ -616,33 +747,11 @@ def bind_paths(
             scratch,
             *(canonical for _, canonical in request.path_roots),
             *(alias.parent for alias in request.read_aliases),
-            *(path for inventory in inventories for path in inventory),
+            *(path for inventory in inventories[:3] for path in inventory),
         )
     )
-    descriptors, identities = {}, {}
     with ExitStack() as opened:
-        for path in sources:
-            _check_deadline(request.deadline)
-            before = path.lstat()
-            if (
-                not (stat.S_ISDIR(before.st_mode) or stat.S_ISREG(before.st_mode))
-                or stat.S_ISREG(before.st_mode)
-                and path not in hardlinked
-                and before.st_nlink != 1
-                or path.resolve(strict=True) != path
-            ):
-                raise ValueError("Linux mount source is not a real directory or single-link file.")
-            descriptor = os.open(path, path_flag | os.O_NOFOLLOW | os.O_CLOEXEC)
-            opened.callback(os.close, descriptor)
-            if _source_state(os.fstat(descriptor)) != _source_state(before):
-                raise ValueError("Linux mount source changed during binding.")
-            descriptors[path] = descriptor
-            identities[path] = before
-        for path, descriptor in descriptors.items():
-            _check_deadline(request.deadline)
-            for latest in (path.lstat(), os.fstat(descriptor)):
-                if _source_state(latest) != _source_state(identities[path]):
-                    raise ValueError("Linux bound mount source changed.")
+        descriptors = _bind_sources(sources, opened, request.deadline)
         if not request.paths_are_current():
             raise ValueError("Linux approved path authority changed.")
         _check_deadline(request.deadline)
@@ -654,6 +763,7 @@ def mount_arguments(
     request: SandboxRequest,
     scratch: Path,
     *,
+    measure: Callable[[tuple[str, ...]], MountBudget],
     empty_mask: int | None = None,
     skip_path_roots: tuple[Path, ...] = (),
     skip_executable_roots: tuple[Path, ...] = (),
@@ -667,14 +777,15 @@ def mount_arguments(
     layer grants writes within those parents. Other roots and ancestors are read-only. Bind
     the fresh host scratch at its original spelling for trusted identity
     checks and at a stable namespace path for payload access. Apply ancestor mountpoints before
-    protected read-only binds, then hide private directories with empty tmpfs mounts and private
-    regular files with the supplied empty inode. Mirror every restrictive scratch overlay;
+    hardlink and protected read-only binds, then hide private directories with empty tmpfs
+    mounts and private regular files with the supplied empty inode. Mirror every restrictive scratch overlay;
     selected workspaces below scratch retain their read-only role. Refuse a whole filesystem or
     home bind and read aliases whose target is absent from this request view. For eligible fresh
     session scratch, create and pin a private conventional temporary subtree, with its contents
     retained as part of the session working directory. Existing grants
     that overlap the conventional destination keep their original view. The filename layer still
-    protects future names.
+    protects future names. Group hardlink mounts only if the complete fixed launch leaves
+    insufficient argument or descriptor space for individual files.
 
     The caller must authenticate the helper and immutable mask-control inode, provide reviewed
     runtime/proc/device/control mounts and namespace/network setup, enforce the filename policy,
@@ -684,6 +795,8 @@ def mount_arguments(
     Args:
         request (SandboxRequest): Current approved roots, read aliases and execution deadline.
         scratch (Path): Live private directory bound as the request's TMPDIR.
+        measure (Callable[[tuple[str, ...]], MountBudget]): Measure the whole launch once the
+            fixed request arguments and descriptors are ready.
         empty_mask (int | None): Caller-authenticated read-only empty regular-file descriptor
             for private file masks. Required only when such targets exist. The original descriptor
             remains caller-owned; this context duplicates and owns its mount-source descriptor.
@@ -704,7 +817,8 @@ def mount_arguments(
         ValueError: Request/source authority is unsafe or stale, a root covers the filesystem or
             home, a reserved namespace destination overlaps another grant, a skipped PATH root is
             not bound to the request, an alias target is outside the bound view, an executable
-            source changes, a temporary subtree is unsafe, or a required mask is missing/unsafe.
+            source changes, a temporary subtree is unsafe, a mask is missing or unsafe, or
+            the complete plan cannot fit the available native arguments and descriptors.
         TimeoutError: Preparation reaches the approved command deadline.
         OSError: Linux O_PATH is unavailable or source/mask descriptors cannot be inspected.
     """
@@ -784,10 +898,8 @@ def mount_arguments(
             temporary_path, temporary_descriptor, _ = conventional
             mount("--bind-fd", temporary_descriptor, temporary_path)
             inherited.add(temporary_descriptor)
-        for path in hardlinked:
-            _check_deadline(request.deadline)
-            mount("--ro-bind-fd", descriptors[path], path)
-            inherited.add(descriptors[path])
+        host_overlay_index = len(arguments)
+        scratch_overlay_index = len(scratch_mounts)
         for path in protected:
             _check_deadline(request.deadline)
             mount("--ro-bind-fd", descriptors[path], path)
@@ -824,6 +936,7 @@ def mount_arguments(
             ):
                 arguments.extend(("--symlink", str(canonical), str(spelling)))
         arguments.extend(("--dir", str(NATIVE_SCRATCH_PATH)))
+        scratch_overlay_index += len(arguments)
         arguments.extend(scratch_mounts)
         inherited.add(descriptors[scratch])
         if conventional is not None:
@@ -895,6 +1008,25 @@ def mount_arguments(
             or os.fstat(mask_descriptor).st_size != 0
         ):
             raise ValueError("Linux private file mask control inode changed.")
+        hardlink_sources = _hardlink_mount_sources(
+            hardlinked,
+            scratch,
+            (*writable, *request.write_files),
+            measure(tuple(arguments)),
+            request.deadline,
+        )
+        additional = _bind_sources(hardlink_sources, owned, request.deadline, hardlinked=True)
+        hardlink_mounts, hardlink_mirrors = [], []
+        for path in hardlink_sources:
+            _check_deadline(request.deadline)
+            descriptor = additional[path]
+            inherited.add(descriptor)
+            hardlink_mounts.extend(("--ro-bind-fd", str(descriptor), str(path)))
+            native = payload_path(path, scratch)
+            if native != path:
+                hardlink_mirrors.extend(("--ro-bind-fd", str(descriptor), str(native)))
+        arguments[scratch_overlay_index:scratch_overlay_index] = hardlink_mirrors
+        arguments[host_overlay_index:host_overlay_index] = hardlink_mounts
         if not request.paths_are_current():
             raise ValueError("Linux approved path authority changed.")
         _check_deadline(request.deadline)

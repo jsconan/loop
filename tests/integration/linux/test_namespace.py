@@ -18,6 +18,8 @@ from loop.execution.sandbox.linux.namespace import namespace_arguments
 
 pytestmark = [pytest.mark.integration, pytest.mark.linux]
 _BWRAP = os.environ.get("LOOP_NATIVE_BWRAP")
+_LAUNCH_ENVIRONMENT = {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
+_SUBPROCESS_PIPE_DESCRIPTORS = 6
 
 _SYSTEM_DATA = """
 import hashlib,json,socket,ssl
@@ -29,6 +31,19 @@ print(json.dumps({
         for path in (Path('/etc/hosts'),Path('/etc/resolv.conf'))}
 }))
 """
+
+
+def _probe_namespace(request, scratch, empty_mask, executable, invocation):
+    """Measure the same fixed command and environment that the probe will launch."""
+    return namespace_arguments(
+        request,
+        scratch,
+        empty_mask=empty_mask,
+        executable=executable,
+        bootstrap=invocation,
+        environment=_LAUNCH_ENVIRONMENT,
+        transient_descriptors=_SUBPROCESS_PIPE_DESCRIPTORS,
+    )
 
 
 def test_namespace_preparation_ignores_unrelated_environment_metadata(tmp_path):
@@ -70,7 +85,15 @@ def test_namespace_preparation_ignores_unrelated_environment_metadata(tmp_path):
 
     with (
         mask.open("rb") as empty,
-        namespace_arguments(request, scratch, empty_mask=empty.fileno()) as (
+        namespace_arguments(
+            request,
+            scratch,
+            empty_mask=empty.fileno(),
+            executable="/usr/bin/bwrap",
+            bootstrap=(),
+            environment={},
+            transient_descriptors=0,
+        ) as (
             arguments,
             descriptors,
             _,
@@ -86,7 +109,7 @@ def test_namespace_preparation_ignores_unrelated_environment_metadata(tmp_path):
 
 def test_dense_private_masks_respect_descriptor_limit(tmp_path):
     """Descriptor exhaustion fails closed and releases all sources."""
-    code = """import errno, os, resource, sys, time
+    code = """import os, resource, sys, time
 from pathlib import Path
 from loop.execution.sandbox.contracts import SandboxRequest
 from loop.execution.sandbox.linux.namespace import namespace_arguments
@@ -105,10 +128,12 @@ resource.setrlimit(resource.RLIMIT_NOFILE, (120,120))
 with mask.open('rb') as empty:
     before=len(os.listdir('/proc/self/fd'))
     try:
-        with namespace_arguments(request,scratch,empty_mask=empty.fileno()):
+        with namespace_arguments(request,scratch,empty_mask=empty.fileno(),
+            executable='/usr/bin/bwrap', bootstrap=(), environment={}, transient_descriptors=0):
             raise RuntimeError('descriptor limit was not enforced')
-    except OSError as error:
-        if error.errno != errno.EMFILE: raise
+    except ValueError as error:
+        if str(error) != 'Linux fixed launch arguments or descriptors exceed native limits.':
+            raise
     if len(os.listdir('/proc/self/fd')) != before: raise RuntimeError('descriptor leak')
 print('descriptor-boundary-preserved')
 """
@@ -176,23 +201,24 @@ else:
     raise RuntimeError('Resolver write was admitted')
 """
     )
+    invocation = ("/usr/bin/python3", "-I", "-c", probe)
     with (
         helper.open_verified(),
         mask.open("rb") as empty,
-        namespace_arguments(request, scratch, empty_mask=empty.fileno()) as (
+        _probe_namespace(request, scratch, empty.fileno(), str(helper.path), invocation) as (
             arguments,
             descriptors,
             _,
         ),
     ):
         result = subprocess.run(
-            [str(helper.path), *arguments, "/usr/bin/python3", "-I", "-c", probe],
+            [str(helper.path), *arguments, *invocation],
             pass_fds=descriptors,
             capture_output=True,
             text=True,
             check=True,
             timeout=10,
-            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+            env=_LAUNCH_ENVIRONMENT,
         )
     lines = result.stdout.splitlines()
     assert len(lines) == 2, result.stdout
@@ -253,31 +279,30 @@ assert (scratch/'.config').read_bytes()==b''
 assert (scratch/'ordinary').read_text()=='allowed'
 print('namespace-boundaries-preserved')
 """
+        invocation = (
+            "/usr/bin/python3",
+            "-I",
+            "-c",
+            code,
+            str(NATIVE_SCRATCH_PATH),
+            str(NATIVE_SCRATCH_PATH / "selected-link"),
+        )
         with (
             helper.open_verified(),
-            namespace_arguments(request, scratch, empty_mask=empty.fileno()) as (
+            _probe_namespace(request, scratch, empty.fileno(), str(helper.path), invocation) as (
                 arguments,
                 descriptors,
                 _,
             ),
         ):
             result = subprocess.run(
-                [
-                    str(helper.path),
-                    *arguments,
-                    "/usr/bin/python3",
-                    "-I",
-                    "-c",
-                    code,
-                    str(NATIVE_SCRATCH_PATH),
-                    str(NATIVE_SCRATCH_PATH / "selected-link"),
-                ],
+                [str(helper.path), *arguments, *invocation],
                 pass_fds=descriptors,
                 capture_output=True,
                 text=True,
                 check=False,
                 timeout=10,
-                env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+                env=_LAUNCH_ENVIRONMENT,
             )
     assert result.returncode == 0 and not result.stderr, result
     assert result.stdout == "namespace-boundaries-preserved\n"
@@ -314,10 +339,16 @@ def test_bound_workspace_source_survives_path_replacement(helper, tmp_path):
         workspace_id="source-replacement",
         scratch_root=scratch,
     )
+    invocation = (
+        "/usr/bin/python3",
+        "-I",
+        "-c",
+        "from pathlib import Path; print(Path('canary').read_text())",
+    )
     with (
         helper.open_verified(),
         mask.open("rb") as empty,
-        namespace_arguments(request, scratch, empty_mask=empty.fileno()) as (
+        _probe_namespace(request, scratch, empty.fileno(), str(helper.path), invocation) as (
             arguments,
             descriptors,
             _,
@@ -326,20 +357,13 @@ def test_bound_workspace_source_survives_path_replacement(helper, tmp_path):
         workspace.rename(tmp_path / "bound-original")
         replacement.rename(workspace)
         result = subprocess.run(
-            [
-                str(helper.path),
-                *arguments,
-                "/usr/bin/python3",
-                "-I",
-                "-c",
-                "from pathlib import Path; print(Path('canary').read_text())",
-            ],
+            [str(helper.path), *arguments, *invocation],
             pass_fds=descriptors,
             capture_output=True,
             text=True,
             check=False,
             timeout=10,
-            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+            env=_LAUNCH_ENVIRONMENT,
         )
     assert result.returncode == 0 and not result.stderr, result
     assert result.stdout == "bound-original\n"

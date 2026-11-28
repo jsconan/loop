@@ -2,11 +2,24 @@
 
 from contextlib import nullcontext
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import ANY, Mock
 
 import pytest
 
 from loop.execution.sandbox.linux import namespace as linux_namespace
+
+
+def _namespace_arguments(request, scratch, *, empty_mask):
+    """Build the namespace with a fixed trusted helper and control tail."""
+    return linux_namespace.namespace_arguments(
+        request,
+        scratch,
+        empty_mask=empty_mask,
+        executable="/trusted/bwrap",
+        bootstrap=("--ro-bind-fd", "8", "/control", "/trusted/entry"),
+        environment={"LC_ALL": "C"},
+        transient_descriptors=14,
+    )
 
 
 @pytest.fixture
@@ -35,7 +48,7 @@ def test_namespace_fixed_boundary_and_original_grants(preparation, network):
     """Only an explicit network grant preserves networking; all fixed isolation remains."""
     request, mounts, stream, context = preparation
     request.network = network
-    with linux_namespace.namespace_arguments(request, Path("/scratch"), empty_mask=9) as result:
+    with _namespace_arguments(request, Path("/scratch"), empty_mask=9) as result:
         arguments, descriptors, mounted_request = result
         assert mounted_request is request
         assert arguments == (
@@ -76,12 +89,49 @@ def test_namespace_fixed_boundary_and_original_grants(preparation, network):
         request,
         Path("/scratch"),
         empty_mask=9,
+        measure=ANY,
         skip_path_roots=(),
         skip_executable_roots=(),
         runtime_roots=(),
     )
     stream.write.assert_called_once_with(b"filter")
     stream.seek.assert_called_once_with(0)
+
+
+def test_namespace_measures_the_complete_launch_with_mirrored_and_fixed_bind_fds(
+    preparation, monkeypatch
+):
+    """Account for the actual bootstrap tail, environment and every pending descriptor duplicate."""
+    request, mounts, _, _ = preparation
+    scratch = Path("/scratch")
+    measured = Mock()
+    monkeypatch.setattr(linux_namespace.MountBudget, "measure", measured)
+    fixed = ("--bind-fd", "4", "/scratch", "--ro-bind-fd", "4", "/mirror")
+
+    def prepare(*_args, measure, **_kwargs):
+        """Measure the fixed filesystem fragment before returning mounts."""
+        assert measure(fixed) is measured.return_value
+        return nullcontext((fixed, (4,), request))
+
+    mounts.side_effect = prepare
+    monkeypatch.setattr(linux_namespace.os, "dup", Mock(return_value=23))
+    monkeypatch.setattr(linux_namespace.os, "close", Mock())
+    with _namespace_arguments(request, scratch, empty_mask=9) as (arguments, _, _):
+        emitted = list(arguments)
+        emitted[emitted.index("/mirror") - 1] = "4"
+        measured.assert_called_once_with(
+            (
+                "/trusted/bwrap",
+                *emitted,
+                "--ro-bind-fd",
+                "8",
+                "/control",
+                "/trusted/entry",
+            ),
+            {"LC_ALL": "C"},
+            ("4",),
+            14,
+        )
 
 
 @pytest.mark.parametrize("failure", [False, True])
@@ -98,12 +148,12 @@ def test_namespace_owns_distinct_repeated_mount_sources(preparation, monkeypatch
     if failure:
         with (
             pytest.raises(OSError, match="descriptor limit"),
-            linux_namespace.namespace_arguments(request, Path("/scratch"), empty_mask=9),
+            _namespace_arguments(request, Path("/scratch"), empty_mask=9),
         ):
             pytest.fail("Incomplete descriptor preparation must not launch.")
         close.assert_called_once_with(20)
         return
-    with linux_namespace.namespace_arguments(request, Path("/scratch"), empty_mask=9) as (
+    with _namespace_arguments(request, Path("/scratch"), empty_mask=9) as (
         arguments,
         descriptors,
         _,
@@ -143,7 +193,7 @@ def test_namespace_failure_closes_owned_resources(preparation, monkeypatch, fail
         pytest.raises(
             category, match="unsafe paths|filter refused|incomplete|deadline expired|launch refused"
         ),
-        linux_namespace.namespace_arguments(request, Path("/scratch"), empty_mask=9),
+        _namespace_arguments(request, Path("/scratch"), empty_mask=9),
     ):
         raise OSError("launch refused")
     assert context.__exit__.call_count == 1
@@ -205,13 +255,13 @@ def test_runtime_sources_are_pinned_readonly_and_closed(preparation, monkeypatch
         )
         with (
             pytest.raises(error, match=message),
-            linux_namespace.namespace_arguments(request, Path("/scratch"), empty_mask=9),
+            _namespace_arguments(request, Path("/scratch"), empty_mask=9),
         ):
             pytest.fail("Unsafe runtime was accepted")
         if failure != "flag":
             closed.assert_called_once_with(descriptor)
     else:
-        with linux_namespace.namespace_arguments(request, Path("/scratch"), empty_mask=9) as (
+        with _namespace_arguments(request, Path("/scratch"), empty_mask=9) as (
             arguments,
             descriptors,
             _,
@@ -256,7 +306,7 @@ def test_runtime_path_alias_is_recreated_when_request_mount_is_skipped(
     monkeypatch.setattr(linux_namespace.os, "open", Mock(return_value=12))
     monkeypatch.setattr(linux_namespace.os, "close", Mock())
     monkeypatch.setattr(linux_namespace.os, "fstat", lambda fd: details)
-    with linux_namespace.namespace_arguments(request, Path("/scratch"), empty_mask=9) as (
+    with _namespace_arguments(request, Path("/scratch"), empty_mask=9) as (
         arguments,
         _,
         _,
@@ -268,6 +318,7 @@ def test_runtime_path_alias_is_recreated_when_request_mount_is_skipped(
         request,
         Path("/scratch"),
         empty_mask=9,
+        measure=ANY,
         skip_path_roots=(spelling,),
         skip_executable_roots=(canonical,),
         runtime_roots=(spelling, canonical),
@@ -288,7 +339,7 @@ def test_selected_system_alias_cannot_overlap_an_owned_mount(preparation, monkey
     )
     with (
         pytest.raises(ValueError, match="system executable alias overlaps another mount"),
-        linux_namespace.namespace_arguments(request, Path("/scratch"), empty_mask=9),
+        _namespace_arguments(request, Path("/scratch"), empty_mask=9),
     ):
         pytest.fail("An overlapping executable alias was accepted")
 
@@ -305,7 +356,7 @@ def test_runtime_path_root_without_alias_adds_no_symlink(preparation, monkeypatc
     monkeypatch.setattr(linux_namespace.os, "close", Mock())
     monkeypatch.setattr(linux_namespace.os, "fstat", lambda fd: details)
 
-    with linux_namespace.namespace_arguments(request, Path("/scratch"), empty_mask=9) as (
+    with _namespace_arguments(request, Path("/scratch"), empty_mask=9) as (
         arguments,
         _,
         _,
@@ -856,7 +907,7 @@ def test_namespace_pins_system_data_at_exact_readonly_destinations(preparation, 
         "runtime_read_files",
         lambda **_kwargs: ((Path("/etc/resolv.conf"), authority),),
     )
-    with linux_namespace.namespace_arguments(request, Path("/scratch"), empty_mask=9) as result:
+    with _namespace_arguments(request, Path("/scratch"), empty_mask=9) as result:
         arguments, descriptors, mounted_request = result
         assert mounted_request is request
         assert arguments[arguments.index("--ro-bind-fd") :][:3] == (

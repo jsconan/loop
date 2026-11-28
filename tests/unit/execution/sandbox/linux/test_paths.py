@@ -2,6 +2,7 @@
 
 import errno
 import os
+import struct
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from pathlib import Path
@@ -13,8 +14,8 @@ import pytest
 from loop.execution.sandbox.contracts import SandboxRequest
 from loop.execution.sandbox.linux import paths as linux_paths
 from loop.execution.sandbox.linux.paths import (
+    MountBudget,
     bind_paths,
-    mount_arguments,
     prepare_paths,
 )
 
@@ -58,6 +59,22 @@ def bound(monkeypatch, tmp_path):
         return SandboxRequest.create(**values)
 
     return create, workspace, scratch
+
+
+def mount_arguments(request, scratch, *, budget=None, **options):
+    """Prepare actual mounts with a controlled native resource budget."""
+    if budget is None:
+        budget = MountBudget(1_000_000, (10_000,), 0, 0)
+    return linux_paths.mount_arguments(request, scratch, measure=lambda _args: budget, **options)
+
+
+def _read_only_targets(arguments):
+    """List the canonical and mirrored destinations of read-only binds."""
+    return {
+        Path(arguments[index + 2])
+        for index, value in enumerate(arguments)
+        if value == "--ro-bind-fd"
+    }
 
 
 def _external_executable_request(create, scratch, tools):
@@ -1051,136 +1068,192 @@ def test_mount_arguments_binds_hardlinks_read_only_after_writable_roots(binding,
     assert outside.read_text() == "outside-data"
 
 
-def test_large_hardlink_sets_use_containing_directory_mounts(binding, tmp_path, monkeypatch):
-    """Group dense hardlink sets to stay within Bubblewrap's argument limit."""
-    create, workspace, scratch, _ = binding
+@pytest.fixture
+def shared_files(binding, tmp_path):
+    """Create recognized hardlinks from writable paths to an admitted read-only peer root."""
+    create, workspace, scratch, _opened = binding
     peers = tmp_path / "peers"
     peers.mkdir()
-    monkeypatch.setattr("loop.execution.sandbox.linux.paths._MAX_HARDLINK_MOUNTS", 2)
-    package = workspace / ".venv/site-packages/package"
-    package.mkdir(parents=True)
+
+    counter = 0
+
+    def link(relative):
+        """Add one writable name and an independently visible read-only peer."""
+        nonlocal counter
+        counter += 1
+        destination = workspace / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        source = peers / str(counter)
+        source.write_text("canary")
+        destination.hardlink_to(source)
+        return destination
+
+    def request(**changes):
+        """Include the peer root in the authorized read view."""
+        changes["read_roots"] = (peers, *changes.get("read_roots", ()))
+        return create(**changes)
+
+    return request, link, workspace, scratch
+
+
+def test_mount_budget_measures_encoded_argv_environment_and_free_decimal_slots(monkeypatch):
+    """Count fixed argv, environment, duplicate digits and only assignable descriptor slots."""
+    monkeypatch.setattr(linux_paths.resource, "getrlimit", lambda _resource: (12, 100))
+    entries = Mock(return_value=[*(str(index) for index in range(10)), "500"])
+    monkeypatch.setattr(linux_paths.os, "listdir", entries)
+    monkeypatch.setattr(linux_paths.os, "open", Mock(return_value=9))
+    close = Mock()
+    monkeypatch.setattr(linux_paths.os, "close", close)
+    arguments = ("helper", "--ro-bind-fd", "34", "/lib/é", "--ro-bind-fd", "34", "/mount")
+    environment = {"LC_ALL": "C", "VAR": "✓"}
+    fixed = (
+        sum(
+            len(value.encode()) + 1 + struct.calcsize("P")
+            for value in (
+                *arguments,
+                "LC_ALL=C",
+                "VAR=✓",
+            )
+        )
+        + len("helper")
+        + 1
+        - len("34")
+    )
+    monkeypatch.setattr(linux_paths.os, "sysconf", lambda _name: fixed + 3)
+    budget = MountBudget.measure(arguments, environment, ("34",), 1)
+    entries.assert_called_once_with("/proc/self/fd")
+    close.assert_called_once_with(9)
+    assert budget.free_descriptors == (1, 2)
+    assert budget.fits(1, 0)  # Decimal widths 1 and 2.
+    assert not budget.fits(1, 1)
+    assert not budget.fits(2, 0)  # Keep one slot for transient setup.
+
+
+@pytest.mark.parametrize("ceiling", ["ample", "descriptors", "arguments"])
+def test_hardlink_grouping_stops_as_soon_as_the_launch_fits(shared_files, ceiling):
+    """Use narrow groups only when actual resources require them, retaining other file mounts."""
+    create, link, workspace, scratch = shared_files
+    leaves = [
+        link(Path(group) / f"branch-{index}" / ("é" * 25))
+        for group in ("a", "b")
+        for index in range(2)
+    ]
+    exact_mount_bytes = sum(
+        len(option.encode()) + 1 + struct.calcsize("P")
+        for leaf in leaves
+        for option in ("--ro-bind-fd", "0", str(leaf))
+    )
+    budgets = {
+        "ample": MountBudget(exact_mount_bytes, (4,), 0, 0),
+        "descriptors": MountBudget(exact_mount_bytes, (3,), 0, 0),
+        "arguments": MountBudget(exact_mount_bytes - 1, (4,), 0, 0),
+    }
+    with mount_arguments(create(), scratch, budget=budgets[ceiling]) as (arguments, _, _):
+        targets = _read_only_targets(arguments)
+        assert {leaf for leaf in leaves if leaf in targets} == (
+            set(leaves) if ceiling == "ample" else set(leaves[2:])
+        )
+        assert (workspace / "a" in targets) is (ceiling != "ample")
+        assert workspace / "b" not in targets
+
+
+def test_hardlink_grouping_restores_disjoint_files_when_a_later_merge_is_enough(shared_files):
+    """A wider merge leaves no redundant read-only directory in a disjoint branch."""
+    create, link, workspace, scratch = shared_files
+    first = [link(Path("a") / str(index)) for index in range(2)]
+    second = [link(Path("b") / str(index)) for index in range(4)]
+    with mount_arguments(create(), scratch, budget=MountBudget(100_000, (3,), 0, 0)) as (
+        arguments,
+        _,
+        _,
+    ):
+        targets = _read_only_targets(arguments)
+        assert set(first) <= targets
+        assert workspace / "a" not in targets
+        assert workspace / "b" in targets
+        assert targets.isdisjoint(second)
+
+
+def test_hardlink_grouping_updates_ancestor_costs_and_prunes_subsumed_groups(shared_files):
+    """Replace children by one ancestor only when the narrower mounts still cannot fit."""
+    create, link, workspace, scratch = shared_files
+    leaves = [link(Path("packages") / f"child-{i // 2}" / str(i)) for i in range(5)]
+    with mount_arguments(create(), scratch, budget=MountBudget(100_000, (1,), 0, 0)) as (
+        arguments,
+        _,
+        _,
+    ):
+        targets = _read_only_targets(arguments)
+        assert workspace / "packages" in targets
+        assert (workspace / "packages/child-0") not in targets
+        assert (workspace / "packages/child-1") not in targets
+        assert targets.isdisjoint(leaves)
+
+
+@pytest.mark.parametrize("phase", [2, 5])
+def test_scattered_hardlink_grouping_stops_when_its_deadline_expires(
+    shared_files,
+    monkeypatch,
+    phase,
+):
+    """Stop deadline-expired preparation while measuring or considering subtree mounts."""
+    create, link, _, scratch = shared_files
     for index in range(3):
-        outside = peers / f"outside-{index}"
-        outside.write_text(f"module-{index}")
-        os.link(outside, package / f"module-{index}.py")
-    nested = package / "data"
-    nested.mkdir()
-    outside = peers / "outside-nested"
-    outside.write_text("nested-module")
-    os.link(outside, nested / "module.py")
-    request = create(read_roots=(peers,))
-    with mount_arguments(request, scratch) as (arguments, inherited, _):
-        workspace_index = arguments.index(str(workspace))
-        package_index = arguments.index(str(package))
-        assert arguments[workspace_index - 2] == "--bind-fd"
-        assert arguments[package_index - 2] == "--ro-bind-fd"
-        assert int(arguments[package_index - 1]) in inherited
-        assert str(package / "module-0.py") not in arguments
+        link(Path("group") / str(index) / "linked")
+    request = create()
+    calls = [0]
+
+    def budget(_arguments):
+        """Start a controlled clock when all fixed sources are ready."""
+
+        def clock():
+            """Expire during the selected mount-planning phase."""
+            calls[0] += 1
+            return request.deadline if calls[0] >= phase else 0
+
+        monkeypatch.setattr(linux_paths.time, "monotonic", clock)
+        return MountBudget(100_000, (2,), 0, 0)
+
+    with (
+        pytest.raises(TimeoutError, match="exceeded the command deadline"),
+        linux_paths.mount_arguments(request, scratch, measure=budget),
+    ):
+        pytest.fail("Expired mounts must not be yielded.")
 
 
-def test_large_hardlink_sets_group_at_a_shared_ancestor_when_needed(bound, tmp_path, monkeypatch):
-    """Escalate grouping only enough to keep scattered hardlink mounts within their bound."""
-    create, workspace, scratch = bound
-    peers = tmp_path / "peers"
-    peers.mkdir()
-    monkeypatch.setattr("loop.execution.sandbox.linux.paths._MAX_HARDLINK_MOUNTS", 2)
-    site_packages = workspace / ".venv/site-packages"
-    for index in range(3):
-        package = site_packages / f"package-{index}"
-        package.mkdir(parents=True)
-        outside = peers / f"outside-{index}"
-        outside.write_text(f"module-{index}")
-        os.link(outside, package / "module.py")
-    assert prepare_paths(create(read_roots=(peers,)), scratch)[3] == (site_packages,)
-
-
-def test_scattered_hardlink_grouping_stops_when_its_deadline_expires(bound, tmp_path, monkeypatch):
-    """Expiry while classifying scattered links cannot return late mount authority."""
-    create, workspace, scratch = bound
-    peers = tmp_path / "peers"
-    peers.mkdir()
-    monkeypatch.setattr("loop.execution.sandbox.linux.paths._MAX_HARDLINK_MOUNTS", 2)
-    links = set()
-    for index in range(3):
-        directory = workspace / "group" / str(index)
-        directory.mkdir(parents=True)
-        outside = peers / f"outside-{index}"
-        outside.write_text("canary")
-        link = directory / "linked"
-        os.link(outside, link)
-        links.add(link)
-    request = create(read_roots=(peers,))
-    clock = {"now": 0}
-    original = Path.is_relative_to
-
-    def relative(path, other):
-        """Let the preparation budget expire when a linked leaf is classified."""
-        result = original(path, other)
-        if path in links:
-            clock["now"] = request.deadline
-        return result
-
-    monkeypatch.setattr(Path, "is_relative_to", relative)
-    monkeypatch.setattr("loop.execution.sandbox.linux.paths.time.monotonic", lambda: clock["now"])
-    with pytest.raises(TimeoutError, match="deadline expired|exceeded the command deadline"):
-        prepare_paths(request, scratch)
-
-
-def test_hardlink_grouping_preserves_nested_writable_roots(bound, tmp_path, monkeypatch):
-    """A group containing another write root cannot silently make that root read-only."""
-    create, workspace, scratch = bound
-    peers = tmp_path / "peers"
-    peers.mkdir()
-    monkeypatch.setattr("loop.execution.sandbox.linux.paths._MAX_HARDLINK_MOUNTS", 2)
-    group = workspace / "group"
-    nested = group / "writable"
+@pytest.mark.parametrize("grant", ["root", "file"])
+def test_hardlink_grouping_preserves_explicit_nested_write_grants(shared_files, grant):
+    """A group containing an explicit root or exact write slot cannot make that grant read-only."""
+    create, link, workspace, scratch = shared_files
+    nested = workspace / "group/writable"
     nested.mkdir(parents=True)
     for index in range(3):
-        directory = group / str(index)
-        directory.mkdir()
-        outside = peers / f"outside-{index}"
-        outside.write_text("canary")
-        os.link(outside, directory / "linked")
-    value = create(write_roots=(workspace, nested), read_roots=(group, peers))
-    with pytest.raises(ValueError, match="exceed the bounded mount limit"):
-        prepare_paths(value, scratch)
-
-
-def test_hardlink_grouping_updates_disjoint_ancestor_membership(bound, tmp_path, monkeypatch):
-    """Several narrow groups meet the cap without making their shared parent read-only."""
-    create, workspace, scratch = bound
-    peers = tmp_path / "peers"
-    peers.mkdir()
-    monkeypatch.setattr("loop.execution.sandbox.linux.paths._MAX_HARDLINK_MOUNTS", 3)
-    leaves = []
-    for group, size in (("a", 2), ("b", 2), ("c", 1)):
-        for index in range(size):
-            directory = workspace / group / str(index)
-            directory.mkdir(parents=True)
-            outside = peers / f"outside-{group}-{index}"
-            outside.write_text("canary")
-            leaf = directory / "linked"
-            os.link(outside, leaf)
-            leaves.append(leaf)
-    assert prepare_paths(create(read_roots=(peers,)), scratch)[3] == (
-        workspace / "a",
-        workspace / "b",
-        leaves[-1],
+        link(Path("group") / str(index) / "linked")
+    changes = (
+        {"write_roots": (workspace, nested)}
+        if grant == "root"
+        else {"write_files": (nested / "slot",)}
     )
+    with (
+        pytest.raises(ValueError, match="exceed the native argument or open-file limit"),
+        mount_arguments(create(**changes), scratch, budget=MountBudget(100_000, (2,), 0, 0)),
+    ):
+        pytest.fail("A nested write grant was grouped.")
 
 
-def test_large_root_hardlink_sets_fail_before_exceeding_mount_limit(bound, tmp_path, monkeypatch):
-    """Root-level aliases cannot force the trusted helper beyond its bounded mount count."""
-    create, workspace, scratch = bound
-    peers = tmp_path / "peers"
-    peers.mkdir()
-    monkeypatch.setattr("loop.execution.sandbox.linux.paths._MAX_HARDLINK_MOUNTS", 2)
+@pytest.mark.parametrize("fixed_fits", [False, True])
+def test_large_root_hardlink_sets_fail_before_exceeding_native_limits(shared_files, fixed_fits):
+    """Refuse an oversized native launch when the workspace root cannot be grouped."""
+    create, link, _, scratch = shared_files
     for index in range(3):
-        outside = peers / f"outside-{index}"
-        outside.write_text(f"module-{index}")
-        os.link(outside, workspace / f"alias-{index}")
-    with pytest.raises(ValueError, match="exceed the bounded mount limit"):
-        prepare_paths(create(read_roots=(peers,)), scratch)
+        link(f"alias-{index}")
+    budget = MountBudget(100_000, (2,), 0, 0 if fixed_fits else 3)
+    expected = "writable hardlinks exceed" if fixed_fits else "fixed launch arguments"
+    with (
+        pytest.raises(ValueError, match=expected),
+        mount_arguments(create(), scratch, budget=budget),
+    ):
+        pytest.fail("Oversized native launch must not be yielded.")
 
 
 def test_mount_arguments_preserves_nested_write_grants_inside_readonly_workspace(binding):
