@@ -26,6 +26,8 @@ config.local.toml
 # Test artifacts
 .pytest_cache/
 .coverage
+.coverage.*
+coverage.xml
 htmlcov/
 
 # Agentic / Tooling
