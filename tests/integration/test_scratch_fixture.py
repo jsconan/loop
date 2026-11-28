@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from coverage import CoverageData
 
 pytestmark = pytest.mark.integration
 _SETFACL = shutil.which("setfacl")
@@ -83,6 +84,65 @@ def test_interrupted_shebang_fixture_never_creates_workspace_files(tmp_path):
     )
     assert result.returncode == 17, result.stdout + result.stderr
     assert set(project.glob("loop-native-test-*")) == existing
+
+
+def test_per_test_coverage_owns_only_its_database_outside_case_scratch(tmp_path):
+    """Record per-test coverage while rejecting neighboring database writes from the test."""
+    project = Path(__file__).resolve().parents[2]
+    measurement = tmp_path / "measurement"
+    measurement.mkdir()
+    data_file = measurement / ".coverage"
+    sibling = measurement / ".coverage.unapproved"
+    (tmp_path / "measured_fixture.py").write_text(
+        "def measured():\n    return 7\n",
+        encoding="utf-8",
+    )
+    case = tmp_path / "test_measurement.py"
+    case.write_text(
+        "import sqlite3\n"
+        "import pytest\n"
+        "from measured_fixture import measured\n"
+        "def test_measurement():\n"
+        "    assert measured() == 7\n"
+        "    with pytest.raises(AssertionError, match='Test output escapes disposable scratch'):\n"
+        f"        sqlite3.connect({str(sibling)!r})\n",
+        encoding="utf-8",
+    )
+    environment = os.environ | {
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONPATH": os.pathsep.join((str(tmp_path), str(project))),
+        "COVERAGE_CORE": "ctrace",
+        "COVERAGE_FILE": str(data_file),
+    }
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-B",
+            "-m",
+            "pytest",
+            "-c",
+            str(project / "pyproject.toml"),
+            "--confcutdir",
+            str(tmp_path),
+            "-p",
+            "tests.conftest",
+            "--cov=measured_fixture",
+            "--cov-context=test",
+            "-x",
+            case.name,
+        ],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert list(measurement.iterdir()) == [data_file]
+    contexts = CoverageData(basename=str(data_file))
+    contexts.read()
+    assert any(value.endswith("::test_measurement|run") for value in contexts.measured_contexts())
 
 
 def test_case_monkeypatch_does_not_leave_a_deleted_temporary_directory(tmp_path):

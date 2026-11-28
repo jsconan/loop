@@ -83,7 +83,7 @@ UV_NO_SYNC=1 UV_OFFLINE=1 PYTHONDONTWRITEBYTECODE=1 \
     PYTEST_ADDOPTS="-o cache_dir=$LOOP_OUTPUT_DIR/pytest-cache" bash ./scripts/check_all_pytest.sh
 ```
 
-For a lint wrapper that uses Ruff, set `RUFF_CACHE_DIR="$LOOP_OUTPUT_DIR/ruff-cache"` in the same way. Parallel coverage workers create suffixed databases alongside `COVERAGE_FILE`, so select a writable directory for the tool's base path. Loop supplies the private output directory. The project or command selects which artifacts to place there.
+For a lint wrapper that uses Ruff, set `RUFF_CACHE_DIR="$LOOP_OUTPUT_DIR/ruff-cache"` in the same way. Parallel coverage workers create suffixed databases alongside `COVERAGE_FILE`, so select a writable directory for the tool's base path. Loop supplies the private output directory. The project or command selects which artifacts to place there. For per-test attribution on a Coverage.py core with dynamic context support, use `--cov-context=test`. Set `COVERAGE_CORE=ctrace` for per-test attribution on Python versions where the default `sysmon` core lacks context support. The test output guard permits the active coverage session’s exact SQLite data file while each test’s other outputs stay in its own scratch.
 
 Keep test-created private names such as a synthetic `.env` in fresh Loop-owned session scratch. A separately approved external directory still applies the hard private-name denials, including when used as pytest's `--basetemp`. Quote scratch paths so the same command works when both private namespaces contain spaces.
 

@@ -25,6 +25,7 @@ from loop.utils import content as content_module
 from loop.utils.path import ensure_private_directory
 
 _OUTPUT_ROOT: str | None = None
+_COVERAGE_DATA_FILE: str | None = None
 _NATIVE_OUTPUT_ROOTS: list[str] = []
 _WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
 _REALPATH = os.path.realpath
@@ -34,7 +35,7 @@ _FCNTL = fcntl.fcntl
 _OPEN = os.open
 
 
-def _check_output(path, *, follow=True, directory=None):
+def _check_output(path, *, follow=True, directory=None, exact_file=None):
     """Reject mutation paths, including descriptor-relative paths, outside test scratch."""
     if isinstance(path, int):
         return
@@ -53,6 +54,8 @@ def _check_output(path, *, follow=True, directory=None):
         if follow
         else os.path.join(_REALPATH(os.path.dirname(absolute)), os.path.basename(absolute))
     )
+    if canonical == exact_file:
+        return
     roots = (_OUTPUT_ROOT, *_NATIVE_OUTPUT_ROOTS)
     if not any(canonical == root or canonical.startswith(root + os.sep) for root in roots):
         raise AssertionError(f"Test output escapes disposable scratch: {canonical}")
@@ -100,10 +103,27 @@ def _audit_output(event, arguments):
         if database.startswith("file:"):
             database = unquote(database[5:].split("?", 1)[0])
         if database != ":memory:":
-            _check_output(database)
+            _check_output(database, exact_file=_COVERAGE_DATA_FILE)
 
 
 sys.addaudithook(_audit_output)
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_sessionstart():
+    """Bind the active coverage runner's exact SQLite file before case isolation."""
+    global _COVERAGE_DATA_FILE
+    _COVERAGE_DATA_FILE = None
+    module = sys.modules.get("coverage")
+    active = module.Coverage.current() if module is not None else None
+    if active is not None:
+        try:
+            _COVERAGE_DATA_FILE = _REALPATH(active.get_data().data_filename())
+        except (module.CoverageException, OSError) as error:
+            raise pytest.UsageError(
+                "Coverage output is unavailable. Set COVERAGE_FILE to a file in a writable "
+                f"directory before starting the tests. {error}"
+            ) from error
 
 
 @pytest.fixture(scope="session")
